@@ -6,7 +6,7 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase } from '../../Pick.js';
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -46,3 +46,16 @@ new BalancerBase(4, [1, 1, 1, 1]);
 
 // @ts-expect-error -- setEligible needs a boolean, not a number.
 base.setEligible(0, 1);
+
+// RoundRobinBalancer: a BalancerBase subclass; pick() returns a number.
+const rr: RoundRobinBalancer = new RoundRobinBalancer(4, new Uint8Array(4));
+const rrBase: BalancerBase = rr; // is-a BalancerBase
+void rrBase;
+const rrCap: number = rr.capacity;
+const rrLive: number = rr.live;
+const rrPick: number = rr.pick();
+void rrCap; void rrLive; void rrPick;
+rr.setEligible(0, true);
+
+// @ts-expect-error -- eligible must be a Uint8Array.
+new RoundRobinBalancer(4, [1, 1, 1, 1]);

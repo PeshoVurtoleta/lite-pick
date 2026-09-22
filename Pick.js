@@ -1,8 +1,7 @@
 /**
  * @zakkster/lite-pick -- zero-GC load-balancing SELECTION KERNEL.
  *
- * M0 (0.0.x): scaffold + substrate seams, NO strategy yet. This file ships the
- * shared machinery every strategy (M1+) will reuse, and nothing else:
+ * M1 (0.1.0): the substrate seams + the FIRST strategy, RoundRobin. This file ships:
  *
  *   - VERSION        the single source-of-truth version stamp (3-place sync).
  *   - PICK_NONE      the fail-closed sentinel (-1): "no endpoint", never a dead pick.
@@ -12,21 +11,23 @@
  *                    written by @zakkster/lite-di-health / circuit breakers and only
  *                    READ here, plus an O(1) live count and a cold-path setEligible().
  *                    It does NOT implement pick() -- strategies subclass it.
+ *   - RoundRobinBalancer  the baseline strategy: a wrapping cursor that forward-scans
+ *                    the eligibility view, skipping down nodes, O(1) amortized, 0 B/op.
  *
  * The identity (decisions/0001): lite-pick OWNS NO mutable state it can avoid owning.
  * It reads pre-allocated views (eligibility, inflight, weights, scores) that siblings or
  * the caller write, and returns an integer index. Health, circuit state, and load
  * counters live OUTSIDE the kernel. The steady-state pick path allocates 0 B/op.
  *
- * Roster (planned, one strategy per session -- see ROADMAP.md):
- *   RoundRobin, SmoothWRR, P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash,
- *   BoundedLoad, WeightedRandom.
+ * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [shipped M1],
+ *   SmoothWRR, P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad,
+ *   WeightedRandom [planned].
  *
  * Zero runtime dependencies. node:test only. ESM, single file, tree-shakeable.
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.0.1';
+export const VERSION = '0.1.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -147,5 +148,57 @@ export class BalancerBase {
      */
     pick() {
         throw new Error('[lite-pick] BalancerBase.pick() is abstract -- use a strategy (M1+)');
+    }
+}
+
+/**
+ * RoundRobinBalancer -- the baseline strategy (M1).
+ *
+ * A single wrapping cursor over the shared eligibility view. `pick()` advances the
+ * cursor and forward-scans, skipping down nodes (`eligible[i] === 0`), until it lands
+ * on the next pickable endpoint. Over a run of picks this hands each eligible endpoint
+ * an equal share, in index order -- true round-robin over the LIVE set, not the raw
+ * index space (the distinction from a naive `i++ % n`, which would return down nodes).
+ *
+ * Ownership (ADR 0001): it owns ONLY the integer cursor. Eligibility is the shared,
+ * read-only Uint8Array from BalancerBase; `pick()` reads it and returns an index. No
+ * SparseSet of eligibles is maintained -- ADR 0003 chose the stateless bitmap-scan path
+ * (Option A) for M1; the lite-o1 RandomSet/SparseSet substrate (Option B, an optional
+ * PEER dep) arrives at M3 when P2C needs a random eligible draw.
+ *
+ * Bound: O(1) amortized (one step when the next index is eligible), worst case O(cap)
+ * when eligibility is sparse (bounded by a single wrap -- `_live > 0` guarantees a hit
+ * within `cap` steps). Steady-state pick(): a compare-wrap loop over the view, one
+ * cursor write. No object, closure, string, or array is created -- proven 0 B/op by
+ * test/torture.mjs and test/perf/PerfGate.test.mjs.
+ */
+export class RoundRobinBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  endpoint count (fixed; add/remove is a cold rebuild).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     */
+    constructor(capacity, eligible) {
+        super(capacity, eligible);
+        // Last index returned. -1 so the first pick starts the scan at index 0.
+        this._cursor = -1;
+    }
+
+    /**
+     * Next eligible endpoint index in round-robin order, or PICK_NONE when the whole
+     * pool is down (fail closed). O(1) amortized, O(cap) worst case, zero-alloc.
+     * @returns {number}
+     */
+    pick() {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const cap = this._cap, el = this._eligible;
+        let i = this._cursor;
+        for (let steps = 0; steps < cap; steps++) {
+            i++;
+            if (i >= cap) i = 0;                   // wrap (cap is caller-given, not power-of-2)
+            if (el[i]) { this._cursor = i; return i; }
+        }
+        // Unreachable while `_live` is exact (setEligible maintains it): a positive live
+        // count guarantees a set bit within one wrap. Fail closed rather than loop.
+        return PICK_NONE;
     }
 }

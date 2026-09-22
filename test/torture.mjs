@@ -13,9 +13,9 @@
  *                                  substrate hot ops (Prng.next / nextBelow, isEligible)
  *                                  is the M0 gate. Strategy pick() paths join at M1+.
  *
- * M0 note: there is no strategy pick() yet, so the profiled hot path is the SUBSTRATE
- * (the PRNG draw + an eligibility read) that every strategy rides. Each strategy session
- * appends its own reused-instance hot phase here (ROADMAP section 3).
+ * M1: the profiled hot paths are the SUBSTRATE (PRNG draw + eligibility read) that every
+ * strategy rides, AND RoundRobin.pick() itself. Each later strategy appends its own
+ * reused-instance hot phase here (ROADMAP section 3).
  *
  * ENTRY CONTRACT (mirrors lite-o1): --expose-gc is mandatory; the two devDeps are
  * imported AFTER the guard so a fresh clone that skipped `npm install` fails with a
@@ -40,7 +40,7 @@ async function main() {
 
     const { measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { Prng, BalancerBase } = await import('../Pick.js');
+    const { Prng, BalancerBase, RoundRobinBalancer } = await import('../Pick.js');
 
     const CAP = 1 << 12;    // pool capacity 4096
     const CYCLES = 4096;    // retention churn
@@ -66,6 +66,9 @@ async function main() {
             b.setEligible(c & (CAP - 1), (c & 1) === 0);
             b.isEligible(c & (CAP - 1));
             tracker.track(b, noop, 'balancerbase', { audit: true });
+            const rr = new RoundRobinBalancer(CAP, el);
+            rr.pick();
+            tracker.track(rr, noop, 'roundrobin', { audit: true });
         }
         return tracker.size();
     }
@@ -99,18 +102,31 @@ async function main() {
     const allocBytes = Math.max(0, Math.round(bpc));
     const allocOk = allocBytes === 0;
 
+    // ---- phase 3: RoundRobin.pick() per-call allocation (0 B/op) -----------
+    // One reused RoundRobinBalancer over a half-eligible pool: every pick() is a
+    // compare-wrap loop + one cursor write, no object/closure/array created.
+    const rr = new RoundRobinBalancer(CAP, el);
+    let rrSink = 0;
+    const rrStep = () => { rrSink = (rrSink + rr.pick()) | 0; };
+    const rrAllocRes = measureAllocs(rrStep, { iterations: 100000, batches: 8 });
+    const rrBpc = rrAllocRes.bytesPerCall === null ? 0 : rrAllocRes.bytesPerCall;
+    const rrAllocBytes = Math.max(0, Math.round(rrBpc));
+    const rrAllocOk = rrAllocBytes === 0;
+
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink;
+    void sink; void rrSink;
 
-    process.stdout.write('lite-pick torture (M0 substrate)\n');
+    process.stdout.write('lite-pick torture (M1: substrate + RoundRobin)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  hot-path allocs: ' + allocBytes + ' B/op -> ' +
+    process.stdout.write('  substrate hot-path allocs: ' + allocBytes + ' B/op -> ' +
         (allocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  RoundRobin.pick() allocs: ' + rrAllocBytes + ' B/op -> ' +
+        (rrAllocOk ? 'PASS' : 'FAIL') + '\n');
 
-    if (!retentionOk || !allocOk) {
+    if (!retentionOk || !allocOk || !rrAllocOk) {
         process.stderr.write('torture: FAIL\n');
         process.exit(1);
     }

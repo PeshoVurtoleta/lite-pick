@@ -1,9 +1,9 @@
 /**
  * @zakkster/lite-pick -- TypeScript declarations.
  *
- * M0 (0.0.x): the substrate seams only. Strategy classes (RoundRobin, SmoothWRR, P2C,
- * LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom) are added
- * one per session (M1+).
+ * M1 (0.1.0): the substrate seams + the first strategy, RoundRobin. The remaining
+ * strategy classes (SmoothWRR, P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash,
+ * BoundedLoad, WeightedRandom) are added one per session.
  */
 
 /** The single source-of-truth version stamp. */
@@ -51,5 +51,20 @@ export class BalancerBase {
     /** Cold path: mark endpoint `i` up/down, keeping the live count exact. */
     setEligible(i: number, up: boolean): void;
     /** Choose an endpoint index, or `PICK_NONE`. Abstract in the base (throws). */
+    pick(): number;
+}
+
+/**
+ * RoundRobinBalancer -- the baseline strategy (M1). A wrapping cursor that forward-scans
+ * the shared eligibility view, skipping down nodes, to hand each LIVE endpoint an equal
+ * share in index order. Owns only its cursor; O(1) amortized, 0 B/op on `pick()`.
+ */
+export class RoundRobinBalancer extends BalancerBase {
+    /**
+     * @param capacity endpoint count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     */
+    constructor(capacity: number, eligible: Uint8Array);
+    /** Next eligible index in round-robin order, or `PICK_NONE` when the pool is down. */
     pick(): number;
 }

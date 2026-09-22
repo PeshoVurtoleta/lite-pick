@@ -17,8 +17,8 @@ wiring proven zero-GC parts, not new low-level code.
 
 | Session | Deliverable | Version | Bound | State |
 | --- | --- | --- | --- | --- |
-| **M0** | Scaffold + substrate seams (no strategy) | 0.0.x | -- | planned |
-| **M1** | **RoundRobin** + witness/balance harness | 0.1.0 | O(1) | planned |
+| **M0** | Scaffold + substrate seams (no strategy) | 0.0.1 | -- | SHIPPED |
+| **M1** | **RoundRobin** + witness/balance harness | 0.1.0 | O(1) | SHIPPED |
 | **M2** | **SmoothWRR** (nginx smooth weighted RR) | 0.2.0 | O(1) amortized | planned |
 | **M3** | **P2C** (the headline + balance anchor) | 0.3.0 | O(d)=O(1) | planned |
 | **M4** | **LeastConn family** (P2C-least-conn, SED, NQ; lite-logn exact fallback) | 0.4.0 | O(1) / O(log n) exact | planned |
@@ -78,10 +78,13 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
 - **In-flight / rtt counters (caller-owned).** `Uint32Array` inflight + `Float64Array`
   rtt/EWMA, passed in at construction. The kernel holds no request state; the lite-query
   adapter (M5) provides the ergonomic increment/decrement layer.
-- **lite-o1 reuse (never fork).** `RandomSet` (O(1) random eligible draw for P2C),
-  `SparseSet` (eligible set with O(1) add/remove), `AliasTable` (WeightedRandom, M10),
-  `MonoDeque`/`RingLog` (sliding-window latency for PeakEWMA/BoundedLoad). Design-parity,
-  not runtime dep, where the zero-deps law requires -- confirm per structure.
+- **lite-o1 reuse (never fork, never vendor).** `RandomSet` (O(1) random eligible draw for
+  P2C), `SparseSet` (eligible set with O(1) add/remove), `AliasTable` (WeightedRandom, M10),
+  `MonoDeque`/`RingLog` (sliding-window latency for PeakEWMA/BoundedLoad). Consumed as an
+  OPTIONAL PEER dependency (`peerDependenciesMeta.optional: true`), NOT inlined and NOT a
+  hard dep: zero-deps law = zero HARD deps, and the suite composes via optional peers (the
+  LiteQuery model). The kernel runs over raw TypedArrays with zero peers present; a peer is
+  declared only when a shipped code path imports it -- lite-o1 lands at M3 (P2C), not before.
 - **Deterministic PRNG.** Instance-local xorshift32 (seed arg, `reset()`), so the balance
   benchmark (the anchor) is reproducible. No `Math.random` on a gated path.
 - **Fail-closed contract.** Whole pool ineligible -> `pick()` returns -1 by default
@@ -91,9 +94,10 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
 
 ## 2. Design calls to settle per session (lifted from RESEARCH.md, so they are not a surprise)
 
-- **M1 RoundRobin:** does the wrapping index skip ineligible nodes inline (O(1) with a
-  bounded scan) or draw from a lite-o1 SparseSet of eligibles? Lean: SparseSet-backed, so
-  the eligibility seam is proven on the simplest strategy first. Foil: `i++ % n`.
+- **M1 RoundRobin:** SETTLED (ADR 0003) -- Option A, the stateless bitmap forward-scan
+  (owns only a cursor, reads the one shared eligibility view). Option B (a lite-o1
+  SparseSet of eligibles, an optional peer) is revisited at M3 when P2C needs the random
+  eligible draw. Foil: `i++ % n` (eligibility-blind -> the dead-pick trap RR avoids).
 - **M2 SmoothWRR:** nginx smooth algorithm (integer `current += weight; pick max; current
   -= total`) confirmed as THE weighted default over naive/bursty WRR. Reweight is a cold
   path. Foil: naive weight-expansion WRR (bursty) -- shown losing on smoothness.

@@ -309,7 +309,11 @@ measure the edges, never hide them:
 ## 6. Boundaries with sibling packages (no duplication)
 
 The suite ships one clear niche per package. lite-pick is unusually COMPOSITIONAL -- most of its substrate
-is already built and torture-proven elsewhere, which is the point: lite-pick is the policy brain wiring
+is already built and torture-proven elsewhere, which is the point: a year of building the lego bricks so
+this one snaps together fast and reliable. Every sibling below is consumed as an OPTIONAL PEER dependency
+(`peerDependenciesMeta.optional: true`, the LiteQuery model) -- NEVER inlined, NEVER forked, NEVER a hard
+dep. Zero-deps law = zero HARD deps; the kernel runs over raw TypedArrays with zero peers installed, and a
+peer is declared only when a shipped code path imports it. lite-pick is the policy brain wiring
 proven zero-GC parts, not new low-level code.
 
 - **lite-di-health** -- OWNS liveness/readiness. lite-pick reads its aggregated health as an eligibility

@@ -3,12 +3,12 @@
  *
  * Run:  node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs
  *
- * A node:test-native COMPLEMENT to torture (0 B/op), not a replacement. M0 gates the
+ * A node:test-native COMPLEMENT to torture (0 B/op), not a replacement. M1 gates the
  * SUBSTRATE hot ops every strategy rides -- the deterministic Prng draw (next /
- * nextBelow) and the BalancerBase eligibility read (isEligible) -- via scavenge scaling
- * at N and k*N, with the old-gen and external / arrayBuffers lanes pinned to 0. The
- * eligibility view is fixed at construction and NEVER grows, so the `grows` counter
- * (its .buffer.byteLength) must show a 0 delta across the whole window.
+ * nextBelow) and the BalancerBase eligibility read (isEligible) -- AND RoundRobin.pick(),
+ * via scavenge scaling at N and k*N, with the old-gen and external / arrayBuffers lanes
+ * pinned to 0. The eligibility view is fixed at construction and NEVER grows, so the
+ * `grows` counter (its .buffer.byteLength) must show a 0 delta across the whole window.
  *
  * Each strategy session (M1+) appends its own reused-instance scenario + its own
  * mustFail teeth-check here (ROADMAP section 3 / accounting site 10).
@@ -18,7 +18,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { Prng, BalancerBase } from '../../Pick.js';
+import { Prng, BalancerBase, RoundRobinBalancer } from '../../Pick.js';
 
 const CAP = 1 << 14;      // pool capacity 16384
 const MASK = CAP - 1;     // power-of-2 mask: nextBelow stays in [0, CAP)
@@ -89,7 +89,23 @@ const setChurn = {
     statsOf(s) { return { grows: grows(s) }; },
 };
 
-const scenarios = [prngDraw, eligibleRead, setChurn];
+/** roundrobin-pick: reused RR over a half-eligible pool; each op a real pick(). */
+const roundRobinPick = {
+    name: 'RoundRobinBalancer.pick()',
+    setup() {
+        const el = makePool();
+        return { el, base: new RoundRobinBalancer(CAP, el), acc: 0 };
+    },
+    hot(s, n) {
+        const rr = s.base;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + rr.pick()) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: grows(s) }; },
+};
+
+const scenarios = [prngDraw, eligibleRead, setChurn, roundRobinPick];
 
 /**
  * The teeth: a draw that pushes each index into a FRESH [] each op -- the array MUST
@@ -111,6 +127,28 @@ const drawMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The RoundRobin teeth: pick() whose result is boxed into a FRESH [] each op -- the array
+ * MUST trip the gate, proving the instrument catches allocation on the RR pick surface.
+ */
+const rrMustFailAlloc = {
+    name: 'RoundRobin.pick() boxed into fresh array (MUST allocate)',
+    setup() {
+        const el = makePool();
+        return { el, base: new RoundRobinBalancer(CAP, el) };
+    },
+    hot(s, n) {
+        const rr = s.base;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [rr.pick()]; // fresh array per op -> heap churn
+            sink += arr[0];
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -120,5 +158,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [drawMustFailAlloc],
+    mustFail: [drawMustFailAlloc, rrMustFailAlloc],
 });

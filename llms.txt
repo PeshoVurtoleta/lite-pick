@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.0.1
+Version: 0.1.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,10 +14,10 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.0.1 is the M0 SCAFFOLD: the substrate seams only, ahead of the strategy roster. It ships
-`VERSION`, the fail-closed sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32),
-and `BalancerBase` (the shared read-only eligibility seam + O(1) live count). Strategies
-land one per session (see ROADMAP.md): RoundRobin, SmoothWRR, P2C, LeastConn/SED/NQ,
+0.1.0 ships the substrate seams + the FIRST strategy, RoundRobin. It exports `VERSION`, the
+fail-closed sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase`
+(the shared read-only eligibility seam + O(1) live count), and `RoundRobinBalancer`. The
+remaining strategies land one per session (see ROADMAP.md): SmoothWRR, P2C, LeastConn/SED/NQ,
 PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
 
 ## Design ownership (decisions/0001, 0002)
@@ -51,6 +51,12 @@ PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
   - `setEligible(i, up)` -> void. Cold path; keeps `live` exact and is idempotent; throws
     `RangeError` on an out-of-range index.
   - `pick()` -> number. ABSTRACT in the base (throws); overridden by each strategy.
+- `RoundRobinBalancer extends BalancerBase` -- class. The baseline strategy (M1).
+  - `new RoundRobinBalancer(capacity, eligible)` -- same shared-eligibility contract as the base.
+  - `pick()` -> number. Next eligible index in round-robin order (a wrapping cursor that
+    forward-scans the eligibility view, skipping down nodes), or `PICK_NONE` when the pool is
+    down. O(1) amortized, O(cap) worst case under sparse eligibility, 0 B/op. Owns only its
+    cursor; no eligible-set structure (ADR 0003 chose the stateless bitmap-scan path for M1).
 
 ## Gates (every session)
 
@@ -68,5 +74,7 @@ PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
 (RandomSet / AliasTable / RingLog substrate), lite-logn (exact least-conn heap / Fenwick
 weights), lite-lru (sticky affinity), lite-fastbit32 (optional small-pool bitset peer),
 lite-query (the fetcher adapter), lite-await (hedging), lite-worker-pool (in-process
-consumer), lite-di-signal / lite-signal-decorators (observability). None is a runtime
-dependency -- every seam is duck-typed over a shared TypedArray.
+consumer), lite-di-signal / lite-signal-decorators (observability). None is a HARD
+dependency -- each is an OPTIONAL PEER dep (peerDependenciesMeta.optional, the LiteQuery
+model), every seam is duck-typed over a shared TypedArray, and the kernel runs with zero
+peers installed. A peer is declared only when a shipped code path imports it.

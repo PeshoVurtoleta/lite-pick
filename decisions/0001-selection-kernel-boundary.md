@@ -6,7 +6,9 @@
   (per-endpoint circuit breaker), @zakkster/lite-o1 (RandomSet/AliasTable/RingLog substrate),
   @zakkster/lite-logn (exact least-conn heap / Fenwick weighted), @zakkster/lite-fastbit32
   (optional small-pool bitset), @zakkster/lite-worker + lite-worker-pool (in-process consumer).
-  Needs NONE of them as a runtime dependency: every seam is duck-typed over a shared TypedArray.
+  Needs NONE of them as a HARD (runtime) dependency: every seam is duck-typed over a shared
+  TypedArray, and each sibling is consumed as an OPTIONAL PEER dep (`peerDependenciesMeta.optional`,
+  the LiteQuery model) -- never inlined, never forked. The kernel runs with zero peers present.
 - Date: 2026-09-22
 
 ## Context

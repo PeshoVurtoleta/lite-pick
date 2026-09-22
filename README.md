@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.0.1 is the M0 scaffold**: the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view) ahead of the strategy roster -- RoundRobin, SmoothWRR, P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom, landing one per session.
+> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.1.0 ships the first strategy, `RoundRobinBalancer`**, on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view). The rest of the roster -- SmoothWRR, P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-pick.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-pick)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -21,13 +21,40 @@ The npm landscape has old algorithm libraries (`load-balancers`, `loadbalance`, 
 - **Two pieces of evidence, both shipped.** A **0 B/op** witness on the pick path (no object, closure, string, or array created per pick), and a measured **balance-quality anchor** -- peak-to-average load within the strategy's theoretical ceiling (for P2C, the Azar-Broder-Karlin-Upfal `ln ln n / ln 2` bound) and strictly better than a random foil.
 - **A pure selector, not a proxy.** It **consumes** health and circuit state; it never owns them. Health is a shared read-only bitmap written by [`@zakkster/lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health); circuit state comes from [`@zakkster/lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart); load counters are caller-owned typed arrays. `pick()` only reads.
 
-> **Status: M0 scaffold (v0.0.1).** This release ships the substrate every strategy will ride, and **no strategy yet**. The first strategy, **RoundRobin (M1)**, lands the throughput witness and the balance gate. See [ROADMAP.md](./ROADMAP.md) for the M0 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ratified ownership boundary (ADR 0001) and the anti-flapping rule (ADR 0002).
+> **Status: M1 (v0.1.0).** Ships the substrate seams **plus the first strategy, `RoundRobinBalancer`**. The M0 harness stubs are now real gates: `pick()` is proven **0 B/op** (torture + PerfGate), **perfectly fair** (balance: imbalance 1.0000, and zero dead picks vs the naive `i++ % n` foil), and **flat** across the pool sweep (witness). See [ROADMAP.md](./ROADMAP.md) for the M1 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), and the RoundRobin design fork (ADR 0003).
 
 ```bash
 npm install @zakkster/lite-pick
 ```
 
-## The substrate (what M0 ships)
+## RoundRobin (v0.1.0)
+
+```js
+import { RoundRobinBalancer, PICK_NONE } from '@zakkster/lite-pick';
+
+// A pool of 4 endpoints. The eligibility view is SHARED and read-only to pick():
+// lite-di-health probes / circuit breakers write it; the balancer only reads it.
+const eligible = Uint8Array.from([1, 1, 0, 1]); // endpoint 2 is down
+
+const rr = new RoundRobinBalancer(4, eligible);
+
+rr.pick();            // -> 0
+rr.pick();            // -> 1
+rr.pick();            // -> 3   (skips the down endpoint 2, never returns it)
+rr.pick();            // -> 0   (wraps)
+
+// A health source marks endpoint 2 back up (cold path; live count stays exact).
+rr.setEligible(2, true);
+rr.pick();            // -> 1, then 2, then 3, ... now that 2 is eligible
+
+// Whole pool down -> fail closed, never a dead pick.
+for (let i = 0; i < 4; i++) rr.setEligible(i, false);
+rr.pick() === PICK_NONE; // -> true  (-1)
+```
+
+Every `pick()` above allocates **0 bytes**, owns only an integer cursor, and reads the one shared eligibility view (no second copy to drift). Over a run it hands each *live* endpoint an equal share -- true round-robin over the eligible set, not the raw index space.
+
+## The substrate (under every strategy)
 
 ```js
 import { BalancerBase, Prng, PICK_NONE, VERSION } from '@zakkster/lite-pick';
@@ -52,10 +79,10 @@ rng.nextBelow(4);     // -> a uint32 in [0, 4)
 rng.reset();          // replays the exact stream
 
 PICK_NONE;            // -> -1  (fail-closed sentinel: no endpoint, never a dead pick)
-VERSION;              // -> '0.0.1'
+VERSION;              // -> '0.1.0'
 ```
 
-`BalancerBase.pick()` is **abstract** at M0 -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Strategy subclasses (M1+) implement it. Here is the shape the headline **P2C** strategy will take (M3), for orientation:
+`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index; `RoundRobinBalancer` (above) overrides it. Here is the shape the headline **P2C** strategy will take (M3), for orientation:
 
 ```js
 // SHAPE ONLY -- not shipped until M3. Two random eligible draws, return the lower
@@ -90,7 +117,7 @@ lite-pick owns **no mutable state it can avoid owning** ([ADR 0001](./decisions/
 
 ## Composes with
 
-The moat is not the algorithms -- it is that lite-pick wires already-proven zero-GC parts of the suite: [`lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health) (liveness), [`lite-o1`](https://www.npmjs.com/package/@zakkster/lite-o1) (`RandomSet` / `AliasTable` / `RingLog` substrate), [`lite-logn`](https://www.npmjs.com/package/@zakkster/lite-logn) (exact least-conn heap / Fenwick weights), [`lite-lru`](https://www.npmjs.com/package/@zakkster/lite-lru) (sticky affinity), [`lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart) (breaker), [`lite-query`](https://www.npmjs.com/package/@zakkster/lite-query) (the fetcher adapter), and [`lite-await`](https://www.npmjs.com/package/@zakkster/lite-await) (hedging). **None is a runtime dependency** -- every seam is duck-typed over a shared TypedArray.
+The moat is not the algorithms -- it is that lite-pick wires already-proven zero-GC parts of the suite: [`lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health) (liveness), [`lite-o1`](https://www.npmjs.com/package/@zakkster/lite-o1) (`RandomSet` / `AliasTable` / `RingLog` substrate), [`lite-logn`](https://www.npmjs.com/package/@zakkster/lite-logn) (exact least-conn heap / Fenwick weights), [`lite-lru`](https://www.npmjs.com/package/@zakkster/lite-lru) (sticky affinity), [`lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart) (breaker), [`lite-query`](https://www.npmjs.com/package/@zakkster/lite-query) (the fetcher adapter), and [`lite-await`](https://www.npmjs.com/package/@zakkster/lite-await) (hedging). **None is a hard dependency** -- each is an *optional peer* (`peerDependenciesMeta.optional`), every seam is duck-typed over a shared TypedArray, and the kernel runs with zero peers installed.
 
 ## Gates
 

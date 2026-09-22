@@ -58,7 +58,8 @@ witnessed-but-unbenchmarked, or typed-but-untortured.
 | 11 | `test/witness.mjs` | pick throughput + flatness gate |
 | 12 | `test/balance.mjs` | imbalance vs the strategy's ceiling + random foil (the anchor gate) |
 | 13 | `benchmark/Matrix.mjs` (+ M6 `GcBlastRadius.mjs`, `Disruption.mjs`, `Fairness.mjs`, `Report.mjs`, `results.json`) | `SUBJECTS` + foil map + dimension flags; the M6 session adds the blast-radius / disruption / fairness dimensions + the seeded, version-stamped report |
-| 14 | `README.md` + `CHANGELOG.md` + `decisions/00NN-*.md` | the docs + the ADR |
+| 14 | `test/fuzz.mjs` (+ the shared per-strategy invariant checker) | a state-owning strategy adds its invariant set + a subject to the seeded property-based fuzzer (RESEARCH section 3) |
+| 15 | `README.md` + `CHANGELOG.md` + `decisions/00NN-*.md` | the docs + the ADR |
 
 `npm pack --dry-run` must exclude `test/`, `benchmark/`, `demo/`, and `decisions/`, and
 include only the `files[]` entries. Published metadata (`homepage`/`repository`/`bugs`)
@@ -189,6 +190,20 @@ The zero-GC proof is TWO complementary tools, kept separate exactly as lite-o1 d
   down/up between picks, up to and including all-down), `pick()` NEVER returns a down index and
   returns `PICK_NONE` when the pool is empty -- proven per strategy. For an evaluator replacing a
   trusted paid lib, "never routes to a dead node" outweighs any ops/sec bar. (Boundary suite.)
+- **Invariant fuzzer (the state-machine attack, `test/fuzz.mjs`):** REQUIRED for any strategy that
+  owns mutable state (SmoothWRR accumulators/totals; later LeastConn/BoundedLoad/AdaptiveWeight),
+  recommended for all. A SEEDED, property-based barrage of `pick`/`setEligible`/`setWeight` that
+  asserts the strategy's INVARIANTS after each op via a REUSABLE per-strategy checker -- not just
+  "never down" (the churn test's job) but STATE-SYNCHRONISATION: every maintained aggregate stays
+  EXACT vs a manual recompute (`_totalEligibleWeight` == sum eligible weights, `live` == count),
+  owned Float64 state stays finite, and `PICK_NONE` IFF pickable-mass is 0. Prints the SEED on
+  failure (byte-for-byte replay). Strict mode (every op -- the real proof) + fast mode (every N).
+  CI runs one FIXED seed (regression) + one RANDOM seed (discovery) + a REGRESSION CORPUS of
+  bug-finding seeds, plus a pathological corpus (max-weight 0xFFFFFFFF -> 0 proving the Float64
+  absorbs a large total under 2^53; all-zero-weight while live>0; single-node; pure-flap phase).
+  Prior art: AWS lightweight formal methods, Linux scheduler selftests/syzkaller, Envoy's RR-LB
+  fuzz test (RESEARCH section 3). Complements -- never replaces -- the balance/anchor gate: the
+  fuzzer proves no state corruption, the anchor proves the algorithm does the right thing.
 - **Pipeline:** planner -> coder -> reviewer -> qa. Reviewer REJECTED goes back to coder.
 - **Release:** `/release <semver>` -- version-site sync (three places), changelog, prepublish
   gate; card sync after. User commits/publishes.

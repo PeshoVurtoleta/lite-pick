@@ -187,6 +187,43 @@ v1), noted, not shipped in the first suite.
 `benchmark/` ships tables AND graphs, always against a hand-rolled foil and, where one exists, the incumbent
 npm package. This is a planned standalone workstream (M6), as in lite-o1 -- do not fold it in piecemeal.
 
+### Correctness methodology: the invariant-fuzz vector (the state-machine attack)
+
+Benchmarks prove the algorithm does the RIGHT thing (balance, smoothness, tail); they do not prove it never
+CORRUPTS its own state under a chaotic operation stream. For the strategies that OWN mutable state --
+SmoothWRR's `_current` accumulators + `_totalEligibleWeight`, later LeastConn/BoundedLoad/AdaptiveWeight --
+handcrafted sequential unit tests only cover the scenarios we imagined. The high-confidence bar for a
+state-owning kernel is the one AWS / Linux / IBM actually use for schedulers and load-balance paths:
+**invariants + randomised (seeded) fuzzing + long soak**, not more handwritten cases.
+
+- **Prior art.** AWS "lightweight formal methods" (property-based testing + coverage-guided fuzzing + fault
+  injection + counter-example minimisation, e.g. S3 ShardStore); the Linux scheduler selftests + syzkaller +
+  `stress-ng` "never return a down CPU / never violate a load-balance invariant" checks; IBM z/OS soak
+  "run it until the numbers stop moving" + data-integrity invariants; and, closest to home, **Envoy ships a
+  dedicated round-robin load-balancer fuzz test** -- the same idea, expressed with a corpus instead of a seed.
+- **The three vectors, mapped to lite-pick's existing machinery (two are already gates):**
+  1. **Zero-GC + precision soak** -- ALREADY a gate: `torture.mjs` (`lite-gc-profiler` `measureAllocs`, 0 B/op)
+     + `PerfGate.test.mjs` (`lite-perf-gate` `zgcSuite`, pinned lanes). Extend the soak to hit the Float64
+     accumulator hard enough to prove the `current -= total` discipline keeps values finite and well under 2^53.
+  2. **Flap / chaos torture** -- ALREADY substantially covered: each boundary suite thrashes
+     `setEligible`/`setWeight` while picking (200k steps) and asserts NEVER-returns-a-down-index.
+  3. **Invariant fuzzer (the net-new piece)** -- a SEEDED, property-based harness firing a randomised barrage
+     of `pick`/`setEligible`/`setWeight` and asserting, after each op, the strategy's INVARIANTS -- not just
+     "never down" but the STATE-SYNCHRONISATION ones our churn tests do not check. On failure it prints the
+     seed for byte-for-byte replay. Two modes: strict (every op -- the real proof, since the maintained totals
+     are exact after each mutation) and fast (every N, for CI speed). CI runs one FIXED seed (regression) plus
+     one RANDOM seed (discovery), and a small REGRESSION CORPUS of seeds that previously found bugs.
+- **The per-strategy invariants** (a reusable checker; each strategy contributes its set): `pick()` never
+  returns an ineligible index; `pick()` returns `PICK_NONE` IFF the strategy's "pickable mass" is zero (all
+  down, or -- SmoothWRR -- eligible-weight sum 0); every maintained aggregate stays EXACT against a manual
+  recompute (`_totalEligibleWeight` == sum of eligible weights; `live` == count of eligible); owned Float64
+  state stays finite (no `NaN`/`Infinity`) and integral where it should be.
+- **Pathological corpus** (explicit, not random): all weights = `0xFFFFFFFF` then dropped to 0 (proves the
+  Float64 accumulator absorbs a large total without crossing 2^53), all-eligible-weight-zero while `live > 0`,
+  single-node, and a rapid pure-flap phase with no picks.
+- **The boundary.** The fuzzer proves the kernel does not CORRUPT state; the balance/anchor gates prove it
+  does the RIGHT thing. Both are required; neither substitutes for the other.
+
 ---
 
 ## 4. The Strategy Roster

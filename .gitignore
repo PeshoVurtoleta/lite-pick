@@ -1,0 +1,6 @@
+/node_modules
+/package-lock.json
+
+# generated benchmark artifacts (machine/time-specific; regenerate with `npm run bench:report`)
+/benchmark/results.json
+/benchmark/report.html

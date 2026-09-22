@@ -1,0 +1,72 @@
+# @zakkster/lite-pick
+
+Version: 0.0.1
+License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
+Node: >= 18.
+
+## What it is
+
+A zero-GC load-balancing SELECTION KERNEL: one hot `pick()` that returns an endpoint
+INDEX over a fixed pool and allocates zero bytes on the steady-state path. It is a pure
+selector, never a proxy -- it CONSUMES health and circuit state (it never owns them),
+reading pre-allocated views that siblings or the caller write, and returning an integer.
+The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
+average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
+
+0.0.1 is the M0 SCAFFOLD: the substrate seams only, ahead of the strategy roster. It ships
+`VERSION`, the fail-closed sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32),
+and `BalancerBase` (the shared read-only eligibility seam + O(1) live count). Strategies
+land one per session (see ROADMAP.md): RoundRobin, SmoothWRR, P2C, LeastConn/SED/NQ,
+PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
+
+## Design ownership (decisions/0001, 0002)
+
+- IN-PROCESS first (workers, DI services); remote HTTP is a thin optional adapter.
+- Eligibility is a SHARED read-only `Uint8Array` (1 = pickable, 0 = down), WRITTEN by
+  @zakkster/lite-di-health / circuit breakers, only READ by `pick()`. Zero-copy.
+- Load counters are CALLER-OWNED typed arrays (`Uint32Array` inflight, `Float64Array`
+  rtt/EWMA); the kernel holds no request state. `pick()` is pure-read.
+- The circuit breaker is CONSUMED (@zakkster/lite-statechart), never built in.
+- Fail-closed: whole pool down -> `pick()` returns `PICK_NONE` (-1), never a dead pick.
+- Anti-flapping is a first-class rule: routing-STATE transitions apply hysteresis/dwell;
+  `pick()` itself stays greedy and stateless.
+
+## Exports (from the single main file Pick.js)
+
+- `VERSION` -- string. The source-of-truth version stamp (synced with package.json + this file).
+- `PICK_NONE` -- the -1 fail-closed sentinel returned by `pick()` when no endpoint is eligible.
+- `Prng` -- class. Instance-local deterministic xorshift32.
+  - `new Prng(seed = 0x9e3779b9)` -- 0 is remapped to the default.
+  - `next()` -> uint32 in [1, 2^32). One xorshift32 step, zero-alloc.
+  - `nextBelow(n)` -> uint32 in [0, n).
+  - `reset()` -> void. Replays the original seed's stream (reproducible benches).
+- `BalancerBase` -- class. The shared eligibility seam; strategies (M1+) subclass it.
+  - `new BalancerBase(capacity, eligible)` -- `eligible` is a shared `Uint8Array`
+    (length >= capacity) owned/written externally; throws `RangeError` on a bad capacity
+    or an undersized / non-Uint8Array view.
+  - `capacity` -- readonly number. Fixed endpoint count.
+  - `live` -- readonly number. Currently eligible endpoints (O(1), cold-path maintained).
+  - `isEligible(i)` -> boolean. O(1); out-of-range is `false`, never a throw.
+  - `setEligible(i, up)` -> void. Cold path; keeps `live` exact and is idempotent; throws
+    `RangeError` on an out-of-range index.
+  - `pick()` -> number. ABSTRACT in the base (throws); overridden by each strategy.
+
+## Gates (every session)
+
+- `npm run torture`   -- `node --expose-gc test/torture.mjs`: lite-leak retention +
+  lite-gc-profiler 0 B/op on the hot path.
+- `npm run test:perf` -- `node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs`:
+  lite-perf-gate `zgcSuite` HARD zero-alloc gate + a `mustFail` teeth-check.
+- `npm run witness`   -- pick throughput flatness across a pool-size sweep.
+- `npm run balance`   -- peak-to-average load vs the strategy ceiling + random foil (the anchor).
+- `npm test` / `npm run test:types` -- node:test boundary suite + tsc type-surface check.
+
+## Composes with
+
+@zakkster/lite-di-health (eligibility writer), lite-statechart (breaker), lite-o1
+(RandomSet / AliasTable / RingLog substrate), lite-logn (exact least-conn heap / Fenwick
+weights), lite-lru (sticky affinity), lite-fastbit32 (optional small-pool bitset peer),
+lite-query (the fetcher adapter), lite-await (hedging), lite-worker-pool (in-process
+consumer), lite-di-signal / lite-signal-decorators (observability). None is a runtime
+dependency -- every seam is duck-typed over a shared TypedArray.

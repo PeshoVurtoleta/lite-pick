@@ -1,0 +1,115 @@
+{
+  "name": "@zakkster/lite-pick",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "version": "0.0.1",
+  "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster: RoundRobin, SmoothWRR, P2C, least-conn, PeakEWMA, consistent hashing.",
+  "type": "module",
+  "main": "./Pick.js",
+  "module": "./Pick.js",
+  "types": "./Pick.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Pick.d.ts",
+      "node": "./Pick.js",
+      "import": "./Pick.js",
+      "default": "./Pick.js"
+    }
+  },
+  "files": [
+    "Pick.js",
+    "Pick.d.ts",
+    "llms.txt",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:types": "tsc -p test/types/tsconfig.json",
+    "torture": "node --expose-gc test/torture.mjs",
+    "witness": "node test/witness.mjs",
+    "balance": "node test/balance.mjs",
+    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
+    "bench": "node benchmark/Matrix.mjs",
+    "bench:report": "node benchmark/Matrix.mjs && node benchmark/Report.mjs",
+    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run balance && npm run test:perf"
+  },
+  "keywords": [
+    "load-balancer",
+    "load-balancing",
+    "load-balance",
+    "balancer",
+    "pick",
+    "selection",
+    "endpoint-selection",
+    "server-selection",
+    "round-robin",
+    "weighted-round-robin",
+    "smooth-weighted-round-robin",
+    "wrr",
+    "power-of-two-choices",
+    "p2c",
+    "two-random-choices",
+    "least-connections",
+    "least-conn",
+    "shortest-expected-delay",
+    "sed",
+    "never-queue",
+    "peak-ewma",
+    "latency-aware",
+    "consistent-hashing",
+    "maglev",
+    "bounded-load",
+    "weighted-random",
+    "sticky-routing",
+    "client-side-load-balancing",
+    "in-process",
+    "worker-pool",
+    "health-check",
+    "circuit-breaker",
+    "fail-closed",
+    "anti-flapping",
+    "hysteresis",
+    "deterministic",
+    "xorshift32",
+    "prng",
+    "zero-gc",
+    "zero-allocation",
+    "gc",
+    "garbage-collection",
+    "typed-array",
+    "performance",
+    "high-throughput",
+    "lightweight",
+    "tree-shakeable",
+    "esm",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-perf-gate": "^1.4.2",
+    "typescript": "^7.0.2"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-pick#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-pick.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-pick/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "sideEffects": false
+}

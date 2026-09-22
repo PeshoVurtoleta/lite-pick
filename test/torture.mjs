@@ -1,0 +1,123 @@
+/**
+ * @zakkster/lite-pick -- torture gate.
+ *
+ *     node --expose-gc test/torture.mjs
+ *
+ * Two jobs, kept separate (torture-harness skill):
+ *   - @zakkster/lite-leak       -- RETENTION: does a balancer instance outlive its
+ *                                  owner? tracker.size() -> 0 after churn is the proof.
+ *                                  A balancer owns no external kernel (no timer, listener,
+ *                                  or the shared eligibility view, which the CALLER owns),
+ *                                  so being collected is the desired outcome.
+ *   - @zakkster/lite-gc-profiler -- BUDGET: does the hot path allocate? 0 B/op on the
+ *                                  substrate hot ops (Prng.next / nextBelow, isEligible)
+ *                                  is the M0 gate. Strategy pick() paths join at M1+.
+ *
+ * M0 note: there is no strategy pick() yet, so the profiled hot path is the SUBSTRATE
+ * (the PRNG draw + an eligibility read) that every strategy rides. Each strategy session
+ * appends its own reused-instance hot phase here (ROADMAP section 3).
+ *
+ * ENTRY CONTRACT (mirrors lite-o1): --expose-gc is mandatory; the two devDeps are
+ * imported AFTER the guard so a fresh clone that skipped `npm install` fails with a
+ * remedy, not a stack trace.
+ */
+
+async function main() {
+    if (typeof globalThis.gc !== 'function') {
+        process.stderr.write(
+            'torture: FAIL -- run with --expose-gc: node --expose-gc test/torture.mjs\n');
+        process.exit(1);
+    }
+    for (const pkg of ['@zakkster/lite-gc-profiler', '@zakkster/lite-leak']) {
+        try {
+            await import(pkg);
+        } catch {
+            process.stderr.write(
+                'torture: FAIL -- missing devDependency ' + pkg + ' -- run: npm install\n');
+            process.exit(2);
+        }
+    }
+
+    const { measureAllocs } = await import('@zakkster/lite-gc-profiler');
+    const { createLeakTracker } = await import('@zakkster/lite-leak');
+    const { Prng, BalancerBase } = await import('../Pick.js');
+
+    const CAP = 1 << 12;    // pool capacity 4096
+    const CYCLES = 4096;    // retention churn
+
+    const warns = [];
+    const tracker = createLeakTracker({
+        name: 'lite-pick',
+        onWarning: (w) => warns.push(w.kind + ':' + w.reason),
+    });
+
+    // ---- phase 1: retention torture ---------------------------------------
+    // A BalancerBase owns only its capacity + a reference to a CALLER-owned Uint8Array
+    // (never copied, never retained beyond the caller). The cleanup closes over NOTHING,
+    // so the tracker can finalize each instance. After churn + gc, tracker.size() must
+    // be 0 -- no balancer outlived its scope. The churn lives in its own function so its
+    // frame is fully torn down before we gc (conservative stack scanning otherwise pins
+    // the last instance).
+    const noop = () => {};
+    function fillTracker() {
+        const el = new Uint8Array(CAP).fill(1);
+        for (let c = 0; c < CYCLES; c++) {
+            const b = new BalancerBase(CAP, el);
+            b.setEligible(c & (CAP - 1), (c & 1) === 0);
+            b.isEligible(c & (CAP - 1));
+            tracker.track(b, noop, 'balancerbase', { audit: true });
+        }
+        return tracker.size();
+    }
+    fillTracker();
+
+    globalThis.gc();
+    await new Promise((r) => setTimeout(r, 0));
+    globalThis.gc();
+    let live = tracker.size();
+    for (let i = 0; i < 8 && live > 0; i++) {
+        globalThis.gc();
+        await new Promise((r) => setTimeout(r, 0));
+        live = tracker.size();
+    }
+    const findings = tracker.audit();
+
+    // ---- phase 2: per-call allocation on the substrate hot path (0 B/op) ---
+    // One reused Prng + one reused BalancerBase. Steady state: one PRNG draw + one
+    // bounded eligibility read. No object, closure, string, or array is created.
+    const el = new Uint8Array(CAP);
+    for (let i = 0; i < CAP; i += 2) el[i] = 1;          // half eligible
+    const base = new BalancerBase(CAP, el);
+    const rng = new Prng(0x1234abcd);
+    let sink = 0;
+    const step = () => {
+        const i = rng.nextBelow(CAP);
+        if (base.isEligible(i)) sink = (sink + i) | 0;
+    };
+    const allocRes = measureAllocs(step, { iterations: 100000, batches: 8 });
+    const bpc = allocRes.bytesPerCall === null ? 0 : allocRes.bytesPerCall;
+    const allocBytes = Math.max(0, Math.round(bpc));
+    const allocOk = allocBytes === 0;
+
+    // ---- verdict ----------------------------------------------------------
+    const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
+    void sink;
+
+    process.stdout.write('lite-pick torture (M0 substrate)\n');
+    process.stdout.write('  retention: tracker.size()=' + live +
+        ' findings=' + findings.length + ' warns=' + warns.length +
+        ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  hot-path allocs: ' + allocBytes + ' B/op -> ' +
+        (allocOk ? 'PASS' : 'FAIL') + '\n');
+
+    if (!retentionOk || !allocOk) {
+        process.stderr.write('torture: FAIL\n');
+        process.exit(1);
+    }
+    process.stdout.write('torture: PASS\n');
+}
+
+main().catch((e) => {
+    process.stderr.write('torture: FAIL -- ' + (e && e.stack ? e.stack : e) + '\n');
+    process.exit(1);
+});

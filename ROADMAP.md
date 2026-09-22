@@ -19,7 +19,7 @@ wiring proven zero-GC parts, not new low-level code.
 | --- | --- | --- | --- | --- |
 | **M0** | Scaffold + substrate seams (no strategy) | 0.0.1 | -- | SHIPPED |
 | **M1** | **RoundRobin** + witness/balance harness | 0.1.0 | O(1) | SHIPPED |
-| **M2** | **SmoothWRR** (nginx smooth weighted RR) | 0.2.0 | O(1) amortized | planned |
+| **M2** | **SmoothWRR** (nginx smooth weighted RR) | 0.2.0 | O(cap) | SHIPPED |
 | **M3** | **P2C** (the headline + balance anchor) | 0.3.0 | O(d)=O(1) | planned |
 | **M4** | **LeastConn family** (P2C-least-conn, SED, NQ; lite-logn exact fallback) | 0.4.0 | O(1) / O(log n) exact | planned |
 | **M5** | **lite-query adapter** (the integration moat) | 0.5.0 | -- | planned |
@@ -98,9 +98,13 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
   (owns only a cursor, reads the one shared eligibility view). Option B (a lite-o1
   SparseSet of eligibles, an optional peer) is revisited at M3 when P2C needs the random
   eligible draw. Foil: `i++ % n` (eligibility-blind -> the dead-pick trap RR avoids).
-- **M2 SmoothWRR:** nginx smooth algorithm (integer `current += weight; pick max; current
-  -= total`) confirmed as THE weighted default over naive/bursty WRR. Reweight is a cold
-  path. Foil: naive weight-expansion WRR (bursty) -- shown losing on smoothness.
+- **M2 SmoothWRR:** SHIPPED (ADR 0004). nginx smooth algorithm (`current += weight; pick
+  max; current -= total`), the weighted default. Weights are the caller's Uint32Array, the
+  balancer the sole writer via cold `setWeight`; Float64 accumulators; eligibility toggles
+  reset the accumulator (epoch-bounded, anti-flap). O(cap) per pick (NOT O(1) -- corrected),
+  0 B/op. Foil: naive weight-expansion WRR (bursty) -- beaten on smoothness (max-run 3 vs 10
+  for weights [10,3,2,1]) at exact fairness. The witness gained a per-strategy complexity
+  flag ('linear' asserts flat work-rate ops/ms*n).
 - **M3 P2C:** rejection-sample two DISTINCT eligible draws vs draw-from-RandomSet; the
   distinct-second-choice nudge policy; tie-break (lean: first draw wins, unbiased over
   many picks). The balance-quality gate (imbalance vs `ln ln n / ln 2`) lands here.

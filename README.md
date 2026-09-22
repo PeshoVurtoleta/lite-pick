@@ -54,6 +54,28 @@ rr.pick() === PICK_NONE; // -> true  (-1)
 
 Every `pick()` above allocates **0 bytes**, owns only an integer cursor, and reads the one shared eligibility view (no second copy to drift). Over a run it hands each *live* endpoint an equal share -- true round-robin over the eligible set, not the raw index space.
 
+## SmoothWRR (v0.2.0)
+
+The weighted default -- nginx's *smooth* weighted round-robin. Weighted picks are **interleaved evenly** instead of clumped, so a heavy endpoint doesn't get a burst of consecutive requests.
+
+```js
+import { SmoothWRRBalancer } from '@zakkster/lite-pick';
+
+const eligible = Uint8Array.from([1, 1, 1]);
+const weights  = Uint32Array.from([5, 1, 1]); // A is 5x
+
+const wrr = new SmoothWRRBalancer(3, eligible, weights);
+
+const seq = Array.from({ length: 7 }, () => wrr.pick());
+// -> [0, 0, 1, 0, 2, 0, 0]   smooth: A A B A C A A  (not A A A A A B C)
+// over 7 picks: A=5, B=1, C=1 -- exactly the weights
+
+// Reweight on the cold path (the balancer stays the sole writer of the weights):
+wrr.setWeight(1, 4);  // B is now 4x
+```
+
+`pick()` is **0 B/op** and **O(cap)** (one scan of the pool -- negligible at real endpoint counts). It owns its smoothing accumulators; weights live in your `Uint32Array` but you mutate them only through `setWeight`, which keeps the internal eligible-weight total exact. Marking a node down/up resets its accumulator, so a recovered node rejoins neutral -- no stale burst or starvation ([ADR 0004](./decisions/0004-smoothwrr-weight-ownership.md)).
+
 ## The substrate (under every strategy)
 
 ```js

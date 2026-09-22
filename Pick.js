@@ -1,7 +1,7 @@
 /**
  * @zakkster/lite-pick -- zero-GC load-balancing SELECTION KERNEL.
  *
- * M1 (0.1.0): the substrate seams + the FIRST strategy, RoundRobin. This file ships:
+ * M2 (0.2.0): substrate seams + RoundRobin + SmoothWRR (weighted). This file ships:
  *
  *   - VERSION        the single source-of-truth version stamp (3-place sync).
  *   - PICK_NONE      the fail-closed sentinel (-1): "no endpoint", never a dead pick.
@@ -13,21 +13,22 @@
  *                    It does NOT implement pick() -- strategies subclass it.
  *   - RoundRobinBalancer  the baseline strategy: a wrapping cursor that forward-scans
  *                    the eligibility view, skipping down nodes, O(1) amortized, 0 B/op.
+ *   - SmoothWRRBalancer   the weighted default: nginx smooth weighted round-robin over
+ *                    caller-configured integer weights, O(cap)/pick, 0 B/op.
  *
  * The identity (decisions/0001): lite-pick OWNS NO mutable state it can avoid owning.
  * It reads pre-allocated views (eligibility, inflight, weights, scores) that siblings or
  * the caller write, and returns an integer index. Health, circuit state, and load
  * counters live OUTSIDE the kernel. The steady-state pick path allocates 0 B/op.
  *
- * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [shipped M1],
- *   SmoothWRR, P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad,
- *   WeightedRandom [planned].
+ * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [M1], SmoothWRR [M2],
+ *   P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom [planned].
  *
  * Zero runtime dependencies. node:test only. ESM, single file, tree-shakeable.
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -200,5 +201,100 @@ export class RoundRobinBalancer extends BalancerBase {
         // Unreachable while `_live` is exact (setEligible maintains it): a positive live
         // count guarantees a set bit within one wrap. Fail closed rather than loop.
         return PICK_NONE;
+    }
+}
+
+/**
+ * SmoothWRRBalancer -- nginx-style smooth weighted round-robin (M2).
+ *
+ * Distributes picks by caller-configured integer weights, spreading them SMOOTHLY over
+ * time rather than in bursts: weights [5, 1, 1] yield A, A, B, A, C, A, A -- not the
+ * A A A A A B C clumping of naive weight-expansion WRR. Each pick adds every eligible
+ * node's weight to its accumulator, takes the node with the highest accumulator, and
+ * subtracts the total eligible weight from it (the nginx `current += weight; pick max;
+ * current -= total` algorithm).
+ *
+ * Ownership (ADR 0001, ADR 0004): this is the first strategy that owns ALGORITHM state --
+ * the per-endpoint smoothing accumulators (`_current`, a Float64Array; Float64 absorbs the
+ * sum of uint32 weights without overflow and is 0 B/op on the hot path). Weights live in
+ * the caller's Uint32Array, but the balancer is the SOLE writer via the cold `setWeight()`,
+ * which keeps `_totalEligibleWeight` exact; mutating the weights array directly desyncs the
+ * total (documented UB). An eligibility toggle maintains the total AND resets the toggled
+ * node's accumulator (ADR 0004: no stale credit across an eligibility epoch -- anti-flap
+ * aligned, ADR 0002).
+ *
+ * Bound: O(cap) per pick (one scan of the pool -- SmoothWRR is inherently linear in the
+ * pool size, negligible at real endpoint counts), zero-alloc. Fails closed (PICK_NONE)
+ * when the eligible-weight sum is 0 -- whole pool down, or every eligible node's weight 0.
+ */
+export class SmoothWRRBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  endpoint count (fixed).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array} weights  per-endpoint weights (length >= capacity); the balancer
+     *   is the sole writer via setWeight() -- direct mutation desyncs the total (UB).
+     */
+    constructor(capacity, eligible, weights) {
+        super(capacity, eligible);
+        if (!(weights instanceof Uint32Array) || weights.length < capacity) {
+            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+        }
+        this._weights = weights;
+        this._current = new Float64Array(capacity);
+        let total = 0;
+        for (let i = 0; i < capacity; i++) if (eligible[i]) total += weights[i];
+        this._totalEligibleWeight = total;
+    }
+
+    /**
+     * Cold path: mark endpoint i up/down, maintaining the eligible-weight total and
+     * RESETTING the toggled node's accumulator (no stale credit across an eligibility
+     * epoch, ADR 0004). Zero-alloc.
+     * @param {number} i
+     * @param {boolean} up
+     */
+    setEligible(i, up) {
+        const was = this.isEligible(i);
+        super.setEligible(i, up);           // validates range, flips the bit, updates _live
+        const now = this._eligible[i] !== 0;
+        if (was !== now) {
+            this._totalEligibleWeight += now ? this._weights[i] : -this._weights[i];
+            this._current[i] = 0;           // reset on every eligibility transition
+        }
+    }
+
+    /**
+     * Cold path: reconfigure endpoint i's weight, keeping the eligible-weight total exact.
+     * @param {number} i
+     * @param {number} w  new weight (uint32)
+     */
+    setWeight(i, w) {
+        if (i < 0 || i >= this._cap) throw new RangeError('[lite-pick] index out of range: ' + i);
+        const nw = w >>> 0;
+        if (nw !== w) throw new RangeError('[lite-pick] weight must be a uint32: ' + w);
+        const old = this._weights[i];
+        if (nw === old) return;
+        this._weights[i] = nw;
+        if (this._eligible[i]) this._totalEligibleWeight += nw - old;
+    }
+
+    /**
+     * Next endpoint by smooth weighting, or PICK_NONE (fail closed). O(cap), zero-alloc.
+     * @returns {number}
+     */
+    pick() {
+        const total = this._totalEligibleWeight;
+        if (total <= 0) return PICK_NONE;   // whole pool down, or all eligible weights 0
+        const cap = this._cap, el = this._eligible, wt = this._weights, cur = this._current;
+        let best = -1, bestCur = -Infinity;
+        for (let i = 0; i < cap; i++) {
+            if (el[i]) {
+                const c = cur[i] + wt[i];
+                cur[i] = c;
+                if (c > bestCur) { bestCur = c; best = i; }
+            }
+        }
+        cur[best] -= total;                 // best >= 0 guaranteed while total > 0
+        return best;
     }
 }

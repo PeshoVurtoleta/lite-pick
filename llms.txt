@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.1.0
+Version: 0.2.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,11 +14,11 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.1.0 ships the substrate seams + the FIRST strategy, RoundRobin. It exports `VERSION`, the
-fail-closed sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase`
-(the shared read-only eligibility seam + O(1) live count), and `RoundRobinBalancer`. The
-remaining strategies land one per session (see ROADMAP.md): SmoothWRR, P2C, LeastConn/SED/NQ,
-PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
+0.2.0 ships the substrate seams + two strategies: RoundRobin and SmoothWRR (the weighted
+default). It exports `VERSION`, the fail-closed sentinel `PICK_NONE` (-1), a deterministic
+`Prng` (xorshift32), `BalancerBase` (the shared read-only eligibility seam + O(1) live count),
+`RoundRobinBalancer`, and `SmoothWRRBalancer`. The remaining strategies land one per session
+(see ROADMAP.md): P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
 
 ## Design ownership (decisions/0001, 0002)
 
@@ -57,6 +57,18 @@ PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
     forward-scans the eligibility view, skipping down nodes), or `PICK_NONE` when the pool is
     down. O(1) amortized, O(cap) worst case under sparse eligibility, 0 B/op. Owns only its
     cursor; no eligible-set structure (ADR 0003 chose the stateless bitmap-scan path for M1).
+- `SmoothWRRBalancer extends BalancerBase` -- class. The weighted default (M2).
+  - `new SmoothWRRBalancer(capacity, eligible, weights)` -- `weights` is a Uint32Array
+    (length >= capacity); the balancer is the sole writer via setWeight (direct mutation
+    desyncs the total -- UB).
+  - `setWeight(i, w)` -> void. COLD. Reconfigure endpoint i's weight (uint32), keeping the
+    eligible-weight total exact.
+  - `setEligible(i, up)` -> void. COLD. Overrides the base to maintain the eligible-weight
+    total and reset the toggled node's accumulator (no stale credit across an epoch, ADR 0004).
+  - `pick()` -> number. Next endpoint by nginx smooth weighted round-robin (`current +=
+    weight; pick max; current -= total`), interleaved smoothly (weights [5,1,1] ->
+    A,A,B,A,C,A,A), or `PICK_NONE` when the eligible-weight sum is 0. O(cap) per pick, 0 B/op.
+    Owns its Float64Array smoothing accumulators (ADR 0004).
 
 ## Gates (every session)
 

@@ -6,7 +6,7 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer } from '../../Pick.js';
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -59,3 +59,18 @@ rr.setEligible(0, true);
 
 // @ts-expect-error -- eligible must be a Uint8Array.
 new RoundRobinBalancer(4, [1, 1, 1, 1]);
+
+// SmoothWRRBalancer: adds a weights arg + setWeight; a BalancerBase subclass.
+const wrr: SmoothWRRBalancer = new SmoothWRRBalancer(4, new Uint8Array(4), new Uint32Array(4));
+const wrrBase: BalancerBase = wrr;
+void wrrBase;
+const wrrPick: number = wrr.pick();
+void wrrPick;
+wrr.setWeight(0, 5);
+wrr.setEligible(1, true);
+
+// @ts-expect-error -- weights must be a Uint32Array, not a number[].
+new SmoothWRRBalancer(4, new Uint8Array(4), [1, 1, 1, 1]);
+
+// @ts-expect-error -- weights arg is required.
+new SmoothWRRBalancer(4, new Uint8Array(4));

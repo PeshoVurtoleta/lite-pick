@@ -4,6 +4,39 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-23
+
+M2: SmoothWRR, the weighted default (ROADMAP.md M2).
+
+### Added
+
+- `SmoothWRRBalancer extends BalancerBase` -- nginx-style smooth weighted round-robin
+  (`current += weight; pick max; current -= total`). Distributes picks by caller-configured
+  integer weights, interleaved SMOOTHLY (weights [5,1,1] -> A,A,B,A,C,A,A), not in the
+  bursts of naive weight-expansion WRR. Owns its Float64Array smoothing accumulators; the
+  sole writer of the weights via the cold `setWeight(i, w)`. O(cap) per pick, 0 B/op. Fails
+  closed (`PICK_NONE`) when the eligible-weight sum is 0 (all down, or all eligible weights 0).
+- `setWeight(i, w)` (cold) -- reconfigure a weight, keeping the eligible-weight total exact.
+  `setEligible` is overridden to maintain the total and reset the toggled node's accumulator
+  (no stale credit across an eligibility epoch).
+- `test/SmoothWRR.test.js` -- 12 tests: the documented [5,1,1] sequence, exact fairness over
+  k cycles, smoothness (max-run strictly below the bursty foil), skips-down / redistribution,
+  fail-closed (all down AND all-zero-weight), setWeight/setEligible invariants + accumulator
+  reset, uint32 validation, and a never-returns-a-down-index proof under 200k churned picks.
+- Gates extended for SmoothWRR: torture (retention + 0 B/op `pick()`), PerfGate (`zgcSuite`
+  scenario at a realistic 256-endpoint pool -- SmoothWRR is O(cap) -- with a `grows` counter
+  over all three backing arrays, plus a `mustFail` teeth-check), witness (a per-strategy
+  complexity flag: `linear` asserts flat WORK RATE `ops/ms * n`), balance (exact weighted
+  fairness + max-run < bursty foil).
+- `benchmark/Matrix.mjs` -- SmoothWRR subject + the naive expand-WRR bursty foil.
+- `decisions/0004-smoothwrr-weight-ownership.md` -- weight ownership (cold setWeight),
+  Float64 accumulators, and the epoch-reset-on-eligibility-transition enrichment.
+
+### Changed
+
+- Version 0.1.0 -> 0.2.0 across `package.json`, `Pick.js` `VERSION`, and `llms.txt`.
+- Corrected the SmoothWRR complexity: O(cap) per pick, not "O(1) amortized" (ROADMAP).
+
 ## [0.1.0] - 2026-09-23
 
 M1: the first strategy, RoundRobin (ROADMAP.md M1). The M0 harness stubs become real,
@@ -72,5 +105,6 @@ ownership boundary in place before any `pick()` is written.
 - Next: **M1 RoundRobin** (0.1.0) -- the first strategy, landing the throughput witness
   and the balance gate.
 
+[0.2.0]: https://github.com/PeshoVurtoleta/lite-pick/releases/tag/v0.2.0
 [0.1.0]: https://github.com/PeshoVurtoleta/lite-pick/releases/tag/v0.1.0
 [0.0.1]: https://github.com/PeshoVurtoleta/lite-pick/releases/tag/v0.0.1

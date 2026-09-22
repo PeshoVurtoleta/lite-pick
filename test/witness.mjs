@@ -3,52 +3,79 @@
  *
  *     node test/witness.mjs
  *
- * Witnesses that a strategy's pick() holds its ops/ms as the pool grows (a good pick() is
- * O(1) or O(d), never O(n)) across a geometric pool-size sweep (n = 8, 64, 512, 4096).
+ * Witnesses that a strategy's pick() cost scales as ADVERTISED across a geometric
+ * pool-size sweep (n = 8, 64, 512, 4096). Strategies carry different complexity, so the
+ * witness carries a per-strategy expectation:
  *
- * M1: RoundRobin.pick() is the strategy under test. It is O(1) amortized when eligibility
- * is dense (the measured case here -- all nodes up), so ops/ms must stay flat as n grows.
- * (The sparse-eligibility O(cap) worst case is a documented edge, not the steady state.)
- * Each later strategy appends its own pick() sweep + flatness assert here.
+ *   - 'const'  (RoundRobin, and later P2C/O(d)): raw ops/ms stays FLAT as n grows.
+ *   - 'linear' (SmoothWRR, O(cap)): ops/ms decays ~1/n, so the WORK RATE (ops/ms * n)
+ *              stays flat -- linear is expected, superlinear is the failure.
+ *
+ * The floor (min/max of the checked series >= 0.4) leaves headroom for cache/JIT noise
+ * on tiny pools while still catching a real complexity regression.
  */
 
-import { RoundRobinBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
+const FLOOR = 0.4;
 
-function measure(n) {
-    const el = new Uint8Array(n);
-    el.fill(1); // all eligible: RR's O(1)-amortized steady state
-    const rr = new RoundRobinBalancer(n, el);
+function timePicks(step) {
     let sink = 0;
-    for (let i = 0; i < OPS; i++) sink = (sink + rr.pick()) | 0; // warmup
+    for (let i = 0; i < OPS; i++) sink = (sink + step()) | 0; // warmup
     const t0 = performance.now();
-    for (let i = 0; i < OPS; i++) sink = (sink + rr.pick()) | 0;
+    for (let i = 0; i < OPS; i++) sink = (sink + step()) | 0;
     const dt = performance.now() - t0;
     void sink;
     return OPS / dt; // ops/ms
 }
 
-const results = SIZES.map((n) => ({ n, opsPerMs: measure(n) }));
-const rates = results.map((r) => r.opsPerMs);
-const min = Math.min(...rates);
-const max = Math.max(...rates);
-const flatness = min / max; // 1.0 = perfectly flat; O(1) pick stays near 1
+/** Each subject: a name, an expected complexity, and a stepper factory over n endpoints. */
+const SUBJECTS = [
+    {
+        name: 'RoundRobin',
+        complexity: 'const',
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const rr = new RoundRobinBalancer(n, el);
+            return () => rr.pick();
+        },
+    },
+    {
+        name: 'SmoothWRR',
+        complexity: 'linear', // O(cap) per pick -> ops/ms * n is the flat series
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) w[i] = 1 + (i & 7);
+            const wrr = new SmoothWRRBalancer(n, el, w);
+            return () => wrr.pick();
+        },
+    },
+];
 
-process.stdout.write('lite-pick witness (M1: RoundRobin.pick())\n');
-for (const r of results) {
-    process.stdout.write('  n=' + String(r.n).padStart(5) + '  ' +
-        r.opsPerMs.toFixed(0).padStart(9) + ' ops/ms\n');
+let failed = false;
+for (const subj of SUBJECTS) {
+    process.stdout.write('lite-pick witness (M2: ' + subj.name + ', ' + subj.complexity + ')\n');
+    const rows = SIZES.map((n) => ({ n, opsPerMs: timePicks(subj.make(n)) }));
+    // The series that MUST stay flat depends on the advertised complexity.
+    const series = rows.map((r) => (subj.complexity === 'linear' ? r.opsPerMs * r.n : r.opsPerMs));
+    const min = Math.min(...series), max = Math.max(...series);
+    const flatness = min / max;
+    for (const r of rows) {
+        process.stdout.write('  n=' + String(r.n).padStart(5) + '  ' +
+            r.opsPerMs.toFixed(0).padStart(9) + ' ops/ms' +
+            (subj.complexity === 'linear' ? '   (work-rate ' + (r.opsPerMs * r.n).toFixed(0) + ')' : '') + '\n');
+    }
+    const label = subj.complexity === 'linear' ? 'work-rate flatness' : 'flatness';
+    process.stdout.write('  ' + label + ' (min/max) = ' + flatness.toFixed(3) +
+        ' -> ' + (flatness >= FLOOR ? 'PASS' : 'FAIL') + '\n\n');
+    if (flatness < FLOOR) failed = true;
 }
-process.stdout.write('  flatness (min/max) = ' + flatness.toFixed(3) + '\n');
 
-// O(1) amortized -> the slowest size stays within ~2.5x of the fastest (headroom for
-// cache/JIT noise on tiny pools). A decay to O(n) would blow this floor at n=4096.
-const FLOOR = 0.4;
-if (flatness < FLOOR) {
-    process.stderr.write('witness: FAIL -- RoundRobin.pick() not flat (min/max ' +
-        flatness.toFixed(3) + ' < ' + FLOOR + ')\n');
+if (failed) {
+    process.stderr.write('witness: FAIL -- a strategy did not scale as advertised\n');
     process.exit(1);
 }
 process.stdout.write('witness: PASS\n');

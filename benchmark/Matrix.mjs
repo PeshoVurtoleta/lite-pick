@@ -16,7 +16,7 @@
  * PARITY check -- a strategy within noise of the foil while holding the contract has passed.
  */
 
-import { RoundRobinBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -38,6 +38,28 @@ const SUBJECTS = [
         make(n) {
             let i = -1;
             return () => { i++; if (i >= n) i = 0; return i; };
+        },
+    },
+    {
+        name: 'SmoothWRR',
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) w[i] = 1 + (i & 7);
+            const wrr = new SmoothWRRBalancer(n, el, w);
+            return () => wrr.pick();
+        },
+    },
+    {
+        // Foil: naive weight-expansion WRR. Precomputes an expanded index list and cycles
+        // it -- fast per step, but BURSTY (balance.mjs shows the clumping SmoothWRR avoids).
+        name: 'foil expand-WRR',
+        make(n) {
+            const list = [];
+            for (let i = 0; i < n; i++) { const w = 1 + (i & 7); for (let k = 0; k < w; k++) list.push(i); }
+            const len = list.length;
+            let i = -1;
+            return () => { i++; if (i >= len) i = 0; return list[i]; };
         },
     },
 ];

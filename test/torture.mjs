@@ -13,9 +13,9 @@
  *                                  substrate hot ops (Prng.next / nextBelow, isEligible)
  *                                  is the M0 gate. Strategy pick() paths join at M1+.
  *
- * M1: the profiled hot paths are the SUBSTRATE (PRNG draw + eligibility read) that every
- * strategy rides, AND RoundRobin.pick() itself. Each later strategy appends its own
- * reused-instance hot phase here (ROADMAP section 3).
+ * M2: the profiled hot paths are the SUBSTRATE (PRNG draw + eligibility read) that every
+ * strategy rides, AND RoundRobin.pick() and SmoothWRR.pick(). Each later strategy appends
+ * its own reused-instance hot phase here (ROADMAP section 3).
  *
  * ENTRY CONTRACT (mirrors lite-o1): --expose-gc is mandatory; the two devDeps are
  * imported AFTER the guard so a fresh clone that skipped `npm install` fails with a
@@ -40,7 +40,7 @@ async function main() {
 
     const { measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { Prng, BalancerBase, RoundRobinBalancer } = await import('../Pick.js');
+    const { Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer } = await import('../Pick.js');
 
     const CAP = 1 << 12;    // pool capacity 4096
     const CYCLES = 4096;    // retention churn
@@ -61,6 +61,7 @@ async function main() {
     const noop = () => {};
     function fillTracker() {
         const el = new Uint8Array(CAP).fill(1);
+        const weights = new Uint32Array(CAP).fill(3);
         for (let c = 0; c < CYCLES; c++) {
             const b = new BalancerBase(CAP, el);
             b.setEligible(c & (CAP - 1), (c & 1) === 0);
@@ -69,6 +70,9 @@ async function main() {
             const rr = new RoundRobinBalancer(CAP, el);
             rr.pick();
             tracker.track(rr, noop, 'roundrobin', { audit: true });
+            const wrr = new SmoothWRRBalancer(CAP, el, weights);
+            wrr.pick();
+            tracker.track(wrr, noop, 'smoothwrr', { audit: true });
         }
         return tracker.size();
     }
@@ -113,11 +117,23 @@ async function main() {
     const rrAllocBytes = Math.max(0, Math.round(rrBpc));
     const rrAllocOk = rrAllocBytes === 0;
 
+    // ---- phase 4: SmoothWRR.pick() per-call allocation (0 B/op) ------------
+    // One reused SmoothWRRBalancer: pick() is an O(cap) scan mutating the owned Float64
+    // accumulators in place + one subtract; no object/closure/array created.
+    const weights = new Uint32Array(CAP).fill(3);
+    const wrr = new SmoothWRRBalancer(CAP, el, weights);
+    let wrrSink = 0;
+    const wrrStep = () => { wrrSink = (wrrSink + wrr.pick()) | 0; };
+    const wrrAllocRes = measureAllocs(wrrStep, { iterations: 100000, batches: 8 });
+    const wrrBpc = wrrAllocRes.bytesPerCall === null ? 0 : wrrAllocRes.bytesPerCall;
+    const wrrAllocBytes = Math.max(0, Math.round(wrrBpc));
+    const wrrAllocOk = wrrAllocBytes === 0;
+
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink; void rrSink;
+    void sink; void rrSink; void wrrSink;
 
-    process.stdout.write('lite-pick torture (M1: substrate + RoundRobin)\n');
+    process.stdout.write('lite-pick torture (M2: substrate + RoundRobin + SmoothWRR)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
@@ -125,8 +141,10 @@ async function main() {
         (allocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  RoundRobin.pick() allocs: ' + rrAllocBytes + ' B/op -> ' +
         (rrAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  SmoothWRR.pick() allocs: ' + wrrAllocBytes + ' B/op -> ' +
+        (wrrAllocOk ? 'PASS' : 'FAIL') + '\n');
 
-    if (!retentionOk || !allocOk || !rrAllocOk) {
+    if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk) {
         process.stderr.write('torture: FAIL\n');
         process.exit(1);
     }

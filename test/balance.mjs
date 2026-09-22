@@ -17,7 +17,7 @@
  * The random-foil peak/avg baseline (what P2C must beat at M3) is printed for context.
  */
 
-import { RoundRobinBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, Prng } from '../Pick.js';
 
 let failed = false;
 function check(cond, msg) {
@@ -68,6 +68,39 @@ for (const n of [64, 512, 4096]) {
     check(rrDead === 0, 'partial (' + live + '/' + n + ' up): RoundRobin dead picks = ' + rrDead);
     check(max - min <= 1, 'partial: RoundRobin imbalance over live set = ' + liveImbalance.toFixed(4) + ' (perfect)');
     check(foilDead > 0, 'partial: `i++ % n` foil dead picks = ' + foilDead + ' (the trap RR avoids)');
+}
+
+// --- SmoothWRR: exact weighted fairness + smoothness vs the bursty foil ----
+process.stdout.write('lite-pick balance (M2: SmoothWRR)\n');
+{
+    const maxRun = (seq) => {
+        let best = 0, run = 0, prev = -2;
+        for (const x of seq) { run = x === prev ? run + 1 : 1; prev = x; if (run > best) best = run; }
+        return best;
+    };
+    const weights = Uint32Array.from([10, 3, 2, 1]); // total 16, skewed
+    const total = 16;
+    const n = weights.length;
+    const el = new Uint8Array(n); el.fill(1);
+    const wrr = new SmoothWRRBalancer(n, el, weights);
+
+    const k = 500;
+    const counts = new Uint32Array(n);
+    const seq = [];
+    for (let i = 0; i < k * total; i++) { const p = wrr.pick(); counts[p]++; seq.push(p); }
+
+    // Fairness: exact convergence to k * weight[i].
+    let fair = true;
+    for (let i = 0; i < n; i++) if (counts[i] !== k * weights[i]) fair = false;
+    check(fair, 'weights [10,3,2,1]: exact fairness over ' + k + ' cycles (counts = k*weight)');
+
+    // Smoothness: max run far below the bursty weight-expansion foil (which clumps 10).
+    const list = [];
+    for (let i = 0; i < n; i++) for (let j = 0; j < weights[i]; j++) list.push(i);
+    const bursty = [];
+    for (let p = 0; p < seq.length; p++) bursty.push(list[p % list.length]);
+    const sRun = maxRun(seq), bRun = maxRun(bursty);
+    check(sRun < bRun, 'smoothness: SmoothWRR max-run=' + sRun + ' < bursty foil max-run=' + bRun);
 }
 
 // --- Context: the random-foil peak/avg baseline P2C must beat at M3 --------

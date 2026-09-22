@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-pick",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster: RoundRobin, SmoothWRR, P2C, least-conn, PeakEWMA, consistent hashing.",
   "type": "module",
   "main": "./Pick.js",

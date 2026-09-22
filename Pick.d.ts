@@ -1,9 +1,9 @@
 /**
  * @zakkster/lite-pick -- TypeScript declarations.
  *
- * M1 (0.1.0): the substrate seams + the first strategy, RoundRobin. The remaining
- * strategy classes (SmoothWRR, P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash,
- * BoundedLoad, WeightedRandom) are added one per session.
+ * M2 (0.2.0): substrate seams + RoundRobin + SmoothWRR (weighted). The remaining
+ * strategy classes (P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad,
+ * WeightedRandom) are added one per session.
  */
 
 /** The single source-of-truth version stamp. */
@@ -66,5 +66,24 @@ export class RoundRobinBalancer extends BalancerBase {
      */
     constructor(capacity: number, eligible: Uint8Array);
     /** Next eligible index in round-robin order, or `PICK_NONE` when the pool is down. */
+    pick(): number;
+}
+
+/**
+ * SmoothWRRBalancer -- nginx-style smooth weighted round-robin (M2). Distributes picks by
+ * caller-configured integer weights, interleaved smoothly (weights [5,1,1] -> A,A,B,A,C,A,A).
+ * Owns its smoothing accumulators; the sole writer of the weights via `setWeight`. O(cap)
+ * per pick, 0 B/op. Fails closed (`PICK_NONE`) when the eligible-weight sum is 0.
+ */
+export class SmoothWRRBalancer extends BalancerBase {
+    /**
+     * @param capacity endpoint count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param weights per-endpoint weights (length >= capacity); mutate only via setWeight.
+     */
+    constructor(capacity: number, eligible: Uint8Array, weights: Uint32Array);
+    /** Cold path: reconfigure endpoint `i`'s weight, keeping the eligible-weight total exact. */
+    setWeight(i: number, w: number): void;
+    /** Next endpoint by smooth weighting, or `PICK_NONE` when the eligible-weight sum is 0. */
     pick(): number;
 }

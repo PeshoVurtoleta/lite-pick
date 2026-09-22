@@ -15,7 +15,7 @@
  * on tiny pools while still catching a real complexity regression.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -53,11 +53,22 @@ const SUBJECTS = [
             return () => wrr.pick();
         },
     },
+    {
+        name: 'P2C',
+        complexity: 'const', // two O(1)-expected rejection draws + a compare -> flat with n
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            for (let i = 0; i < n; i++) inflight[i] = i & 15;
+            const p2c = new P2cBalancer(n, el, inflight, 0xABCDEF);
+            return () => p2c.pick();
+        },
+    },
 ];
 
 let failed = false;
 for (const subj of SUBJECTS) {
-    process.stdout.write('lite-pick witness (M2: ' + subj.name + ', ' + subj.complexity + ')\n');
+    process.stdout.write('lite-pick witness (M3: ' + subj.name + ', ' + subj.complexity + ')\n');
     const rows = SIZES.map((n) => ({ n, opsPerMs: timePicks(subj.make(n)) }));
     // The series that MUST stay flat depends on the advertised complexity.
     const series = rows.map((r) => (subj.complexity === 'linear' ? r.opsPerMs * r.n : r.opsPerMs));

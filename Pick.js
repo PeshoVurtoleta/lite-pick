@@ -1,7 +1,7 @@
 /**
  * @zakkster/lite-pick -- zero-GC load-balancing SELECTION KERNEL.
  *
- * M2 (0.2.0): substrate seams + RoundRobin + SmoothWRR (weighted). This file ships:
+ * M3 (0.3.0): substrate seams + RoundRobin + SmoothWRR + P2C (the headline). This file ships:
  *
  *   - VERSION        the single source-of-truth version stamp (3-place sync).
  *   - PICK_NONE      the fail-closed sentinel (-1): "no endpoint", never a dead pick.
@@ -15,6 +15,8 @@
  *                    the eligibility view, skipping down nodes, O(1) amortized, 0 B/op.
  *   - SmoothWRRBalancer   the weighted default: nginx smooth weighted round-robin over
  *                    caller-configured integer weights, O(cap)/pick, 0 B/op.
+ *   - P2cBalancer    the headline: power-of-two-choices over caller-owned in-flight counts;
+ *                    the ln ln n balance ceiling, O(1)/pick, 0 B/op.
  *
  * The identity (decisions/0001): lite-pick OWNS NO mutable state it can avoid owning.
  * It reads pre-allocated views (eligibility, inflight, weights, scores) that siblings or
@@ -22,13 +24,13 @@
  * counters live OUTSIDE the kernel. The steady-state pick path allocates 0 B/op.
  *
  * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [M1], SmoothWRR [M2],
- *   P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom [planned].
+ *   P2C [M3], LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom [planned].
  *
  * Zero runtime dependencies. node:test only. ESM, single file, tree-shakeable.
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -296,5 +298,88 @@ export class SmoothWRRBalancer extends BalancerBase {
         }
         cur[best] -= total;                 // best >= 0 guaranteed while total > 0
         return best;
+    }
+}
+
+/**
+ * P2cBalancer -- power-of-two-choices (M3), the headline strategy.
+ *
+ * `pick()` draws TWO distinct eligible endpoints uniformly at random and returns the one
+ * with the lower in-flight load. One extra probe over pure random buys an exponential drop
+ * in peak load: the max load stays within `ln ln n / ln 2 + O(1)` of the mean (Azar-Broder-
+ * Karlin-Upfal 1994), versus random's `ln n / ln ln n` gap. That additive `ln ln n` ceiling
+ * -- proven in test/balance.mjs against a random foil -- is the library's analytical anchor.
+ *
+ * Ownership (ADR 0001, ADR 0005): in-flight counts live in the CALLER's Uint32Array, read-
+ * only to `pick()` (the caller / the M5 lite-query adapter increments on dispatch, decrements
+ * on settle -- lite-pick holds no request state). The eligible draw is REJECTION SAMPLING
+ * over the shared bitmap: no peer, no owned draw-set, expected O(1) draws when eligibility is
+ * dense (the common case), a bounded retry + a zero-alloc rotated linear-scan fallback for the
+ * degenerate sparse case. A true worst-case-O(1) draw via lite-o1 `RandomSet` is a deferred
+ * optional-peer optimization (ADR 0005), added only if sparse-eligibility measurement demands.
+ *
+ * Bound: O(d) = O(1) with d = 2 (two expected-O(1) draws + one compare). Steady-state pick():
+ * a few PRNG steps + array reads, no object/closure/array created -- proven 0 B/op by
+ * test/torture.mjs and test/perf/PerfGate.test.mjs. Fails closed (PICK_NONE) when the whole
+ * pool is down.
+ */
+export class P2cBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  endpoint count (fixed).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array} inflight  per-endpoint in-flight counts (length >= capacity),
+     *   caller-owned and only READ here.
+     * @param {number} [seed=0x9e3779b9]  deterministic PRNG seed (reproducible benches).
+     */
+    constructor(capacity, eligible, inflight, seed = 0x9e3779b9) {
+        super(capacity, eligible);
+        if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
+            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+        }
+        this._inflight = inflight;
+        this._rng = new Prng(seed);
+    }
+
+    /**
+     * A uniformly random ELIGIBLE index, or PICK_NONE if none. Expected O(1) (rejection
+     * sampling); a rotated linear scan from a random start is the zero-alloc fallback under
+     * degenerate sparsity (unbiased first-eligible-after-a-random-offset). Internal.
+     * @returns {number}
+     */
+    _draw() {
+        if (this._live === 0) return PICK_NONE;
+        const cap = this._cap, el = this._eligible;
+        for (let tries = 0; tries < 64; tries++) {
+            const i = this._rng.nextBelow(cap);
+            if (el[i]) return i;
+        }
+        // Degenerate (very sparse eligibility): scan from a random start, wrapping, and
+        // return the first eligible found. Zero-alloc; live > 0 guarantees a hit.
+        let i = this._rng.nextBelow(cap);
+        for (let k = 0; k < cap; k++) {
+            if (el[i]) return i;
+            i++;
+            if (i >= cap) i = 0;
+        }
+        return PICK_NONE;
+    }
+
+    /**
+     * Pick an endpoint by power-of-two-choices, or PICK_NONE (fail closed). O(1).
+     * @returns {number}
+     */
+    pick() {
+        const a = this._draw();
+        if (a < 0) return PICK_NONE;          // whole pool down: fail closed
+        if (this._live === 1) return a;       // only one eligible: it is both choices
+        // Draw a DISTINCT second choice. A bounded redraw (not a single nudge) keeps the
+        // two-choices property intact even at tiny pool sizes, where a single retry collides
+        // often: at live>=2 each redraw misses with probability <= 1/2, so 32 tries leaves a
+        // ~2^-32 collision chance -- while staying expected-O(1) (about two draws) and 0 B/op.
+        let b = this._draw();
+        for (let t = 0; b === a && t < 32; t++) b = this._draw();
+        if (b < 0 || b === a) return a;       // astronomically rare: fall back to the first draw
+        // Lower in-flight wins; ties go to the first draw (unbiased over many picks).
+        return this._inflight[b] < this._inflight[a] ? b : a;
     }
 }

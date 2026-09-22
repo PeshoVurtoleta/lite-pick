@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.2.0
+Version: 0.3.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,11 +14,12 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.2.0 ships the substrate seams + two strategies: RoundRobin and SmoothWRR (the weighted
-default). It exports `VERSION`, the fail-closed sentinel `PICK_NONE` (-1), a deterministic
-`Prng` (xorshift32), `BalancerBase` (the shared read-only eligibility seam + O(1) live count),
-`RoundRobinBalancer`, and `SmoothWRRBalancer`. The remaining strategies land one per session
-(see ROADMAP.md): P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
+0.3.0 ships the substrate seams + three strategies: RoundRobin, SmoothWRR (the weighted
+default), and P2C (power-of-two-choices, the headline). It exports `VERSION`, the fail-closed
+sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (the shared
+read-only eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`, and
+`P2cBalancer`. The remaining strategies land one per session (see ROADMAP.md): LeastConn/SED/NQ,
+PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
 
 ## Design ownership (decisions/0001, 0002)
 
@@ -69,6 +70,15 @@ default). It exports `VERSION`, the fail-closed sentinel `PICK_NONE` (-1), a det
     weight; pick max; current -= total`), interleaved smoothly (weights [5,1,1] ->
     A,A,B,A,C,A,A), or `PICK_NONE` when the eligible-weight sum is 0. O(cap) per pick, 0 B/op.
     Owns its Float64Array smoothing accumulators (ADR 0004).
+- `P2cBalancer extends BalancerBase` -- class. The headline strategy (M3): power-of-two-choices.
+  - `new P2cBalancer(capacity, eligible, inflight, seed?=0x9e3779b9)` -- `inflight` is a
+    caller-owned Uint32Array (length >= capacity), read-only to pick(): the caller / the M5
+    lite-query adapter increments on dispatch, decrements on settle. `seed` seeds the internal
+    deterministic PRNG (reproducible benches).
+  - `pick()` -> number. Draws two DISTINCT eligible endpoints uniformly at random (rejection
+    sampling over the bitmap, no peer) and returns the one with the lower in-flight load; ties
+    to the first draw. The `ln ln n / ln 2` peak-load ceiling (ADR 0005). O(1) per pick, 0 B/op.
+    `PICK_NONE` when the whole pool is down.
 
 ## Gates (every session)
 

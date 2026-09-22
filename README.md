@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.2.0 ships two strategies -- `RoundRobinBalancer` and `SmoothWRRBalancer`** (the weighted default) -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view). The rest of the roster -- P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
+> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.3.0 ships three strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, and `P2cBalancer`** (power-of-two-choices, the headline) -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view). The rest of the roster -- LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-pick.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-pick)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -21,7 +21,7 @@ The npm landscape has old algorithm libraries (`load-balancers`, `loadbalance`, 
 - **Two pieces of evidence, both shipped.** A **0 B/op** witness on the pick path (no object, closure, string, or array created per pick), and a measured **balance-quality anchor** -- peak-to-average load within the strategy's theoretical ceiling (for P2C, the Azar-Broder-Karlin-Upfal `ln ln n / ln 2` bound) and strictly better than a random foil.
 - **A pure selector, not a proxy.** It **consumes** health and circuit state; it never owns them. Health is a shared read-only bitmap written by [`@zakkster/lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health); circuit state comes from [`@zakkster/lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart); load counters are caller-owned typed arrays. `pick()` only reads.
 
-> **Status: M2 (v0.2.0).** Ships the substrate seams **plus `RoundRobinBalancer` and `SmoothWRRBalancer`**. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth** (max-run far below bursty weight-expansion WRR), and each scales as advertised (witness). See [ROADMAP.md](./ROADMAP.md) for the M2 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), and the RoundRobin (ADR 0003) and SmoothWRR (ADR 0004) design forks.
+> **Status: M3 (v0.3.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, and `P2cBalancer`**. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, and **P2C proves the `ln ln n` balance ceiling** -- peak-to-mean gap ~2 vs a random foil's ~21 at n=1024, holding flat as the pool grows. See [ROADMAP.md](./ROADMAP.md) for the M3 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), and the RoundRobin (0003), SmoothWRR (0004), and P2C (0005) design forks.
 
 ```bash
 npm install @zakkster/lite-pick
@@ -76,6 +76,32 @@ wrr.setWeight(1, 4);  // B is now 4x
 
 `pick()` is **0 B/op** and **O(cap)** (one scan of the pool -- negligible at real endpoint counts). It owns its smoothing accumulators; weights live in your `Uint32Array` but you mutate them only through `setWeight`, which keeps the internal eligible-weight total exact. Marking a node down/up resets its accumulator, so a recovered node rejoins neutral -- no stale burst or starvation ([ADR 0004](./decisions/0004-smoothwrr-weight-ownership.md)).
 
+## P2C -- power-of-two-choices (v0.3.0, the headline)
+
+Two random eligible draws, take the one with lower in-flight load. That single extra probe buys an **exponential** drop in peak load -- the max stays within an *additive* `ln ln n / ln 2` of the mean, versus random's `ln n / ln ln n` gap.
+
+```js
+import { P2cBalancer } from '@zakkster/lite-pick';
+
+const eligible = Uint8Array.from([1, 1, 1, 1]);
+const inflight = new Uint32Array(4);           // YOU own this; pick() only reads it
+
+const p2c = new P2cBalancer(4, eligible, inflight);
+
+const i = p2c.pick();                           // the lower-loaded of two random eligibles
+inflight[i]++;                                  // you increment on dispatch...
+// ...and inflight[i]-- when the request settles (the M5 lite-query adapter will do this)
+```
+
+The proof (from `test/balance.mjs`, the library's analytical anchor):
+
+| pool `n` | P2C peak/avg | random foil peak/avg |
+|---|---|---|
+| 1024 | **1.06** (gap 2) | 1.66 (gap 21) |
+| 4096 | **1.06** (gap 2) | 1.78 (gap 25) |
+
+P2C's gap stays a small `ln ln n` constant while the random foil's grows with the pool. `pick()` is **0 B/op** and **O(1)** (two expected-O(1) rejection draws + a compare); in-flight counts are your caller-owned `Uint32Array` ([ADR 0005](./decisions/0005-p2c-draw.md)).
+
 ## The substrate (under every strategy)
 
 ```js
@@ -101,27 +127,10 @@ rng.nextBelow(4);     // -> a uint32 in [0, 4)
 rng.reset();          // replays the exact stream
 
 PICK_NONE;            // -> -1  (fail-closed sentinel: no endpoint, never a dead pick)
-VERSION;              // -> '0.1.0'
+VERSION;              // -> '0.3.0'
 ```
 
-`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index; `RoundRobinBalancer` (above) overrides it. Here is the shape the headline **P2C** strategy will take (M3), for orientation:
-
-```js
-// SHAPE ONLY -- not shipped until M3. Two random eligible draws, return the lower
-// in-flight load. One extra probe over random buys the ln ln n balance ceiling.
-class P2cBalancer extends BalancerBase {
-  constructor(capacity, eligible, inflight, seed) {
-    super(capacity, eligible);
-    this._inflight = inflight;  // caller-owned Uint32Array; pick() only reads it
-    this._rng = new Prng(seed);
-  }
-  pick() {
-    if (this.live === 0) return PICK_NONE;      // fail closed
-    const a = this._draw(), b = this._draw();   // two distinct eligible draws
-    return this._inflight[b] < this._inflight[a] ? b : a;
-  }
-}
-```
+`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
 
 ## Design ownership (ratified before any strategy)
 

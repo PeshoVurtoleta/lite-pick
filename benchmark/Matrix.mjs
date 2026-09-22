@@ -16,7 +16,7 @@
  * PARITY check -- a strategy within noise of the foil while holding the contract has passed.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, Prng } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -60,6 +60,25 @@ const SUBJECTS = [
             const len = list.length;
             let i = -1;
             return () => { i++; if (i >= len) i = 0; return list[i]; };
+        },
+    },
+    {
+        name: 'P2C',
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            for (let i = 0; i < n; i++) inflight[i] = i & 15;
+            const p2c = new P2cBalancer(n, el, inflight, 0xABCDEF);
+            return () => p2c.pick();
+        },
+    },
+    {
+        // Foil: random single draw. Ties P2C on throughput but loses on balance (the
+        // ln ln n vs ln n / ln ln n gap -- balance.mjs is the anchor that shows it).
+        name: 'foil random',
+        make(n) {
+            const rng = new Prng(0xABCDEF);
+            return () => rng.nextBelow(n);
         },
     },
 ];

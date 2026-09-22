@@ -20,7 +20,7 @@ wiring proven zero-GC parts, not new low-level code.
 | **M0** | Scaffold + substrate seams (no strategy) | 0.0.1 | -- | SHIPPED |
 | **M1** | **RoundRobin** + witness/balance harness | 0.1.0 | O(1) | SHIPPED |
 | **M2** | **SmoothWRR** (nginx smooth weighted RR) | 0.2.0 | O(cap) | SHIPPED |
-| **M3** | **P2C** (the headline + balance anchor) | 0.3.0 | O(d)=O(1) | planned |
+| **M3** | **P2C** (the headline + balance anchor) | 0.3.0 | O(d)=O(1) | SHIPPED |
 | **M4** | **LeastConn family** (P2C-least-conn, SED, NQ; lite-logn exact fallback) | 0.4.0 | O(1) / O(log n) exact | planned |
 | **M5** | **lite-query adapter** (the integration moat) | 0.5.0 | -- | planned |
 | **M6** | **Benchmark suite** (ecosystem MVP: balance + GC blast-radius headlines, trust gates, vs-AWS positioning) | 0.6.0 | -- | planned |
@@ -105,9 +105,15 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
   0 B/op. Foil: naive weight-expansion WRR (bursty) -- beaten on smoothness (max-run 3 vs 10
   for weights [10,3,2,1]) at exact fairness. The witness gained a per-strategy complexity
   flag ('linear' asserts flat work-rate ops/ms*n).
-- **M3 P2C:** rejection-sample two DISTINCT eligible draws vs draw-from-RandomSet; the
-  distinct-second-choice nudge policy; tie-break (lean: first draw wins, unbiased over
-  many picks). The balance-quality gate (imbalance vs `ln ln n / ln 2`) lands here.
+- **M3 P2C:** SETTLED (ADR 0005) -- REJECTION-SAMPLE two distinct eligible draws over the
+  shared bitmap (no peer, no owned draw-set): expected O(1) draws when eligibility is dense
+  (the common case), a bounded retry + zero-alloc linear-scan fallback for the degenerate
+  sparse case. A true worst-case-O(1) draw via lite-o1 `RandomSet` (the DYNAMIC-set member,
+  NOT RankSelect -- whose static O(n) rebuild is wrong for a mutating bitmap) is a deferred
+  optional-peer optimization, added only when sparse-eligibility measurement demands it.
+  d=2 fixed; distinct-second via one nudge-redraw (not a loop); tie-break to the first draw
+  (unbiased over many picks); `inflight` a caller-owned Uint32Array, pure-read (ADR 0001).
+  The balance-quality gate (imbalance vs `ln ln n / ln 2` + random foil) is THE deliverable.
 - **M4 LeastConn family** (the IPVS lc/wlc/sed/nq cohort, made zero-GC): P2C-least-conn (O(1))
   is the default; **SED** minimizes `(inflight+1)/weight` (IPVS `sed` -- charges the new request's
   marginal cost); **NQ** ("never queue", IPVS `nq`) sends to an IDLE endpoint immediately if one
@@ -139,7 +145,9 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
 - **M7 PeakEWMA:** EWMA half-life; score = inflight x ewmaRtt; the Float64Array ring
   substrate (lite-o1). The documented "FE profile" (PeakEWMA + health only) is defined here.
 - **M8 ConsistentHash:** Maglev table (O(1) lookup, minimal disruption, O(n) build --
-  fits lite-o1's static build-once contract) vs ring-with-vnodes. Lean Maglev -- it is the
+  fits lite-o1's static build-once contract) vs ring-with-vnodes (now viable on lite-o1's
+  `EliasFano` -- a ring lookup IS a `nextGEQ` successor query over the sorted vnode hashes,
+  O(1) typical / O(log n) clustered). Lean Maglev -- it is the
   in-kernel/production choice (Linux IPVS `mh`, Meta Katran, Cilium). Key MUST be an integer /
   buffer view -- NO per-pick string hashing (the one zero-GC hazard). Disruption disclosed.
 - **M9 BoundedLoad:** consistent-hashing-with-bounded-loads (eps cap) vs occupancy/Little's
@@ -194,7 +202,7 @@ The zero-GC proof is TWO complementary tools, kept separate exactly as lite-o1 d
 | Post-1.0 #1 | **lite-worker-pool integration** (sticky/keyed + push dispatch) | The in-process consumer beyond work-stealing: consistent-hash an item to a worker (warm caches), push/fire-and-forget dispatch, routing across heterogeneous pools. Doubles as the integration torture test. | 1.1.0 |
 | Post-1.0 #2 | **lite-await hedging combinator** (`hedged()`) | The async power-of-two: race the P2C second choice past a percentile. The lite-await face of the kernel. | 1.2.0 |
 | Post-1.0 #3 | **AZ-aware / zone-affinity** wrapper (sched-domains model) | Local-first, threshold-to-escalate -- modeled on Linux CFS scheduler domains (SMT->socket->NUMA, escalate a level only when imbalanced) with a latency-health escape hatch (Zalando: suppress local to a 1% probe floor at >35% rtt drift). A wrapper over PeakEWMA + a zone tag array. | 1.3.0 |
-| Post-1.0 #4 | **Subsetting** (Google SRE deterministic subset) | Cap connection fan-out from a large client set to a large pool. A cold-path pool-shaping helper. | 1.4.0 |
+| Post-1.0 #4 | **Subsetting** (Google SRE deterministic subset) | Cap connection fan-out from a large client set to a large pool. A cold-path pool-shaping helper. Substrate: lite-o1 `Reservoir` (Vitter Algo R, O(1)/item uniform k-sampling) -- pick k of N endpoints uniformly, zero-GC. | 1.4.0 |
 | Post-1.0 #5 | **The visual demo** (lite-lru style) | One seeded stream -> every strategy side by side, drawn from `dump()`; headline gauge = imbalance vs the P2C ceiling, with a random foil piling load on one bin. | 1.5.0 |
 | Post-1.0 #6 | **AdaptiveWeight** (WLM-style goal/feedback) | Recompute per-endpoint weights from observed latency vs a target (IBM z/OS WLM composite weight 0-64). The feedback-driven parent of PeakEWMA/bounded-load; a Tier-3 strategy. Weights written cold, read hot -- ADR 0001 ownership. | 1.6.0 |
 | Post-1.0 #7 | **Observability adapter** (lite-di-signal) | Expose balancer status (per-endpoint eligibility/load, live imbalance) as DI-wired reactive signals/computeds with deterministic teardown -- the reactivity pillar beside lite-di-health. FE dashboards use lite-signal-decorators instead. WARM/COLD only, never the pick path. | 1.7.0 |

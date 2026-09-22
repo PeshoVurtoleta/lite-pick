@@ -1,8 +1,8 @@
 /**
  * @zakkster/lite-pick -- TypeScript declarations.
  *
- * M2 (0.2.0): substrate seams + RoundRobin + SmoothWRR (weighted). The remaining
- * strategy classes (P2C, LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad,
+ * M3 (0.3.0): substrate seams + RoundRobin + SmoothWRR + P2C (the headline). The
+ * remaining strategy classes (LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad,
  * WeightedRandom) are added one per session.
  */
 
@@ -85,5 +85,23 @@ export class SmoothWRRBalancer extends BalancerBase {
     /** Cold path: reconfigure endpoint `i`'s weight, keeping the eligible-weight total exact. */
     setWeight(i: number, w: number): void;
     /** Next endpoint by smooth weighting, or `PICK_NONE` when the eligible-weight sum is 0. */
+    pick(): number;
+}
+
+/**
+ * P2cBalancer -- power-of-two-choices (M3), the headline strategy. Draws two distinct
+ * eligible endpoints at random and returns the one with the lower in-flight load; the
+ * `ln ln n / ln 2` peak-load ceiling. In-flight counts are the caller's Uint32Array
+ * (read-only to `pick()`). O(1) per pick, 0 B/op. Fails closed (`PICK_NONE`) when down.
+ */
+export class P2cBalancer extends BalancerBase {
+    /**
+     * @param capacity endpoint count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read-only.
+     * @param seed deterministic PRNG seed (default 0x9e3779b9); reproducible benches.
+     */
+    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, seed?: number);
+    /** Pick by power-of-two-choices (lower in-flight of two random eligibles), or `PICK_NONE`. */
     pick(): number;
 }

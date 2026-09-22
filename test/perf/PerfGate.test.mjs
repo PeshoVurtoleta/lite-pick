@@ -3,12 +3,12 @@
  *
  * Run:  node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs
  *
- * A node:test-native COMPLEMENT to torture (0 B/op), not a replacement. M2 gates the
- * SUBSTRATE hot ops every strategy rides -- the deterministic Prng draw (next /
- * nextBelow) and the BalancerBase eligibility read (isEligible) -- AND RoundRobin.pick()
- * and SmoothWRR.pick(), via scavenge scaling at N and k*N, with the old-gen and external /
- * arrayBuffers lanes pinned to 0. Backing arrays are fixed at construction and NEVER grow,
- * so each scenario's `grows` counter (its backing .buffer.byteLength) shows a 0 delta.
+ * A node:test-native COMPLEMENT to torture (0 B/op), not a replacement. M3 gates the
+ * SUBSTRATE hot ops every strategy rides -- the deterministic Prng draw (next / nextBelow)
+ * and the BalancerBase eligibility read (isEligible) -- AND RoundRobin.pick(),
+ * SmoothWRR.pick(), and P2C.pick(), via scavenge scaling at N and k*N, with the old-gen and
+ * external / arrayBuffers lanes pinned to 0. Backing arrays are fixed at construction and
+ * NEVER grow, so each scenario's `grows` counter (its backing .buffer.byteLength) shows a 0 delta.
  *
  * Each strategy session (M1+) appends its own reused-instance scenario + its own
  * mustFail teeth-check here (ROADMAP section 3 / accounting site 10).
@@ -18,7 +18,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer } from '../../Pick.js';
+import { Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer } from '../../Pick.js';
 
 const CAP = 1 << 14;      // pool capacity 16384 (O(1)/O(d) scenarios: size is irrelevant)
 const MASK = CAP - 1;     // power-of-2 mask: nextBelow stays in [0, CAP)
@@ -137,7 +137,29 @@ const smoothWrrPick = {
     },
 };
 
-const scenarios = [prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick];
+/**
+ * p2c-pick: reused P2cBalancer over a half-eligible pool + a caller-owned inflight array;
+ * each op two rejection-sampled draws + a compare. O(1), so CAP is fine. The `grows`
+ * counter covers the eligibility + inflight arrays (neither reallocates -> 0 delta).
+ */
+const p2cPick = {
+    name: 'P2cBalancer.pick()',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        for (let i = 0; i < CAP; i++) inflight[i] = i & 15;
+        return { el, inflight, p2c: new P2cBalancer(CAP, el, inflight, 0xABCDEF), acc: 0 };
+    },
+    hot(s, n) {
+        const p2c = s.p2c;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + p2c.pick()) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength }; },
+};
+
+const scenarios = [prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick];
 
 /**
  * The teeth: a draw that pushes each index into a FRESH [] each op -- the array MUST
@@ -200,6 +222,23 @@ const wrrMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** P2C teeth: pick() boxed into a fresh [] each op -- MUST trip the gate. */
+const p2cMustFailAlloc = {
+    name: 'P2C.pick() boxed into fresh array (MUST allocate)',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        return { el, inflight, base: new P2cBalancer(CAP, el, inflight, 1) };
+    },
+    hot(s, n) {
+        const p2c = s.base;
+        let sink = 0;
+        for (let i = 0; i < n; i++) { const arr = [p2c.pick()]; sink += arr[0]; }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -209,5 +248,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc],
+    mustFail: [drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc, p2cMustFailAlloc],
 });

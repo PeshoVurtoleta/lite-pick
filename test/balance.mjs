@@ -17,7 +17,7 @@
  * The random-foil peak/avg baseline (what P2C must beat at M3) is printed for context.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, Prng } from '../Pick.js';
 
 let failed = false;
 function check(cond, msg) {
@@ -103,15 +103,43 @@ process.stdout.write('lite-pick balance (M2: SmoothWRR)\n');
     check(sRun < bRun, 'smoothness: SmoothWRR max-run=' + sRun + ' < bursty foil max-run=' + bRun);
 }
 
-// --- Context: the random-foil peak/avg baseline P2C must beat at M3 --------
+// --- P2C: THE anchor -- the ln ln n peak-load ceiling vs a random foil -----
+// The canonical balls-into-bins experiment: throw m = k*n balls into n bins. P2C's peak
+// load stays within an ADDITIVE ln ln n / ln 2 gap of the mean (Azar-Broder-Karlin-Upfal);
+// a random single draw's gap grows like sqrt(k ln n) -- far larger. We assert P2C's gap is
+// (a) dramatically below random's, and (b) a small constant consistent with ln ln n / ln 2.
+process.stdout.write('lite-pick balance (M3: P2C -- THE anchor)\n');
 {
-    const rng = new Prng(0xfeedface);
-    for (const n of [64, 512, 4096]) {
-        const bins = new Uint32Array(n);
-        for (let i = 0; i < n; i++) bins[rng.nextBelow(n)]++;
-        let max = 0; for (let i = 0; i < n; i++) if (bins[i] > max) max = bins[i];
-        process.stdout.write('  ctx  n=' + String(n).padStart(4) +
-            ' random peak/avg = ' + max.toFixed(2) + ' (P2C target ~ ln ln n / ln 2 at M3)\n');
+    const k = 32; // balls per bin (mean load)
+    for (const n of [64, 1024, 4096]) {
+        const el = new Uint8Array(n); el.fill(1);
+        const picks = k * n;
+
+        // P2C: each pick increments the chosen bin's in-flight; pick() reads it back.
+        const p2cLoad = new Uint32Array(n);
+        const p2c = new P2cBalancer(n, el, p2cLoad, 0xABCDEF);
+        for (let i = 0; i < picks; i++) p2cLoad[p2c.pick()]++;
+
+        // Random single-draw foil.
+        const rndLoad = new Uint32Array(n);
+        const rng = new Prng(0xABCDEF);
+        for (let i = 0; i < picks; i++) rndLoad[rng.nextBelow(n)]++;
+
+        let p2cMax = 0, rndMax = 0;
+        for (let i = 0; i < n; i++) { if (p2cLoad[i] > p2cMax) p2cMax = p2cLoad[i]; if (rndLoad[i] > rndMax) rndMax = rndLoad[i]; }
+        const p2cGap = p2cMax - k, rndGap = rndMax - k;
+        const ceiling = Math.log(Math.log(n)) / Math.LN2; // ln ln n / ln 2 (~2.8 at n=1024)
+
+        process.stdout.write('  n=' + String(n).padStart(4) +
+            '  P2C peak/avg=' + (p2cMax / k).toFixed(2) + ' (gap ' + p2cGap + ')' +
+            '  random peak/avg=' + (rndMax / k).toFixed(2) + ' (gap ' + rndGap + ')' +
+            '  ceiling~' + ceiling.toFixed(1) + '\n');
+
+        check(p2cGap < rndGap / 2,
+            'n=' + n + ': P2C gap ' + p2cGap + ' is far below random gap ' + rndGap);
+        check(p2cGap <= 4 * ceiling + 4,
+            'n=' + n + ': P2C gap ' + p2cGap + ' within the ln ln n ceiling band (<= ' +
+            (4 * ceiling + 4).toFixed(1) + ')');
     }
 }
 

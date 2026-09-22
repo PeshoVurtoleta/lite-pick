@@ -13,9 +13,9 @@
  *                                  substrate hot ops (Prng.next / nextBelow, isEligible)
  *                                  is the M0 gate. Strategy pick() paths join at M1+.
  *
- * M2: the profiled hot paths are the SUBSTRATE (PRNG draw + eligibility read) that every
- * strategy rides, AND RoundRobin.pick() and SmoothWRR.pick(). Each later strategy appends
- * its own reused-instance hot phase here (ROADMAP section 3).
+ * M3: the profiled hot paths are the SUBSTRATE (PRNG draw + eligibility read) that every
+ * strategy rides, AND RoundRobin.pick(), SmoothWRR.pick(), and P2C.pick(). Each later
+ * strategy appends its own reused-instance hot phase here (ROADMAP section 3).
  *
  * ENTRY CONTRACT (mirrors lite-o1): --expose-gc is mandatory; the two devDeps are
  * imported AFTER the guard so a fresh clone that skipped `npm install` fails with a
@@ -40,7 +40,7 @@ async function main() {
 
     const { measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer } = await import('../Pick.js');
+    const { Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer } = await import('../Pick.js');
 
     const CAP = 1 << 12;    // pool capacity 4096
     const CYCLES = 4096;    // retention churn
@@ -62,6 +62,7 @@ async function main() {
     function fillTracker() {
         const el = new Uint8Array(CAP).fill(1);
         const weights = new Uint32Array(CAP).fill(3);
+        const inflight = new Uint32Array(CAP);
         for (let c = 0; c < CYCLES; c++) {
             const b = new BalancerBase(CAP, el);
             b.setEligible(c & (CAP - 1), (c & 1) === 0);
@@ -73,6 +74,9 @@ async function main() {
             const wrr = new SmoothWRRBalancer(CAP, el, weights);
             wrr.pick();
             tracker.track(wrr, noop, 'smoothwrr', { audit: true });
+            const p2c = new P2cBalancer(CAP, el, inflight, c);
+            p2c.pick();
+            tracker.track(p2c, noop, 'p2c', { audit: true });
         }
         return tracker.size();
     }
@@ -129,11 +133,25 @@ async function main() {
     const wrrAllocBytes = Math.max(0, Math.round(wrrBpc));
     const wrrAllocOk = wrrAllocBytes === 0;
 
+    // ---- phase 5: P2C.pick() per-call allocation (0 B/op) ------------------
+    // One reused P2cBalancer over a half-eligible pool + a caller-owned inflight array:
+    // pick() is a few PRNG steps + array reads (rejection draws) + one compare -- no
+    // object/closure/array created.
+    const inflight = new Uint32Array(CAP);
+    for (let i = 0; i < CAP; i++) inflight[i] = i & 15;
+    const p2c = new P2cBalancer(CAP, el, inflight, 0xABCDEF);
+    let p2cSink = 0;
+    const p2cStep = () => { p2cSink = (p2cSink + p2c.pick()) | 0; };
+    const p2cAllocRes = measureAllocs(p2cStep, { iterations: 100000, batches: 8 });
+    const p2cBpc = p2cAllocRes.bytesPerCall === null ? 0 : p2cAllocRes.bytesPerCall;
+    const p2cAllocBytes = Math.max(0, Math.round(p2cBpc));
+    const p2cAllocOk = p2cAllocBytes === 0;
+
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink; void rrSink; void wrrSink;
+    void sink; void rrSink; void wrrSink; void p2cSink;
 
-    process.stdout.write('lite-pick torture (M2: substrate + RoundRobin + SmoothWRR)\n');
+    process.stdout.write('lite-pick torture (M3: substrate + RoundRobin + SmoothWRR + P2C)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
@@ -143,8 +161,10 @@ async function main() {
         (rrAllocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  SmoothWRR.pick() allocs: ' + wrrAllocBytes + ' B/op -> ' +
         (wrrAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  P2C.pick() allocs: ' + p2cAllocBytes + ' B/op -> ' +
+        (p2cAllocOk ? 'PASS' : 'FAIL') + '\n');
 
-    if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk) {
+    if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk) {
         process.stderr.write('torture: FAIL\n');
         process.exit(1);
     }

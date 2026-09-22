@@ -319,11 +319,19 @@ proven zero-GC parts, not new low-level code.
 - **lite-di-health** -- OWNS liveness/readiness. lite-pick reads its aggregated health as an eligibility
   bitmap (a node's bit off -> excluded from the pick set) and feeds observed failures back. lite-pick adds
   NO probing of its own. This is the load-bearing seam.
-- **lite-o1** -- OWNS the zero-GC O(1) substrate. lite-pick builds ON it, never forks it: `RandomSet`
-  (O(1) random eligible draw for P2C), `SparseSet` (the eligible-node set with O(1) add/remove/clear),
-  `AliasTable` (WeightedRandom sampling -- reused verbatim, not re-implemented), `RingLog`/`MonoDeque`
-  (EWMA + sliding-window latency for PeakEWMA/BoundedLoad). If lite-pick needs an O(1) structure, it comes
-  from lite-o1.
+- **lite-o1** (v1.11.0, 21 members) -- OWNS the zero-GC O(1) substrate. lite-pick builds ON it, never
+  forks it: `RandomSet` (O(1) random eligible draw for P2C -- the DYNAMIC-set draw peer: O(1)
+  add/remove/sample, maintained in setEligible, the right fit for a MUTATING eligibility set),
+  `SparseSet` (the eligible-node set with O(1) add/remove/clear), `AliasTable` (WeightedRandom sampling --
+  reused verbatim, not re-implemented), `RingLog`/`MonoDeque` (EWMA + sliding-window latency for
+  PeakEWMA/BoundedLoad). Three newer members map to specific milestones: **`Reservoir`** (Vitter's Algo R,
+  O(1)/item uniform k-sampling) is the substrate for **Subsetting** (post-1.0 #4 -- pick k of N endpoints
+  uniformly); **`EliasFano`** (`nextGEQ` successor over a monotone integer sequence) makes the
+  **ring-with-vnodes** option for **M8 ConsistentHash** viable (a ring lookup IS a successor query), an
+  alternative to the Maglev table; **`RankSelect`** (`select1(k)` = k-th set bit, worst-case O(1)) is a
+  STATIC/build-once index -- attractive only for a FIXED bit pattern, NOT the mutating eligibility bitmap
+  (its O(n) rebuild-on-change is the wrong tradeoff there; RandomSet is the dynamic answer). If lite-pick
+  needs an O(1) structure, it comes from lite-o1.
 - **lite-lru** -- OWNS bounded caches. lite-pick uses a `LiteCache` for the sticky-session affinity map
   (`sessionKey -> lastNode`, LRU-evicted, bounded) instead of an unbounded `Map` (the usual sticky-LB
   memory leak). No eviction policy is re-implemented here.

@@ -4,6 +4,42 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-23
+
+M3: P2C (power-of-two-choices), the headline strategy -- and the balance-quality anchor
+(ROADMAP.md M3).
+
+### Added
+
+- `P2cBalancer extends BalancerBase` -- power-of-two-choices. Draws two DISTINCT eligible
+  endpoints uniformly at random (rejection sampling over the shared bitmap -- no peer, no
+  owned draw-set) and returns the one with the lower in-flight load; ties to the first draw.
+  In-flight counts are the caller's `Uint32Array` (read-only to `pick()`). O(1) per pick,
+  0 B/op. Fails closed (`PICK_NONE`) when the whole pool is down. Owns only a seeded,
+  deterministic PRNG (reproducible benches).
+- The distinct second choice uses a BOUNDED redraw (up to 32 tries), not a single nudge, so
+  the two-choices property holds even at tiny pool sizes (~2^-32 collision chance), while
+  staying expected-O(1) and 0 B/op.
+- `test/P2C.test.js` -- 10 tests: n=2 always-lower-load, determinism by seed, fail-closed,
+  single-node, skips-down, a very-sparse-pool fallback path, a never-returns-a-down-index
+  proof under 200k churned picks, and an in-suite balance smoke.
+- **The balance anchor** (`test/balance.mjs`): the balls-into-bins experiment now proves the
+  `ln ln n / ln 2` ceiling -- at n=1024, k=32 balls/bin, P2C peak-to-mean gap ~2 vs a random
+  single-draw foil's ~21, and P2C's gap stays ~2-3 as n grows to 4096 while random's grows.
+- Gates extended for P2C: torture (retention + 0 B/op `pick()`), PerfGate (`zgcSuite` scenario
+  + a `mustFail` teeth-check), witness (`const` complexity -> flat throughput), benchmark
+  matrix (P2C subject + a random-draw foil).
+- `decisions/0005-p2c-draw.md` -- rejection sampling (no peer, RandomSet deferred), the
+  bounded-distinct-redraw enrichment, and caller-owned in-flight counters.
+
+### Changed
+
+- Version 0.2.0 -> 0.3.0 across `package.json`, `Pick.js` `VERSION`, and `llms.txt`.
+- Folded lite-o1 v1.11.0's new members into the substrate map (RESEARCH s6, ROADMAP):
+  `Reservoir` -> the Subsetting substrate (post-1.0 #4); `EliasFano` -> a viable ring-with-
+  vnodes option for M8 ConsistentHash; `RankSelect` noted as static-only (not for the
+  mutating eligibility bitmap).
+
 ## [0.2.0] - 2026-09-23
 
 M2: SmoothWRR, the weighted default (ROADMAP.md M2).
@@ -105,6 +141,7 @@ ownership boundary in place before any `pick()` is written.
 - Next: **M1 RoundRobin** (0.1.0) -- the first strategy, landing the throughput witness
   and the balance gate.
 
+[0.3.0]: https://github.com/PeshoVurtoleta/lite-pick/releases/tag/v0.3.0
 [0.2.0]: https://github.com/PeshoVurtoleta/lite-pick/releases/tag/v0.2.0
 [0.1.0]: https://github.com/PeshoVurtoleta/lite-pick/releases/tag/v0.1.0
 [0.0.1]: https://github.com/PeshoVurtoleta/lite-pick/releases/tag/v0.0.1

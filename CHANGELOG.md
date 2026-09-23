@@ -4,6 +4,19 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-09-23
+
+### Added
+
+- `RECIPES.md` -- a beginner-to-advanced usage guide that builds the selection kernel up into a
+  real load balancer (health/eligibility wiring, caller-owned in-flight counters, the
+  dispatch/settle loop, `/pool` failover, PeakEWMA rtt feedback, the FE profile, a strategy
+  decision table, suite composition, zero-GC discipline, and gotchas). Added to the published
+  package (`files[]`) and linked from the README.
+
+Docs-only release: no source or behavior change from 0.7.1 (the `VERSION` stamp is bumped for the
+three-place sync).
+
 ## [0.7.1] - 2026-09-23
 
 ### Fixed

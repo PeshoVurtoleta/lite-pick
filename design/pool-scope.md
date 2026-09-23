@@ -264,6 +264,16 @@ is essentially #5 (viz) + #7 (lite-di-signal observability adapter) combined -- 
 - Doubles as the live face of the endurance soak (post-1.0 #8): leave it on
   `caffeinate -i`, the panel is the overnight dashboard. Confirm the soak's JSONL feeds
   the same panel.
+- TWO RENDER TARGETS (user, 2026-09-23): (a) the browser-canvas panel this brief describes,
+  and (b) a TERMINAL-ONLY TUI -- a genuine htop/btop-for-load-balancing. SAME data (dump()
+  snapshot), SAME pathology detectors, SAME calm-baseline color budget; only the renderer
+  differs. TUI render path (already researched, section 6): braille dots (U+2800, 2x4/cell)
+  for the fingerprint + scope traces, block/eighth glyphs (U+2580-259F, U+2581-2588) for
+  the heat-strip + bars, sextant/octant density tiers (notcurses) for richness, 256/true-
+  color ANSI on the same green->amber->red ramp; render on a throttled tick, no per-pick
+  telemetry. Open: shared "scene model" so browser + TUI render from one snapshot source;
+  which ships first (the TUI is the purer thesis + the easier zero-dep artifact; the browser
+  one is the richer pitch). Decide when #5 is greenlit.
 
 ---
 

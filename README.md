@@ -300,6 +300,8 @@ VERSION;              // -> '0.6.0'
 
 ## Wiring it up -- `@zakkster/lite-pick/pool` (v0.5.0)
 
+> **New to lite-pick as a load balancer?** [**RECIPES.md**](./RECIPES.md) is a beginner-to-advanced guide: it builds the kernel up into a real balancer step by step -- health/eligibility, load counters, the dispatch/settle loop, failover, latency feedback (PeakEWMA), the FE profile, and choosing a strategy. Start there; the sections below are the reference.
+
 The kernel gives you `pick() -> index`. Real callers also need the counter ergonomics: **increment in-flight on dispatch, decrement on settle, and re-pick a *different* endpoint on failure.** That layer is async (it wraps the request), so it lives in a separate subpath -- `@zakkster/lite-pick/pool` -- and the kernel stays 0 B/op.
 
 ```js

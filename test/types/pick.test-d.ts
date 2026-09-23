@@ -6,7 +6,7 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer } from '../../Pick.js';
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -89,3 +89,39 @@ new P2cBalancer(4, new Uint8Array(4), [0, 0, 0, 0]);
 
 // @ts-expect-error -- inflight arg is required.
 new P2cBalancer(4, new Uint8Array(4));
+
+// LeastConnBalancer: capacity + eligibility + a caller-owned inflight view; a BalancerBase subclass.
+const lc: LeastConnBalancer = new LeastConnBalancer(4, new Uint8Array(4), new Uint32Array(4));
+const lcBase: BalancerBase = lc;
+void lcBase;
+const lcPick: number = lc.pick();
+void lcPick;
+
+// @ts-expect-error -- inflight must be a Uint32Array, not a number[].
+new LeastConnBalancer(4, new Uint8Array(4), [0, 0, 0, 0]);
+
+// @ts-expect-error -- inflight arg is required.
+new LeastConnBalancer(4, new Uint8Array(4));
+
+// SedBalancer: adds a weights arg after inflight; a BalancerBase subclass.
+const sed: SedBalancer = new SedBalancer(4, new Uint8Array(4), new Uint32Array(4), new Uint32Array(4));
+const sedBase: BalancerBase = sed;
+void sedBase;
+const sedPick: number = sed.pick();
+void sedPick;
+
+// @ts-expect-error -- weights must be a Uint32Array, not a number[].
+new SedBalancer(4, new Uint8Array(4), new Uint32Array(4), [1, 1, 1, 1]);
+
+// @ts-expect-error -- weights arg is required.
+new SedBalancer(4, new Uint8Array(4), new Uint32Array(4));
+
+// NqBalancer: same signature as SED; a BalancerBase subclass.
+const nq: NqBalancer = new NqBalancer(4, new Uint8Array(4), new Uint32Array(4), new Uint32Array(4));
+const nqBase: BalancerBase = nq;
+void nqBase;
+const nqPick: number = nq.pick();
+void nqPick;
+
+// @ts-expect-error -- weights arg is required.
+new NqBalancer(4, new Uint8Array(4), new Uint32Array(4));

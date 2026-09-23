@@ -16,7 +16,7 @@
  * PARITY check -- a strategy within noise of the foil while holding the contract has passed.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, Prng } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -79,6 +79,42 @@ const SUBJECTS = [
         make(n) {
             const rng = new Prng(0xABCDEF);
             return () => rng.nextBelow(n);
+        },
+    },
+    {
+        // EXACT fewest-in-flight, O(cap) scan. The PARITY point is that the exact scan is a
+        // few ns/endpoint; balance.mjs shows it achieves the perfect greedy balance P2C
+        // approximates. (The allocating "fresh Array + Math.min" anti-pattern this replaces is
+        // proven to trip the gate by PerfGate's mustFail teeth, not raced on throughput here.)
+        name: 'LeastConn',
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            for (let i = 0; i < n; i++) inflight[i] = i & 15;
+            const lc = new LeastConnBalancer(n, el, inflight);
+            return () => lc.pick();
+        },
+    },
+    {
+        name: 'SED',
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) { inflight[i] = i & 15; w[i] = 1 + (i & 7); }
+            const sed = new SedBalancer(n, el, inflight, w);
+            return () => sed.pick();
+        },
+    },
+    {
+        name: 'NQ',
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) { inflight[i] = 1 + (i & 15); w[i] = 1 + (i & 7); } // all busy: SED fallback
+            const nq = new NqBalancer(n, el, inflight, w);
+            return () => nq.pick();
         },
     },
 ];

@@ -1,7 +1,8 @@
 /**
  * @zakkster/lite-pick -- zero-GC load-balancing SELECTION KERNEL.
  *
- * M3 (0.3.0): substrate seams + RoundRobin + SmoothWRR + P2C (the headline). This file ships:
+ * M4 (0.4.0): substrate seams + six strategies -- RoundRobin, SmoothWRR, P2C, and the
+ * exact LeastConn family (LeastConn, SED, NQ). This file ships:
  *
  *   - VERSION        the single source-of-truth version stamp (3-place sync).
  *   - PICK_NONE      the fail-closed sentinel (-1): "no endpoint", never a dead pick.
@@ -15,8 +16,16 @@
  *                    the eligibility view, skipping down nodes, O(1) amortized, 0 B/op.
  *   - SmoothWRRBalancer   the weighted default: nginx smooth weighted round-robin over
  *                    caller-configured integer weights, O(cap)/pick, 0 B/op.
- *   - P2cBalancer    the headline: power-of-two-choices over caller-owned in-flight counts;
- *                    the ln ln n balance ceiling, O(1)/pick, 0 B/op.
+ *   - P2cBalancer    power-of-two-choices over caller-owned in-flight counts; the ln ln n
+ *                    balance ceiling, O(1)/pick, 0 B/op. This IS the O(1) least-connections
+ *                    APPROXIMATION ("P2C-least-conn") -- the LeastConn family below is exact.
+ *   - LeastConnBalancer   EXACT fewest-in-flight (IPVS `lc`): a full O(cap) scan of the
+ *                    caller-owned in-flight view, 0 B/op. The deterministic complement to
+ *                    P2C's O(1) approximation.
+ *   - SedBalancer    shortest-expected-delay (IPVS `sed`): minimizes (inflight+1)/weight --
+ *                    charges the NEW request's marginal cost. O(cap)/pick, 0 B/op.
+ *   - NqBalancer     never-queue (IPVS `nq`): an IDLE eligible endpoint immediately if one
+ *                    exists, else SED. The worker-pool fit. O(cap)/pick, 0 B/op.
  *
  * The identity (decisions/0001): lite-pick OWNS NO mutable state it can avoid owning.
  * It reads pre-allocated views (eligibility, inflight, weights, scores) that siblings or
@@ -24,13 +33,15 @@
  * counters live OUTSIDE the kernel. The steady-state pick path allocates 0 B/op.
  *
  * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [M1], SmoothWRR [M2],
- *   P2C [M3], LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom [planned].
+ *   P2C [M3], LeastConn/SED/NQ [M4], PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom
+ *   [planned]. The EXACT-O(log n) fewest-in-flight variant is a deferred @zakkster/lite-logn
+ *   BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan.
  *
  * Zero runtime dependencies. node:test only. ESM, single file, tree-shakeable.
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -381,5 +392,180 @@ export class P2cBalancer extends BalancerBase {
         if (b < 0 || b === a) return a;       // astronomically rare: fall back to the first draw
         // Lower in-flight wins; ties go to the first draw (unbiased over many picks).
         return this._inflight[b] < this._inflight[a] ? b : a;
+    }
+}
+
+/**
+ * LeastConnBalancer -- EXACT fewest-in-flight (M4), IPVS `lc` made zero-GC.
+ *
+ * `pick()` scans the whole pool and returns the eligible endpoint with the lowest in-flight
+ * count -- the deterministic, exact complement to P2cBalancer's O(1) two-choice APPROXIMATION
+ * of the same objective. Where P2C trades a tiny balance gap for O(1), LeastConn pays O(cap)
+ * for the exact minimum: in a closed feedback loop (the caller increments inflight on dispatch
+ * and decrements on settle) it is the greedy-optimal assignment -- max-minus-min load stays
+ * within 1 (test/balance.mjs proves the perfect balance, tighter than P2C's ln ln n gap).
+ *
+ * Ownership (ADR 0001, ADR 0006): in-flight counts live in the CALLER's Uint32Array, read-only
+ * to `pick()`. LeastConn owns NO derived state beyond the base `_live` -- it reads inflight
+ * live each scan, so (unlike SmoothWRR's weights) the caller may mutate the inflight view
+ * directly between picks; that is the whole point of the shared-counter seam.
+ *
+ * Bound: O(cap) per pick (one scan). Steady-state pick(): integer compares + one index write,
+ * no object/closure/array created -- 0 B/op. Tie-break is the lowest index (deterministic);
+ * the feedback loop breaks a startup all-zero tie by raising the picked node's count. Fails
+ * closed (PICK_NONE) when the whole pool is down.
+ *
+ * NOTE: without a feedback loop (inflight never changes) LeastConn returns the same lowest-load
+ * index every call -- correct by contract (it IS the least-loaded), but the caller must feed
+ * load back for it to distribute. The M5 lite-query adapter provides that increment/decrement.
+ */
+export class LeastConnBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  endpoint count (fixed).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array} inflight  per-endpoint in-flight counts (length >= capacity),
+     *   caller-owned and only READ here.
+     */
+    constructor(capacity, eligible, inflight) {
+        super(capacity, eligible);
+        if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
+            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+        }
+        this._inflight = inflight;
+    }
+
+    /**
+     * The eligible endpoint with the fewest in-flight requests, or PICK_NONE (fail closed).
+     * O(cap), zero-alloc. Lowest index on a tie.
+     * @returns {number}
+     */
+    pick() {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const cap = this._cap, el = this._eligible, inf = this._inflight;
+        let best = -1, bestLoad = 0;
+        for (let i = 0; i < cap; i++) {
+            if (el[i]) {
+                const c = inf[i];
+                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }
+            }
+        }
+        return best;                              // best >= 0 guaranteed while _live > 0
+    }
+}
+
+/**
+ * SedBalancer -- shortest-expected-delay (M4), IPVS `sed` made zero-GC.
+ *
+ * `pick()` returns the eligible endpoint that minimizes `(inflight + 1) / weight` -- the
+ * expected delay if the NEW request were placed there (the +1 charges the request itself).
+ * Higher-weight endpoints absorb proportionally more load; SED converges to inflight/weight
+ * equal across the pool (test/balance.mjs proves the weighted fairness). It is the weighted
+ * generalization of least-connections: with all weights equal, SED and LeastConn agree.
+ *
+ * Ownership (ADR 0001, ADR 0006): BOTH inflight AND weights are caller-owned Uint32Arrays,
+ * read-only to `pick()`. SED (like LeastConn, unlike SmoothWRR) owns NO derived weight
+ * aggregate -- it reads weights live each scan, so there is no `setWeight` and no total to
+ * desync: the caller may retune weights directly between picks. An eligible endpoint whose
+ * weight is 0 is NOT a candidate (its expected delay is infinite); if every eligible endpoint
+ * has weight 0, `pick()` fails closed.
+ *
+ * Bound: O(cap) per pick (one scan, one Float64 division per eligible node), 0 B/op. Lowest
+ * index on a tie. Fails closed (PICK_NONE) when no eligible endpoint has a positive weight.
+ */
+export class SedBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  endpoint count (fixed).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array} inflight  per-endpoint in-flight counts (length >= capacity), caller-owned.
+     * @param {Uint32Array} weights  per-endpoint weights (length >= capacity), caller-owned; read live.
+     */
+    constructor(capacity, eligible, inflight, weights) {
+        super(capacity, eligible);
+        if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
+            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+        }
+        if (!(weights instanceof Uint32Array) || weights.length < capacity) {
+            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+        }
+        this._inflight = inflight;
+        this._weights = weights;
+    }
+
+    /**
+     * The eligible endpoint minimizing (inflight + 1) / weight, or PICK_NONE (fail closed).
+     * O(cap), zero-alloc. Lowest index on a tie; weight-0 nodes are not candidates.
+     * @returns {number}
+     */
+    pick() {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const cap = this._cap, el = this._eligible, inf = this._inflight, wt = this._weights;
+        let best = -1, bestScore = Infinity;
+        for (let i = 0; i < cap; i++) {
+            if (el[i]) {
+                const w = wt[i];
+                if (w > 0) {
+                    const score = (inf[i] + 1) / w;
+                    if (score < bestScore) { bestScore = score; best = i; }
+                }
+            }
+        }
+        return best;                              // -1 when every eligible node has weight 0
+    }
+}
+
+/**
+ * NqBalancer -- never-queue (M4), IPVS `nq` made zero-GC.
+ *
+ * `pick()` returns an IDLE eligible endpoint (in-flight 0, positive weight) the instant one
+ * exists -- never leaving a free server idle while queueing elsewhere -- and otherwise falls
+ * back to SED (`(inflight + 1) / weight`). This is the best fit for the in-process worker-pool
+ * case: spin up idle capacity first, only weigh expected delay once everyone is busy.
+ *
+ * Ownership (ADR 0001, ADR 0006): identical to SED -- caller-owned inflight + weights, read
+ * live, no derived aggregate. The first idle eligible node (lowest index, in-flight 0, weight
+ * > 0) short-circuits the scan.
+ *
+ * Bound: O(cap) worst case (no idle node -> a full SED scan); O(1) when a low-index endpoint is
+ * idle. 0 B/op. Fails closed (PICK_NONE) when no eligible endpoint has a positive weight.
+ */
+export class NqBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  endpoint count (fixed).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array} inflight  per-endpoint in-flight counts (length >= capacity), caller-owned.
+     * @param {Uint32Array} weights  per-endpoint weights (length >= capacity), caller-owned; read live.
+     */
+    constructor(capacity, eligible, inflight, weights) {
+        super(capacity, eligible);
+        if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
+            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+        }
+        if (!(weights instanceof Uint32Array) || weights.length < capacity) {
+            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+        }
+        this._inflight = inflight;
+        this._weights = weights;
+    }
+
+    /**
+     * The first idle eligible endpoint (in-flight 0, weight > 0), else the SED minimum, else
+     * PICK_NONE (fail closed). O(cap) worst case, O(1) when an early node is idle. Zero-alloc.
+     * @returns {number}
+     */
+    pick() {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const cap = this._cap, el = this._eligible, inf = this._inflight, wt = this._weights;
+        let best = -1, bestScore = Infinity;
+        for (let i = 0; i < cap; i++) {
+            if (el[i]) {
+                const w = wt[i];
+                if (w > 0) {
+                    if (inf[i] === 0) return i;   // idle: never queue -- take it immediately
+                    const score = (inf[i] + 1) / w;
+                    if (score < bestScore) { bestScore = score; best = i; }
+                }
+            }
+        }
+        return best;                              // -1 when every eligible node has weight 0
     }
 }

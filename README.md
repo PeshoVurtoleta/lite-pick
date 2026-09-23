@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.3.0 ships three strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, and `P2cBalancer`** (power-of-two-choices, the headline) -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view). The rest of the roster -- LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
+> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.4.0 ships six strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, and the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family** -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view). The rest of the roster -- PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-pick.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-pick)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -21,7 +21,7 @@ The npm landscape has old algorithm libraries (`load-balancers`, `loadbalance`, 
 - **Two pieces of evidence, both shipped.** A **0 B/op** witness on the pick path (no object, closure, string, or array created per pick), and a measured **balance-quality anchor** -- peak-to-average load within the strategy's theoretical ceiling (for P2C, the Azar-Broder-Karlin-Upfal `ln ln n / ln 2` bound) and strictly better than a random foil.
 - **A pure selector, not a proxy.** It **consumes** health and circuit state; it never owns them. Health is a shared read-only bitmap written by [`@zakkster/lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health); circuit state comes from [`@zakkster/lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart); load counters are caller-owned typed arrays. `pick()` only reads.
 
-> **Status: M3 (v0.3.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, and `P2cBalancer`**. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, and **P2C proves the `ln ln n` balance ceiling** -- peak-to-mean gap ~2 vs a random foil's ~21 at n=1024, holding flat as the pool grows. See [ROADMAP.md](./ROADMAP.md) for the M3 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), and the RoundRobin (0003), SmoothWRR (0004), and P2C (0005) design forks.
+> **Status: M4 (v0.4.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, and the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family**. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), and **SED tracks weight within 1%**. New in M4: a **seeded invariant fuzzer** (`test/fuzz.mjs`) that asserts each strategy's state-synchronisation invariants after *every* op. See [ROADMAP.md](./ROADMAP.md) for the M4 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), and the RoundRobin (0003), SmoothWRR (0004), P2C (0005), and LeastConn-family (0006) design forks.
 
 ```bash
 npm install @zakkster/lite-pick
@@ -102,6 +102,43 @@ The proof (from `test/balance.mjs`, the library's analytical anchor):
 
 P2C's gap stays a small `ln ln n` constant while the random foil's grows with the pool. `pick()` is **0 B/op** and **O(1)** (two expected-O(1) rejection draws + a compare); in-flight counts are your caller-owned `Uint32Array` ([ADR 0005](./decisions/0005-p2c-draw.md)).
 
+## LeastConn / SED / NQ -- the exact load-aware family (v0.4.0)
+
+P2C above is the **O(1) approximation** of least-connections. When you want the **exact** least-loaded endpoint -- and the weighted (SED) and worker-pool (NQ) variants -- M4 ships the IPVS `lc` / `sed` / `nq` cohort, made zero-GC. All three read your caller-owned `inflight` (and, for SED/NQ, `weights`) **live** -- no `setWeight`, no derived total, so you mutate the counters directly in your feedback loop ([ADR 0006](./decisions/0006-leastconn-family.md)).
+
+```js
+import { LeastConnBalancer, SedBalancer, NqBalancer } from '@zakkster/lite-pick';
+
+const eligible = Uint8Array.from([1, 1, 1, 1]);
+const inflight = new Uint32Array(4);            // YOU own this; increment on dispatch, decrement on settle
+
+// LeastConn: the EXACT fewest-in-flight endpoint (O(cap) scan). In a feedback loop it is
+// greedy-optimal -- load spreads within 1 of the mean (tighter than P2C's ln ln n gap).
+const lc = new LeastConnBalancer(4, eligible, inflight);
+const a = lc.pick(); inflight[a]++;
+
+// SED (shortest-expected-delay): minimizes (inflight + 1) / weight -- higher weight absorbs
+// proportionally more load. A weight-0 eligible node is never a candidate.
+const weights = Uint32Array.from([1, 2, 3, 4]);
+const sed = new SedBalancer(4, eligible, inflight, weights);
+const b = sed.pick(); inflight[b]++;
+
+// NQ (never-queue): jump to an IDLE endpoint (in-flight 0) the instant one exists, else SED.
+// The best fit for a worker pool -- fill free workers before queueing anywhere.
+const nq = new NqBalancer(4, eligible, inflight, weights);
+const c = nq.pick(); inflight[c]++;
+```
+
+The proof (from `test/balance.mjs`):
+
+| strategy | claim | measured |
+|---|---|---|
+| **LeastConn** | exact greedy balance | **max-minus-min load <= 1** (peak/avg 1.00), tighter than P2C; peak <= P2C's on the same run |
+| **SED** | load proportional to weight | **< 1% share drift** from each node's weight fraction; weighted-imbalance far below a random foil |
+| **NQ** | never queue while idle | first *n* dispatches hit **n distinct idle workers**, then falls back to SED |
+
+Each `pick()` is **0 B/op** and **O(cap)** (NQ is O(1) when an early node is idle). Because these are the state-heaviest strategies so far, M4 also introduces the **invariant fuzzer** (`npm run fuzz`): a seeded state-machine attack that, after *every* `pick` / `setEligible` / weight / load op, asserts the chosen endpoint is the *exact* optimum, `live` stays exact, and `PICK_NONE` holds *iff* nothing is pickable -- printing the seed on any failure for byte-for-byte replay.
+
 ## The substrate (under every strategy)
 
 ```js
@@ -127,10 +164,10 @@ rng.nextBelow(4);     // -> a uint32 in [0, 4)
 rng.reset();          // replays the exact stream
 
 PICK_NONE;            // -> -1  (fail-closed sentinel: no endpoint, never a dead pick)
-VERSION;              // -> '0.3.0'
+VERSION;              // -> '0.4.0'
 ```
 
-`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
+`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
 
 ## Design ownership (ratified before any strategy)
 
@@ -161,6 +198,7 @@ npm run torture    # lite-leak retention + lite-gc-profiler 0 B/op (needs --expo
 npm run test:perf  # lite-perf-gate HARD zero-alloc gate + a mustFail teeth-check
 npm run witness    # pick throughput flatness across a pool-size sweep
 npm run balance    # peak-to-average vs the strategy ceiling + random foil (the anchor)
+npm run fuzz       # seeded invariant fuzzer: state-sync invariants after every op
 npm run verify     # all of the above
 ```
 

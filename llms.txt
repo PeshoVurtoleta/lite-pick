@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.3.0
+Version: 0.4.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,12 +14,15 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.3.0 ships the substrate seams + three strategies: RoundRobin, SmoothWRR (the weighted
-default), and P2C (power-of-two-choices, the headline). It exports `VERSION`, the fail-closed
-sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (the shared
-read-only eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`, and
-`P2cBalancer`. The remaining strategies land one per session (see ROADMAP.md): LeastConn/SED/NQ,
-PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
+0.4.0 ships the substrate seams + six strategies: RoundRobin, SmoothWRR (the weighted
+default), P2C (power-of-two-choices -- also the O(1) least-connections APPROXIMATION), and the
+EXACT LeastConn family (LeastConn, SED, NQ). It exports `VERSION`, the fail-closed sentinel
+`PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (the shared read-only
+eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`,
+`LeastConnBalancer`, `SedBalancer`, and `NqBalancer`. The remaining strategies land one per
+session (see ROADMAP.md): PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom. The EXACT-O(log
+n) fewest-in-flight variant is a deferred @zakkster/lite-logn `BinaryHeap` optional-peer seam
+(decisions/0006), not this exact-O(cap) scan.
 
 ## Design ownership (decisions/0001, 0002)
 
@@ -78,7 +81,31 @@ PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
   - `pick()` -> number. Draws two DISTINCT eligible endpoints uniformly at random (rejection
     sampling over the bitmap, no peer) and returns the one with the lower in-flight load; ties
     to the first draw. The `ln ln n / ln 2` peak-load ceiling (ADR 0005). O(1) per pick, 0 B/op.
-    `PICK_NONE` when the whole pool is down.
+    `PICK_NONE` when the whole pool is down. This IS the O(1) least-connections APPROXIMATION;
+    `LeastConnBalancer` below is the exact-O(cap) complement.
+- `LeastConnBalancer extends BalancerBase` -- class. EXACT fewest-in-flight (M4, IPVS `lc`).
+  - `new LeastConnBalancer(capacity, eligible, inflight)` -- `inflight` a caller-owned Uint32Array
+    (length >= capacity), read LIVE each pick. No `setWeight`, no derived aggregate: the caller may
+    mutate inflight directly between picks (that is the shared-counter seam).
+  - `pick()` -> number. Full O(cap) scan returning the eligible node with the fewest in-flight
+    requests (lowest index on a tie), or `PICK_NONE` when the whole pool is down. 0 B/op. In a
+    feedback loop (increment on dispatch, decrement on settle) it is greedy-optimal: max-minus-min
+    load stays within 1 (balance.mjs). Without feedback it returns the same lowest-load index --
+    correct by contract; the M5 lite-query adapter provides the increment/decrement.
+- `SedBalancer extends BalancerBase` -- class. Shortest-expected-delay (M4, IPVS `sed`).
+  - `new SedBalancer(capacity, eligible, inflight, weights)` -- `inflight` AND `weights` are
+    caller-owned Uint32Arrays (length >= capacity), read LIVE (no `setWeight`, no derived total --
+    the caller may retune weights directly, UNLIKE SmoothWRR).
+  - `pick()` -> number. O(cap) scan returning the eligible, positive-weight node minimizing
+    `(inflight + 1) / weight` (the new request's marginal expected delay), lowest index on a tie,
+    or `PICK_NONE` when no eligible node has a positive weight. A weight-0 eligible node is NOT a
+    candidate. Converges to load proportional-to-weight (balance.mjs). 0 B/op.
+- `NqBalancer extends BalancerBase` -- class. Never-queue (M4, IPVS `nq`); the worker-pool fit.
+  - `new NqBalancer(capacity, eligible, inflight, weights)` -- same caller-owned, read-live
+    inflight + weights contract as SED.
+  - `pick()` -> number. Returns the FIRST idle eligible positive-weight node (in-flight 0) if one
+    exists -- never queueing while a server is free -- else the SED minimum, else `PICK_NONE`.
+    O(cap) worst case, O(1) when an early node is idle. 0 B/op.
 
 ## Gates (every session)
 
@@ -88,6 +115,8 @@ PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom.
   lite-perf-gate `zgcSuite` HARD zero-alloc gate + a `mustFail` teeth-check.
 - `npm run witness`   -- pick throughput flatness across a pool-size sweep.
 - `npm run balance`   -- peak-to-average load vs the strategy ceiling + random foil (the anchor).
+- `npm run fuzz`      -- the seeded invariant fuzzer (the state-machine attack): strict-mode
+  state-synchronisation invariants after every op, per strategy; prints the seed on failure.
 - `npm test` / `npm run test:types` -- node:test boundary suite + tsc type-surface check.
 
 ## Composes with

@@ -3,12 +3,13 @@
  *
  * Run:  node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs
  *
- * A node:test-native COMPLEMENT to torture (0 B/op), not a replacement. M3 gates the
+ * A node:test-native COMPLEMENT to torture (0 B/op), not a replacement. M4 gates the
  * SUBSTRATE hot ops every strategy rides -- the deterministic Prng draw (next / nextBelow)
- * and the BalancerBase eligibility read (isEligible) -- AND RoundRobin.pick(),
- * SmoothWRR.pick(), and P2C.pick(), via scavenge scaling at N and k*N, with the old-gen and
- * external / arrayBuffers lanes pinned to 0. Backing arrays are fixed at construction and
- * NEVER grow, so each scenario's `grows` counter (its backing .buffer.byteLength) shows a 0 delta.
+ * and the BalancerBase eligibility read (isEligible) -- AND RoundRobin.pick(), SmoothWRR.pick(),
+ * P2C.pick(), LeastConn.pick(), SED.pick(), and NQ.pick(), via scavenge scaling at N and k*N,
+ * with the old-gen and external / arrayBuffers lanes pinned to 0. Backing arrays are fixed at
+ * construction and NEVER grow, so each scenario's `grows` counter (its backing .buffer.byteLength)
+ * shows a 0 delta.
  *
  * Each strategy session (M1+) appends its own reused-instance scenario + its own
  * mustFail teeth-check here (ROADMAP section 3 / accounting site 10).
@@ -18,14 +19,19 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer } from '../../Pick.js';
+import {
+    Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
+    LeastConnBalancer, SedBalancer, NqBalancer,
+} from '../../Pick.js';
 
 const CAP = 1 << 14;      // pool capacity 16384 (O(1)/O(d) scenarios: size is irrelevant)
 const MASK = CAP - 1;     // power-of-2 mask: nextBelow stays in [0, CAP)
-// SmoothWRR is O(cap) per pick, so its scenarios use a REALISTIC pool size (real
-// balancer pools are dozens-to-hundreds of endpoints). Proving 0 B/op does not need a
-// huge pool, and CAP=16384 would make each pick scan 16384 nodes -- a needless slow gate.
+// The O(cap)-per-pick strategies (SmoothWRR + the exact LeastConn family) use a REALISTIC
+// pool size (real balancer pools are dozens-to-hundreds of endpoints). Proving 0 B/op does
+// not need a huge pool, and CAP=16384 would make each pick scan 16384 nodes -- a needless
+// slow gate.
 const SWRR_CAP = 256;
+const SCAN_CAP = 256;     // LeastConn / SED / NQ (all O(cap) scans)
 
 /** The zero-alloc counter for substrate scenarios: the eligibility view's byte length. */
 function grows(s) {
@@ -159,7 +165,70 @@ const p2cPick = {
     statsOf(s) { return { grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength }; },
 };
 
-const scenarios = [prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick];
+/** A half-eligible SCAN_CAP pool + a caller-owned inflight (and optional weights). */
+function makeScanPool(withWeights) {
+    const el = new Uint8Array(SCAN_CAP);
+    for (let i = 0; i < SCAN_CAP; i += 2) el[i] = 1;
+    const inflight = new Uint32Array(SCAN_CAP);
+    for (let i = 0; i < SCAN_CAP; i++) inflight[i] = 1 + (i & 15); // all busy (NQ worst case)
+    if (!withWeights) return { el, inflight };
+    const weights = new Uint32Array(SCAN_CAP);
+    for (let i = 0; i < SCAN_CAP; i++) weights[i] = 1 + (i & 7);
+    return { el, inflight, weights };
+}
+
+/** leastconn-pick: reused LeastConn over a half-eligible pool; each op a real O(cap) pick(). */
+const leastConnPick = {
+    name: 'LeastConnBalancer.pick()',
+    setup() {
+        const { el, inflight } = makeScanPool(false);
+        return { el, inflight, lc: new LeastConnBalancer(SCAN_CAP, el, inflight), acc: 0 };
+    },
+    hot(s, n) {
+        const lc = s.lc;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + lc.pick()) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength }; },
+};
+
+/** sed-pick: reused SED over a weighted, half-eligible pool; each op an O(cap) scan + divisions. */
+const sedPick = {
+    name: 'SedBalancer.pick()',
+    setup() {
+        const { el, inflight, weights } = makeScanPool(true);
+        return { el, inflight, weights, sed: new SedBalancer(SCAN_CAP, el, inflight, weights), acc: 0 };
+    },
+    hot(s, n) {
+        const sed = s.sed;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + sed.pick()) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength + s.weights.buffer.byteLength }; },
+};
+
+/** nq-pick: reused NQ over an ALL-BUSY weighted pool so every pick takes the full SED-fallback scan. */
+const nqPick = {
+    name: 'NqBalancer.pick()',
+    setup() {
+        const { el, inflight, weights } = makeScanPool(true); // inflight all >= 1 -> no idle short-circuit
+        return { el, inflight, weights, nq: new NqBalancer(SCAN_CAP, el, inflight, weights), acc: 0 };
+    },
+    hot(s, n) {
+        const nq = s.nq;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + nq.pick()) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength + s.weights.buffer.byteLength }; },
+};
+
+const scenarios = [
+    prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
+    leastConnPick, sedPick, nqPick,
+];
 
 /**
  * The teeth: a draw that pushes each index into a FRESH [] each op -- the array MUST
@@ -239,6 +308,54 @@ const p2cMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** LeastConn teeth: pick() boxed into a fresh [] each op -- MUST trip the gate. */
+const lcMustFailAlloc = {
+    name: 'LeastConn.pick() boxed into fresh array (MUST allocate)',
+    setup() {
+        const { el, inflight } = makeScanPool(false);
+        return { el, inflight, base: new LeastConnBalancer(SCAN_CAP, el, inflight) };
+    },
+    hot(s, n) {
+        const lc = s.base;
+        let sink = 0;
+        for (let i = 0; i < n; i++) { const arr = [lc.pick()]; sink += arr[0]; }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/** SED teeth: pick() boxed into a fresh [] each op -- MUST trip the gate. */
+const sedMustFailAlloc = {
+    name: 'SED.pick() boxed into fresh array (MUST allocate)',
+    setup() {
+        const { el, inflight, weights } = makeScanPool(true);
+        return { el, inflight, weights, base: new SedBalancer(SCAN_CAP, el, inflight, weights) };
+    },
+    hot(s, n) {
+        const sed = s.base;
+        let sink = 0;
+        for (let i = 0; i < n; i++) { const arr = [sed.pick()]; sink += arr[0]; }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/** NQ teeth: pick() boxed into a fresh [] each op -- MUST trip the gate. */
+const nqMustFailAlloc = {
+    name: 'NQ.pick() boxed into fresh array (MUST allocate)',
+    setup() {
+        const { el, inflight, weights } = makeScanPool(true);
+        return { el, inflight, weights, base: new NqBalancer(SCAN_CAP, el, inflight, weights) };
+    },
+    hot(s, n) {
+        const nq = s.base;
+        let sink = 0;
+        for (let i = 0; i < n; i++) { const arr = [nq.pick()]; sink += arr[0]; }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -248,5 +365,8 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc, p2cMustFailAlloc],
+    mustFail: [
+        drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc, p2cMustFailAlloc,
+        lcMustFailAlloc, sedMustFailAlloc, nqMustFailAlloc,
+    ],
 });

@@ -17,7 +17,7 @@
  * The random-foil peak/avg baseline (what P2C must beat at M3) is printed for context.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, Prng } from '../Pick.js';
 
 let failed = false;
 function check(cond, msg) {
@@ -141,6 +141,99 @@ process.stdout.write('lite-pick balance (M3: P2C -- THE anchor)\n');
             'n=' + n + ': P2C gap ' + p2cGap + ' within the ln ln n ceiling band (<= ' +
             (4 * ceiling + 4).toFixed(1) + ')');
     }
+}
+
+// --- LeastConn: EXACT fewest-in-flight -- perfect greedy balance ------------
+// The exact complement to P2C's approximation. In a closed feedback loop (increment on
+// dispatch) exact least-connections is greedy-optimal: max-minus-min load stays within 1 --
+// TIGHTER than P2C's ln ln n gap. We assert the perfection AND that LeastConn's peak is <=
+// P2C's peak on the same balls-into-bins run (exact beats approximate).
+process.stdout.write('lite-pick balance (M4: LeastConn -- exact, perfect greedy)\n');
+{
+    const k = 32;
+    for (const n of [64, 1024, 4096]) {
+        const picks = k * n;
+
+        const lcLoad = new Uint32Array(n);
+        const lc = new LeastConnBalancer(n, (() => { const e = new Uint8Array(n); e.fill(1); return e; })(), lcLoad);
+        for (let i = 0; i < picks; i++) lcLoad[lc.pick()]++;
+
+        const p2cLoad = new Uint32Array(n);
+        const p2c = new P2cBalancer(n, (() => { const e = new Uint8Array(n); e.fill(1); return e; })(), p2cLoad, 0xABCDEF);
+        for (let i = 0; i < picks; i++) p2cLoad[p2c.pick()]++;
+
+        let lcMax = 0, lcMin = Infinity, p2cMax = 0;
+        for (let i = 0; i < n; i++) {
+            if (lcLoad[i] > lcMax) lcMax = lcLoad[i];
+            if (lcLoad[i] < lcMin) lcMin = lcLoad[i];
+            if (p2cLoad[i] > p2cMax) p2cMax = p2cLoad[i];
+        }
+        process.stdout.write('  n=' + String(n).padStart(4) +
+            '  LeastConn peak/avg=' + (lcMax / k).toFixed(2) + ' (max-min=' + (lcMax - lcMin) + ')' +
+            '  P2C peak/avg=' + (p2cMax / k).toFixed(2) + '\n');
+        check(lcMax - lcMin <= 1, 'n=' + n + ': LeastConn perfect greedy balance (max-min=' + (lcMax - lcMin) + ')');
+        check(lcMax <= p2cMax, 'n=' + n + ': LeastConn peak ' + lcMax + ' <= P2C peak ' + p2cMax + ' (exact beats approximate)');
+    }
+}
+
+// --- SED: weighted least-conn -- load converges proportional to weight ------
+// SED minimizes (inflight+1)/weight, so in a feedback loop each node's share tracks its
+// weight fraction. We assert every node's observed share is within a tight band of its
+// weight target, and that SED's weighted imbalance crushes a random foil's.
+process.stdout.write('lite-pick balance (M4: SED -- weighted fairness)\n');
+{
+    const weights = Uint32Array.from([1, 2, 3, 4, 6, 8, 12, 16]); // sum 52, skewed
+    let wsum = 0; for (const w of weights) wsum += w;
+    const n = weights.length;
+    const el = new Uint8Array(n); el.fill(1);
+    const inflight = new Uint32Array(n);
+    const sed = new SedBalancer(n, el, inflight, weights);
+    const TOTAL = 200000;
+    for (let i = 0; i < TOTAL; i++) inflight[sed.pick()]++;
+
+    let worst = 0;
+    for (let i = 0; i < n; i++) {
+        const share = inflight[i] / TOTAL, target = weights[i] / wsum;
+        const drift = Math.abs(share - target);
+        if (drift > worst) worst = drift;
+    }
+    // Random foil: draw uniformly (weight-blind) -- its heaviest node is starved/flooded.
+    const rndLoad = new Uint32Array(n);
+    const rng = new Prng(0xABCDEF);
+    for (let i = 0; i < TOTAL; i++) rndLoad[rng.nextBelow(n)]++;
+    let sedWImb = 0, rndWImb = 0; // max over nodes of |share - target| / target
+    for (let i = 0; i < n; i++) {
+        const target = weights[i] / wsum;
+        sedWImb = Math.max(sedWImb, Math.abs(inflight[i] / TOTAL - target) / target);
+        rndWImb = Math.max(rndWImb, Math.abs(rndLoad[i] / TOTAL - target) / target);
+    }
+    process.stdout.write('  worst share drift=' + worst.toFixed(4) +
+        '  SED weighted-imbalance=' + sedWImb.toFixed(3) + '  random=' + rndWImb.toFixed(3) + '\n');
+    check(worst < 0.01, 'SED load tracks weight within 1% (worst drift ' + worst.toFixed(4) + ')');
+    check(sedWImb < rndWImb / 2, 'SED weighted-imbalance ' + sedWImb.toFixed(3) + ' far below random ' + rndWImb.toFixed(3));
+}
+
+// --- NQ: never-queue -- idle-first fan-out before any queueing --------------
+// NQ's defining property: it never queues while a server is idle. On a fresh pool of n
+// idle workers, the first n dispatches must hit n DISTINCT workers (no double-up), and it
+// reduces to SED once all are busy. The exact-min correctness is proven by the fuzzer;
+// here we anchor the observable worker-pool fan-out.
+process.stdout.write('lite-pick balance (M4: NQ -- idle-first fan-out)\n');
+{
+    const n = 32;
+    const el = new Uint8Array(n); el.fill(1);
+    const inflight = new Uint32Array(n);
+    const weights = new Uint32Array(n).fill(1);
+    const nq = new NqBalancer(n, el, inflight, weights);
+    const seen = new Uint8Array(n);
+    let distinct = 0;
+    for (let i = 0; i < n; i++) { const p = nq.pick(); if (!seen[p]) { seen[p] = 1; distinct++; } inflight[p]++; }
+    check(distinct === n, 'NQ first ' + n + ' dispatches hit ' + distinct + '/' + n + ' distinct idle workers');
+    // Now all busy (inflight 1): NQ falls back to SED -> next pick is a least-loaded node.
+    const before = inflight.slice();
+    const p = nq.pick();
+    let minLoad = Infinity; for (let i = 0; i < n; i++) if (before[i] < minLoad) minLoad = before[i];
+    check(before[p] === minLoad, 'NQ SED-fallback picks a least-loaded node once none are idle');
 }
 
 if (failed) {

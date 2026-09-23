@@ -15,7 +15,7 @@
  * on tiny pools while still catching a real complexity regression.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -64,11 +64,46 @@ const SUBJECTS = [
             return () => p2c.pick();
         },
     },
+    {
+        name: 'LeastConn',
+        complexity: 'linear', // exact O(cap) scan -> ops/ms * n is the flat series
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            for (let i = 0; i < n; i++) inflight[i] = i & 15;
+            const lc = new LeastConnBalancer(n, el, inflight);
+            return () => lc.pick();
+        },
+    },
+    {
+        name: 'SED',
+        complexity: 'linear', // O(cap) scan + a division per eligible node
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) { inflight[i] = i & 15; w[i] = 1 + (i & 7); }
+            const sed = new SedBalancer(n, el, inflight, w);
+            return () => sed.pick();
+        },
+    },
+    {
+        name: 'NQ',
+        complexity: 'linear', // O(cap) worst case (no idle node); busy pool forces the full scan
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) { inflight[i] = 1 + (i & 15); w[i] = 1 + (i & 7); } // all busy
+            const nq = new NqBalancer(n, el, inflight, w);
+            return () => nq.pick();
+        },
+    },
 ];
 
 let failed = false;
 for (const subj of SUBJECTS) {
-    process.stdout.write('lite-pick witness (M3: ' + subj.name + ', ' + subj.complexity + ')\n');
+    process.stdout.write('lite-pick witness (M4: ' + subj.name + ', ' + subj.complexity + ')\n');
     const rows = SIZES.map((n) => ({ n, opsPerMs: timePicks(subj.make(n)) }));
     // The series that MUST stay flat depends on the advertised complexity.
     const series = rows.map((r) => (subj.complexity === 'linear' ? r.opsPerMs * r.n : r.opsPerMs));

@@ -21,7 +21,7 @@ wiring proven zero-GC parts, not new low-level code.
 | **M1** | **RoundRobin** + witness/balance harness | 0.1.0 | O(1) | SHIPPED |
 | **M2** | **SmoothWRR** (nginx smooth weighted RR) | 0.2.0 | O(cap) | SHIPPED |
 | **M3** | **P2C** (the headline + balance anchor) | 0.3.0 | O(d)=O(1) | SHIPPED |
-| **M4** | **LeastConn family** (P2C-least-conn, SED, NQ; lite-logn exact fallback) | 0.4.0 | O(1) / O(log n) exact | planned |
+| **M4** | **LeastConn family** (exact LeastConn/SED/NQ; P2C already the O(1) approx; lite-logn exact-O(log n) seam confirmed/deferred) + the invariant fuzzer | 0.4.0 | O(cap) exact / O(1) NQ-idle | SHIPPED |
 | **M5** | **lite-query adapter** (the integration moat) | 0.5.0 | -- | planned |
 | **M6** | **Benchmark suite** (ecosystem MVP: balance + GC blast-radius headlines, trust gates, vs-AWS positioning) | 0.6.0 | -- | planned |
 | **M7** | **PeakEWMA** (latency-aware P2C) | 0.7.0 | O(d)=O(1) | planned |
@@ -115,12 +115,15 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
   d=2 fixed; distinct-second via one nudge-redraw (not a loop); tie-break to the first draw
   (unbiased over many picks); `inflight` a caller-owned Uint32Array, pure-read (ADR 0001).
   The balance-quality gate (imbalance vs `ln ln n / ln 2` + random foil) is THE deliverable.
-- **M4 LeastConn family** (the IPVS lc/wlc/sed/nq cohort, made zero-GC): P2C-least-conn (O(1))
-  is the default; **SED** minimizes `(inflight+1)/weight` (IPVS `sed` -- charges the new request's
-  marginal cost); **NQ** ("never queue", IPVS `nq`) sends to an IDLE endpoint immediately if one
-  exists, else falls back to SED -- the best fit for the in-process/worker-pool case. The EXACT
-  fewest-in-flight variant routes to a lite-logn indexed heap (O(log n) decrease-key), NOT an O(n)
-  scan -- confirm the seam. All three ride the caller-owned `inflight`/`weight` views (ADR 0001).
+- **M4 LeastConn family:** SHIPPED (ADR 0006). P2C over inflight (M3) IS the O(1) least-conn
+  APPROXIMATION, so M4 ships the EXACT complement -- `LeastConnBalancer` (exact fewest-in-flight,
+  O(cap) scan), `SedBalancer` (minimizes `(inflight+1)/weight`, IPVS `sed`), `NqBalancer` (idle
+  eligible node first, else SED -- IPVS `nq`, the worker-pool fit) -- NO redundant P2cLeastConn
+  alias. Counters/weights are caller-owned and read LIVE (no setWeight, no derived total -- the
+  documented asymmetry with SmoothWRR); weight-0 eligible nodes are not candidates; all fail closed.
+  0 B/op, all gated. The EXACT-O(log n) variant is a CONFIRMED-but-DEFERRED lite-logn `BinaryHeap`
+  optional-peer seam (its `changeKey` is the O(log n) decrease-key), added only when a large pool
+  makes the O(cap) scan measurably hot. The invariant fuzzer (see s3) lands here with an M2 retrofit.
 - **M5 lite-query adapter:** counters caller-owned arrays vs kernel hooks (lean: arrays +
   adapter ergonomics). Retry MUST re-pick a DIFFERENT node; rtt feeds PeakEWMA (M7).
   Home: `lite-pick/adapters` vs the lite-query repo -- decide with the user.

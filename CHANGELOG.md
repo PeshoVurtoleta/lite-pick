@@ -4,6 +4,55 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-23
+
+M4: the exact LeastConn family (IPVS `lc` / `sed` / `nq` made zero-GC) + the seeded invariant
+fuzzer (ROADMAP.md M4).
+
+### Added
+
+- `LeastConnBalancer extends BalancerBase` -- EXACT fewest-in-flight (IPVS `lc`). A full O(cap)
+  scan of the caller-owned in-flight view returning the eligible node with the lowest count
+  (lowest index on a tie); the deterministic complement to P2C's O(1) approximation. In-flight
+  is read LIVE (no `setWeight`, no derived aggregate -- the caller may mutate it directly).
+  0 B/op. Fails closed (`PICK_NONE`) when the whole pool is down.
+- `SedBalancer extends BalancerBase` -- shortest-expected-delay (IPVS `sed`). Returns the
+  eligible, positive-weight node minimizing `(inflight + 1) / weight`. BOTH inflight and weights
+  are caller-owned, read live. A weight-0 eligible node is not a candidate; all-zero-weight fails
+  closed even with the pool up. O(cap), 0 B/op.
+- `NqBalancer extends BalancerBase` -- never-queue (IPVS `nq`). Returns the FIRST idle eligible
+  positive-weight node (in-flight 0) if one exists, else the SED minimum -- the worker-pool fit.
+  O(cap) worst case, O(1) when an early node is idle, 0 B/op.
+- **The invariant fuzzer** (`test/fuzz.mjs` + the reusable `test/invariants.mjs` checker): a
+  seeded, property-based state-machine attack asserting STATE-SYNCHRONISATION invariants after
+  EVERY op (strict mode) per strategy -- `live` and (SmoothWRR) `_totalEligibleWeight` stay EXACT
+  vs a manual recompute, owned Float64 accumulators stay finite, `PICK_NONE` holds IFF the
+  pickable mass is 0, and LeastConn/SED/NQ return the true optimum (NQ its idle-first rule). Prints
+  the seed on failure for byte-for-byte replay; CI runs a fixed seed + a random seed + a regression
+  corpus + a pathological corpus (max-weight 0xFFFFFFFF summed, all-zero-weight while live>0,
+  single-node). Retrofits M2 SmoothWRR. Wired into `npm run fuzz` and `npm run verify`.
+- `test/LeastConn.test.js` (10), `test/SED.test.js` (8), `test/NQ.test.js` (10) -- boundary +
+  behaviour suites (exact minimum, weight-0 exclusion, feedback-loop balance, idle-first fan-out,
+  never-a-down-index under 200k churned picks).
+- Balance anchors (`test/balance.mjs`): LeastConn is greedy-perfect (max-minus-min <= 1, tighter
+  than P2C's gap; peak <= P2C's on the same run); SED converges to load proportional-to-weight
+  (< 1% drift; weighted-imbalance far below a random foil); NQ fans the first n dispatches out to
+  n distinct idle workers.
+- Gates extended for all three: torture (retention + 0 B/op `pick()` phases 6-8), PerfGate
+  (three `zgcSuite` scenarios + three `mustFail` teeth-checks), witness (`linear` complexity ->
+  flat work-rate), benchmark matrix (LeastConn/SED/NQ subjects + a per-pick-allocating
+  `lc-array` foil).
+- `decisions/0006-leastconn-family.md` -- P2C-is-already-least-conn (no redundant alias), exact-
+  O(cap)-scan-first, caller-owned live-read counters (the documented asymmetry with SmoothWRR),
+  and the confirmed-but-deferred lite-logn `BinaryHeap` exact-O(log n) peer seam.
+
+### Changed
+
+- Version 0.3.0 -> 0.4.0 across `package.json`, `Pick.js` `VERSION`, and `llms.txt`.
+- Folded the invariant-fuzz testing methodology (RESEARCH s3, ROADMAP s3/s0) into an adopted,
+  shipped gate: vectors 2 (flap chaos) + 3 (zero-GC soak) were already covered; the net-new
+  seeded state-synchronisation fuzzer is now `test/fuzz.mjs`.
+
 ## [0.3.0] - 2026-09-23
 
 M3: P2C (power-of-two-choices), the headline strategy -- and the balance-quality anchor

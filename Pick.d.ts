@@ -1,8 +1,8 @@
 /**
  * @zakkster/lite-pick -- TypeScript declarations.
  *
- * M3 (0.3.0): substrate seams + RoundRobin + SmoothWRR + P2C (the headline). The
- * remaining strategy classes (LeastConn/SED/NQ, PeakEWMA, ConsistentHash, BoundedLoad,
+ * M4 (0.4.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
+ * (LeastConn/SED/NQ). The remaining strategy classes (PeakEWMA, ConsistentHash, BoundedLoad,
  * WeightedRandom) are added one per session.
  */
 
@@ -103,5 +103,60 @@ export class P2cBalancer extends BalancerBase {
      */
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, seed?: number);
     /** Pick by power-of-two-choices (lower in-flight of two random eligibles), or `PICK_NONE`. */
+    pick(): number;
+}
+
+/**
+ * LeastConnBalancer -- EXACT fewest-in-flight (M4, IPVS `lc`). A full O(cap) scan of the
+ * caller-owned in-flight view returning the eligible node with the lowest count (lowest index
+ * on a tie) -- the deterministic complement to P2C's O(1) approximation. In-flight counts are
+ * caller-owned and read LIVE (no `setWeight`, no derived aggregate). 0 B/op. Fails closed
+ * (`PICK_NONE`) when the whole pool is down.
+ */
+export class LeastConnBalancer extends BalancerBase {
+    /**
+     * @param capacity endpoint count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read live.
+     */
+    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array);
+    /** The eligible node with the fewest in-flight requests, or `PICK_NONE`. O(cap). */
+    pick(): number;
+}
+
+/**
+ * SedBalancer -- shortest-expected-delay (M4, IPVS `sed`). Returns the eligible, positive-weight
+ * node minimizing `(inflight + 1) / weight`; converges to load proportional-to-weight. BOTH
+ * inflight and weights are caller-owned Uint32Arrays, read LIVE (no `setWeight`, no derived
+ * aggregate). A weight-0 eligible node is not a candidate. O(cap), 0 B/op. Fails closed
+ * (`PICK_NONE`) when no eligible node has a positive weight.
+ */
+export class SedBalancer extends BalancerBase {
+    /**
+     * @param capacity endpoint count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read live.
+     * @param weights per-endpoint weights (length >= capacity), caller-owned, read live.
+     */
+    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array);
+    /** The eligible node minimizing (inflight+1)/weight, or `PICK_NONE`. O(cap). */
+    pick(): number;
+}
+
+/**
+ * NqBalancer -- never-queue (M4, IPVS `nq`). Returns the first idle eligible positive-weight
+ * node (in-flight 0) if one exists, else the SED minimum -- the worker-pool fit. BOTH inflight
+ * and weights are caller-owned, read LIVE. O(cap) worst case, O(1) when an early node is idle,
+ * 0 B/op. Fails closed (`PICK_NONE`) when no eligible node has a positive weight.
+ */
+export class NqBalancer extends BalancerBase {
+    /**
+     * @param capacity endpoint count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read live.
+     * @param weights per-endpoint weights (length >= capacity), caller-owned, read live.
+     */
+    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array);
+    /** The first idle eligible node, else the SED minimum, or `PICK_NONE`. O(cap). */
     pick(): number;
 }

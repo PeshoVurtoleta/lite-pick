@@ -13,9 +13,10 @@
  *                                  substrate hot ops (Prng.next / nextBelow, isEligible)
  *                                  is the M0 gate. Strategy pick() paths join at M1+.
  *
- * M3: the profiled hot paths are the SUBSTRATE (PRNG draw + eligibility read) that every
- * strategy rides, AND RoundRobin.pick(), SmoothWRR.pick(), and P2C.pick(). Each later
- * strategy appends its own reused-instance hot phase here (ROADMAP section 3).
+ * M4: the profiled hot paths are the SUBSTRATE (PRNG draw + eligibility read) that every
+ * strategy rides, AND RoundRobin.pick(), SmoothWRR.pick(), P2C.pick(), LeastConn.pick(),
+ * SED.pick(), and NQ.pick(). Each later strategy appends its own reused-instance hot phase
+ * here (ROADMAP section 3).
  *
  * ENTRY CONTRACT (mirrors lite-o1): --expose-gc is mandatory; the two devDeps are
  * imported AFTER the guard so a fresh clone that skipped `npm install` fails with a
@@ -40,7 +41,10 @@ async function main() {
 
     const { measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer } = await import('../Pick.js');
+    const {
+        Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
+        LeastConnBalancer, SedBalancer, NqBalancer,
+    } = await import('../Pick.js');
 
     const CAP = 1 << 12;    // pool capacity 4096
     const CYCLES = 4096;    // retention churn
@@ -77,6 +81,15 @@ async function main() {
             const p2c = new P2cBalancer(CAP, el, inflight, c);
             p2c.pick();
             tracker.track(p2c, noop, 'p2c', { audit: true });
+            const lc = new LeastConnBalancer(CAP, el, inflight);
+            lc.pick();
+            tracker.track(lc, noop, 'leastconn', { audit: true });
+            const sed = new SedBalancer(CAP, el, inflight, weights);
+            sed.pick();
+            tracker.track(sed, noop, 'sed', { audit: true });
+            const nq = new NqBalancer(CAP, el, inflight, weights);
+            nq.pick();
+            tracker.track(nq, noop, 'nq', { audit: true });
         }
         return tracker.size();
     }
@@ -147,11 +160,46 @@ async function main() {
     const p2cAllocBytes = Math.max(0, Math.round(p2cBpc));
     const p2cAllocOk = p2cAllocBytes === 0;
 
+    // ---- phase 6: LeastConn.pick() per-call allocation (0 B/op) ------------
+    // One reused LeastConnBalancer: pick() is an O(cap) integer-compare scan + one index
+    // write over the caller-owned inflight view; no object/closure/array created.
+    const lc = new LeastConnBalancer(CAP, el, inflight);
+    let lcSink = 0;
+    const lcStep = () => { lcSink = (lcSink + lc.pick()) | 0; };
+    const lcAllocRes = measureAllocs(lcStep, { iterations: 100000, batches: 8 });
+    const lcBpc = lcAllocRes.bytesPerCall === null ? 0 : lcAllocRes.bytesPerCall;
+    const lcAllocBytes = Math.max(0, Math.round(lcBpc));
+    const lcAllocOk = lcAllocBytes === 0;
+
+    // ---- phase 7: SED.pick() per-call allocation (0 B/op) ------------------
+    // One reused SedBalancer: pick() is an O(cap) scan + one Float64 division per eligible
+    // node over caller-owned inflight + weights; no object/closure/array created.
+    const sed = new SedBalancer(CAP, el, inflight, weights);
+    let sedSink = 0;
+    const sedStep = () => { sedSink = (sedSink + sed.pick()) | 0; };
+    const sedAllocRes = measureAllocs(sedStep, { iterations: 100000, batches: 8 });
+    const sedBpc = sedAllocRes.bytesPerCall === null ? 0 : sedAllocRes.bytesPerCall;
+    const sedAllocBytes = Math.max(0, Math.round(sedBpc));
+    const sedAllocOk = sedAllocBytes === 0;
+
+    // ---- phase 8: NQ.pick() per-call allocation (0 B/op) -------------------
+    // One reused NqBalancer over a BUSY pool (inflight all >= 1) so every pick() takes the
+    // full SED-fallback scan -- the worst case, still no object/closure/array created.
+    const busy = new Uint32Array(CAP);
+    for (let i = 0; i < CAP; i++) busy[i] = 1 + (i & 15);
+    const nq = new NqBalancer(CAP, el, busy, weights);
+    let nqSink = 0;
+    const nqStep = () => { nqSink = (nqSink + nq.pick()) | 0; };
+    const nqAllocRes = measureAllocs(nqStep, { iterations: 100000, batches: 8 });
+    const nqBpc = nqAllocRes.bytesPerCall === null ? 0 : nqAllocRes.bytesPerCall;
+    const nqAllocBytes = Math.max(0, Math.round(nqBpc));
+    const nqAllocOk = nqAllocBytes === 0;
+
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink; void rrSink; void wrrSink; void p2cSink;
+    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink;
 
-    process.stdout.write('lite-pick torture (M3: substrate + RoundRobin + SmoothWRR + P2C)\n');
+    process.stdout.write('lite-pick torture (M4: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
@@ -163,8 +211,15 @@ async function main() {
         (wrrAllocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  P2C.pick() allocs: ' + p2cAllocBytes + ' B/op -> ' +
         (p2cAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  LeastConn.pick() allocs: ' + lcAllocBytes + ' B/op -> ' +
+        (lcAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  SED.pick() allocs: ' + sedAllocBytes + ' B/op -> ' +
+        (sedAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  NQ.pick() allocs: ' + nqAllocBytes + ' B/op -> ' +
+        (nqAllocOk ? 'PASS' : 'FAIL') + '\n');
 
-    if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk) {
+    if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk ||
+        !lcAllocOk || !sedAllocOk || !nqAllocOk) {
         process.stderr.write('torture: FAIL\n');
         process.exit(1);
     }

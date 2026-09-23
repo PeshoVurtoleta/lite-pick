@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.6.0
+Version: 0.7.1
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,15 +14,25 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.6.0 ships the substrate seams + six strategies: RoundRobin, SmoothWRR (the weighted
-default), P2C (power-of-two-choices -- also the O(1) least-connections APPROXIMATION), and the
-EXACT LeastConn family (LeastConn, SED, NQ). It exports `VERSION`, the fail-closed sentinel
-`PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (the shared read-only
-eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`,
-`LeastConnBalancer`, `SedBalancer`, and `NqBalancer`. The remaining strategies land one per
-session (see ROADMAP.md): PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom. The EXACT-O(log
-n) fewest-in-flight variant is a deferred @zakkster/lite-logn `BinaryHeap` optional-peer seam
-(decisions/0006), not this exact-O(cap) scan.
+0.7.0 ships the substrate seams + seven strategies: RoundRobin, SmoothWRR (the weighted
+default), P2C (power-of-two-choices -- also the O(1) least-connections APPROXIMATION), the
+EXACT LeastConn family (LeastConn, SED, NQ), and PeakEWMA (latency-aware P2C). It exports
+`VERSION`, the fail-closed sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32),
+`BalancerBase` (the shared read-only eligibility seam + O(1) live count), `RoundRobinBalancer`,
+`SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, and
+`PeakEwmaBalancer`. The remaining strategies land one per session (see ROADMAP.md):
+ConsistentHash, BoundedLoad, WeightedRandom. The EXACT-O(log n) fewest-in-flight variant is a
+deferred @zakkster/lite-logn `BinaryHeap` optional-peer seam (decisions/0006), not this
+exact-O(cap) scan.
+
+M7 (0.7.0) adds PeakEwmaBalancer (decisions/0009). The FE PROFILE: for a browser / front-end
+client (a handful of picks per second, not a zero-GC hot loop), the recommended profile is
+PeakEWMA + health/eligibility ONLY -- no bounded-load / AZ / occupancy machinery -- latency-aware
+choice across origins with a fail-closed eligibility view. DEFERRED tail-aware variant: a p99-aware
+score (inflight x p99Rtt) via a per-node @zakkster/lite-sketch `DDSketch` (published 0.3.0; `add`
+is O(1) / 0 B/op, `quantile` carries a hard relative-error bound) is an OPTIONAL PEER complement;
+the EWMA-mean score is the shipped, zero-peer default and `peerDependencies` STAYS `{}` until a
+shipped code path imports the sketch.
 
 M6 (0.6.0) adds the BENCHMARK SUITE -- an evidence session, no API change: Pick.js / Pool.js are
 byte-identical to 0.5.0 apart from the VERSION stamp. It lives entirely under benchmark/ (NOT in
@@ -116,6 +126,30 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - `pick()` -> number. Returns the FIRST idle eligible positive-weight node (in-flight 0) if one
     exists -- never queueing while a server is free -- else the SED minimum, else `PICK_NONE`.
     O(cap) worst case, O(1) when an early node is idle. 0 B/op.
+- `PeakEwmaBalancer extends BalancerBase` -- class. Latency-aware P2C (M7, Finagle peak-EWMA).
+  - `new PeakEwmaBalancer(capacity, eligible, inflight, tauNs, seed?=0x9e3779b9)` -- `inflight` is a
+    caller-owned Uint32Array (length >= capacity) read LIVE; `tauNs` is the EWMA time-constant /
+    half-life in nanoseconds (finite, > 0). The per-endpoint EWMA state (`_ewma` / `_stamp`,
+    Float64) is BALANCER-OWNED and written ONLY by `recordRtt`. Validates typeof-first BEFORE
+    allocating (RangeError/TypeError). Cold start seeds the EWMA to 1.0 with an UNSAMPLED sentinel
+    (`_stamp = -1`), so an unsampled node scores at its undecayed baseline -> graceful
+    least-connections regardless of clock magnitude (never underflows to 0).
+  - `pick(now)` -> number. Draws two DISTINCT eligible endpoints (ADR 0005's rejection sampling,
+    reused) and returns the lower `cost = (inflight + 1) * ewmaAt(now)`; a tie goes to the first
+    draw. `now` is caller-supplied nanoseconds. Decays ON READ (never writes) -> O(d)=O(1), 0 B/op.
+    `PICK_NONE` when the whole pool is down. A slow-but-up node (high EWMA rtt) is avoided even while
+    idle -- the difference from P2C-over-inflight (latency anchor in balance.mjs).
+  - `ewmaAt(i, now)` -> number. The EWMA rtt estimate for endpoint i at `now`. Pure read. An
+    unsampled node (`_stamp < 0`) returns the baseline 1.0 undecayed; otherwise exponential decay.
+  - `recordRtt(i, sampleNs, now)` -> void. WARM feedback path (not the hot pick path): the FIRST
+    sample initializes the EWMA EXACTLY to `sampleNs` (clock-magnitude-independent); thereafter the
+    Finagle peak rule -- the cost SNAPS UP to a larger sample instantly and DECAYS DOWN over ~tau.
+    `now` / `sampleNs` are caller-supplied nanoseconds, consistent with `pick(now)`. Validates
+    typeof-first; 0 B/op on the success path. Anti-flap = the half-life, no extra dwell (ADR 0002,
+    ADR 0009).
+  - CONTRACT: `now` and `sampleNs` MUST be FINITE numbers. `recordRtt` THROWS on a non-finite
+    argument (warm path); `pick(now)` NEVER throws (fail-closed contract), so a non-finite `now`
+    yields P2C-random selection, not an error.
 
 ## Subpath: @zakkster/lite-pick/pool -- the ergonomic request layer (M5, Pool.js)
 
@@ -140,7 +174,11 @@ duck-typed and imports NOTHING from lite-query.
     once aborted after a failure, failover stops and the abort propagates. NOT a 0 B/op path (the
     kernel `pick()` is): a normal async wrapper adding O(1) counter ops + one small per-run array.
     BOUNDARY: Pool owns SPATIAL failover (across the pool); the caller / query cache owns TEMPORAL
-    retry (backoff, staleness). Never double-owned (decisions/0007).
+    retry (backoff, staleness). Never double-owned (decisions/0007). OPT-IN latency feedback: when
+    `opts.clock` (a caller-owned nanosecond source) is supplied AND the balancer duck-types
+    `recordRtt` (PeakEwmaBalancer), Pool drives `pick(now)` and records the settled rtt on success;
+    otherwise the hook is inert -- Pool stays generic, in-flight stays net-zero, abort/failover
+    unchanged.
 - `liteQueryFetcher(pool, perEndpoint, opts?)` -> a `({ key, signal }) => Promise` fetcher for a
   query cache (lite-query's `fetcher`, or any fetcher-shaped consumer). `perEndpoint({ endpoint,
   key, signal })` -> the per-endpoint work. `opts.tries` (default 1) is the spatial failover count.

@@ -91,6 +91,23 @@ test('A3: at dt = tau the EWMA decays to sample / e within ~1%', () => {
         'decayed ' + decayed + ' not within 1% of sample/e ' + expected);
 });
 
+test('A3b: cold start under a LARGE clock degrades to LeastConn, not random (0.7.1 regression)', () => {
+    // The bug: with _stamp seeded to 0, an unsampled node decays as exp(-now/tau) -> 0 under a real
+    // large clock, so every cold cost collapses to ~0 and selection becomes random. With the
+    // unsampled sentinel, cost = (inflight+1) x 1 undecayed -> the lower-inflight node wins.
+    const NOW = 1e12;                         // a realistic large-magnitude ns clock
+    const inflight = Uint32Array.from([0, 5]);
+    const b = new PeakEwmaBalancer(2, up(2), inflight, 1e6, 0xC0FFEE);
+    for (let i = 0; i < 2000; i++) {
+        assert.equal(b.pick(NOW), 0, 'cold pick under large clock must take the lower-inflight node');
+    }
+    // First recordRtt initializes the EWMA EXACTLY to the sample, regardless of `now` magnitude.
+    b.recordRtt(1, 1234, NOW);
+    assert.equal(b.ewmaAt(1, NOW), 1234, 'first sample sets ewma exactly, clock-magnitude-independent');
+    // And an unsampled node still reads its undecayed baseline at the same large clock.
+    assert.equal(b.ewmaAt(0, NOW), 1.0, 'unsampled node reads undecayed baseline under large clock');
+});
+
 test('A4: a slow node (10x EWMA rtt) is (almost) never chosen', () => {
     const n = 8;
     const inflight = new Uint32Array(n); // all idle -> the (inflight+1) factor is uniform

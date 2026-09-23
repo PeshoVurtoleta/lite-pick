@@ -4,6 +4,76 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-09-23
+
+### Fixed
+
+- PeakEWMA cold-start / unsampled-node scoring under real large-magnitude clocks. An unsampled node
+  now scores at its UNDECAYED baseline (`_stamp` initialized to a negative sentinel, read as the
+  1.0 baseline) = graceful least-connections, instead of `exp(-now/tau)` underflowing to 0 and
+  collapsing a cold pool to random selection. The FIRST `recordRtt` sample now initializes the EWMA
+  EXACTLY to the sample (clock-magnitude-independent); the Finagle peak rule applies from the second
+  sample on. `pick()` stays a pure 0 B/op read (a per-candidate sentinel compare, no allocation).
+
+### Changed
+
+- Completes the 0.7.0 packaging: synced the `llms.txt` version stamp, added the PeakEWMA
+  README / CHANGELOG sections + `decisions/0009-peakewma.md`, and regenerated the benchmark
+  `results.json`. Documented that `pick(now)` / `recordRtt` require a FINITE `now` -- `recordRtt`
+  throws on a non-finite argument; `pick(now)` never throws (fail-closed) and degrades a non-finite
+  `now` to P2C-random selection. No API or behavior change beyond the cold-start fix.
+
+## [0.7.0] - 2026-09-23
+
+M7: `PeakEwmaBalancer` -- latency-aware power-of-two-choices (Twitter Finagle's peak-EWMA). A
+STRATEGY-APPEND session: one class is added to `Pick.js`; the other strategies are byte-identical,
+only the header roster/count and the `VERSION` stamp change. `peerDependencies` stays `{}`.
+
+### Added
+
+- `PeakEwmaBalancer extends BalancerBase` (`Pick.js`, `Pick.d.ts`) -- `new PeakEwmaBalancer(capacity,
+  eligible, inflight, tauNs, seed?)`. `pick(now)` draws two distinct eligible endpoints (reusing
+  `P2cBalancer`'s rejection-sampling `_draw`) and returns the lower `cost = (inflight + 1) x
+  ewmaAt(now)`, tie to the first draw; `O(d)=O(1)`. `ewmaAt(i, now)` decays ON READ
+  (`_ewma[i] * exp(-(now - _stamp[i]) / tau)`), so `pick()` never writes and is **0 B/op**.
+  `recordRtt(i, sampleNs, now)` is the warm feedback path (the Finagle peak rule: snap up to a
+  larger sample, decay down over `~tau`), also **0 B/op** on the success path. `now` / `sampleNs`
+  are caller-supplied nanoseconds. The EWMA state (`_ewma` / `_stamp`, `Float64Array`) is
+  balancer-owned; `inflight` is the caller's `Uint32Array` read live. Cold start seeds the EWMA to
+  `1.0` -> graceful least-connections, never `NaN`. Constructor and `recordRtt` validate
+  typeof-first, before allocation. Anti-flap = the half-life, no extra dwell.
+- `Pool.run` opt-in latency feedback (`Pool.js`, `Pool.d.ts`): when `opts.clock` (a caller-owned
+  nanosecond source) is supplied AND the balancer duck-types `recordRtt`, Pool drives `pick(now)`
+  and records the settled rtt on success. Otherwise the hook is inert -- Pool stays generic, the
+  in-flight counter stays net-zero, and abort/failover are unchanged.
+- `test/PeakEWMA.test.js` -- the boundary suite (cold-start valid + never-NaN, snap-up, decay to
+  sample/e at dt=tau within ~1%, slow-node avoidance, fail-closed, tie-break to the first draw =
+  identical to P2C on the same seed, constructor + recordRtt validation throws, flap churn).
+- `test/balance.mjs` -- the LATENCY ANCHOR: a closed-loop single-server-per-node queue with one node
+  at 10x service time. Measured: PeakEWMA slow-node share ~0.007% vs P2C ~1.47% (<= 25% of P2C);
+  PeakEWMA service p99 ~1950ns vs P2C ~14500ns (>= 20% lower); random foil worse than both.
+- `test/torture.mjs` -- PeakEWMA retention + `pick(now)` and `recordRtt()` 0 B/op phases.
+- `test/perf/PerfGate.test.mjs` -- `PeakEwmaBalancer.pick(now)` + `recordRtt()` zero-alloc scenarios
+  and a `pick(now)`-boxed-into-a-fresh-array `mustFail` tooth.
+- `test/witness.mjs` -- PeakEWMA subject, `const` (O(d)=O(1)) flat flag; work-rate flatness ~0.89
+  (the `Math.exp` runs ~2x/pick and stays flat -- the cached 2^-k decay-table fallback was NOT
+  needed).
+- `test/fuzz.mjs` -- PeakEWMA subject: `_ewma` / `_stamp` stay finite and `PICK_NONE` holds iff the
+  pickable mass is 0 under a `recordRtt` / `pick(now)` / `setEligible` barrage.
+- `test/types/pick.test-d.ts` -- PeakEwmaBalancer type-surface smoke.
+- `benchmark/Matrix.mjs` PeakEWMA throughput subject; PeakEWMA lanes in `benchmark/GcBlastRadius.mjs`
+  (same maxMajor 0 / 0 B/op / bounded-pause contract) and `benchmark/Fairness.mjs` (latency
+  steering); `benchmark/results.json` regenerated (version 0.7.0), `bench:verify` green.
+- `decisions/0009-peakewma.md` -- the ADR (latency-aware P2C, decay-on-read, the Finagle peak rule,
+  caller-supplied clock, balancer-owned state, deferred DDSketch-p99, anti-flap = half-life).
+
+### Changed
+
+- `Pick.js` header roster/count (six -> seven strategies), `VERSION` 0.6.0 -> 0.7.0; `package.json`
+  version + description; `llms.txt` version + PeakEWMA surface + the FE-profile note + the deferred
+  DDSketch-p99 note; `README.md` PeakEWMA section + FE profile + the AWS anomaly-mitigation mapping
+  row.
+
 ## [0.6.0] - 2026-09-23
 
 M6: the benchmark suite (ROADMAP.md M6). An EVIDENCE session -- no API change. `Pick.js` and

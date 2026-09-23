@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.5.0 ships six strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, and the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family** -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view), plus a **`@zakkster/lite-pick/pool`** subpath: the async dispatch/settle counter layer with distinct-endpoint failover and a duck-typed query-cache fetcher. The rest of the roster -- PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
+> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.7.0 ships seven strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family, and the latency-aware `PeakEwmaBalancer`** -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view), plus a **`@zakkster/lite-pick/pool`** subpath: the async dispatch/settle counter layer with distinct-endpoint failover and a duck-typed query-cache fetcher. The rest of the roster -- ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-pick.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-pick)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -21,7 +21,7 @@ The npm landscape has old algorithm libraries (`load-balancers`, `loadbalance`, 
 - **Two pieces of evidence, both shipped.** A **0 B/op** witness on the pick path (no object, closure, string, or array created per pick), and a measured **balance-quality anchor** -- peak-to-average load within the strategy's theoretical ceiling (for P2C, the Azar-Broder-Karlin-Upfal `ln ln n / ln 2` bound) and strictly better than a random foil.
 - **A pure selector, not a proxy.** It **consumes** health and circuit state; it never owns them. Health is a shared read-only bitmap written by [`@zakkster/lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health); circuit state comes from [`@zakkster/lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart); load counters are caller-owned typed arrays. `pick()` only reads.
 
-> **Status: M6 (v0.6.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, and the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family**, the **`@zakkster/lite-pick/pool`** request layer, and now the **benchmark suite** -- the balance anchor + GC blast-radius headlines, a seeded/version-stamped `results.json`, a `bench:verify` drift check with teeth, and the vs-AWS positioning (see *Evidence* below). The kernel `Pick.js` / `Pool.js` are byte-identical to v0.5.0 apart from the version stamp. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), and **SED tracks weight within 1%** -- all held under a **seeded invariant fuzzer** (`test/fuzz.mjs`) that checks state-synchronisation after *every* op. See [ROADMAP.md](./ROADMAP.md) for the M6 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), the RoundRobin (0003), SmoothWRR (0004), P2C (0005), LeastConn-family (0006), pool-adapter (0007), and benchmark-suite (0008) design forks.
+> **Status: M7 (v0.7.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family, and the latency-aware `PeakEwmaBalancer`**, the **`@zakkster/lite-pick/pool`** request layer (now with an opt-in latency-feedback hook), and the **benchmark suite** -- the balance anchor + GC blast-radius headlines, a seeded/version-stamped `results.json`, a `bench:verify` drift check with teeth, and the vs-AWS positioning (see *Evidence* below). This session APPENDS one class: the other strategies in `Pick.js` are byte-identical, only the header roster/count and the `VERSION` stamp change. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), **SED tracks weight within 1%**, and **PeakEWMA steers around a 10x-slow node** (it takes <= 25% of P2C's share for it and cuts service p99) -- all held under a **seeded invariant fuzzer** (`test/fuzz.mjs`) that checks state-synchronisation after *every* op. See [ROADMAP.md](./ROADMAP.md) for the M7 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), the RoundRobin (0003), SmoothWRR (0004), P2C (0005), LeastConn-family (0006), pool-adapter (0007), benchmark-suite (0008), and PeakEWMA (0009) design forks.
 
 ```bash
 npm install @zakkster/lite-pick
@@ -139,6 +139,47 @@ The proof (from `test/balance.mjs`):
 
 Each `pick()` is **0 B/op** and **O(cap)** (NQ is O(1) when an early node is idle). Because these are the state-heaviest strategies so far, M4 also introduces the **invariant fuzzer** (`npm run fuzz`): a seeded state-machine attack that, after *every* `pick` / `setEligible` / weight / load op, asserts the chosen endpoint is the *exact* optimum, `live` stays exact, and `PICK_NONE` holds *iff* nothing is pickable -- printing the seed on any failure for byte-for-byte replay.
 
+## PeakEWMA -- latency-aware P2C (v0.7.0)
+
+When endpoints differ in **latency**, not just queue depth, count-based strategies keep re-probing a slow-but-up node: it drains its queue between visits, so its in-flight looks attractive again. `PeakEwmaBalancer` (Twitter Finagle's *peak-EWMA*) is power-of-two-choices over a **latency cost** -- `cost = (inflight + 1) x decayed-EWMA(rtt)` -- so a degraded node is avoided **even while idle** ([ADR 0009](./decisions/0009-peakewma.md)). It is `O(d) = O(1)` per pick and **0 B/op** on both the pick path and the feedback path.
+
+```js
+import { PeakEwmaBalancer } from '@zakkster/lite-pick';
+
+const eligible = Uint8Array.from([1, 1, 1, 1]);
+const inflight = new Uint32Array(4);          // YOU own this; read live by pick()
+const TAU_NS = 30e6;                          // EWMA half-life: 30ms of latency memory
+
+// `now` and rtt samples are CALLER-supplied nanoseconds -- deterministic, testable, zero-GC.
+const pe = new PeakEwmaBalancer(4, eligible, inflight, TAU_NS);
+
+const now = perfNs();                          // your monotonic ns clock
+const i = pe.pick(now);                         // two random eligibles, lower latency-cost wins
+inflight[i]++;                                  // dispatch
+// ... await the request ...
+inflight[i]--;                                  // settle
+pe.recordRtt(i, perfNs() - now, perfNs());      // feed the observed rtt back (the warm path)
+```
+
+- **Decay-on-read.** `pick()` *never writes* -- it applies exponential decay when it reads (`ewmaAt(i, now) = _ewma[i] x exp(-(now - _stamp[i]) / tau)`), so the hot path is a pure read and allocates nothing.
+- **The peak rule.** `recordRtt` *snaps the cost up* to a larger sample instantly (a spike is felt on the next pick) and *decays it down* over `~tau`. The half-life **is** the anti-flap smoothing -- no extra dwell ([ADR 0002](./decisions/0002-anti-flapping.md)).
+- **Balancer-owned state.** `inflight` is your live-read `Uint32Array`; the EWMA arrays are owned by the balancer and written *only* by `recordRtt`. Cold start seeds the EWMA to `1.0` with an *unsampled* sentinel (`_stamp = -1`): an unsampled node scores at its undecayed baseline, so before any sample PeakEWMA degrades gracefully to least-connections **regardless of your clock's magnitude** -- never underflowing to `0` (which a plain `_stamp = 0` would, as `exp(-now/tau)`, under a real large clock) and never `NaN`. The first `recordRtt` initializes the EWMA *exactly* to the sample; the peak rule applies from the second sample on.
+- **`now` must be finite.** `now` (for `pick(now)` / `recordRtt`) and `sampleNs` must be finite numbers. `recordRtt` throws on a non-finite argument; `pick(now)` never throws (the fail-closed contract), so a non-finite `now` yields P2C-random selection rather than an error.
+
+The proof (from `test/balance.mjs`, a closed-loop queue sim with one node at 10x service time):
+
+| lane | slow-node share | service p99 |
+|---|---|---|
+| **PeakEWMA** | **~0.01%** (learns and avoids it) | **lowest** |
+| P2C (in-flight only) | ~1.5% (keeps re-probing) | ~7x PeakEWMA's |
+| random foil | ~6% (blind) | saturates the slow node |
+
+PeakEWMA sends the slow node **<= 25% of P2C's share** for it and cuts service p99 **>= 20% below** P2C-over-inflight; the random foil is worse than both.
+
+### FE profile -- PeakEWMA + health, nothing else
+
+For a **front-end / browser client** -- a handful of picks per second across origins/regions, not a zero-GC hot loop -- the recommended profile is **PeakEWMA + the eligibility bitmap only**: latency-aware choice with a fail-closed health view, and **none** of the server-side bounded-load / availability-zone / occupancy machinery. It is the smallest honest latency-aware client balancer. *(Deferred: a tail-aware `inflight x p99Rtt` variant via an optional-peer `@zakkster/lite-sketch` `DDSketch`; the EWMA-mean score is the shipped zero-peer default, and `peerDependencies` stays `{}` -- [ADR 0009](./decisions/0009-peakewma.md).)*
+
 ## Evidence -- the two headlines (v0.6.0 benchmark suite)
 
 > **Framing: parity on speed, superiority on the contract + balance + tail.** A trivial `i++ % n` round-robin -- or `wrr` -- *matches* P2C on raw ops/sec, so `lite-pick` does **not** claim "N times faster." Throughput is claimed at **parity**; the wins are **zero-GC**, **balance quality**, **tail latency** (GC blast-radius), and **never a dead pick**. Every number below is **seeded** and regenerated by `npm run bench:report`; `npm run bench:verify` fails CI if a README number drifts from a fresh run (algorithmic exact, timing within +/-15%). Node / CPU / OS / every PRNG seed are stamped into `benchmark/results.json`.
@@ -151,9 +192,9 @@ The real pinned npm incumbents (`load-balancers`, `loadbalance`, `wrr`) run thro
 
 | family | lite-pick | lite-pick ops/ms | incumbent (npm) | incumbent ops/ms |
 | --- | --- | --- | --- | --- |
-| P2C (power-of-two-choices) | P2cBalancer | 59591 | load-balancers@1.3.52 | 60956 |
-| RoundRobin | RoundRobinBalancer | 260168 | loadbalance@1.0.0 | 334541 |
-| Weighted-random | WeightedRandom -- SKIP, ships M10 | -- | wrr@1.0.0 | 158395 |
+| P2C (power-of-two-choices) | P2cBalancer | 53426 | load-balancers@1.3.52 | 61749 |
+| RoundRobin | RoundRobinBalancer | 246108 | loadbalance@1.0.0 | 282939 |
+| Weighted-random | WeightedRandom -- SKIP, ships M10 | -- | wrr@1.0.0 | 151557 |
 
 <!-- /bench:competitors -->
 
@@ -181,8 +222,8 @@ The point of zero-GC is **not** the pick's own latency -- a major GC pause freez
 
 | lane | major GC | pick B/op | max GC pause (ms) |
 | --- | --- | --- | --- |
-| lite-pick | 0 | 0 | 0.1 |
-| allocating foil | 13 | allocates | 2.9 |
+| lite-pick | 0 | 0 | 0.3 |
+| allocating foil | 13 | allocates | 1.9 |
 
 <!-- /bench:gc -->
 
@@ -221,6 +262,7 @@ On a scale event (add / remove a node), what fraction of keys keep their node? T
 | AWS edge feature (managed, billed) | `lite-pick` equivalent (in-process, zero-GC) |
 | --- | --- |
 | ALB `least_outstanding_requests` (LOR) | `LeastConnBalancer` / `P2cBalancer` |
+| ALB anomaly mitigation / latency-aware shedding | `PeakEwmaBalancer` (latency-aware P2C) |
 | ALB `weighted_random` + anomaly mitigation | `WeightedRandom` + `BoundedLoad` (M9/M10) |
 | NLB flow-hash (5-tuple) | `ConsistentHash` (Maglev, M8) |
 
@@ -254,7 +296,7 @@ PICK_NONE;            // -> -1  (fail-closed sentinel: no endpoint, never a dead
 VERSION;              // -> '0.6.0'
 ```
 
-`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
+`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
 
 ## Wiring it up -- `@zakkster/lite-pick/pool` (v0.5.0)
 

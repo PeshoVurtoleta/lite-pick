@@ -16,7 +16,7 @@
  * Convergence + burstiness are ALGORITHMIC and seeded -- exact, reproducible, drift-checked.
  */
 
-import { SmoothWRRBalancer, SedBalancer, Prng } from '../Pick.js';
+import { SmoothWRRBalancer, SedBalancer, PeakEwmaBalancer, P2cBalancer, Prng } from '../Pick.js';
 import { SEEDS } from './Matrix.mjs';
 
 const maxRun = (seq) => {
@@ -96,9 +96,49 @@ function measureSed() {
     };
 }
 
-/** Measure both; returns the structured result Report.mjs stamps + renders. */
+/**
+ * PeakEWMA latency-steering: a closed-loop single-server-per-node queue with ONE slow node (10x
+ * service time). Reports the slow node's share of traffic under PeakEWMA (latency-aware), P2C
+ * (in-flight-aware) and a random foil, plus each lane's service p99 -- the same anchor gate as
+ * test/balance.mjs, surfaced here as the strategy's fairness-under-latency dimension.
+ */
+function measurePeakEwmaSteering() {
+    const n = 16, REQ = 100000, DT = 150, BASE = 1000, SLOW = 0, TAU = 1e9;
+    const runLane = (kind) => {
+        const el = new Uint8Array(n); el.fill(1);
+        const inflight = new Uint32Array(n);
+        const busyUntil = new Float64Array(n);
+        const serviceNs = new Float64Array(n);
+        for (let j = 0; j < n; j++) serviceNs[j] = BASE;
+        serviceNs[SLOW] = 10 * BASE;
+        let pe = null, p2c = null, rng = null;
+        if (kind === 'peakewma') pe = new PeakEwmaBalancer(n, el, inflight, TAU, SEEDS.p2c);
+        else if (kind === 'p2c') p2c = new P2cBalancer(n, el, inflight, SEEDS.p2c);
+        else rng = new Prng(SEEDS.p2c);
+        const counts = new Uint32Array(n);
+        const lat = new Float64Array(REQ);
+        for (let r = 0; r < REQ; r++) {
+            const t = r * DT;
+            for (let j = 0; j < n; j++) {
+                const rem = busyUntil[j] - t;
+                inflight[j] = rem > 0 ? Math.ceil(rem / serviceNs[j]) : 0;
+            }
+            const i = pe ? pe.pick(t) : p2c ? p2c.pick() : rng.nextBelow(n);
+            const start = busyUntil[i] > t ? busyUntil[i] : t;
+            busyUntil[i] = start + serviceNs[i];
+            lat[r] = busyUntil[i] - t;
+            counts[i]++;
+            if (pe) pe.recordRtt(i, lat[r], t);
+        }
+        lat.sort();
+        return { slowShare: counts[SLOW] / REQ, p99: lat[Math.floor(0.99 * REQ)] };
+    };
+    return { n, slowNode: SLOW, peakewma: runLane('peakewma'), p2c: runLane('p2c'), random: runLane('random') };
+}
+
+/** Measure all; returns the structured result Report.mjs stamps + renders. */
 export function measureFairness() {
-    return { smoothwrr: measureSmoothWRR(), sed: measureSed() };
+    return { smoothwrr: measureSmoothWRR(), sed: measureSed(), peakewma: measurePeakEwmaSteering() };
 }
 
 if (import.meta.url === 'file://' + process.argv[1]) {
@@ -115,9 +155,19 @@ if (import.meta.url === 'file://' + process.argv[1]) {
     process.stdout.write('  SED weighted-imbalance=' + d.weightedImbalance.toFixed(3) +
         ' vs weight-blind random=' + d.randomImbalance.toFixed(3) + '\n');
 
+    const pe = r.peakewma;
+    process.stdout.write('  PeakEWMA slow-node (node ' + pe.slowNode + ', 10x rtt) share: PeakEWMA=' +
+        (pe.peakewma.slowShare * 100).toFixed(3) + '%  P2C=' + (pe.p2c.slowShare * 100).toFixed(3) +
+        '%  random=' + (pe.random.slowShare * 100).toFixed(3) + '%\n');
+    process.stdout.write('  PeakEWMA service p99 (ns): PeakEWMA=' + pe.peakewma.p99.toFixed(0) +
+        '  P2C=' + pe.p2c.p99.toFixed(0) + '  random=' + pe.random.p99.toFixed(0) + '\n');
+
+    const peOk = pe.peakewma.slowShare <= 0.25 * pe.p2c.slowShare &&
+        pe.peakewma.p99 <= 0.8 * pe.p2c.p99 &&
+        pe.random.p99 > pe.peakewma.p99 && pe.random.p99 > pe.p2c.p99;
     const ok = s.exactFair && s.smoothMaxRun < s.burstyMaxRun &&
-        d.worstShareDrift < 0.01 && d.weightedImbalance < d.randomImbalance / 2;
-    process.stdout.write('  fairness (exact + smooth + weight-proportional) -> ' +
+        d.worstShareDrift < 0.01 && d.weightedImbalance < d.randomImbalance / 2 && peOk;
+    process.stdout.write('  fairness (exact + smooth + weight-proportional + latency-steering) -> ' +
         (ok ? 'PASS' : 'FAIL') + '\n');
     if (!ok) { process.stderr.write('bench:fairness: FAIL\n'); process.exit(1); }
     process.stdout.write('bench:fairness: PASS\n');

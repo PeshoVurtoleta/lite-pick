@@ -159,6 +159,22 @@ Render techniques (from the TUI-aesthetic thread):
   PERSISTENT SHAPES (a standing wave = oscillation) -- shape-over-time is more
   diagnostic than btop's magnitude-over-time.
 
+macOS Activity Monitor reference (user, 2026-09-23) -- a resource monitor like btop, so
+steal the INTERACTION + LAYOUT craft, reject the subject. Transferables (some btop lacks):
+- TABBED VIEWS (CPU / Memory / Energy / ...) -> our scene tabs (fingerprint / heat / latency
+  / fairness), aligning with the lite-signal scene-tab layout.
+- SORTABLE dense live TABLE with a % column + inline mini-bar per row, sorted by load -> the
+  per-worker rows (sort by share / load / latency / EWMA-cost); dense + scannable.
+- CLICK-A-ROW -> DETAIL INSPECTOR (Activity Monitor double-click -> sample) -> click a worker
+  for its detail: latency percentiles, recent picks, EWMA cost, eligibility history.
+- The MEMORY-PRESSURE graph (a colored green/yellow/red pressure strip that answers "is the
+  system healthy" pre-attentively) -> a FAIRNESS-PRESSURE gauge (green = balanced, red =
+  starving/monopolised), reinforcing the calm-baseline color budget.
+- The bottom SUMMARY STRIP (history sparkline + aggregate footer stats) -> our aggregate
+  header/footer with the fairness / throughput / latency mini-charts.
+NOTE: keep the DARK oscilloscope identity (lite-signal house style); Activity Monitor is
+light + native-precise -- borrow its restraint and precision, not its light theme.
+
 Sources: btop README (three symbol modes: braille U+2800-28FF, geometric U+25A0-25FF,
 block U+2500-259F; 3-stop gradient meters) https://github.com/aristocratos/btop ;
 drawille https://github.com/asciimoo/drawille ; unicode sparklines

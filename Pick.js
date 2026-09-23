@@ -51,7 +51,7 @@
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.7.0';
+export const VERSION = '0.7.1';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -602,9 +602,17 @@ export class NqBalancer extends BalancerBase {
  * between `pick(now)` and `recordRtt(i, sampleNs, now)`, so the whole strategy is deterministic
  * and testable and allocates nothing.
  *
- * Cold start: `_ewma` seeds to 1.0 and `_stamp` to 0 at construction, so before any sample
- * cost(i) ~ (inflight[i] + 1) x 1 and PeakEWMA degrades GRACEFULLY to plain least-connections
- * (P2C-over-inflight). It is never NaN.
+ * Cold start: `_ewma` seeds to 1.0 and `_stamp` to a NEGATIVE "unsampled" sentinel (-1). While a
+ * node is unsampled `ewmaAt` returns the baseline 1.0 UNDECAYED, so before any sample cost(i) =
+ * (inflight[i] + 1) x 1 and PeakEWMA degrades GRACEFULLY to plain least-connections (P2C-over-
+ * inflight) REGARDLESS of the caller's clock magnitude -- a plain `_stamp = 0` would decay as
+ * exp(-now/tau) -> 0 under a real large clock and collapse a cold pool to random. The first
+ * `recordRtt` initializes the EWMA EXACTLY to the sample (clock-independent); the peak rule applies
+ * only from the second sample on. It is never NaN.
+ *
+ * Contract: `now` (in `pick(now)` / `recordRtt`) and `sampleNs` MUST be FINITE numbers. `recordRtt`
+ * throws on a non-finite argument (the warm path); `pick(now)` never throws (the fail-closed
+ * contract), so a non-finite `now` yields P2C-random selection rather than an error.
  *
  * Anti-flap (ADR 0002, ADR 0009): the EWMA half-life IS the smoothing -- a single slow sample
  * snaps the cost up instantly and it decays back over ~tau, so there is NO extra dwell/hysteresis.
@@ -643,8 +651,12 @@ export class PeakEwmaBalancer extends BalancerBase {
         this._tau = tauNs;
         this._rng = new Prng(seed);
         this._ewma = new Float64Array(capacity);
-        this._stamp = new Float64Array(capacity);   // all-zero: last-update timestamp
-        for (let i = 0; i < capacity; i++) this._ewma[i] = 1.0; // cold start -> graceful LeastConn
+        this._stamp = new Float64Array(capacity);
+        // Cold start: _ewma seeds to 1.0 and _stamp to a NEGATIVE "unsampled" sentinel (-1). The
+        // sentinel makes ewmaAt read the baseline UNDECAYED (graceful LeastConn) regardless of the
+        // caller's clock magnitude -- a plain _stamp=0 would decay as exp(-now/tau) -> 0 under a
+        // real large-magnitude clock and collapse a cold pool to random selection.
+        for (let i = 0; i < capacity; i++) { this._ewma[i] = 1.0; this._stamp[i] = -1; }
     }
 
     /**
@@ -659,20 +671,26 @@ export class PeakEwmaBalancer extends BalancerBase {
 
     /**
      * The decayed EWMA rtt estimate for endpoint i at time `now` (ns). Pure READ -- exponential
-     * decay applied on read, never written. Cold (unsampled) nodes read ~1.0. Zero-alloc.
+     * decay applied on read, never written. An UNSAMPLED node (`_stamp < 0`) reads its baseline
+     * 1.0 UNDECAYED (graceful LeastConn), so a cold pool never underflows to 0 under a real
+     * large-magnitude clock. `now` must be finite. Zero-alloc.
      * @param {number} i
      * @param {number} now  caller-supplied nanoseconds
      * @returns {number}
      */
     ewmaAt(i, now) {
-        return this._ewma[i] * Math.exp(-(now - this._stamp[i]) / this._tau);
+        const s = this._stamp[i];
+        if (s < 0) return this._ewma[i]; // unsampled: undecayed baseline, clock-magnitude-independent
+        return this._ewma[i] * Math.exp(-(now - s) / this._tau);
     }
 
     /**
      * Record an rtt SAMPLE for endpoint i at time `now` (the warm feedback path -- NOT the hot
-     * pick path). The Finagle peak rule: decay the stored estimate to `now`, then SNAP UP to the
-     * sample if it is larger (a spike is felt instantly) else ease toward it (it decays back over
-     * ~tau). The balancer is the SOLE writer of `_ewma` / `_stamp`. Zero-alloc on the success path.
+     * pick path). The FIRST sample (an unsampled node, `_stamp < 0`) initializes the EWMA EXACTLY
+     * to the sample, clock-magnitude-independent. Thereafter the Finagle peak rule applies: decay
+     * the stored estimate to `now`, then SNAP UP to the sample if it is larger (a spike is felt
+     * instantly) else ease toward it (it decays back over ~tau). The balancer is the SOLE writer of
+     * `_ewma` / `_stamp`. Zero-alloc on the success path.
      * @param {number} i  endpoint index
      * @param {number} sampleNs  observed rtt in nanoseconds (finite, >= 0)
      * @param {number} now  caller-supplied nanoseconds (finite), consistent with pick(now)
@@ -686,9 +704,13 @@ export class PeakEwmaBalancer extends BalancerBase {
             throw new RangeError('[lite-pick] sampleNs must be a finite number >= 0');
         }
         if (!Number.isFinite(now)) throw new RangeError('[lite-pick] now must be a finite number');
-        const w = Math.exp(-(now - this._stamp[i]) / this._tau);
-        const e = this._ewma[i] * w;
-        this._ewma[i] = sampleNs > e ? sampleNs : e + (sampleNs - e) * (1 - w);
+        if (this._stamp[i] < 0) {
+            this._ewma[i] = sampleNs;   // first sample: exact init, no decay (clock-independent)
+        } else {
+            const w = Math.exp(-(now - this._stamp[i]) / this._tau);
+            const e = this._ewma[i] * w;
+            this._ewma[i] = sampleNs > e ? sampleNs : e + (sampleNs - e) * (1 - w);
+        }
         this._stamp[i] = now;
     }
 
@@ -709,8 +731,11 @@ export class PeakEwmaBalancer extends BalancerBase {
         for (let t = 0; b === a && t < 32; t++) b = this._draw();
         if (b < 0 || b === a) return a;       // astronomically rare: fall back to the first draw
         const inf = this._inflight, ewma = this._ewma, stamp = this._stamp, tau = this._tau;
-        const costA = (inf[a] + 1) * (ewma[a] * Math.exp(-(now - stamp[a]) / tau));
-        const costB = (inf[b] + 1) * (ewma[b] * Math.exp(-(now - stamp[b]) / tau));
+        // Decay-on-read with the unsampled sentinel: `_stamp < 0` reads the undecayed baseline
+        // (graceful LeastConn), else exponential decay. A cheap per-candidate compare, no alloc.
+        const sa = stamp[a], sb = stamp[b];
+        const costA = (inf[a] + 1) * (sa < 0 ? ewma[a] : ewma[a] * Math.exp(-(now - sa) / tau));
+        const costB = (inf[b] + 1) * (sb < 0 ? ewma[b] : ewma[b] * Math.exp(-(now - sb) / tau));
         return costB < costA ? b : a;         // lower cost wins; tie -> the first draw
     }
 }

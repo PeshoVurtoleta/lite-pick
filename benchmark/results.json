@@ -1,7 +1,7 @@
 {
   "schema": "lite-pick-bench/1",
-  "version": "0.6.0",
-  "generatedAt": "2026-09-23T02:08:15.817Z",
+  "version": "0.7.0",
+  "generatedAt": "2026-09-23T06:39:26.535Z",
   "env": {
     "node": "v26.8.2",
     "v8": "14.6.202.34-node.28",
@@ -45,19 +45,28 @@
       "seed": 85596141,
       "litePick": {
         "major": 0,
-        "minor": 2,
-        "maxPauseMs": 0.1433749981224537,
+        "minor": 4,
+        "maxPauseMs": 0.32716700434684753,
         "bpop": 0,
-        "serviceP999Ms": 0.00008400000000108321,
-        "serviceMaxMs": 0.09658400000000711,
+        "serviceP999Ms": 0.00012499999999704414,
+        "serviceMaxMs": 0.06512499999999477,
+        "gateOk": true
+      },
+      "peakEwma": {
+        "major": 0,
+        "minor": 1,
+        "maxPauseMs": 0.05925000458955765,
+        "bpop": 0,
+        "serviceP999Ms": 0.0002499999999940883,
+        "serviceMaxMs": 0.09608299999996461,
         "gateOk": true
       },
       "foil": {
         "major": 13,
-        "minor": 79,
-        "maxPauseMs": 2.8679169975221157,
-        "serviceP999Ms": 0.0015829999999823485,
-        "serviceMaxMs": 2.875083000000018
+        "minor": 81,
+        "maxPauseMs": 1.8647910058498383,
+        "serviceP999Ms": 0.0017910000000256332,
+        "serviceMaxMs": 1.8830840000000535
       }
     },
     "disruption": {
@@ -108,6 +117,22 @@
         "worstShareDrift": 0.0000026923076922868994,
         "weightedImbalance": 0.00004000000000008626,
         "randomImbalance": 5.5145599999999995
+      },
+      "peakewma": {
+        "n": 16,
+        "slowNode": 0,
+        "peakewma": {
+          "slowShare": 0.00007,
+          "p99": 1950
+        },
+        "p2c": {
+          "slowShare": 0.0147,
+          "p99": 14500
+        },
+        "random": {
+          "slowShare": 0.06177,
+          "p99": 39143100
+        }
       }
     },
     "competitors": [
@@ -116,13 +141,13 @@
         "litePick": {
           "strategy": "P2cBalancer",
           "status": "ok",
-          "opsPerMs": 59591.20433823905
+          "opsPerMs": 53426.41211617014
         },
         "competitor": {
           "pkg": "load-balancers",
           "version": "1.3.52",
           "status": "ok",
-          "opsPerMs": 60956.40848742399
+          "opsPerMs": 61748.7264016441
         }
       },
       {
@@ -130,13 +155,13 @@
         "litePick": {
           "strategy": "RoundRobinBalancer",
           "status": "ok",
-          "opsPerMs": 260168.28725492902
+          "opsPerMs": 246108.4107549283
         },
         "competitor": {
           "pkg": "loadbalance",
           "version": "1.0.0",
           "status": "ok",
-          "opsPerMs": 334541.2502743422
+          "opsPerMs": 282938.8976474055
         }
       },
       {
@@ -150,7 +175,7 @@
           "pkg": "wrr",
           "version": "1.0.0",
           "status": "ok",
-          "opsPerMs": 158394.91463623015
+          "opsPerMs": 151557.22012534417
         }
       }
     ]

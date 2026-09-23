@@ -49,6 +49,8 @@
     "bench:verify": "node benchmark/Report.mjs --verify",
     "soak": "node --expose-gc benchmark/Soak.mjs",
     "demo": "node demo/fanout.mjs",
+    "scope": "node --expose-gc demo/pool-scope/tui.mjs",
+    "scope:frames": "node --expose-gc demo/pool-scope/tui.mjs --frames 40 --scenario flapstorm",
     "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run balance && npm run fuzz && npm run test:perf"
   },
   "keywords": [

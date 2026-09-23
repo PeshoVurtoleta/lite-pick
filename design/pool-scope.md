@@ -190,12 +190,32 @@ The REAL demo (not the prototype) rides existing siblings, all OPTIONAL PEERS:
   Reactive, zero-GC on lite-scene, 60fps at 100k points via min/max decimation.
 - @zakkster/lite-signal (+ lite-signal-decorators / lite-di-signal): drives data,
   theme, and control state reactively; the panel updates on signal change.
-- @zakkster/lite-sketch (DDSketch, v0.3.0): the peak/avg/p99 latency header -- 0 B/op
-  add, hard per-query relative-error bound. See ROADMAP M7 + RESEARCH tail-latency.
+- @zakkster/lite-sketch (v1.1.2, stable): the latency + frequency layer -- DDSketch
+  for the peak/p50/p95/p99 latency header (0 B/op add, HARD per-query relative-error
+  bound; see ROADMAP M7 + RESEARCH tail-latency), and SpaceSaving / CountMin / HeavyKeeper
+  for a HOT-KEY panel over the keyed strategies (ConsistentHash / BoundedLoad hotspot viz).
+- @zakkster/lite-adaptive (v0.4.0 -> 1.0.0): the RECENCY / DRIFT substrate for the
+  DETECTORS + the snapshot's time axis, replacing hand-rolled detector math with witnessed,
+  paper-backed members (user pointer, 2026-09-24). Maps ~1:1 onto section 5:
+  - ADWIN (concept-drift, adaptive window that grows-while-stable / shrinks-on-change,
+    Bifet-Gavalda) -> the principled OSCILLATION / regime-change detector (stronger + more
+    honest than raw autocorrelation).
+  - ForwardDecay (time-decayed count / sum / mean / rate, two scalars, exact modulo FP) ->
+    the DECAYED per-worker share / rate a live monitor wants (recent picks weighted heavier);
+    also the natural anti-flap half-life for the alarm layer.
+  - ExponentialHistogram (sliding-window count / sum, HARD rel-error, DGIM) -> the rolling
+    WINDOWED per-worker load behind the heat-strip.
+  - HeavyKeeper (decayed / windowed top-k) -> "which keys are HOT right now" for the keyed
+    strategies (decayed, so it tracks the CURRENT hot set, not cumulative).
 - Also named in ROADMAP #5: lite-hud, lite-canvas-graph, lite-fps-meter.
 
 None is a hard dep. The viz reads the balancer's `dump()` snapshot; the kernel imports
-nothing from the viz.
+nothing from the viz. NOTE (PS1 sequencing): the FIRST TUI artifact is intentionally
+ZERO-DEP (self-contained, runnable anywhere, fast to a watchable thing) with the detector /
+recency math inlined; lite-adaptive + lite-sketch + lite-charts fold in at PS2+ (the browser
+target + the richer detector/latency layer) as optional peers -- the inlined math is the
+seam they slot into, the lite-o1/P2C "inline first, adopt the peer when it earns its place"
+pattern.
 
 ## 8. The prototype (feel-check, throwaway)
 

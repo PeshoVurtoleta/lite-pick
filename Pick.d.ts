@@ -1,9 +1,9 @@
 /**
  * @zakkster/lite-pick -- TypeScript declarations.
  *
- * M4 (0.4.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
- * (LeastConn/SED/NQ). The remaining strategy classes (PeakEWMA, ConsistentHash, BoundedLoad,
- * WeightedRandom) are added one per session.
+ * M7 (0.7.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
+ * (LeastConn/SED/NQ) + PeakEWMA (latency-aware P2C). The remaining strategy classes
+ * (ConsistentHash, BoundedLoad, WeightedRandom) are added one per session.
  */
 
 /** The single source-of-truth version stamp. */
@@ -159,4 +159,31 @@ export class NqBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array);
     /** The first idle eligible node, else the SED minimum, or `PICK_NONE`. O(cap). */
     pick(): number;
+}
+
+/**
+ * PeakEwmaBalancer -- latency-aware power-of-two-choices (M7, Twitter Finagle's peak-EWMA).
+ * Draws two distinct eligible endpoints and returns the lower cost = `(inflight + 1) * ewmaAt(now)`;
+ * a slow endpoint (high decayed EWMA rtt) is avoided even with a short queue. `inflight` is the
+ * caller-owned Uint32Array read LIVE; the EWMA state (`_ewma` / `_stamp`, Float64) is BALANCER-OWNED
+ * and written ONLY by `recordRtt` (the warm feedback path). `pick(now)` decays on READ -- never
+ * writes -- so it is 0 B/op, as is `recordRtt`. `now` / `sampleNs` are caller-supplied nanoseconds.
+ * Cold start seeds the EWMA to 1.0 -> graceful least-connections, never NaN. O(d)=O(1). Fails
+ * closed (`PICK_NONE`) when the whole pool is down.
+ */
+export class PeakEwmaBalancer extends BalancerBase {
+    /**
+     * @param capacity endpoint count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read live.
+     * @param tauNs the EWMA time-constant / half-life in nanoseconds (finite, > 0).
+     * @param seed deterministic PRNG seed (default 0x9e3779b9); reproducible benches.
+     */
+    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, tauNs: number, seed?: number);
+    /** The decayed EWMA rtt estimate for endpoint `i` at time `now` (ns). Pure read, zero-alloc. */
+    ewmaAt(i: number, now: number): number;
+    /** Warm feedback path: record an rtt sample (ns) for endpoint `i` at time `now` (ns). 0 B/op. */
+    recordRtt(i: number, sampleNs: number, now: number): void;
+    /** Pick by latency-aware power-of-two-choices at time `now` (ns), or `PICK_NONE`. O(d)=O(1). */
+    pick(now?: number): number;
 }

@@ -22,7 +22,7 @@
  */
 
 import { buildWorkload, SEEDS } from './Matrix.mjs';
-import { P2cBalancer, Prng } from '../Pick.js';
+import { P2cBalancer, PeakEwmaBalancer, Prng } from '../Pick.js';
 
 const CAP = 1024;          // a realistic downstream pool
 const REQUESTS = 2_000_000; // sustained request stream (enough churn to fill old gen)
@@ -60,6 +60,30 @@ function runLitePick(work) {
         work.inflight[i]++;                 // dispatch
         sink = (sink + i) | 0;
         work.inflight[i]--;                 // settle (net-zero: steady-state pool)
+        lat[r] = performance.now() - t0;
+        if ((r & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    }
+    void sink;
+    return gc;
+}
+
+/**
+ * PeakEWMA lane: the latency-aware sibling of the lite-pick lane. pick(now) is a PURE read
+ * (decay-on-read) and recordRtt on settle is the warm feedback path -- BOTH 0 B/op, so this lane
+ * holds the same maxMajor 0 / bounded-pause contract as P2C while carrying the extra EWMA state.
+ */
+function runPeakEwma(work) {
+    const pe = new PeakEwmaBalancer(CAP, work.eligible, work.inflight, 1e9, SEEDS.p2c);
+    const gc = new GcProfiler().start();
+    let sink = 0, now = 0;
+    for (let r = 0; r < REQUESTS; r++) {
+        const t0 = performance.now();
+        now += 1000;
+        const i = pe.pick(now);
+        work.inflight[i]++;                 // dispatch
+        sink = (sink + i) | 0;
+        work.inflight[i]--;                 // settle (net-zero: steady-state pool)
+        pe.recordRtt(i, 1000 + (r & 4095), now); // warm feedback, still 0 B/op
         lat[r] = performance.now() - t0;
         if ((r & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
     }
@@ -135,6 +159,24 @@ export async function measureGcBlastRadius() {
     void bpSink;
     const lpBpop = Math.max(0, Math.round(bpRes.bytesPerCall === null ? 0 : bpRes.bytesPerCall));
 
+    // --- PeakEWMA lane (latency-aware sibling; same 0 B/op contract) --------
+    const peWork = buildWorkload('skewed-cost', CAP, SEEDS.gc);
+    const peGc = runPeakEwma(peWork);
+    await peGc.settle();
+    const peSum = peGc.summary();
+    peGc.stop();
+    const peTail = tailFromLat();
+    const peReport = checkNoGc(peSum, { maxMajor: 0, maxPauseMs: 2 });
+
+    // Exact B/op on the PeakEWMA pick + recordRtt bodies (the 0 B/op claim, measured).
+    const bpeWork = buildWorkload('skewed-cost', CAP, SEEDS.gc);
+    const bpePe = new PeakEwmaBalancer(CAP, bpeWork.eligible, bpeWork.inflight, 1e9, SEEDS.p2c);
+    let bpeSink = 0, bpeNow = 0;
+    const bpeStep = () => { bpeNow += 1000; bpeSink = (bpeSink + bpePe.pick(bpeNow)) | 0; };
+    const bpeRes = measureAllocs(bpeStep, { iterations: 100000, batches: 8 });
+    void bpeSink;
+    const peBpop = Math.max(0, Math.round(bpeRes.bytesPerCall === null ? 0 : bpeRes.bytesPerCall));
+
     // --- allocating foil lane ----------------------------------------------
     const foilWork = buildWorkload('skewed-cost', CAP, SEEDS.gc);
     const foilGc = runFoil(foilWork);
@@ -155,6 +197,15 @@ export async function measureGcBlastRadius() {
             serviceP999Ms: lpTail.p999,
             serviceMaxMs: lpTail.max,
             gateOk: lpReport.ok,
+        },
+        peakEwma: {
+            major: peSum.gc.major,
+            minor: peSum.gc.minor,
+            maxPauseMs: peSum.gc.maxMs,
+            bpop: peBpop,
+            serviceP999Ms: peTail.p999,
+            serviceMaxMs: peTail.max,
+            gateOk: peReport.ok,
         },
         foil: {
             major: foilSum.gc.major,
@@ -177,6 +228,12 @@ if (import.meta.url === 'file://' + process.argv[1]) {
         ' B/op=' + r.litePick.bpop +
         ' | service p99.9=' + fmt(r.litePick.serviceP999Ms) + 'ms' +
         ' max=' + fmt(r.litePick.serviceMaxMs) + 'ms\n');
+    process.stdout.write('  PeakEWMA lane    major=' + r.peakEwma.major +
+        ' minor=' + r.peakEwma.minor +
+        ' maxPause=' + fmt(r.peakEwma.maxPauseMs) + 'ms' +
+        ' B/op=' + r.peakEwma.bpop +
+        ' | service p99.9=' + fmt(r.peakEwma.serviceP999Ms) + 'ms' +
+        ' max=' + fmt(r.peakEwma.serviceMaxMs) + 'ms\n');
     process.stdout.write('  allocating foil  major=' + r.foil.major +
         ' minor=' + r.foil.minor +
         ' maxPause=' + fmt(r.foil.maxPauseMs) + 'ms' +
@@ -185,12 +242,16 @@ if (import.meta.url === 'file://' + process.argv[1]) {
 
     const lpOk = r.litePick.major === 0 && r.litePick.bpop === 0 &&
         r.litePick.maxPauseMs <= 2 && r.litePick.gateOk;
+    const peOk = r.peakEwma.major === 0 && r.peakEwma.bpop === 0 &&
+        r.peakEwma.maxPauseMs <= 2 && r.peakEwma.gateOk;
     const foilOk = r.foil.major >= 1;
     process.stdout.write('  lite-pick lane (maxMajor 0 / 0 B/op / maxPause<=2ms) -> ' +
         (lpOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  PeakEWMA lane  (maxMajor 0 / 0 B/op / maxPause<=2ms) -> ' +
+        (peOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  allocating foil (maxMajor >= 1, the contrast) -> ' +
         (foilOk ? 'PASS' : 'FAIL') + '\n');
-    if (!lpOk || !foilOk) {
+    if (!lpOk || !peOk || !foilOk) {
         process.stderr.write('bench:gc: FAIL\n');
         process.exit(1);
     }

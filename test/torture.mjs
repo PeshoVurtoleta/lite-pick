@@ -43,7 +43,7 @@ async function main() {
     const { createLeakTracker } = await import('@zakkster/lite-leak');
     const {
         Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
-        LeastConnBalancer, SedBalancer, NqBalancer,
+        LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer,
     } = await import('../Pick.js');
 
     const CAP = 1 << 12;    // pool capacity 4096
@@ -90,6 +90,10 @@ async function main() {
             const nq = new NqBalancer(CAP, el, inflight, weights);
             nq.pick();
             tracker.track(nq, noop, 'nq', { audit: true });
+            const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, c);
+            pe.pick(c);
+            pe.recordRtt(c & (CAP - 1), 1000, c);
+            tracker.track(pe, noop, 'peakewma', { audit: true });
         }
         return tracker.size();
     }
@@ -195,11 +199,34 @@ async function main() {
     const nqAllocBytes = Math.max(0, Math.round(nqBpc));
     const nqAllocOk = nqAllocBytes === 0;
 
+    // ---- phase 9: PeakEWMA.pick(now) per-call allocation (0 B/op) ----------
+    // One reused PeakEwmaBalancer over a half-eligible pool + caller-owned inflight: pick(now)
+    // is two rejection draws + two decay-on-read exp() + a compare -- a PURE read (no write),
+    // no object/closure/array created. `now` is a monotonically advancing caller clock.
+    const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xBADC0DE);
+    let peSink = 0, peNow = 0;
+    const peStep = () => { peNow += 1000; peSink = (peSink + pe.pick(peNow)) | 0; };
+    const peAllocRes = measureAllocs(peStep, { iterations: 100000, batches: 8 });
+    const peBpc = peAllocRes.bytesPerCall === null ? 0 : peAllocRes.bytesPerCall;
+    const peAllocBytes = Math.max(0, Math.round(peBpc));
+    const peAllocOk = peAllocBytes === 0;
+
+    // ---- phase 10: PeakEWMA.recordRtt() per-call allocation (0 B/op) -------
+    // The warm feedback path: one decay + one branch + two Float64 writes over the owned EWMA
+    // state; validation is typeof/range guards that only construct an Error on the (untaken)
+    // failure branch -- the success path allocates nothing.
+    let rttNow = 0;
+    const rttStep = () => { rttNow += 1000; pe.recordRtt(rttNow & (CAP - 1), rttNow % 500000, rttNow); };
+    const rttAllocRes = measureAllocs(rttStep, { iterations: 100000, batches: 8 });
+    const rttBpc = rttAllocRes.bytesPerCall === null ? 0 : rttAllocRes.bytesPerCall;
+    const rttAllocBytes = Math.max(0, Math.round(rttBpc));
+    const rttAllocOk = rttAllocBytes === 0;
+
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink;
+    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void peSink;
 
-    process.stdout.write('lite-pick torture (M4: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ)\n');
+    process.stdout.write('lite-pick torture (M7: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ + PeakEWMA)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
@@ -217,9 +244,13 @@ async function main() {
         (sedAllocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  NQ.pick() allocs: ' + nqAllocBytes + ' B/op -> ' +
         (nqAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  PeakEWMA.pick() allocs: ' + peAllocBytes + ' B/op -> ' +
+        (peAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  PeakEWMA.recordRtt() allocs: ' + rttAllocBytes + ' B/op -> ' +
+        (rttAllocOk ? 'PASS' : 'FAIL') + '\n');
 
     if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk ||
-        !lcAllocOk || !sedAllocOk || !nqAllocOk) {
+        !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk) {
         process.stderr.write('torture: FAIL\n');
         process.exit(1);
     }

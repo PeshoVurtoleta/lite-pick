@@ -16,7 +16,7 @@
  * PARITY check -- a strategy within noise of the foil while holding the contract has passed.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, Prng } from '../Pick.js';
 
 export const SIZES = [8, 64, 512, 4096];
 export const OPS = 2_000_000;
@@ -182,6 +182,21 @@ export const SUBJECTS = [
             for (let i = 0; i < n; i++) { inflight[i] = 1 + (i & 15); w[i] = 1 + (i & 7); } // all busy: SED fallback
             const nq = new NqBalancer(n, el, inflight, w);
             return () => nq.pick();
+        },
+    },
+    {
+        // Latency-aware P2C (Finagle peak-EWMA): two rejection draws + two decay-on-read exp() +
+        // a compare. O(d)=O(1), 0 B/op on the pick path; latency steering is proven in balance.mjs.
+        name: 'PeakEWMA',
+        dims: ['throughput', 'gc'],
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            for (let i = 0; i < n; i++) inflight[i] = i & 15;
+            const pe = new PeakEwmaBalancer(n, el, inflight, 1e9, 0xABCDEF);
+            for (let i = 0; i < n; i += 4) pe.recordRtt(i, (i & 31) * 1000, 0); // warm, varied costs
+            let now = 0;
+            return () => { now += 1000; return pe.pick(now); };
         },
     },
 ];

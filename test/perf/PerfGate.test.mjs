@@ -21,7 +21,7 @@
 import { zgcSuite } from '@zakkster/lite-perf-gate';
 import {
     Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
-    LeastConnBalancer, SedBalancer, NqBalancer,
+    LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer,
 } from '../../Pick.js';
 
 const CAP = 1 << 14;      // pool capacity 16384 (O(1)/O(d) scenarios: size is irrelevant)
@@ -225,9 +225,68 @@ const nqPick = {
     statsOf(s) { return { grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength + s.weights.buffer.byteLength }; },
 };
 
+/**
+ * peakewma-pick: reused PeakEwmaBalancer over a half-eligible pool + a caller-owned inflight
+ * array; each op two rejection draws + two decay-on-read exp() + a compare (a PURE read -- pick
+ * NEVER writes the owned EWMA state). O(d)=O(1), so CAP is fine. `now` advances each op. The
+ * `grows` counter covers the eligibility + inflight arrays AND the owned _ewma / _stamp buffers
+ * (none reallocates -> 0 delta).
+ */
+const peakEwmaPick = {
+    name: 'PeakEwmaBalancer.pick(now)',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        for (let i = 0; i < CAP; i++) inflight[i] = i & 15;
+        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xABCDEF);
+        // Warm the EWMA state once (cold path) so pick() reads varied costs, not the flat seed.
+        for (let i = 0; i < CAP; i += 8) pe.recordRtt(i, (i & 31) * 1000, 0);
+        return { el, inflight, pe, now: 0, acc: 0 };
+    },
+    hot(s, n) {
+        const pe = s.pe;
+        let acc = s.acc | 0, now = s.now;
+        for (let i = 0; i < n; i++) { now += 1000; acc = (acc + pe.pick(now)) | 0; }
+        s.acc = acc | 0; s.now = now;
+    },
+    statsOf(s) {
+        return {
+            grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength +
+                s.pe._ewma.buffer.byteLength + s.pe._stamp.buffer.byteLength,
+        };
+    },
+};
+
+/**
+ * peakewma-recordrtt: the WARM feedback path. Each op is one decay + one branch + two Float64
+ * writes over the owned EWMA state; the typeof/range guards only construct an Error on the
+ * (untaken) failure branch, so the success path allocates nothing.
+ */
+const peakEwmaRecord = {
+    name: 'PeakEwmaBalancer.recordRtt()',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xFEEDBEEF);
+        return { el, inflight, pe, now: 0 };
+    },
+    hot(s, n) {
+        const pe = s.pe;
+        let now = s.now;
+        for (let i = 0; i < n; i++) { now += 1000; pe.recordRtt(now & MASK, now % 500000, now); }
+        s.now = now;
+    },
+    statsOf(s) {
+        return {
+            grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength +
+                s.pe._ewma.buffer.byteLength + s.pe._stamp.buffer.byteLength,
+        };
+    },
+};
+
 const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
-    leastConnPick, sedPick, nqPick,
+    leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord,
 ];
 
 /**
@@ -356,6 +415,23 @@ const nqMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** PeakEWMA teeth: pick(now) boxed into a fresh [] each op -- MUST trip the gate. */
+const peMustFailAlloc = {
+    name: 'PeakEWMA.pick(now) boxed into fresh array (MUST allocate)',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        return { el, inflight, base: new PeakEwmaBalancer(CAP, el, inflight, 1e6, 1), now: 0 };
+    },
+    hot(s, n) {
+        const pe = s.base;
+        let sink = 0, now = s.now;
+        for (let i = 0; i < n; i++) { now += 1000; const arr = [pe.pick(now)]; sink += arr[0]; }
+        s.sink = sink; s.now = now;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -367,6 +443,6 @@ zgcSuite({
     scenarios,
     mustFail: [
         drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc, p2cMustFailAlloc,
-        lcMustFailAlloc, sedMustFailAlloc, nqMustFailAlloc,
+        lcMustFailAlloc, sedMustFailAlloc, nqMustFailAlloc, peMustFailAlloc,
     ],
 });

@@ -17,7 +17,7 @@
  * The random-foil peak/avg baseline (what P2C must beat at M3) is printed for context.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, Prng } from '../Pick.js';
 
 let failed = false;
 function check(cond, msg) {
@@ -234,6 +234,80 @@ process.stdout.write('lite-pick balance (M4: NQ -- idle-first fan-out)\n');
     const p = nq.pick();
     let minLoad = Infinity; for (let i = 0; i < n; i++) if (before[i] < minLoad) minLoad = before[i];
     check(before[p] === minLoad, 'NQ SED-fallback picks a least-loaded node once none are idle');
+}
+
+// --- PeakEWMA: THE latency anchor -- steer around a slow-but-up node -----------
+// The differentiator vs P2C-over-inflight: PeakEWMA REMEMBERS a node's latency (EWMA), so it
+// avoids a slow node even while that node is idle (inflight 0) and therefore looks attractive to
+// a pure in-flight strategy. We run the SAME closed-loop single-server-per-node queue simulation
+// through three lanes -- PeakEWMA (latency-aware), P2C (in-flight-aware), random (blind) -- with
+// ONE node at 10x service time, and assert: PeakEWMA sends the slow node <= 25% of P2C's share
+// for it, PeakEWMA's service p99 is >= 20% below P2C's, and the random foil is worse than both.
+process.stdout.write('lite-pick balance (M7: PeakEWMA -- latency anchor)\n');
+{
+    const n = 16;
+    const REQ = 100000;
+    const DT = 150;            // arrival interval (ns): moderate load on the fast pool
+    const BASE = 1000;         // fast-node service time (ns)
+    const SLOW = 0;            // the slow endpoint
+    const seed = 0xABCDEF;
+    // tau >> total run duration (REQ*DT ~ 1.5e7 ns), so a learned latency persists across the run.
+    const TAU = 1e9;
+
+    function runLane(kind) {
+        const el = new Uint8Array(n); el.fill(1);
+        const inflight = new Uint32Array(n);      // backlog depth, recomputed each arrival
+        const busyUntil = new Float64Array(n);    // when each single-server node is next free
+        const serviceNs = new Float64Array(n);
+        for (let j = 0; j < n; j++) serviceNs[j] = BASE;
+        serviceNs[SLOW] = 10 * BASE;              // the slow-but-up node
+
+        let pe = null, p2c = null, rng = null;
+        if (kind === 'peakewma') pe = new PeakEwmaBalancer(n, el, inflight, TAU, seed);
+        else if (kind === 'p2c') p2c = new P2cBalancer(n, el, inflight, seed);
+        else rng = new Prng(seed);
+
+        const counts = new Uint32Array(n);
+        const lat = new Float64Array(REQ);
+        for (let r = 0; r < REQ; r++) {
+            const t = r * DT;
+            // Backlog-derived in-flight (FIFO single server): the depth the strategy reads.
+            for (let j = 0; j < n; j++) {
+                const rem = busyUntil[j] - t;
+                inflight[j] = rem > 0 ? Math.ceil(rem / serviceNs[j]) : 0;
+            }
+            let i;
+            if (pe) i = pe.pick(t);
+            else if (p2c) i = p2c.pick();
+            else i = rng.nextBelow(n);
+            const start = busyUntil[i] > t ? busyUntil[i] : t;
+            const finish = start + serviceNs[i];
+            busyUntil[i] = finish;
+            const latency = finish - t;
+            lat[r] = latency;
+            counts[i]++;
+            if (pe) pe.recordRtt(i, latency, t);   // warm feedback on settle
+        }
+        lat.sort();
+        return { share: counts[SLOW] / REQ, p99: lat[Math.floor(0.99 * REQ)] };
+    }
+
+    const pe = runLane('peakewma');
+    const p2c = runLane('p2c');
+    const rnd = runLane('random');
+
+    process.stdout.write('  slow-node share: PeakEWMA=' + (pe.share * 100).toFixed(3) + '%' +
+        '  P2C=' + (p2c.share * 100).toFixed(3) + '%  random=' + (rnd.share * 100).toFixed(3) + '%\n');
+    process.stdout.write('  service p99 (ns): PeakEWMA=' + pe.p99.toFixed(0) +
+        '  P2C=' + p2c.p99.toFixed(0) + '  random=' + rnd.p99.toFixed(0) + '\n');
+
+    check(pe.share <= 0.25 * p2c.share,
+        'PeakEWMA slow-node share ' + (pe.share * 100).toFixed(3) + '% <= 25% of P2C ' +
+        (p2c.share * 100).toFixed(3) + '% (i.e. <= ' + (0.25 * p2c.share * 100).toFixed(3) + '%)');
+    check(pe.p99 <= 0.8 * p2c.p99,
+        'PeakEWMA service p99 ' + pe.p99.toFixed(0) + 'ns >= 20% below P2C ' + p2c.p99.toFixed(0) + 'ns');
+    check(rnd.p99 > pe.p99 && rnd.p99 > p2c.p99,
+        'random foil p99 ' + rnd.p99.toFixed(0) + 'ns is worse than both PeakEWMA and P2C');
 }
 
 if (failed) {

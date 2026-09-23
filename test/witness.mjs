@@ -15,7 +15,7 @@
  * on tiny pools while still catching a real complexity regression.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -99,11 +99,24 @@ const SUBJECTS = [
             return () => nq.pick();
         },
     },
+    {
+        name: 'PeakEWMA',
+        complexity: 'const', // two O(1)-expected rejection draws + two decay exp() + a compare -> flat with n
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            for (let i = 0; i < n; i++) inflight[i] = i & 15;
+            const pe = new PeakEwmaBalancer(n, el, inflight, 1e6, 0xABCDEF);
+            for (let i = 0; i < n; i += 4) pe.recordRtt(i, (i & 31) * 1000, 0); // warm, varied costs
+            let now = 0;
+            return () => { now += 1000; return pe.pick(now); };
+        },
+    },
 ];
 
 let failed = false;
 for (const subj of SUBJECTS) {
-    process.stdout.write('lite-pick witness (M4: ' + subj.name + ', ' + subj.complexity + ')\n');
+    process.stdout.write('lite-pick witness (M7: ' + subj.name + ', ' + subj.complexity + ')\n');
     const rows = SIZES.map((n) => ({ n, opsPerMs: timePicks(subj.make(n)) }));
     // The series that MUST stay flat depends on the advertised complexity.
     const series = rows.map((r) => (subj.complexity === 'linear' ? r.opsPerMs * r.n : r.opsPerMs));

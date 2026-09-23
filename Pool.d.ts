@@ -10,9 +10,11 @@ export const VERSION: string;
 
 /** The minimal balancer shape Pool drives (any lite-pick strategy satisfies it). */
 export interface Balancer {
-    pick(): number;
+    pick(now?: number): number;
     readonly capacity: number;
     readonly live: number;
+    /** Optional latency-feedback sink (PeakEwmaBalancer); fed on settle when a clock is supplied. */
+    recordRtt?(i: number, sampleNs: number, now: number): void;
 }
 
 /** Options for `Pool.run`. */
@@ -21,6 +23,11 @@ export interface RunOptions {
     signal?: AbortSignal;
     /** Max distinct-endpoint attempts (default 1 = no failover). */
     tries?: number;
+    /**
+     * A caller-owned nanosecond clock. When present it drives `pick(now)` and the opt-in
+     * `recordRtt` latency feedback for a latency-aware balancer (PeakEwma); otherwise inert.
+     */
+    clock?: () => number;
 }
 
 /**

@@ -6,7 +6,7 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer } from '../../Pick.js';
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -125,3 +125,24 @@ void nqPick;
 
 // @ts-expect-error -- weights arg is required.
 new NqBalancer(4, new Uint8Array(4), new Uint32Array(4));
+
+// PeakEwmaBalancer: capacity + eligibility + inflight + tauNs + optional seed; a BalancerBase subclass.
+const pe: PeakEwmaBalancer = new PeakEwmaBalancer(4, new Uint8Array(4), new Uint32Array(4), 1e6);
+const peSeeded: PeakEwmaBalancer = new PeakEwmaBalancer(4, new Uint8Array(4), new Uint32Array(4), 1e6, 123);
+void peSeeded;
+const peBase: BalancerBase = pe;
+void peBase;
+const pePick: number = pe.pick(1000);
+void pePick;
+const peEwma: number = pe.ewmaAt(0, 1000);
+void peEwma;
+pe.recordRtt(0, 5000, 1000);
+
+// @ts-expect-error -- inflight must be a Uint32Array, not a number[].
+new PeakEwmaBalancer(4, new Uint8Array(4), [0, 0, 0, 0], 1e6);
+
+// @ts-expect-error -- tauNs (a number) is required.
+new PeakEwmaBalancer(4, new Uint8Array(4), new Uint32Array(4));
+
+// @ts-expect-error -- recordRtt needs three numbers.
+pe.recordRtt(0, 5000);

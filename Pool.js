@@ -70,11 +70,20 @@ export class Pool {
      * DIFFERENT endpoint -- up to `tries` attempts, then throw the last error. All counts this run
      * raised are released before returning or throwing (net-zero per run).
      *
+     * A LATENCY-AWARE balancer (PeakEwmaBalancer -- anything duck-typing `recordRtt`) is fed on
+     * settle WHEN a `clock` is supplied: Pool reads `clock()` (caller-owned nanoseconds) before the
+     * attempt, passes it to `pick(now)`, and on a SUCCESSFUL settle records `recordRtt(i, elapsed,
+     * now2)`. Without a `clock`, or against a balancer with no `recordRtt`, the hook is INERT --
+     * Pool stays generic, the in-flight counter stays net-zero, and abort/failover are unaffected.
+     * The kernel `pick()` remains 0 B/op; this wrapper is not held to that bar.
+     *
      * @template T
      * @param {(endpoint: number, signal?: AbortSignal) => (Promise<T>|T)} fn  the per-endpoint work.
-     * @param {{ signal?: AbortSignal, tries?: number }} [opts]  `tries` (default 1 = no failover)
-     *   is the max number of distinct-endpoint attempts; `signal` is passed to `fn` and, when
-     *   already aborted after a failure, stops failover (the abort propagates, no re-pick).
+     * @param {{ signal?: AbortSignal, tries?: number, clock?: () => number }} [opts]  `tries`
+     *   (default 1 = no failover) is the max number of distinct-endpoint attempts; `signal` is
+     *   passed to `fn` and, when already aborted after a failure, stops failover (the abort
+     *   propagates, no re-pick); `clock` is a caller-owned nanosecond source that, when present,
+     *   drives `pick(now)` and the opt-in `recordRtt` latency feedback for a latency-aware balancer.
      * @returns {Promise<T>}
      */
     async run(fn, opts) {
@@ -82,12 +91,17 @@ export class Pool {
         const rawTries = opts && opts.tries != null ? (opts.tries | 0) : 1;
         const tries = rawTries > 0 ? rawTries : 1;
         const signal = opts ? opts.signal : undefined;
+        const clock = opts && typeof opts.clock === 'function' ? opts.clock : undefined;
         const inflight = this._inflight, b = this._b;
+        // Opt-in latency feedback: only when BOTH a clock is supplied AND the balancer duck-types
+        // recordRtt. Otherwise inert -- Pool stays generic and byte-for-byte behaviour is unchanged.
+        const rtt = clock !== undefined && typeof b.recordRtt === 'function';
         const held = [];                 // endpoints incremented this run (kept elevated across failover)
         let lastErr;
         try {
             for (let attempt = 0; attempt < tries; attempt++) {
-                const i = b.pick();
+                const now = clock !== undefined ? clock() : undefined;
+                const i = b.pick(now);
                 if (i === PICK_NONE) {
                     if (attempt === 0) {
                         const e = new Error('[lite-pick] no eligible endpoint');
@@ -99,7 +113,12 @@ export class Pool {
                 inflight[i] = (inflight[i] + 1) >>> 0;
                 held.push(i);
                 try {
-                    return await fn(i, signal);
+                    const out = await fn(i, signal);
+                    if (rtt) {           // successful settle: feed the measured rtt back to the balancer
+                        const done = clock();
+                        b.recordRtt(i, done > now ? done - now : 0, done);
+                    }
+                    return out;
                 } catch (err) {
                     lastErr = err;
                     if (signal && signal.aborted) throw err;   // abort: stop failover, propagate

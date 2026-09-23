@@ -1,8 +1,8 @@
 {
   "name": "@zakkster/lite-pick",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.6.0",
-  "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, plus PeakEWMA and consistent hashing; the /pool subpath adds dispatch/settle counters + failover and a duck-typed query-cache fetcher.",
+  "version": "0.7.0",
+  "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, PeakEWMA (latency-aware peak-EWMA), plus consistent hashing; the /pool subpath adds dispatch/settle counters + failover and a duck-typed query-cache fetcher.",
   "type": "module",
   "main": "./Pick.js",
   "module": "./Pick.js",

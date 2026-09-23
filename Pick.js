@@ -1,8 +1,8 @@
 /**
  * @zakkster/lite-pick -- zero-GC load-balancing SELECTION KERNEL.
  *
- * M4 (0.4.0): substrate seams + six strategies -- RoundRobin, SmoothWRR, P2C, and the
- * exact LeastConn family (LeastConn, SED, NQ). This file ships:
+ * M7 (0.7.0): substrate seams + seven strategies -- RoundRobin, SmoothWRR, P2C, the exact
+ * LeastConn family (LeastConn, SED, NQ), and PeakEWMA (latency-aware P2C). This file ships:
  *
  *   - VERSION        the single source-of-truth version stamp (3-place sync).
  *   - PICK_NONE      the fail-closed sentinel (-1): "no endpoint", never a dead pick.
@@ -26,6 +26,11 @@
  *                    charges the NEW request's marginal cost. O(cap)/pick, 0 B/op.
  *   - NqBalancer     never-queue (IPVS `nq`): an IDLE eligible endpoint immediately if one
  *                    exists, else SED. The worker-pool fit. O(cap)/pick, 0 B/op.
+ *   - PeakEwmaBalancer  latency-aware P2C (Twitter Finagle's peak-EWMA): draws two distinct
+ *                    eligible endpoints and takes the lower cost = (inflight+1) x decayed EWMA(rtt).
+ *                    Decay-on-READ (pick() never writes -> 0 B/op); the balancer OWNS the Float64
+ *                    _ewma/_stamp state and is its SOLE writer via the warm recordRtt() feedback
+ *                    path (also 0 B/op). Caller-supplied nanosecond clock. O(d)=O(1)/pick.
  *
  * The identity (decisions/0001): lite-pick OWNS NO mutable state it can avoid owning.
  * It reads pre-allocated views (eligibility, inflight, weights, scores) that siblings or
@@ -33,7 +38,7 @@
  * counters live OUTSIDE the kernel. The steady-state pick path allocates 0 B/op.
  *
  * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [M1], SmoothWRR [M2],
- *   P2C [M3], LeastConn/SED/NQ [M4], PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom
+ *   P2C [M3], LeastConn/SED/NQ [M4], PeakEWMA [M7], ConsistentHash, BoundedLoad, WeightedRandom
  *   [planned]. The EXACT-O(log n) fewest-in-flight variant is a deferred @zakkster/lite-logn
  *   BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan.
  *
@@ -46,7 +51,7 @@
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.6.0';
+export const VERSION = '0.7.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -572,5 +577,140 @@ export class NqBalancer extends BalancerBase {
             }
         }
         return best;                              // -1 when every eligible node has weight 0
+    }
+}
+
+/**
+ * PeakEwmaBalancer -- latency-aware power-of-two-choices (M7), Twitter Finagle's peak-EWMA.
+ *
+ * `pick(now)` draws TWO distinct eligible endpoints (the same rejection-sampling machinery as
+ * P2cBalancer -- reused verbatim, not re-implemented) and returns the one with the lower COST,
+ * where cost(i) = (inflight[i] + 1) x ewmaAt(i, now). It is P2C over a LATENCY signal instead of
+ * raw in-flight count: a slow endpoint (high EWMA rtt) is avoided even when its queue is short,
+ * so the pool steers around a degraded-but-up node -- the strategy the multi-region FE case wants.
+ * O(d) = O(1) per pick.
+ *
+ * Ownership (ADR 0001, ADR 0009): `inflight` is the CALLER's Uint32Array, read LIVE (the P2C /
+ * LeastConn seam). The EWMA state -- `_ewma` (the decayed rtt estimate) and `_stamp` (the ns
+ * timestamp of each node's last update), both Float64Array -- is BALANCER-OWNED (the SmoothWRR
+ * precedent: a strategy may own algorithm state), and the balancer is its SOLE writer, via the
+ * warm `recordRtt()` feedback path. `pick()` NEVER writes: it decays ON READ, so the hot path
+ * stays a pure read -> 0 B/op.
+ *
+ * Decay-on-read: ewmaAt(i, now) = _ewma[i] x exp(-(now - _stamp[i]) / tau). No write, no clock
+ * call on the gated path -- `now` (and the rtt sample) are CALLER-supplied nanoseconds, consistent
+ * between `pick(now)` and `recordRtt(i, sampleNs, now)`, so the whole strategy is deterministic
+ * and testable and allocates nothing.
+ *
+ * Cold start: `_ewma` seeds to 1.0 and `_stamp` to 0 at construction, so before any sample
+ * cost(i) ~ (inflight[i] + 1) x 1 and PeakEWMA degrades GRACEFULLY to plain least-connections
+ * (P2C-over-inflight). It is never NaN.
+ *
+ * Anti-flap (ADR 0002, ADR 0009): the EWMA half-life IS the smoothing -- a single slow sample
+ * snaps the cost up instantly and it decays back over ~tau, so there is NO extra dwell/hysteresis.
+ *
+ * Deferred (ADR 0009 / llms.txt): a p99-aware variant scoring inflight x p99Rtt via a per-node
+ * @zakkster/lite-sketch `DDSketch` (optional peer, 0 B/op `add`). EWMA-mean is the shipped,
+ * zero-peer default; `peerDependencies` stays empty until a shipped path imports the sketch.
+ *
+ * Bound: O(d) = O(1) per pick (two expected-O(1) rejection draws + two exp() + a compare),
+ * 0 B/op on BOTH `pick()` and `recordRtt()` (torture + PerfGate). Fails closed (PICK_NONE) when
+ * the whole pool is down.
+ */
+export class PeakEwmaBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  endpoint count (fixed).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array} inflight  per-endpoint in-flight counts (length >= capacity),
+     *   caller-owned and only READ here.
+     * @param {number} tauNs  the EWMA time-constant / half-life in nanoseconds (> 0, finite):
+     *   larger tau = slower decay = longer memory of a latency spike.
+     * @param {number} [seed=0x9e3779b9]  deterministic PRNG seed (reproducible benches).
+     */
+    constructor(capacity, eligible, inflight, tauNs, seed = 0x9e3779b9) {
+        super(capacity, eligible);
+        // Validate typeof-first, BEFORE allocating the owned Float64 state (fail closed early).
+        if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
+            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+        }
+        if (typeof tauNs !== 'number') {
+            throw new TypeError('[lite-pick] tauNs must be a number');
+        }
+        if (!Number.isFinite(tauNs) || tauNs <= 0) {
+            throw new RangeError('[lite-pick] tauNs must be a finite number > 0');
+        }
+        this._inflight = inflight;
+        this._tau = tauNs;
+        this._rng = new Prng(seed);
+        this._ewma = new Float64Array(capacity);
+        this._stamp = new Float64Array(capacity);   // all-zero: last-update timestamp
+        for (let i = 0; i < capacity; i++) this._ewma[i] = 1.0; // cold start -> graceful LeastConn
+    }
+
+    /**
+     * A uniformly random ELIGIBLE index, or PICK_NONE if none. Reuses P2cBalancer's exact
+     * rejection-sampling draw (ADR 0005) verbatim -- same `_rng` / `_eligible` / `_live` fields,
+     * no re-implementation, no owned draw-set. Internal, zero-alloc.
+     * @returns {number}
+     */
+    _draw() {
+        return P2cBalancer.prototype._draw.call(this);
+    }
+
+    /**
+     * The decayed EWMA rtt estimate for endpoint i at time `now` (ns). Pure READ -- exponential
+     * decay applied on read, never written. Cold (unsampled) nodes read ~1.0. Zero-alloc.
+     * @param {number} i
+     * @param {number} now  caller-supplied nanoseconds
+     * @returns {number}
+     */
+    ewmaAt(i, now) {
+        return this._ewma[i] * Math.exp(-(now - this._stamp[i]) / this._tau);
+    }
+
+    /**
+     * Record an rtt SAMPLE for endpoint i at time `now` (the warm feedback path -- NOT the hot
+     * pick path). The Finagle peak rule: decay the stored estimate to `now`, then SNAP UP to the
+     * sample if it is larger (a spike is felt instantly) else ease toward it (it decays back over
+     * ~tau). The balancer is the SOLE writer of `_ewma` / `_stamp`. Zero-alloc on the success path.
+     * @param {number} i  endpoint index
+     * @param {number} sampleNs  observed rtt in nanoseconds (finite, >= 0)
+     * @param {number} now  caller-supplied nanoseconds (finite), consistent with pick(now)
+     */
+    recordRtt(i, sampleNs, now) {
+        if (typeof i !== 'number' || typeof sampleNs !== 'number' || typeof now !== 'number') {
+            throw new TypeError('[lite-pick] recordRtt(i, sampleNs, now) requires numbers');
+        }
+        if (i < 0 || i >= this._cap) throw new RangeError('[lite-pick] index out of range: ' + i);
+        if (!Number.isFinite(sampleNs) || sampleNs < 0) {
+            throw new RangeError('[lite-pick] sampleNs must be a finite number >= 0');
+        }
+        if (!Number.isFinite(now)) throw new RangeError('[lite-pick] now must be a finite number');
+        const w = Math.exp(-(now - this._stamp[i]) / this._tau);
+        const e = this._ewma[i] * w;
+        this._ewma[i] = sampleNs > e ? sampleNs : e + (sampleNs - e) * (1 - w);
+        this._stamp[i] = now;
+    }
+
+    /**
+     * Pick by latency-aware power-of-two-choices: two distinct eligible draws, lower cost =
+     * (inflight+1) x ewmaAt(now) wins; a tie goes to the first draw. PICK_NONE (fail closed) iff
+     * the whole pool is down. O(d)=O(1), 0 B/op (pure read -- no write, no clock call).
+     * @param {number} now  caller-supplied nanoseconds (consistent with recordRtt)
+     * @returns {number}
+     */
+    pick(now) {
+        const a = this._draw();
+        if (a < 0) return PICK_NONE;          // whole pool down: fail closed
+        if (this._live === 1) return a;       // only one eligible: it is both choices
+        // A DISTINCT second draw, bounded (the ADR 0005 rationale): at live>=2 each redraw misses
+        // with probability <= 1/2, so 32 tries leaves a ~2^-32 collision chance, expected-O(1), 0 B/op.
+        let b = this._draw();
+        for (let t = 0; b === a && t < 32; t++) b = this._draw();
+        if (b < 0 || b === a) return a;       // astronomically rare: fall back to the first draw
+        const inf = this._inflight, ewma = this._ewma, stamp = this._stamp, tau = this._tau;
+        const costA = (inf[a] + 1) * (ewma[a] * Math.exp(-(now - stamp[a]) / tau));
+        const costB = (inf[b] + 1) * (ewma[b] * Math.exp(-(now - stamp[b]) / tau));
+        return costB < costA ? b : a;         // lower cost wins; tie -> the first draw
     }
 }

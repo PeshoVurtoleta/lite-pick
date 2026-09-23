@@ -20,7 +20,7 @@
 
 import {
     RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
-    LeastConnBalancer, SedBalancer, NqBalancer, PICK_NONE,
+    LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, PICK_NONE,
 } from '../Pick.js';
 import {
     checkBase, recomputeEligibleWeight, recomputeEligibleWeighted,
@@ -119,6 +119,18 @@ const SPECS = {
             return null;
         },
     },
+    PeakEWMA: {
+        weighted: false, loadAware: true, usesSetWeight: false, latencyAware: true,
+        make: (cap, el, inf) => new PeakEwmaBalancer(cap, el, inf, 1e6, 0xC0FFEE),
+        mass: (ctx) => ctx.b.live,
+        // Two-choice: no exact-min claim. The state invariant is that the owned EWMA state stays
+        // finite (never NaN / +-Infinity) under the recordRtt / pick / setEligible barrage.
+        extra: (b, ctx) => {
+            if (!allFinite(b._ewma, ctx.cap)) return '_ewma has a non-finite cell';
+            if (!allFinite(b._stamp, ctx.cap)) return '_stamp has a non-finite cell';
+            return null;
+        },
+    },
 };
 
 /**
@@ -137,6 +149,8 @@ function runOne(name, seed, cap, steps) {
 
     const b = spec.make(cap, el, inflight, weights);
     const ctx = { b, cap, el, inflight, weights };
+    // A monotonic caller clock for the latency-aware strategy (pick(now) + recordRtt(...,now)).
+    let now = 0;
 
     for (let step = 0; step < steps; step++) {
         const r = rnd() % 100;
@@ -155,7 +169,16 @@ function runOne(name, seed, cap, steps) {
         // Sometimes exercise the pathological max on SmoothWRR's summed total directly.
         if ((r & 31) === 7 && spec.weighted && spec.usesSetWeight) b.setWeight(rnd() % cap, 0xFFFFFFFF);
 
-        const p = b.pick();
+        // Barrage the latency-aware feedback path: a mix of ordinary, zero, and huge rtt samples.
+        if (spec.latencyAware && (r & 3) === 1) {
+            now += 1 + (rnd() % 4096);
+            const kind = rnd() % 4;
+            const sample = kind === 0 ? 0 : kind === 1 ? 1e8 : rnd() % 500000;
+            b.recordRtt(rnd() % cap, sample, now);
+        }
+
+        now += 1 + (rnd() % 1024);
+        const p = spec.latencyAware ? b.pick(now) : b.pick();
         const mass = spec.mass(ctx);
         const baseErr = checkBase(b, el, cap, p, mass);
         if (baseErr) return { name, seed, cap, step, reason: baseErr };
@@ -196,6 +219,7 @@ function pathological() {
         const bs = [
             new RoundRobinBalancer(1, el), new SmoothWRRBalancer(1, el, w), new P2cBalancer(1, el, inf),
             new LeastConnBalancer(1, el, inf), new SedBalancer(1, el, inf, w), new NqBalancer(1, el, inf, w),
+            new PeakEwmaBalancer(1, el, inf, 1e6),
         ];
         for (const b of bs) if (b.pick() !== 0) fails.push('single-node ' + b.constructor.name + ' did not return 0');
         el[0] = 0;

@@ -17,7 +17,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { RoundRobinBalancer, LeastConnBalancer } from '../Pick.js';
+import { RoundRobinBalancer, LeastConnBalancer, PeakEwmaBalancer } from '../Pick.js';
 import { Pool, liteQueryFetcher, VERSION } from '../Pool.js';
 
 const up = (n) => { const e = new Uint8Array(n); e.fill(1); return e; };
@@ -142,4 +142,63 @@ test('A9: liteQueryFetcher validates its inputs', () => {
     const pool = new Pool(new LeastConnBalancer(2, up(2), inflight), inflight);
     assert.throws(() => liteQueryFetcher({}, () => 1), TypeError);
     assert.throws(() => liteQueryFetcher(pool, 'nope'), TypeError);
+});
+
+// A monotonic caller clock (ns): advances 1000 per read.
+function makeClock() {
+    let t = 0;
+    return () => (t += 1000);
+}
+
+test('A10: records rtt on settle when the balancer supports it AND a clock is supplied', async () => {
+    const n = 4;
+    const inflight = new Uint32Array(n);
+    const pe = new PeakEwmaBalancer(n, up(n), inflight, 1e9, 0xABCDEF);
+    const pool = new Pool(pe, inflight);
+    // Before any run every node reads the cold seed 1.0.
+    for (let i = 0; i < n; i++) assert.equal(pe.ewmaAt(i, 0), 1.0);
+    let endpoint = -1;
+    // clock: pick -> now=1000, settle -> done=2000, so the recorded sample is 1000ns at now=2000.
+    await pool.run((i) => { endpoint = i; return 'ok'; }, { clock: makeClock() });
+    assert.ok(endpoint >= 0);
+    assert.equal(pe.ewmaAt(endpoint, 2000), 1000, 'the settled endpoint recorded its 1000ns rtt');
+    assert.equal(inflight[endpoint], 0, 'in-flight net-zero after settle');
+});
+
+test('A11: inert (no error, net-zero inflight) when the balancer has no recordRtt', async () => {
+    const n = 4;
+    const inflight = new Uint32Array(n);
+    const pool = new Pool(new LeastConnBalancer(n, up(n), inflight), inflight);
+    const result = await pool.run((i) => 'served-' + i, { clock: makeClock() });
+    assert.match(result, /^served-\d$/);
+    for (let i = 0; i < n; i++) assert.equal(inflight[i], 0);
+});
+
+test('A12: inert when a recordRtt-capable balancer is run WITHOUT a clock', async () => {
+    const n = 4;
+    const inflight = new Uint32Array(n);
+    const pe = new PeakEwmaBalancer(n, up(n), inflight, 1e9, 0xABCDEF);
+    const pool = new Pool(pe, inflight);
+    await pool.run((i) => 'ok:' + i);                 // no opts -> no clock -> hook inert
+    for (let i = 0; i < n; i++) {
+        assert.equal(pe.ewmaAt(i, 0), 1.0, 'no rtt recorded -- EWMA state untouched');
+        assert.equal(inflight[i], 0, 'in-flight net-zero');
+    }
+});
+
+test('A13: abort/failover paths unaffected by the rtt hook (tries=2, first throws)', async () => {
+    const n = 2;
+    const inflight = new Uint32Array(n);
+    const pe = new PeakEwmaBalancer(n, up(n), inflight, 1e9, 0xABCDEF);
+    const pool = new Pool(pe, inflight);
+    const seen = [];
+    const result = await pool.run((i) => {
+        seen.push(i);
+        if (seen.length === 1) throw new Error('first fails');
+        return 'served-by-' + i;
+    }, { tries: 2, clock: makeClock() });
+    assert.equal(seen.length, 2, 'two attempts');
+    assert.notEqual(seen[0], seen[1], 'second attempt is a DISTINCT endpoint');
+    assert.equal(result, 'served-by-' + seen[1]);
+    assert.equal(inflight[0], 0); assert.equal(inflight[1], 0);   // all released, net-zero
 });

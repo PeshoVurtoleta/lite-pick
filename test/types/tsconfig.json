@@ -3,12 +3,12 @@
     "strict": true,
     "noEmit": true,
     "target": "ES2020",
-    "lib": ["ES2020"],
+    "lib": ["ES2020", "DOM"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "types": [],
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["pick.test-d.ts"]
+  "include": ["pick.test-d.ts", "pool.test-d.ts"]
 }

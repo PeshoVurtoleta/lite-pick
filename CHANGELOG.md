@@ -4,6 +4,46 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-23
+
+M5: the ergonomic request layer at the `@zakkster/lite-pick/pool` subpath -- dispatch/settle
+in-flight counters + distinct-endpoint failover + a duck-typed query-cache fetcher (ROADMAP.md M5).
+
+### Added
+
+- `@zakkster/lite-pick/pool` (`Pool.js`) -- a new SUBPATH export (the kernel `Pick.js` stays a
+  single 0 B/op file; the async layer lives outside it, the lite-query `/stream` + `/await`
+  precedent, ADR 0007).
+- `Pool` -- wraps a balancer + the caller-owned in-flight view. `run(fn, opts?)` picks an endpoint,
+  increments in-flight on dispatch, awaits `fn(endpoint, signal)`, decrements on settle (in a
+  `finally` -- net-zero per run, even on throw). On a thrown error it keeps the failed endpoint's
+  count ELEVATED and re-picks, so a load-aware strategy (P2C/LeastConn/SED/NQ) steers the next
+  attempt to a DISTINCT endpoint -- up to `opts.tries` attempts (default 1 = no failover), then
+  rejects with the last error. Rejects a `code:'LITE_PICK_NONE'` error when no endpoint is eligible;
+  `opts.signal` is passed to `fn` and, once aborted after a failure, stops failover. NOT a 0 B/op
+  path (the kernel `pick()` is) -- a normal async wrapper, disclosed.
+- `liteQueryFetcher(pool, perEndpoint, opts?)` -- returns a `({ key, signal }) => Promise` fetcher
+  for a query cache (lite-query's `fetcher`, or any fetcher-shaped consumer). Imports NOTHING from
+  lite-query -- duck-typed, so `peerDependencies` stays empty. `opts.tries` is the spatial failover
+  count. BOUNDARY: Pool owns SPATIAL failover across the pool; the cache owns TEMPORAL retry/backoff.
+- `test/Pool.test.js` -- 12 tests: dispatch/settle in-flight balance (success AND throw), fail-closed
+  coding, distinct-endpoint failover, tries exhaustion (last error), abort-stops-failover, signal
+  passthrough, a 200-way CONCURRENT-consistency check (in-flight drains to all-zero -- no leak), and
+  the duck-typed fetcher.
+- `Pool.d.ts` + `test/types/pool.test-d.ts` -- the typed surface (the type-test tsconfig gains the
+  `DOM` lib for `AbortSignal`).
+- `demo/fanout.mjs` (`npm run demo`) -- the integration moat: least-connections fan-out over a flaky
+  pool with a replica killed mid-run, proving 0 dead picks + 0 leaked in-flight + live failover, and
+  showing the lite-query fetcher wiring. (`demo/` is not in `files[]`.)
+- `decisions/0007-pool-adapter.md` -- the /pool-subpath home, spatial-vs-temporal retry ownership,
+  the explicit 0 B/op boundary, and the duck-typed (zero-peer) fetcher.
+
+### Changed
+
+- Version 0.4.0 -> 0.5.0 across `package.json`, `Pick.js` `VERSION` (re-exported by `Pool.js`), and
+  `llms.txt`. `exports` gains `./pool`; `files[]` gains `Pool.js` + `Pool.d.ts`.
+- `peerDependencies` stays `{}` -- the fetcher adapter is duck-typed (ADR 0007 Fork 4).
+
 ## [0.4.0] - 2026-09-23
 
 M4: the exact LeastConn family (IPVS `lc` / `sed` / `nq` made zero-GC) + the seeded invariant

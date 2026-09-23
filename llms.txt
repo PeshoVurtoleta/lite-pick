@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.4.0
+Version: 0.5.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -106,6 +106,35 @@ n) fewest-in-flight variant is a deferred @zakkster/lite-logn `BinaryHeap` optio
   - `pick()` -> number. Returns the FIRST idle eligible positive-weight node (in-flight 0) if one
     exists -- never queueing while a server is free -- else the SED minimum, else `PICK_NONE`.
     O(cap) worst case, O(1) when an early node is idle. 0 B/op.
+
+## Subpath: @zakkster/lite-pick/pool -- the ergonomic request layer (M5, Pool.js)
+
+The kernel is a PURE 0 B/op selector; `/pool` is the ASYNC layer over it -- dispatch/settle
+in-flight counter ergonomics + distinct-endpoint failover + a duck-typed query-cache fetcher.
+It is a SEPARATE subpath file (the lite-query /stream + /await precedent), NOT part of the
+0 B/op single-file kernel (decisions/0007). Zero HARD deps, zero peers: the fetcher adapter is
+duck-typed and imports NOTHING from lite-query.
+
+- `VERSION` -- string. Re-exported from the core (same three-place stamp).
+- `Pool` -- class. Wraps a balancer + the caller-owned in-flight view.
+  - `new Pool(balancer, inflight)` -- `balancer` is duck-typed (any `{ pick(): number, capacity,
+    live }` -- every lite-pick strategy qualifies); `inflight` is the SAME caller-owned Uint32Array
+    the balancer reads (length >= balancer.capacity). Throws on a bad balancer / undersized view.
+  - `balancer` / `inflight` -- readonly getters.
+  - `run(fn, opts?)` -> Promise. Picks an endpoint, increments its in-flight on DISPATCH, awaits
+    `fn(endpoint, signal)`, decrements on SETTLE (in a finally -- net-zero per run, even on throw).
+    On a thrown error it keeps the failed endpoint's count ELEVATED and re-picks, so a load-aware
+    strategy (P2C/LeastConn/SED/NQ) steers the next attempt to a DIFFERENT endpoint -- up to
+    `opts.tries` attempts (default 1 = no failover), then rejects with the LAST error. Rejects with
+    a `code:'LITE_PICK_NONE'` error when no endpoint is eligible. `opts.signal` is passed to `fn`;
+    once aborted after a failure, failover stops and the abort propagates. NOT a 0 B/op path (the
+    kernel `pick()` is): a normal async wrapper adding O(1) counter ops + one small per-run array.
+    BOUNDARY: Pool owns SPATIAL failover (across the pool); the caller / query cache owns TEMPORAL
+    retry (backoff, staleness). Never double-owned (decisions/0007).
+- `liteQueryFetcher(pool, perEndpoint, opts?)` -> a `({ key, signal }) => Promise` fetcher for a
+  query cache (lite-query's `fetcher`, or any fetcher-shaped consumer). `perEndpoint({ endpoint,
+  key, signal })` -> the per-endpoint work. `opts.tries` (default 1) is the spatial failover count.
+  Imports nothing from lite-query -- duck-typed, so `peerDependencies` stays empty.
 
 ## Gates (every session)
 

@@ -37,11 +37,16 @@
  *   [planned]. The EXACT-O(log n) fewest-in-flight variant is a deferred @zakkster/lite-logn
  *   BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan.
  *
+ * M5 (0.5.0) adds the ergonomic request layer at the @zakkster/lite-pick/pool subpath (a
+ * SEPARATE file, Pool.js -- the async dispatch/settle counter wrapper + distinct-endpoint
+ * failover + a duck-typed query-cache fetcher). This kernel file stays PURE and 0 B/op; the
+ * async Pool lives outside it (decisions/0007, the lite-query /stream + /await subpath precedent).
+ *
  * Zero runtime dependencies. node:test only. ESM, single file, tree-shakeable.
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.4.0';
+export const VERSION = '0.5.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.

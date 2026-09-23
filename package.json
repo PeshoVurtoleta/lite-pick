@@ -1,8 +1,8 @@
 {
   "name": "@zakkster/lite-pick",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.4.0",
-  "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, plus PeakEWMA and consistent hashing.",
+  "version": "0.5.0",
+  "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, plus PeakEWMA and consistent hashing; the /pool subpath adds dispatch/settle counters + failover and a duck-typed query-cache fetcher.",
   "type": "module",
   "main": "./Pick.js",
   "module": "./Pick.js",
@@ -13,11 +13,19 @@
       "node": "./Pick.js",
       "import": "./Pick.js",
       "default": "./Pick.js"
+    },
+    "./pool": {
+      "types": "./Pool.d.ts",
+      "node": "./Pool.js",
+      "import": "./Pool.js",
+      "default": "./Pool.js"
     }
   },
   "files": [
     "Pick.js",
     "Pick.d.ts",
+    "Pool.js",
+    "Pool.d.ts",
     "llms.txt",
     "README.md",
     "CHANGELOG.md",
@@ -33,6 +41,7 @@
     "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
     "bench": "node benchmark/Matrix.mjs",
     "bench:report": "node benchmark/Matrix.mjs && node benchmark/Report.mjs",
+    "demo": "node demo/fanout.mjs",
     "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run balance && npm run fuzz && npm run test:perf"
   },
   "keywords": [

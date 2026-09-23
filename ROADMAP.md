@@ -22,7 +22,7 @@ wiring proven zero-GC parts, not new low-level code.
 | **M2** | **SmoothWRR** (nginx smooth weighted RR) | 0.2.0 | O(cap) | SHIPPED |
 | **M3** | **P2C** (the headline + balance anchor) | 0.3.0 | O(d)=O(1) | SHIPPED |
 | **M4** | **LeastConn family** (exact LeastConn/SED/NQ; P2C already the O(1) approx; lite-logn exact-O(log n) seam confirmed/deferred) + the invariant fuzzer | 0.4.0 | O(cap) exact / O(1) NQ-idle | SHIPPED |
-| **M5** | **lite-query adapter** (the integration moat) | 0.5.0 | -- | planned |
+| **M5** | **The `/pool` request layer** (dispatch/settle counters + distinct-endpoint failover + a duck-typed lite-query fetcher) | 0.5.0 | -- | SHIPPED |
 | **M6** | **Benchmark suite** (ecosystem MVP: balance + GC blast-radius headlines, trust gates, vs-AWS positioning) | 0.6.0 | -- | planned |
 | **M7** | **PeakEWMA** (latency-aware P2C) | 0.7.0 | O(d)=O(1) | planned |
 | **M8** | **ConsistentHash** (Maglev table) | 0.8.0 | O(1) lookup | planned |
@@ -124,9 +124,16 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
   0 B/op, all gated. The EXACT-O(log n) variant is a CONFIRMED-but-DEFERRED lite-logn `BinaryHeap`
   optional-peer seam (its `changeKey` is the O(log n) decrease-key), added only when a large pool
   makes the O(cap) scan measurably hot. The invariant fuzzer (see s3) lands here with an M2 retrofit.
-- **M5 lite-query adapter:** counters caller-owned arrays vs kernel hooks (lean: arrays +
-  adapter ergonomics). Retry MUST re-pick a DIFFERENT node; rtt feeds PeakEWMA (M7).
-  Home: `lite-pick/adapters` vs the lite-query repo -- decide with the user.
+- **M5 the /pool request layer:** SHIPPED (ADR 0007). HOME SETTLED = a `@zakkster/lite-pick/pool`
+  subpath (Pool.js), NOT the lite-query repo (keeps selection knowledge in lite-pick; the lite-query
+  /stream + /await subpath precedent). `Pool(balancer, inflight).run(fn, {signal, tries})` = pick ->
+  inflight++ -> await fn -> inflight-- (finally); on a throw it keeps the failed node ELEVATED and
+  re-picks so a load-aware strategy STEERS to a distinct endpoint (no avoid-last hack) -- SPATIAL
+  failover only; the caller/cache owns TEMPORAL retry (no double-own). `liteQueryFetcher` is
+  DUCK-TYPED (imports nothing from lite-query -> peerDependencies stays EMPTY). Pool is async, NOT
+  0 B/op (disclosed); gated by a node:test boundary suite incl. a 200-way concurrent in-flight-drain
+  check. demo/fanout.mjs is the moat. rtt/EWMA feed lands at M7 (PeakEWMA). NOTE: adapter session,
+  no s0 strategy-accounting row.
 - **M6 benchmark suite:** all TEN dimensions (RESEARCH section 3), framed as "parity on
   speed, superiority on the contract + balance + tail" -- NOT "X times faster" (a trivial
   RR/wrr foil matches P2C on raw ops/sec; a speed-superiority headline shows lite-pick
@@ -221,9 +228,10 @@ The zero-GC proof is TWO complementary tools, kept separate exactly as lite-o1 d
 | Post-1.0 #2 | **lite-await hedging combinator** (`hedged()`) | The async power-of-two: race the P2C second choice past a percentile. The lite-await face of the kernel. | 1.2.0 |
 | Post-1.0 #3 | **AZ-aware / zone-affinity** wrapper (sched-domains model) | Local-first, threshold-to-escalate -- modeled on Linux CFS scheduler domains (SMT->socket->NUMA, escalate a level only when imbalanced) with a latency-health escape hatch (Zalando: suppress local to a 1% probe floor at >35% rtt drift). A wrapper over PeakEWMA + a zone tag array. | 1.3.0 |
 | Post-1.0 #4 | **Subsetting** (Google SRE deterministic subset) | Cap connection fan-out from a large client set to a large pool. A cold-path pool-shaping helper. Substrate: lite-o1 `Reservoir` (Vitter Algo R, O(1)/item uniform k-sampling) -- pick k of N endpoints uniformly, zero-GC. | 1.4.0 |
-| Post-1.0 #5 | **The visual demo** (lite-lru style) | One seeded stream -> every strategy side by side, drawn from `dump()`; headline gauge = imbalance vs the P2C ceiling, with a random foil piling load on one bin. | 1.5.0 |
+| Post-1.0 #5 | **The visual demo -- an `htop` for the endpoint pool** (lite-lru style) | A live process-monitor panel: each endpoint a row with a real-time load bar (its `inflight`), color-coded by state (live / hot / flapping / down); a header of aggregates (picks/sec, imbalance vs the P2C ceiling, live count, RSS/GC); a STRATEGY SWITCH flipped live so you WATCH the distribution snap between shapes (random's lopsided piles -> RoundRobin's flat comb -> P2C's tight band -> LeastConn's exact even fill -> SED's weighted staircase), plus interactive chaos (kill a node, watch traffic redistribute; flap storm; add load). Reads `dump()` on a throttled ~10Hz rAF tick so the panel NEVER perturbs the 0 B/op pick path (lite-law: no per-pick telemetry). Composes the suite's canvas bricks -- lite-hud / lite-charts(-gl) / lite-canvas-graph / lite-fps-meter / lite-signal(+dom) -- NO new low-level code. Doubles as the LIVE FACE of the #8 endurance soak (leave it on `caffeinate -i`, the panel is the overnight dashboard). THE pitch artifact for an evaluator: "my selector vs random, live, killing nodes on demand." | 1.5.0 |
 | Post-1.0 #6 | **AdaptiveWeight** (WLM-style goal/feedback) | Recompute per-endpoint weights from observed latency vs a target (IBM z/OS WLM composite weight 0-64). The feedback-driven parent of PeakEWMA/bounded-load; a Tier-3 strategy. Weights written cold, read hot -- ADR 0001 ownership. | 1.6.0 |
 | Post-1.0 #7 | **Observability adapter** (lite-di-signal) | Expose balancer status (per-endpoint eligibility/load, live imbalance) as DI-wired reactive signals/computeds with deterministic teardown -- the reactivity pillar beside lite-di-health. FE dashboards use lite-signal-decorators instead. WARM/COLD only, never the pick path. | 1.7.0 |
+| Post-1.0 #8 | **The endurance soak** (`benchmark/Soak.mjs`, multi-hour `caffeinate -i` burn-in) | The UNBOUNDED cousin of torture: run a continuous mixed-chaos workload (heavy pick streams + eligibility flap storms + whole-pool-down + load feedback + weight retuning + idle troughs) over a realistic pool for HOURS/DAYS, snapshotting RSS / GC pauses / ops-sec + RUNNING the M4 invariant checker (test/invariants.mjs, reused) at every checkpoint to catch slow drift no bounded gate can: RSS creep, GC-pause degradation, a one-in-a-billion aggregate desync, throughput decay. Emits a time-series (JSONL) + a headline summary ("ran 6h, 14B picks, RSS flat, GC major 0, invariants green at all N checkpoints") -- the A+ evidence artifact for an evaluator replacing a paid lib. Scaffold opportunistically at M6 (shares the sustained-load GC machinery), grow a lane per strategy. | any |
 | Optional peer | **lite-fastbit32 small-pool fast path** | N <= 32 eligibility in one branchless word; internal optimization, identical `pick()`, opt-in/auto. ADR 0001 Fork 5 (most reversible fork, deferred by design). | any |
 
 ---

@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.4.0 ships six strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, and the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family** -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view). The rest of the roster -- PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
+> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.5.0 ships six strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, and the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family** -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view), plus a **`@zakkster/lite-pick/pool`** subpath: the async dispatch/settle counter layer with distinct-endpoint failover and a duck-typed query-cache fetcher. The rest of the roster -- PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom -- lands one per session.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-pick.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-pick)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -21,7 +21,7 @@ The npm landscape has old algorithm libraries (`load-balancers`, `loadbalance`, 
 - **Two pieces of evidence, both shipped.** A **0 B/op** witness on the pick path (no object, closure, string, or array created per pick), and a measured **balance-quality anchor** -- peak-to-average load within the strategy's theoretical ceiling (for P2C, the Azar-Broder-Karlin-Upfal `ln ln n / ln 2` bound) and strictly better than a random foil.
 - **A pure selector, not a proxy.** It **consumes** health and circuit state; it never owns them. Health is a shared read-only bitmap written by [`@zakkster/lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health); circuit state comes from [`@zakkster/lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart); load counters are caller-owned typed arrays. `pick()` only reads.
 
-> **Status: M4 (v0.4.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, and the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family**. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), and **SED tracks weight within 1%**. New in M4: a **seeded invariant fuzzer** (`test/fuzz.mjs`) that asserts each strategy's state-synchronisation invariants after *every* op. See [ROADMAP.md](./ROADMAP.md) for the M4 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), and the RoundRobin (0003), SmoothWRR (0004), P2C (0005), and LeastConn-family (0006) design forks.
+> **Status: M5 (v0.5.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, and the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family**, and the **`@zakkster/lite-pick/pool`** request layer. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), and **SED tracks weight within 1%** -- all held under a **seeded invariant fuzzer** (`test/fuzz.mjs`) that checks state-synchronisation after *every* op. See [ROADMAP.md](./ROADMAP.md) for the M5 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), and the RoundRobin (0003), SmoothWRR (0004), P2C (0005), LeastConn-family (0006), and pool-adapter (0007) design forks.
 
 ```bash
 npm install @zakkster/lite-pick
@@ -168,6 +168,37 @@ VERSION;              // -> '0.4.0'
 ```
 
 `BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
+
+## Wiring it up -- `@zakkster/lite-pick/pool` (v0.5.0)
+
+The kernel gives you `pick() -> index`. Real callers also need the counter ergonomics: **increment in-flight on dispatch, decrement on settle, and re-pick a *different* endpoint on failure.** That layer is async (it wraps the request), so it lives in a separate subpath -- `@zakkster/lite-pick/pool` -- and the kernel stays 0 B/op.
+
+```js
+import { LeastConnBalancer } from '@zakkster/lite-pick';
+import { Pool, liteQueryFetcher } from '@zakkster/lite-pick/pool';
+
+const eligible = Uint8Array.from([1, 1, 1, 1]);
+const inflight = new Uint32Array(4);
+const balancer = new LeastConnBalancer(4, eligible, inflight);
+const pool = new Pool(balancer, inflight);      // Pool is the inc/dec authority around run()
+
+// run(): pick -> inflight++ -> await fn -> inflight-- (in a finally). tries=2 re-picks a
+// DIFFERENT endpoint if the first throws (a load-aware strategy steers off the failed node).
+const res = await pool.run((i, signal) => fetch(urls[i], { signal }), { tries: 2 });
+
+// Drop-in for a query cache (lite-query, or any `({ key, signal }) => Promise` fetcher).
+// Duck-typed -- imports NOTHING from lite-query, so peerDependencies stays empty.
+const fetcher = liteQueryFetcher(pool,
+  ({ endpoint, key, signal }) => fetch(urls[endpoint] + '/' + key[0], { signal }).then(r => r.json()),
+  { tries: 2 });
+// query(qc, { key: ['users'], fetcher });
+```
+
+**Two layers, no overlap** ([ADR 0007](./decisions/0007-pool-adapter.md)): the pool owns **spatial** failover (try a different endpoint *now*); your query cache owns **temporal** retry (backoff, staleness). `run()` is a normal async wrapper -- it adds O(1) counter ops per attempt, **it is not held to the kernel's 0 B/op bar** (that's `pick()`). See it end-to-end -- least-conn fan-out over a flaky pool with a node killed mid-run, proving 0 dead picks and 0 leaked in-flight:
+
+```bash
+npm run demo
+```
 
 ## Design ownership (ratified before any strategy)
 

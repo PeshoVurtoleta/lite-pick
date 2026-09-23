@@ -17,7 +17,7 @@
  * The random-foil peak/avg baseline (what P2C must beat at M3) is printed for context.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, Prng } from '../Pick.js';
 
 let failed = false;
 function check(cond, msg) {
@@ -308,6 +308,50 @@ process.stdout.write('lite-pick balance (M7: PeakEWMA -- latency anchor)\n');
         'PeakEWMA service p99 ' + pe.p99.toFixed(0) + 'ns >= 20% below P2C ' + p2c.p99.toFixed(0) + 'ns');
     check(rnd.p99 > pe.p99 && rnd.p99 > p2c.p99,
         'random foil p99 ' + rnd.p99.toFixed(0) + 'ns is worse than both PeakEWMA and P2C');
+}
+
+// --- ConsistentHash: THE disruption anchor -- minimal remap on a scale event -----------------
+// The consistent-hash selling point: removing a backend must reshuffle ONLY that backend's keys
+// (~1/N), not the whole keyspace. We hash 1e5 seeded keys through a 64-backend Maglev table, remove
+// one backend (mark it down -- NO rebuild), and count how many keys changed backend. The anchor:
+// remapped/1e5 <= 2/N (3.13%); the naive-modulo foil (key % n -> key % (n-1)) reshuffles >= 95%.
+process.stdout.write('lite-pick balance (M8: ConsistentHash -- disruption anchor)\n');
+{
+    const N = 64;
+    const M = 8191;                 // a prime table size, smooth at N=64
+    const KEYS = 100000;
+    const el = new Uint8Array(N); el.fill(1);
+    const ch = new ConsistentHashBalancer(N, el, null, M, 0xABCDEF);
+
+    // Seeded integer keys (the caller-hashes-the-key contract: pick takes an integer).
+    const rng = new Prng(0xBEEF1234);
+    const keys = new Uint32Array(KEYS);
+    for (let i = 0; i < KEYS; i++) keys[i] = rng.next();
+
+    const before = new Int32Array(KEYS);
+    for (let i = 0; i < KEYS; i++) before[i] = ch.pick(keys[i]);
+
+    const removed = 7;
+    ch.setEligible(removed, false);   // remove a backend: table UNCHANGED, probe reroutes its keys
+    let moved = 0, deadPicks = 0;
+    for (let i = 0; i < KEYS; i++) {
+        const p = ch.pick(keys[i]);
+        if (p !== before[i]) moved++;
+        if (p === removed) deadPicks++;
+    }
+    const chRemapPct = moved / KEYS * 100;
+
+    // Naive-modulo foil: key % N vs key % (N-1) on a remove event.
+    let foilMoved = 0;
+    for (let i = 0; i < KEYS; i++) if (keys[i] % N !== keys[i] % (N - 1)) foilMoved++;
+    const foilPct = foilMoved / KEYS * 100;
+
+    const anchor = 2 / N * 100;      // 3.125%
+    process.stdout.write('  remove 1 of ' + N + ': ConsistentHash remaps ' + chRemapPct.toFixed(2) +
+        '% of keys (anchor <= ' + anchor.toFixed(2) + '%)  naive-modulo foil ' + foilPct.toFixed(1) + '%\n');
+    check(chRemapPct <= anchor, 'ConsistentHash remap ' + chRemapPct.toFixed(2) + '% <= ' + anchor.toFixed(2) + '% (2/N)');
+    check(deadPicks === 0, 'ConsistentHash never routes to the removed backend (dead picks = ' + deadPicks + ')');
+    check(foilPct >= 95, 'naive-modulo foil remap ' + foilPct.toFixed(1) + '% >= 95% (the trap ConsistentHash avoids)');
 }
 
 if (failed) {

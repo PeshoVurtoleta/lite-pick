@@ -268,6 +268,38 @@ data (dump() snapshot) + pathology detectors; only the render target differs. Se
 
 ---
 
+## 5. THE CAPSTONE (north-star, user 2026-09-23) -- a served, FUNCTIONING load-balancing system
+
+Modeled on lite-di-container's `diEcosystem/` (a served hub page + REAL working sub-apps -- audio-rooms,
+market-map with a live feed-server -- deployed via CI, "not built but functioning, anyone can see the served
+system"). The lite-pick equivalent, built when the roster is complete (>= 1.0), UNIFIES the already-planned
+threads into one living artifact -- the proof that an A+, zero-GC, zero-alloc module is still worth building
+in the AI age (the user's explicit mission: "me and you should prove it is still possible"). It doesn't
+matter how many sessions it takes.
+
+Composition (each part is already on this roadmap; the capstone WIRES them together and SERVES them):
+- **The hub page** (mirrors diEcosystem/index.html): what lite-pick is, all ten strategies, the SHIPPED
+  evidence (balance anchor, GC blast-radius, the ~1.5%-vs-98% disruption headline, the fingerprint gallery),
+  links into the live demos. Served on GitHub Pages via a YAML workflow -- anyone sees it, no clone.
+- **A REAL fan-out service, watched LIVE** (the market-map equivalent): actual backends with real latency +
+  injectable failure, a real lite-pick balancer routing real traffic, with Pool Scope (post-1.0 #5) rendering
+  the live `dump()` -- flip the strategy, kill a node, watch the distribution morph + pathologies light up
+  FROM REAL REQUESTS, not a sim. Functioning, not just built.
+- **Both surfaces** (user requirement): the BROWSER Pool Scope (canvas) AND the TERMINAL TUI Pool Scope
+  (braille/block) driving the SAME live system.
+- **Kept alive by the endurance soak** (post-1.0 #8): run under `caffeinate -i` so the served demo is a
+  genuinely long-running system -- the soak is the demo's heartbeat, not a canned recording.
+- **The lego proof**: the service is built from lite-pick + di-health (eligibility) + lite-query (fetcher) +
+  lite-charts/lite-signal (the viz) + lite-sketch (latency percentiles) -- the bricks snapping into a real
+  self-balancing system.
+
+Deliverable shape (when scoped): a `pickEcosystem/` dir (hub + the live fan-out app + browser & TUI Pool
+Scope + a feed/backend server) + a GitHub Pages CI workflow. Depends on: #5 (viz, browser + TUI) and #8
+(soak). Design captured in design/pool-scope.md. This is the LAST thing built, and the thing everything else
+was evidence for.
+
+---
+
 *First-pass build roadmap for lite-pick, modeled on lite-o1/ROADMAP.md + the suite
 blueprint. Turns RESEARCH.md's strategy roster into one pipeline session each, substrate
 and benchmark suite as dedicated sessions. Name SETTLED: LitePick (@zakkster/lite-pick).

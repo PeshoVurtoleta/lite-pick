@@ -69,6 +69,41 @@ export function checkBase(b, eligible, cap, lastPick, mass) {
     return null;
 }
 
+/**
+ * ConsistentHash structural invariants (M8): the lookup table maps ONLY to in-range backend
+ * indices, and the last pick is PICK_NONE or an in-range ELIGIBLE index (never a down / oob one).
+ * Returns null or the first violated invariant as a string.
+ */
+export function checkConsistentHash(b, eligible, cap, lastPick) {
+    const lookup = b._lookup, M = b._m;
+    for (let s = 0; s < M; s++) {
+        const i = lookup[s];
+        if (i < 0 || i >= cap) return 'lookup[' + s + '] out of range: ' + i;
+    }
+    if (lastPick !== PICK_NONE) {
+        if (lastPick < 0 || lastPick >= cap) return 'pick ' + lastPick + ' out of range';
+        if (!eligible[lastPick]) return 'pick ' + lastPick + ' is a DOWN index';
+    }
+    return null;
+}
+
+/**
+ * The independent reachability oracle for ConsistentHash's fail-closed IFF: is an eligible backend
+ * reachable from `keyHash`'s slot within the bounded forward-probe (initial slot + `bound` probes)?
+ * Reads the table + eligibility exactly as pick() does, so a mismatch flags an off-by-one / stale
+ * table. Returns 1 (reachable) or 0 (fail-closed within the bound).
+ */
+export function reachableWithinBound(b, eligible, keyHash, bound) {
+    const M = b._m, lookup = b._lookup;
+    let slot = (keyHash >>> 0) % M;
+    if (eligible[lookup[slot]]) return 1;
+    for (let p = 0; p < bound; p++) {
+        slot++; if (slot >= M) slot = 0;
+        if (eligible[lookup[slot]]) return 1;
+    }
+    return 0;
+}
+
 /** The exact minimum of scoreFn(i) over eligible i (candidateFn gates candidacy). Infinity if none. */
 export function minEligibleScore(eligible, cap, scoreFn, candidateFn) {
     let best = Infinity;

@@ -20,12 +20,16 @@
 
 import {
     RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
-    LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, PICK_NONE,
+    LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer,
+    ConsistentHashBalancer, PICK_NONE, CH_PROBE_LIMIT,
 } from '../Pick.js';
 import {
     checkBase, recomputeEligibleWeight, recomputeEligibleWeighted,
-    allFinite, minEligibleScore,
+    allFinite, minEligibleScore, checkConsistentHash, reachableWithinBound,
 } from './invariants.mjs';
+
+/** A small PRIME Maglev table size for the fuzzer -- large enough for CAPS max (63), fast to rebuild. */
+const CH_FUZZ_M = 127;
 
 /** The fuzzer's OWN deterministic RNG (an LCG), independent of any balancer's internal PRNG. */
 function lcg(seed) {
@@ -131,6 +135,15 @@ const SPECS = {
             return null;
         },
     },
+    ConsistentHash: {
+        weighted: true, loadAware: false, usesSetWeight: true, keyed: true,
+        make: (cap, el, _inf, w) => new ConsistentHashBalancer(cap, el, w, CH_FUZZ_M, 0xC0FFEE),
+        // Fail-closed IFF for a bounded-probe consistent hash is per-KEY: PICK_NONE holds exactly
+        // when no eligible backend is reachable from the key's slot within the probe bound.
+        mass: (ctx) => reachableWithinBound(ctx.b, ctx.el, ctx.keyHash, CH_PROBE_LIMIT),
+        // Structural: the table maps only to in-range indices, and the pick is eligible/in-range.
+        extra: (b, ctx, p) => checkConsistentHash(b, ctx.el, ctx.cap, p),
+    },
 };
 
 /**
@@ -148,7 +161,7 @@ function runOne(name, seed, cap, steps) {
     if (spec.weighted) for (let i = 0; i < cap; i++) weights[i] = drawWeight(rnd);
 
     const b = spec.make(cap, el, inflight, weights);
-    const ctx = { b, cap, el, inflight, weights };
+    const ctx = { b, cap, el, inflight, weights, keyHash: 0 };
     // A monotonic caller clock for the latency-aware strategy (pick(now) + recordRtt(...,now)).
     let now = 0;
 
@@ -178,7 +191,10 @@ function runOne(name, seed, cap, steps) {
         }
 
         now += 1 + (rnd() % 1024);
-        const p = spec.latencyAware ? b.pick(now) : b.pick();
+        let p;
+        if (spec.keyed) { ctx.keyHash = rnd(); p = b.pick(ctx.keyHash); }
+        else if (spec.latencyAware) p = b.pick(now);
+        else p = b.pick();
         const mass = spec.mass(ctx);
         const baseErr = checkBase(b, el, cap, p, mass);
         if (baseErr) return { name, seed, cap, step, reason: baseErr };
@@ -224,6 +240,14 @@ function pathological() {
         for (const b of bs) if (b.pick() !== 0) fails.push('single-node ' + b.constructor.name + ' did not return 0');
         el[0] = 0;
         for (const b of bs) { b.setEligible(0, false); if (b.pick() !== PICK_NONE) fails.push('single-node-down ' + b.constructor.name + ' did not fail closed'); }
+    }
+    // 4. ConsistentHash single-node (keyed pick): the sole backend for every key, PICK_NONE when down.
+    {
+        const el = new Uint8Array(1).fill(1);
+        const ch = new ConsistentHashBalancer(1, el, null, 2);
+        for (let k = 0; k < 1000; k++) if (ch.pick(k * 2654435761) !== 0) { fails.push('single-node ConsistentHash did not return 0'); break; }
+        ch.setEligible(0, false);
+        if (ch.pick(123) !== PICK_NONE) fails.push('single-node-down ConsistentHash did not fail closed');
     }
     return fails;
 }

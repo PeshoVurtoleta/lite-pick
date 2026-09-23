@@ -6,7 +6,7 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer } from '../../Pick.js';
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -146,3 +146,27 @@ new PeakEwmaBalancer(4, new Uint8Array(4), new Uint32Array(4));
 
 // @ts-expect-error -- recordRtt needs three numbers.
 pe.recordRtt(0, 5000);
+
+// ConsistentHashBalancer: capacity + eligibility + optional weights + optional m + optional seed.
+const chM: number = CH_DEFAULT_M;
+const chP: number = CH_PROBE_LIMIT;
+void chM; void chP;
+const ch: ConsistentHashBalancer = new ConsistentHashBalancer(4, new Uint8Array(4));
+const chW: ConsistentHashBalancer = new ConsistentHashBalancer(4, new Uint8Array(4), new Uint32Array(4));
+const chFull: ConsistentHashBalancer = new ConsistentHashBalancer(4, new Uint8Array(4), new Uint32Array(4), 257, 123);
+void chW; void chFull;
+const chBase: BalancerBase = ch; // is-a BalancerBase
+void chBase;
+const chSize: number = ch.tableSize;
+void chSize;
+const chPick: number = ch.pick(0xdeadbeef);
+void chPick;
+ch.setWeight(0, 5);
+ch.rebuild();
+ch.setEligible(1, false);
+
+// @ts-expect-error -- weights must be a Uint32Array, not a number[].
+new ConsistentHashBalancer(4, new Uint8Array(4), [1, 1, 1, 1]);
+
+// @ts-expect-error -- tableSize is readonly.
+ch.tableSize = 5;

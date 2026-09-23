@@ -15,7 +15,7 @@
  * on tiny pools while still catching a real complexity regression.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -112,11 +112,22 @@ const SUBJECTS = [
             return () => { now += 1000; return pe.pick(now); };
         },
     },
+    {
+        name: 'ConsistentHash',
+        complexity: 'const', // slot = key % M + a prebuilt-table read + a bounded probe -> flat with n
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const ch = new ConsistentHashBalancer(n, el, null, 4099, 0xABCDEF); // M=4099 prime >= max n
+            // Stride 97 keeps `key` a Smi (a value >= 2^31 would box as a HeapNumber, perturbing timing).
+            let key = 0;
+            return () => { key = (key + 97) & 0x3fffffff; return ch.pick(key); };
+        },
+    },
 ];
 
 let failed = false;
 for (const subj of SUBJECTS) {
-    process.stdout.write('lite-pick witness (M7: ' + subj.name + ', ' + subj.complexity + ')\n');
+    process.stdout.write('lite-pick witness (M8: ' + subj.name + ', ' + subj.complexity + ')\n');
     const rows = SIZES.map((n) => ({ n, opsPerMs: timePicks(subj.make(n)) }));
     // The series that MUST stay flat depends on the advertised complexity.
     const series = rows.map((r) => (subj.complexity === 'linear' ? r.opsPerMs * r.n : r.opsPerMs));

@@ -21,7 +21,7 @@
 import { zgcSuite } from '@zakkster/lite-perf-gate';
 import {
     Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
-    LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer,
+    LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer,
 } from '../../Pick.js';
 
 const CAP = 1 << 14;      // pool capacity 16384 (O(1)/O(d) scenarios: size is irrelevant)
@@ -284,9 +284,39 @@ const peakEwmaRecord = {
     },
 };
 
+/**
+ * consistenthash-pick: reused ConsistentHashBalancer over a half-eligible pool. Each op is
+ * slot = keyHash % M, a prebuilt-table read, and a bounded forward-probe past down slots -- O(1),
+ * a PURE read (the table is built ONCE, COLD, in setup -- excluded from the hot measurement). A
+ * small M (257) keeps the cold build cheap; pick is O(1) so pool size is irrelevant. The `grows`
+ * counter covers the eligibility + weights + the owned lookup table (none reallocates -> 0 delta).
+ */
+const CH_CAP = 256;
+const CH_M = 257;         // prime, >= CH_CAP
+const consistentHashPick = {
+    name: 'ConsistentHashBalancer.pick(keyHash)',
+    setup() {
+        const el = new Uint8Array(CH_CAP);
+        for (let i = 0; i < CH_CAP; i += 2) el[i] = 1; // half eligible -> exercise the probe
+        const ch = new ConsistentHashBalancer(CH_CAP, el, null, CH_M, 0xABCDEF);
+        return { el, ch, key: 0, acc: 0 };
+    },
+    hot(s, n) {
+        const ch = s.ch;
+        // Stride 97 (coprime to M=257) walks every slot; masked to 30 bits so `key` stays a Smi
+        // (a value >= 2^31 would box as a HeapNumber and be the ONLY thing scavenging -- not pick).
+        let acc = s.acc | 0, key = s.key | 0;
+        for (let i = 0; i < n; i++) { key = (key + 97) & 0x3fffffff; acc = (acc + ch.pick(key)) | 0; }
+        s.acc = acc | 0; s.key = key | 0;
+    },
+    statsOf(s) {
+        return { grows: s.el.buffer.byteLength + s.ch._weights.buffer.byteLength + s.ch._lookup.buffer.byteLength };
+    },
+};
+
 const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
-    leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord,
+    leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord, consistentHashPick,
 ];
 
 /**
@@ -432,6 +462,23 @@ const peMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** ConsistentHash teeth: pick(keyHash) boxed into a fresh [] each op -- MUST trip the gate. */
+const chMustFailAlloc = {
+    name: 'ConsistentHash.pick(keyHash) boxed into fresh array (MUST allocate)',
+    setup() {
+        const el = new Uint8Array(CH_CAP);
+        for (let i = 0; i < CH_CAP; i += 2) el[i] = 1;
+        return { el, base: new ConsistentHashBalancer(CH_CAP, el, null, CH_M, 1), key: 0 };
+    },
+    hot(s, n) {
+        const ch = s.base;
+        let sink = 0, key = s.key | 0;
+        for (let i = 0; i < n; i++) { key = (key + 97) & 0x3fffffff; const arr = [ch.pick(key)]; sink += arr[0]; }
+        s.sink = sink; s.key = key | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -443,6 +490,6 @@ zgcSuite({
     scenarios,
     mustFail: [
         drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc, p2cMustFailAlloc,
-        lcMustFailAlloc, sedMustFailAlloc, nqMustFailAlloc, peMustFailAlloc,
+        lcMustFailAlloc, sedMustFailAlloc, nqMustFailAlloc, peMustFailAlloc, chMustFailAlloc,
     ],
 });

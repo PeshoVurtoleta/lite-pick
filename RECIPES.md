@@ -236,7 +236,51 @@ Notes:
 
 ---
 
-## 9. Wire it into a query cache (lite-query, or any fetcher)
+## 9. Sticky / affinity routing -- ConsistentHash (you hash the key)
+
+When a request must land on the **same** backend every time -- a session pinned to a shard,
+a cache key kept warm, a stateful worker -- use `ConsistentHashBalancer`. It is a prebuilt
+**Maglev table**, so `pick(keyHash)` is `O(1)` and `0 B/op`, and scaling the pool moves only
+~`1/N` of keys (not the whole keyspace, the way `key % n` would).
+
+The one rule: **you hash the key to an INTEGER**, on the cold path. Per-pick *string* hashing
+allocates -- the single zero-GC hazard -- so `pick()` takes a number and `lite-pick` ships no
+hashing dependency. Any small integer hash works; FNV-1a is a fine default:
+
+```js
+import { ConsistentHashBalancer, PICK_NONE } from '@zakkster/lite-pick';
+
+// A tiny FNV-1a over a string -- done ONCE per key, never inside pick().
+function fnv1a(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return h >>> 0;
+}
+
+const eligible = new Uint8Array(CAP).fill(1);
+const lb = new ConsistentHashBalancer(CAP, eligible);   // default M = 65537 (prime)
+
+function routeFor(sessionId) {
+  const i = lb.pick(fnv1a(sessionId));   // same session -> same backend, at fixed membership
+  if (i === PICK_NONE) return respond503();
+  return endpoints[i];
+}
+```
+
+Notes:
+- **Remove a backend by marking it down** (`lb.setEligible(i, false)`) -- the table is
+  untouched, so only that backend's keys reroute (~`1/N`); everyone else stays put. A health
+  flap costs nothing (the bounded probe absorbs it) -- it never rebuilds.
+- **Add / reweight** rebuilds the table (cold): `new ConsistentHashBalancer(N + 1, ...)`, or
+  `lb.setWeight(i, w)` / `lb.rebuild()`. Pass a `Uint32Array` of weights for proportional shares.
+- **Cost:** the table is `M x 4` bytes (~256KB at the `65537` default) -- a cold, one-time
+  allocation. Turn `M` down for a small pool (any prime `>= N`).
+- `pick(keyHash)` coerces `keyHash >>> 0` and never throws; it returns `PICK_NONE` only when the
+  pool is down or no eligible backend is reachable within the probe bound.
+
+---
+
+## 10. Wire it into a query cache (lite-query, or any fetcher)
 
 `liteQueryFetcher` adapts a Pool into a `({ key, signal }) => Promise` fetcher -- the
 shape lite-query (or any cache/route-loader) expects. It imports nothing from lite-query
@@ -256,7 +300,7 @@ const fetcher = liteQueryFetcher(
 
 ---
 
-## 10. Choosing a strategy
+## 11. Choosing a strategy
 
 | Strategy      | Route by            | Cost        | Reach for it when |
 |---------------|---------------------|-------------|-------------------|
@@ -267,12 +311,14 @@ const fetcher = liteQueryFetcher(
 | SED           | in-flight / weight  | O(cap)      | weighted least-conn |
 | NQ            | idle-first else SED  | O(cap)/O(1) | worker pools -- never queue while a worker is free |
 | PeakEWMA      | in-flight x ewma(rtt)| O(1)        | heterogeneous / flaky backends; steer around slow nodes |
+| ConsistentHash| key hash (sticky)   | O(1)        | affinity/sticky: same key -> same backend, minimal disruption on scale |
 
-All read the SAME `inflight` array live, so you can swap strategies without rewiring.
+The load-aware strategies read the SAME `inflight` array live, so you can swap among them
+without rewiring; ConsistentHash instead takes an integer key per pick (recipe 9).
 
 ---
 
-## 11. The "FE profile" -- a browser / front-end client
+## 12. The "FE profile" -- a browser / front-end client
 
 For a front-end client picking among origins a handful of times per second (not a
 zero-GC hot loop), the recommended profile is **PeakEWMA + health/eligibility only** --
@@ -282,22 +328,24 @@ bounded-load / AZ / occupancy machinery. Feed rtt from your `fetch` timings via
 
 ---
 
-## 12. Compose with the suite (all optional, all duck-typed)
+## 13. Compose with the suite (all optional, all duck-typed)
 
 lite-pick declares ZERO hard dependencies and an EMPTY `peerDependencies`. Each seam is
 a shared TypedArray or a duck-typed shape, so you wire in a sibling only if you use it:
 
 - `@zakkster/lite-di-health` -- writes the eligibility bitmap from health checks.
 - `@zakkster/lite-statechart` -- a circuit breaker that flips eligibility.
-- `@zakkster/lite-query` -- the cache behind `liteQueryFetcher` (recipe 9).
+- `@zakkster/lite-query` -- the cache behind `liteQueryFetcher` (recipe 10).
 - `@zakkster/lite-sketch` -- `DDSketch` for a p99-aware PeakEWMA variant (deferred).
+- `@zakkster/lite-filter` -- a hot-key / known-key oracle at the ConsistentHash key-routing
+  layer (warm/cold only, never the pick path; deferred).
 - `@zakkster/lite-await` -- hedging (race the P2C second choice past a percentile).
 
 None is required; the kernel runs over raw TypedArrays with nothing installed.
 
 ---
 
-## 13. Zero-GC discipline (why the pick path stays 0 B/op)
+## 14. Zero-GC discipline (why the pick path stays 0 B/op)
 
 - Allocate `eligible` / `inflight` / `weights` ONCE at startup and reuse them. Never
   build arrays per pick.
@@ -310,10 +358,12 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
 
 ---
 
-## 14. Gotchas
+## 15. Gotchas
 
 - **PICK_NONE (-1)** is always possible -- handle it before indexing (recipe 2).
 - **SmoothWRR weights** must go through `setWeight`; direct array mutation is UB.
+- **ConsistentHash takes an INTEGER key** -- hash strings yourself, cold (recipe 9). Never
+  `pick(someString)` on the hot path; `M` must be a prime `>= capacity`.
 - **Load-aware strategies need the dispatch/settle loop** -- forget the `inflight--` in
   a `finally` and load leaks upward forever. Use `/pool` (recipe 6) to avoid it.
 - **PeakEWMA needs a finite `now`** and rtt feedback -- without `recordRtt` it behaves

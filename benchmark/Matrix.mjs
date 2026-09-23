@@ -16,7 +16,7 @@
  * PARITY check -- a strategy within noise of the foil while holding the contract has passed.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, Prng } from '../Pick.js';
 
 export const SIZES = [8, 64, 512, 4096];
 export const OPS = 2_000_000;
@@ -197,6 +197,18 @@ export const SUBJECTS = [
             for (let i = 0; i < n; i += 4) pe.recordRtt(i, (i & 31) * 1000, 0); // warm, varied costs
             let now = 0;
             return () => { now += 1000; return pe.pick(now); };
+        },
+    },
+    {
+        // Consistent hashing over a prebuilt Maglev table: pick(keyHash) = slot = key % M, a table
+        // read, and a bounded probe. O(1), 0 B/op; minimal disruption is proven by Disruption.mjs.
+        name: 'ConsistentHash',
+        dims: ['throughput', 'disruption'],
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const ch = new ConsistentHashBalancer(n, el, null, 4099, 0xABCDEF); // M=4099 prime >= max n
+            let key = 0; // stride 97 keeps key a Smi (a value >= 2^31 would box as a HeapNumber)
+            return () => { key = (key + 97) & 0x3fffffff; return ch.pick(key); };
         },
     },
 ];

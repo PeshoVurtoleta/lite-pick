@@ -43,7 +43,7 @@ async function main() {
     const { createLeakTracker } = await import('@zakkster/lite-leak');
     const {
         Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
-        LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer,
+        LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer,
     } = await import('../Pick.js');
 
     const CAP = 1 << 12;    // pool capacity 4096
@@ -98,6 +98,24 @@ async function main() {
         return tracker.size();
     }
     fillTracker();
+
+    // ConsistentHash owns a Maglev table + weights but no external kernel (no timer / listener /
+    // shared view retained beyond the caller), so it must finalize like every sibling. Its COLD
+    // build is O(M x N), so this churns SMALL instances (capacity 64, M 257) -- enough to prove
+    // finalization without a slow build storm. The cleanup closes over NOTHING.
+    const CH_CAP = 64, CH_M = 257, CH_CYCLES = 256;
+    function fillTrackerCH() {
+        const el = new Uint8Array(CH_CAP).fill(1);
+        const w = new Uint32Array(CH_CAP).fill(3);
+        for (let c = 0; c < CH_CYCLES; c++) {
+            const ch = new ConsistentHashBalancer(CH_CAP, el, w, CH_M, c);
+            ch.pick(c * 2654435761);
+            ch.setEligible(c & (CH_CAP - 1), (c & 1) === 0);
+            tracker.track(ch, noop, 'consistenthash', { audit: true });
+        }
+        return tracker.size();
+    }
+    fillTrackerCH();
 
     globalThis.gc();
     await new Promise((r) => setTimeout(r, 0));
@@ -222,11 +240,25 @@ async function main() {
     const rttAllocBytes = Math.max(0, Math.round(rttBpc));
     const rttAllocOk = rttAllocBytes === 0;
 
+    // ---- phase 11: ConsistentHash.pick(keyHash) per-call allocation (0 B/op) -
+    // The Maglev TABLE is built ONCE here (the COLD, disclosed cost -- M x 4 bytes, ~256KB at the
+    // 65537 default; excluded from the hot measurement). Steady-state pick(keyHash) is slot = key %
+    // M, a prebuilt-table read, and a bounded probe -- integer ops, no object/closure/array created.
+    const chEl = new Uint8Array(CAP);
+    for (let i = 0; i < CAP; i += 2) chEl[i] = 1;             // half eligible (exercise the probe)
+    const ch = new ConsistentHashBalancer(CAP, chEl, null, 65537, 0xC0FFEE); // COLD build, not measured
+    let chSink = 0, chKey = 0x12345678 >>> 0;
+    const chStep = () => { chKey = (Math.imul(chKey, 1664525) + 1013904223) >>> 0; chSink = (chSink + ch.pick(chKey)) | 0; };
+    const chAllocRes = measureAllocs(chStep, { iterations: 100000, batches: 8 });
+    const chBpc = chAllocRes.bytesPerCall === null ? 0 : chAllocRes.bytesPerCall;
+    const chAllocBytes = Math.max(0, Math.round(chBpc));
+    const chAllocOk = chAllocBytes === 0;
+
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void peSink;
+    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void peSink; void chSink;
 
-    process.stdout.write('lite-pick torture (M7: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ + PeakEWMA)\n');
+    process.stdout.write('lite-pick torture (M8: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ + PeakEWMA + ConsistentHash)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
@@ -248,9 +280,11 @@ async function main() {
         (peAllocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  PeakEWMA.recordRtt() allocs: ' + rttAllocBytes + ' B/op -> ' +
         (rttAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  ConsistentHash.pick(keyHash) allocs: ' + chAllocBytes + ' B/op -> ' +
+        (chAllocOk ? 'PASS' : 'FAIL') + ' (Maglev table build is the disclosed COLD cost)\n');
 
     if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk ||
-        !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk) {
+        !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk || !chAllocOk) {
         process.stderr.write('torture: FAIL\n');
         process.exit(1);
     }

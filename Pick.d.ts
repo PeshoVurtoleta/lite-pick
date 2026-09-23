@@ -1,9 +1,9 @@
 /**
  * @zakkster/lite-pick -- TypeScript declarations.
  *
- * M7 (0.7.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
- * (LeastConn/SED/NQ) + PeakEWMA (latency-aware P2C). The remaining strategy classes
- * (ConsistentHash, BoundedLoad, WeightedRandom) are added one per session.
+ * M8 (0.8.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
+ * (LeastConn/SED/NQ) + PeakEWMA (latency-aware P2C) + ConsistentHash (Maglev table). The
+ * remaining strategy classes (BoundedLoad, WeightedRandom) are added one per session.
  */
 
 /** The single source-of-truth version stamp. */
@@ -186,4 +186,41 @@ export class PeakEwmaBalancer extends BalancerBase {
     recordRtt(i: number, sampleNs: number, now: number): void;
     /** Pick by latency-aware power-of-two-choices at time `now` (ns), or `PICK_NONE`. O(d)=O(1). */
     pick(now?: number): number;
+}
+
+/** The default Maglev lookup-table size (a prime, 2^16 + 1). Configurable via the ctor. */
+export const CH_DEFAULT_M: number;
+
+/** The bounded forward-probe limit ConsistentHash walks past down slots (fail-closed). */
+export const CH_PROBE_LIMIT: number;
+
+/**
+ * ConsistentHashBalancer -- sticky / cache-affinity routing via a prebuilt MAGLEV lookup table
+ * (M8, IPVS `mh` / Meta Katran / Cilium). `pick(keyHash)` maps a caller-supplied INTEGER key to a
+ * fixed backend (slot = keyHash % M, a table read, and a bounded forward-probe past down slots) --
+ * O(1), 0 B/op. The key is a caller-supplied integer (coerced `>>> 0`; NaN -> 0), never a per-pick
+ * string hash (the one zero-GC hazard -- hash string keys yourself, cold). The balancer OWNS the
+ * lookup table (M x 4 bytes; the 65537 default is ~256KB, a COLD one-time allocation) and an internal
+ * weights array; `setWeight` / `rebuild` rebuild the table (COLD). A health flap is absorbed by the
+ * probe -- never a rebuild -- so removing a backend (`setEligible(i, false)`) remaps only ~1/N keys.
+ * Fails closed (`PICK_NONE`) when the pool is down or no eligible backend is reachable within the bound.
+ */
+export class ConsistentHashBalancer extends BalancerBase {
+    /**
+     * @param capacity backend count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param weights optional per-backend weights (length >= capacity), COPIED at construction;
+     *   null = equal weight.
+     * @param m the Maglev table size: a prime, > 1, and >= capacity (default 65537).
+     * @param seed deterministic salt for the permutation mix (default 0x9e3779b9); reproducible.
+     */
+    constructor(capacity: number, eligible: Uint8Array, weights?: Uint32Array | null, m?: number, seed?: number);
+    /** The Maglev table size M (prime). */
+    readonly tableSize: number;
+    /** Cold path: reconfigure backend `i`'s weight (uint32) and rebuild the table. */
+    setWeight(i: number, w: number): void;
+    /** Cold path: rebuild the lookup table from the current owned weights. */
+    rebuild(): void;
+    /** Map an integer `keyHash` to a backend index (bounded probe past down slots), or `PICK_NONE`. */
+    pick(keyHash?: number): number;
 }

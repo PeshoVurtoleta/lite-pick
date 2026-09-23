@@ -1,8 +1,9 @@
 /**
  * @zakkster/lite-pick -- zero-GC load-balancing SELECTION KERNEL.
  *
- * M7 (0.7.0): substrate seams + seven strategies -- RoundRobin, SmoothWRR, P2C, the exact
- * LeastConn family (LeastConn, SED, NQ), and PeakEWMA (latency-aware P2C). This file ships:
+ * M8 (0.8.0): substrate seams + eight strategies -- RoundRobin, SmoothWRR, P2C, the exact
+ * LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C), and ConsistentHash
+ * (a Maglev lookup table). This file ships:
  *
  *   - VERSION        the single source-of-truth version stamp (3-place sync).
  *   - PICK_NONE      the fail-closed sentinel (-1): "no endpoint", never a dead pick.
@@ -31,6 +32,12 @@
  *                    Decay-on-READ (pick() never writes -> 0 B/op); the balancer OWNS the Float64
  *                    _ewma/_stamp state and is its SOLE writer via the warm recordRtt() feedback
  *                    path (also 0 B/op). Caller-supplied nanosecond clock. O(d)=O(1)/pick.
+ *   - ConsistentHashBalancer  sticky/affinity routing via a prebuilt Maglev lookup table (IPVS
+ *                    `mh`, Meta Katran, Cilium): pick(keyHash) is slot = keyHash % M, a table read,
+ *                    and a bounded forward-probe over down slots -- O(1)/pick, 0 B/op. keyHash is a
+ *                    caller-supplied INTEGER (no per-pick string hashing = the one zero-GC hazard);
+ *                    the balancer OWNS the Uint32Array table + weights, rebuilt COLD on membership /
+ *                    weight change (health flap is handled by the probe, never a rebuild).
  *
  * The identity (decisions/0001): lite-pick OWNS NO mutable state it can avoid owning.
  * It reads pre-allocated views (eligibility, inflight, weights, scores) that siblings or
@@ -38,9 +45,9 @@
  * counters live OUTSIDE the kernel. The steady-state pick path allocates 0 B/op.
  *
  * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [M1], SmoothWRR [M2],
- *   P2C [M3], LeastConn/SED/NQ [M4], PeakEWMA [M7], ConsistentHash, BoundedLoad, WeightedRandom
- *   [planned]. The EXACT-O(log n) fewest-in-flight variant is a deferred @zakkster/lite-logn
- *   BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan.
+ *   P2C [M3], LeastConn/SED/NQ [M4], PeakEWMA [M7], ConsistentHash [M8], BoundedLoad,
+ *   WeightedRandom [planned]. The EXACT-O(log n) fewest-in-flight variant is a deferred
+ *   @zakkster/lite-logn BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan.
  *
  * M5 (0.5.0) adds the ergonomic request layer at the @zakkster/lite-pick/pool subpath (a
  * SEPARATE file, Pool.js -- the async dispatch/settle counter wrapper + distinct-endpoint
@@ -51,7 +58,7 @@
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.7.2';
+export const VERSION = '0.8.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -737,5 +744,235 @@ export class PeakEwmaBalancer extends BalancerBase {
         const costA = (inf[a] + 1) * (sa < 0 ? ewma[a] : ewma[a] * Math.exp(-(now - sa) / tau));
         const costB = (inf[b] + 1) * (sb < 0 ? ewma[b] : ewma[b] * Math.exp(-(now - sb) / tau));
         return costB < costA ? b : a;         // lower cost wins; tie -> the first draw
+    }
+}
+
+/** The default Maglev lookup-table size: a prime (2^16 + 1). Configurable via the ctor. */
+export const CH_DEFAULT_M = 65537;
+
+/** The bounded forward-probe limit ConsistentHash walks past down slots (fail-closed). */
+export const CH_PROBE_LIMIT = 64;
+
+/**
+ * A deterministic 32-bit integer mix (an SplitMix/Murmur-style finalizer). Used COLD, once
+ * per backend at table build, to derive the two Maglev permutation parameters from a backend
+ * INDEX -- NO string hashing, NO new dependency, no allocation. Returns a uint32.
+ * @param {number} x
+ * @returns {number}
+ */
+function chMix32(x) {
+    x = x >>> 0;
+    x ^= x >>> 16; x = Math.imul(x, 0x7feb352d);
+    x ^= x >>> 15; x = Math.imul(x, 0x846ca68b);
+    x ^= x >>> 16;
+    return x >>> 0;
+}
+
+/** Cold primality test (trial division). M must be prime so a Maglev skip yields a full permutation. */
+function chIsPrime(n) {
+    if (!Number.isInteger(n) || n < 2) return false;
+    if (n % 2 === 0) return n === 2;
+    if (n % 3 === 0) return n === 3;
+    for (let d = 5; d * d <= n; d += 6) {
+        if (n % d === 0 || n % (d + 2) === 0) return false;
+    }
+    return true;
+}
+
+/**
+ * ConsistentHashBalancer -- sticky / cache-affinity routing via a prebuilt MAGLEV lookup table
+ * (M8), the in-kernel/production consistent-hash choice (Linux IPVS `mh`, Meta Katran, Cilium).
+ *
+ * `pick(keyHash)` maps a caller-supplied INTEGER key to a fixed backend: slot = keyHash % M, read
+ * the backend at `lookup[slot]`, and if it is down walk a BOUNDED forward-probe (<= 64 slots) to
+ * the next eligible backend. That is a few integer ops over a prebuilt Uint32Array table -- O(1)
+ * per pick, 0 B/op. The KEY MUST BE AN INTEGER (`keyHash >>> 0`, so NaN -> 0 deterministically):
+ * per-pick STRING hashing is the one zero-GC hazard, so the caller hashes string keys themselves
+ * (cold) and passes the integer -- lite-pick adds NO hashing dependency (RESEARCH section 5).
+ *
+ * MINIMAL DISRUPTION is the selling point: on a scale event only ~1/N of keys move. Removing a
+ * backend is just marking it down (`setEligible(i, false)`) -- the table is UNCHANGED, so every
+ * key NOT on that backend keeps its exact backend (0 remap) and only its keys probe forward.
+ * A membership or WEIGHT change rebuilds the table (COLD); a health flap NEVER does (the probe
+ * absorbs it). test/balance.mjs anchors this: remove 1 of 64 backends -> <= 3.13% keys remapped,
+ * vs the naive-modulo foil's >= 95%.
+ *
+ * Ownership (ADR 0001, ADR 0010): the balancer OWNS the lookup `Uint32Array` (M x 4 bytes; the
+ * 65537 default is ~256KB, a COLD one-time allocation -- disclosed, and M is configurable DOWN
+ * for small pools) AND an internal weights `Uint32Array` (the SmoothWRR sole-writer precedent):
+ * cold `setWeight(i, w)` / `rebuild()` rebuild the table from the current weights. Eligibility is
+ * the shared read-only bitmap from BalancerBase, read live by `pick()`; the base `setEligible`
+ * only flips a bit (no rebuild).
+ *
+ * Weighted Maglev populate: each backend b takes a per-backend slot QUOTA proportional to its
+ * weight (unweighted = equal quota, quotas summing to exactly M), stepping through its own
+ * permutation `permutation[j] = (offset + j*skip) % M` (offset = h1(b) % M, skip = h2(b) % (M-1) +
+ * 1, h1/h2 from a deterministic integer mix of the index -- no string hashing). Because the
+ * permutation covers ALL M slots, a backend with remaining quota can always reach an empty slot
+ * while one exists, so the O(M x N) COLD build never stalls. BUILD-COST GUARD (fail closed): the
+ * ctor requires `capacity <= M` (more members than slots would overfill M / starve backends) and
+ * M prime > 1.
+ *
+ * DEFERRED optional-peer seam (ADR 0010 / llms.txt, never on the pick path): a `@zakkster/lite-filter`
+ * hot-key / known-key oracle (BlockedBloom etc.) for warm-affinity + admission at the KEY-routing
+ * layer, and a `@zakkster/lite-o1` `EliasFano` ring alternative to the table. Import NOTHING;
+ * `peerDependencies` STAYS `{}` until a shipped code path imports it.
+ *
+ * Bound: O(1) per pick, 0 B/op (integer ops over the prebuilt table -- no allocation). Fails closed
+ * (PICK_NONE) when the whole pool is down OR no eligible backend is reachable within the probe bound
+ * (a near-total outage may return PICK_NONE even if a far eligible slot exists -- safe, never a dead
+ * pick, over-conservative only under mass outage; ADR 0010).
+ */
+export class ConsistentHashBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  backend count (fixed; add/remove is a cold rebuild).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array|null} [weights=null]  optional per-backend weights (length >= capacity);
+     *   the values are COPIED into the balancer-owned weights at construction. null = equal weight.
+     * @param {number} [m=CH_DEFAULT_M]  the Maglev table size: a prime, > 1, and >= capacity.
+     * @param {number} [seed=0x9e3779b9]  deterministic salt for the permutation mix (reproducible).
+     */
+    constructor(capacity, eligible, weights = null, m = CH_DEFAULT_M, seed = 0x9e3779b9) {
+        super(capacity, eligible);
+        // Validate typeof-first, BEFORE allocating the table / owned weights (fail closed early).
+        if (typeof m !== 'number') {
+            throw new TypeError('[lite-pick] table size M must be a number');
+        }
+        if (!Number.isInteger(m) || m < 2 || !chIsPrime(m)) {
+            throw new RangeError('[lite-pick] table size M must be a prime integer > 1: ' + m);
+        }
+        if (capacity > m) {
+            throw new RangeError('[lite-pick] capacity ' + capacity +
+                ' exceeds table size M ' + m + ' (would overfill / starve backends)');
+        }
+        if (weights !== null && (!(weights instanceof Uint32Array) || weights.length < capacity)) {
+            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+        }
+        this._m = m;
+        this._seed = seed >>> 0;
+        // Balancer-owned weights (the SmoothWRR sole-writer precedent): copied, then the sole
+        // mutator is setWeight (which rebuilds). Unweighted default = equal weight 1.
+        this._weights = new Uint32Array(capacity);
+        if (weights !== null) this._weights.set(weights.subarray(0, capacity));
+        else this._weights.fill(1);
+        // The prebuilt lookup table (slot -> backend index). M x 4 bytes; the COLD build fills it.
+        this._lookup = new Uint32Array(m);
+        this._build();
+    }
+
+    /** The Maglev table size M (prime). Readonly. */
+    get tableSize() {
+        return this._m;
+    }
+
+    /**
+     * COLD: (re)populate the lookup table from the current balancer-owned weights via the weighted
+     * Maglev algorithm. O(M x N); never stalls (each backend's permutation covers all M slots).
+     * Rebuilt only on a membership / weight change -- never on a health flap. Allocates only cold
+     * scratch that is released after the build; the lookup table itself is reused in place.
+     */
+    _build() {
+        const M = this._m, N = this._cap, wt = this._weights, lookup = this._lookup, seed = this._seed;
+        // Per-backend Maglev permutation parameters from a deterministic integer mix of the index.
+        const offset = new Int32Array(N);
+        const skip = new Int32Array(N);
+        for (let b = 0; b < N; b++) {
+            const h1 = chMix32(b ^ seed);
+            const h2 = chMix32((b ^ seed) + 0x9e3779b9);
+            offset[b] = h1 % M;
+            skip[b] = (h2 % (M - 1)) + 1;
+        }
+        // Per-backend slot QUOTA proportional to weight, summing to exactly M (unweighted = equal).
+        const quota = new Int32Array(N);
+        let total = 0;
+        for (let b = 0; b < N; b++) total += wt[b];
+        if (total <= 0) {
+            // Degenerate all-zero weights: equal quota so the table is still fully, validly populated.
+            const base = Math.floor(M / N);
+            for (let b = 0; b < N; b++) quota[b] = base;
+            let leftover = M - base * N;
+            for (let b = 0; leftover > 0; b = (b + 1) % N) { quota[b]++; leftover--; }
+        } else {
+            let assigned = 0;
+            for (let b = 0; b < N; b++) { const q = Math.floor(wt[b] / total * M); quota[b] = q; assigned += q; }
+            let leftover = M - assigned;
+            // Hand the rounding leftover to positive-weight backends in index order (deterministic).
+            for (let b = 0; leftover > 0; b = (b + 1) % N) { if (wt[b] > 0) { quota[b]++; leftover--; } }
+        }
+        // Maglev populate honoring the quota. The permutation is surjective over all M slots, so a
+        // backend with remaining quota always reaches an empty slot while one exists -> no stall.
+        const next = new Int32Array(N);
+        const filledCount = new Int32Array(N);
+        const taken = new Uint8Array(M);
+        let filled = 0;
+        while (filled < M) {
+            let progressed = false;
+            for (let b = 0; b < N; b++) {
+                if (filledCount[b] >= quota[b]) continue;
+                let j = next[b];
+                let c = (offset[b] + (j % M) * skip[b]) % M;
+                while (taken[c]) { j++; c = (offset[b] + (j % M) * skip[b]) % M; }
+                lookup[c] = b;
+                taken[c] = 1;
+                next[b] = j + 1;
+                filledCount[b]++;
+                filled++;
+                progressed = true;
+                if (filled >= M) break;
+            }
+            if (!progressed) break;   // unreachable while quotas sum to M -- defensive
+        }
+        // Defensive completeness (unreachable): any slot left empty is pinned to backend 0 so pick()
+        // never reads a stale / out-of-range index. Fail closed on a valid table, always.
+        if (filled < M) {
+            for (let c = 0; c < M; c++) if (!taken[c]) lookup[c] = 0;
+        }
+    }
+
+    /**
+     * COLD: reconfigure backend i's weight (uint32) and REBUILD the table from the new weights.
+     * The balancer is the sole writer of its owned weights (the SmoothWRR precedent).
+     * @param {number} i
+     * @param {number} w  new weight (uint32)
+     */
+    setWeight(i, w) {
+        if (i < 0 || i >= this._cap) throw new RangeError('[lite-pick] index out of range: ' + i);
+        const nw = w >>> 0;
+        if (nw !== w) throw new RangeError('[lite-pick] weight must be a uint32: ' + w);
+        if (nw === this._weights[i]) return;
+        this._weights[i] = nw;
+        this._build();
+    }
+
+    /** COLD: rebuild the lookup table from the current owned weights (e.g. after a membership change). */
+    rebuild() {
+        this._build();
+    }
+
+    /**
+     * Map an INTEGER key to a backend index, or PICK_NONE (fail closed). O(1), 0 B/op.
+     *
+     * slot = (keyHash >>> 0) % M; if `lookup[slot]` is eligible return it, else forward-probe up to
+     * CH_PROBE_LIMIT (64) slots for the next eligible backend. `keyHash` is coerced `>>> 0` (NaN -> 0
+     * deterministically) and pick NEVER throws (the fail-closed contract). Returns PICK_NONE when the
+     * whole pool is down or no eligible backend is reachable within the bound.
+     * @param {number} keyHash  a caller-supplied integer key hash (coerced to uint32)
+     * @returns {number}
+     */
+    pick(keyHash) {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const M = this._m, el = this._eligible, lookup = this._lookup;
+        let slot = (keyHash >>> 0) % M;           // integer key; NaN >>> 0 = 0 (never throws)
+        let i = lookup[slot];
+        if (el[i]) return i;
+        // Bounded forward-probe past down slots. Past the bound we fail closed: a near-total outage
+        // may return PICK_NONE even if a far eligible slot exists -- safe, never a dead pick.
+        for (let p = 0; p < CH_PROBE_LIMIT; p++) {
+            slot++;
+            if (slot >= M) slot = 0;
+            i = lookup[slot];
+            if (el[i]) return i;
+        }
+        return PICK_NONE;
     }
 }

@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.7.2
+Version: 0.8.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,16 +14,26 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.7.0 ships the substrate seams + seven strategies: RoundRobin, SmoothWRR (the weighted
+0.8.0 ships the substrate seams + eight strategies: RoundRobin, SmoothWRR (the weighted
 default), P2C (power-of-two-choices -- also the O(1) least-connections APPROXIMATION), the
-EXACT LeastConn family (LeastConn, SED, NQ), and PeakEWMA (latency-aware P2C). It exports
-`VERSION`, the fail-closed sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32),
-`BalancerBase` (the shared read-only eligibility seam + O(1) live count), `RoundRobinBalancer`,
-`SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, and
-`PeakEwmaBalancer`. The remaining strategies land one per session (see ROADMAP.md):
-ConsistentHash, BoundedLoad, WeightedRandom. The EXACT-O(log n) fewest-in-flight variant is a
-deferred @zakkster/lite-logn `BinaryHeap` optional-peer seam (decisions/0006), not this
-exact-O(cap) scan.
+EXACT LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C), and ConsistentHash
+(a Maglev lookup table -- sticky/affinity routing). It exports `VERSION`, the fail-closed
+sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (the shared
+read-only eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`,
+`P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`,
+`ConsistentHashBalancer`, and the ConsistentHash constants `CH_DEFAULT_M` (65537) / `CH_PROBE_LIMIT`
+(64). The remaining strategies land one per session (see ROADMAP.md): BoundedLoad, WeightedRandom.
+The EXACT-O(log n) fewest-in-flight variant is a deferred @zakkster/lite-logn `BinaryHeap`
+optional-peer seam (decisions/0006), not this exact-O(cap) scan.
+
+M8 (0.8.0) adds ConsistentHashBalancer (decisions/0010): a prebuilt Maglev lookup table (IPVS `mh`,
+Meta Katran, Cilium) mapping a caller-supplied INTEGER key to a backend, O(1) / 0 B/op, with minimal
+disruption on a scale event (~1/N keys move, measured ~1.6% vs the naive-modulo foil's ~98%). The
+vs-AWS positioning: NLB flow-hash (5-tuple) is a Maglev consistent hash -- ConsistentHashBalancer is
+that same family at the in-process hop AWS never sees. DEFERRED optional-peer seams (import NOTHING;
+peerDependencies STAYS `{}` until a shipped path imports one): a @zakkster/lite-filter hot-key /
+known-key oracle (BlockedBloom etc.) at the KEY-routing layer (warm/cold only, never the pick path),
+and a @zakkster/lite-o1 `EliasFano` ring alternative to the table.
 
 M7 (0.7.0) adds PeakEwmaBalancer (decisions/0009). The FE PROFILE: for a browser / front-end
 client (a handful of picks per second, not a zero-GC hot loop), the recommended profile is
@@ -150,6 +160,30 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - CONTRACT: `now` and `sampleNs` MUST be FINITE numbers. `recordRtt` THROWS on a non-finite
     argument (warm path); `pick(now)` NEVER throws (fail-closed contract), so a non-finite `now`
     yields P2C-random selection, not an error.
+- `ConsistentHashBalancer extends BalancerBase` -- class. Sticky/affinity routing via a prebuilt
+  MAGLEV lookup table (M8, IPVS `mh` / Meta Katran / Cilium).
+  - `new ConsistentHashBalancer(capacity, eligible, weights?=null, m?=65537, seed?=0x9e3779b9)` --
+    `weights` is an optional caller Uint32Array (length >= capacity) COPIED into balancer-owned
+    weights (null = equal). `m` is the table size: a PRIME, > 1, and >= capacity (the guard: capacity
+    > m throws -- it would overfill / starve backends). Validates typeof-first BEFORE allocating the
+    table. Builds the table COLD (O(M x N) weighted Maglev populate; the M x 4-byte table is ~256KB at
+    the 65537 default -- disclosed cold cost, M configurable down for small pools).
+  - `pick(keyHash)` -> number. Maps an INTEGER key: slot = (keyHash >>> 0) % M, read `lookup[slot]`,
+    and if down forward-probe up to CH_PROBE_LIMIT (64) slots for the next eligible backend. O(1),
+    0 B/op. `keyHash` is coerced `>>> 0` (NaN -> 0) and pick NEVER throws. `PICK_NONE` when the pool is
+    down OR no eligible backend is reachable within the bound (a mass outage may fail closed even if a
+    far eligible slot exists -- safe, never a dead pick). KEY IS A CALLER INTEGER -- no per-pick string
+    hashing (the one zero-GC hazard); hash string keys yourself, cold. No hashing dependency added.
+  - `setWeight(i, w)` -> void. COLD. Set backend i's weight (uint32) and REBUILD the table.
+  - `rebuild()` -> void. COLD. Rebuild the table from the current owned weights (e.g. after a
+    membership change). A health flap does NOT rebuild -- the bounded probe absorbs it.
+  - `tableSize` -- readonly number. The Maglev table size M (prime).
+  - Minimal disruption: removing a backend is `setEligible(i, false)` (no rebuild), so only ~1/N keys
+    reroute (measured ~1.6% on remove/add vs the naive-modulo foil's ~98%; benchmark/Disruption.mjs).
+  - vs-AWS: NLB flow-hash (5-tuple) is a Maglev consistent hash -- this is that family at the
+    in-process hop. DEFERRED optional-peer seams (import nothing, peerDependencies STAYS `{}`): a
+    @zakkster/lite-filter hot-key oracle at the key-routing layer (warm/cold only), and a
+    @zakkster/lite-o1 `EliasFano` ring alternative to the table (decisions/0010).
 
 ## Subpath: @zakkster/lite-pick/pool -- the ergonomic request layer (M5, Pool.js)
 

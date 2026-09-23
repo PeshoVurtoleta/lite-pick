@@ -196,22 +196,25 @@ function buildBlocks(data) {
         blocks.gc = { lines, entries };
     }
 
-    // bench:disruption -- trust gate (naive-modulo remap % exact; ConsistentHash SKIP row).
+    // bench:disruption -- trust gate. Naive-modulo remap %, the REAL Maglev remap % (measured at
+    // M8), and the 1/n ideal -- all exact (seeded keys + deterministic Maglev build).
     {
         const d = data.disruption;
         const labels = ['node removed', 'node added'];
         const lines = [
-            '| scale event | naive-modulo remap | good consistent hash |',
-            '| --- | --- | --- |',
+            '| scale event | naive-modulo remap | ConsistentHash (Maglev) | ideal (1/n) |',
+            '| --- | --- | --- | --- |',
         ];
         const entries = [];
         for (let i = 0; i < d.naiveModulo.length; i++) {
             const m = d.naiveModulo[i];
-            lines.push('| ' + labels[i] + ' | ' + fmt1(m.remapPct) + '% | ' + fmt1(m.idealPct) + '% |');
+            const c = d.consistentHash[i];
+            lines.push('| ' + labels[i] + ' | ' + fmt1(m.remapPct) + '% | ' +
+                fmt1(c.remapPct) + '% | ' + fmt1(m.idealPct) + '% |');
             entries.push({ kind: 'exact', value: Number(fmt1(m.remapPct)) });
+            entries.push({ kind: 'exact', value: Number(fmt1(c.remapPct)) });
             entries.push({ kind: 'exact', value: Number(fmt1(m.idealPct)) });
         }
-        lines.push('| ConsistentHash (Maglev) | SKIP -- ships in a later milestone | -- |');
         blocks.disruption = { lines, entries };
     }
 

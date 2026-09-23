@@ -4,6 +4,43 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-23
+
+### Added
+
+- **`ConsistentHashBalancer` (M8)** -- sticky / cache-affinity routing via a prebuilt **Maglev
+  lookup table** (the in-kernel/production choice: Linux IPVS `mh`, Meta Katran, Cilium).
+  `pick(keyHash)` maps a caller-supplied **integer** key to a backend (`slot = keyHash % M`, a table
+  read, and a bounded forward-probe past down slots) -- **O(1)**, **0 B/op**. The key is coerced
+  `>>> 0` (NaN -> 0) and `pick` never throws (fail-closed). Per-pick *string* hashing is the one
+  zero-GC hazard, so callers hash string keys themselves (cold); `lite-pick` adds **no hashing
+  dependency**. The balancer owns the lookup `Uint32Array` (`M x 4` bytes -- ~256KB at the `65537`
+  default `M`, a disclosed **cold** one-time allocation; `M` is configurable down for small pools)
+  and an internal weights array; `setWeight(i, w)` / `rebuild()` rebuild the table cold, while a
+  **health flap never rebuilds** -- the bounded probe (<= 64 slots) absorbs it. Weighted Maglev
+  populate gives each backend a per-backend slot quota proportional to its weight (unweighted = equal).
+  Fails closed (`PICK_NONE`) when the pool is down or no eligible backend is reachable within the bound.
+  Exports `CH_DEFAULT_M` (65537) and `CH_PROBE_LIMIT` (64) alongside the class. ([ADR 0010](./decisions/0010-consistenthash.md)).
+- **Minimal-disruption anchor** -- removing 1 of 64 backends remaps only **~1.6%** of keys (`test/balance.mjs`,
+  `benchmark/Disruption.mjs`), versus the naive-modulo foil's **~98%**. `benchmark/Disruption.mjs`
+  replaces its M6 explicit ConsistentHash **SKIP** row with a real measured Maglev row (vs the modulo
+  foil and the `1/n` ideal); `benchmark/results.json` + the README fences regenerated (bench:verify green).
+- Gates extended for the new strategy: `test/ConsistentHash.test.js` boundary suite; `test/fuzz.mjs`
+  keyed subject + `checkConsistentHash` / `reachableWithinBound` invariants; `test/torture.mjs` retention
+  + a `pick(keyHash)` 0 B/op phase (build excluded, cold); `test/perf/PerfGate.test.mjs`
+  `consistentHashPick` scenario + a `mustFail` alloc tooth; `test/witness.mjs` O(1) const flat-work
+  subject; `benchmark/Matrix.mjs` subject; `Pick.d.ts` + `test/types/pick.test-d.ts` typed surface.
+
+### Changed
+
+- `Pick.js`: STRATEGY-APPEND only -- the other seven strategies are **byte-identical**; the sole
+  changes are the header roster/count (seven -> eight), the `VERSION` bump, and the appended
+  `ConsistentHashBalancer` (+ the `chMix32` / `chIsPrime` cold helpers and the `CH_*` constants).
+- `VERSION` bumped 0.7.2 -> **0.8.0** across the three sync sites (package.json, `Pick.js`, llms.txt);
+  package `description` + `keywords` (added `consistent-hash`, `sticky`) updated. `peerDependencies`
+  stays `{}` (the deferred `@zakkster/lite-filter` hot-key-oracle and `@zakkster/lite-o1` `EliasFano`
+  ring seams import nothing until a shipped path uses them).
+
 ## [0.7.2] - 2026-09-23
 
 ### Added

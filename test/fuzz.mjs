@@ -21,11 +21,12 @@
 import {
     RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
     LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer,
-    ConsistentHashBalancer, PICK_NONE, CH_PROBE_LIMIT,
+    ConsistentHashBalancer, BoundedLoadBalancer, PICK_NONE, CH_PROBE_LIMIT,
 } from '../Pick.js';
 import {
     checkBase, recomputeEligibleWeight, recomputeEligibleWeighted,
     allFinite, minEligibleScore, checkConsistentHash, reachableWithinBound,
+    checkBoundedLoad,
 } from './invariants.mjs';
 
 /** A small PRIME Maglev table size for the fuzzer -- large enough for CAPS max (63), fast to rebuild. */
@@ -135,6 +136,19 @@ const SPECS = {
             return null;
         },
     },
+    BoundedLoad: {
+        // CHBL: ConsistentHash (keyed, Maglev table, weighted) + an occupancy cap. State-owning: the
+        // balancer OWNS a running _total, written SOLELY via note(). The fuzzer starts inflight at 0
+        // (no preseed) and routes EVERY inflight change through note() (the documented contract), so
+        // the invariant totalInflight === sum(inflight) must hold exactly after every op. Keyed, so
+        // the fail-closed IFF is per-KEY reachability within the probe window (like ConsistentHash --
+        // pick falls back to the first eligible, so PICK_NONE holds iff none is reachable).
+        weighted: true, loadAware: true, usesSetWeight: true, keyed: true, boundedLoad: true,
+        make: (cap, el, inf, w) => new BoundedLoadBalancer(cap, el, inf, 0.25, w, CH_FUZZ_M, 0xC0FFEE),
+        mass: (ctx) => reachableWithinBound(ctx.b, ctx.el, ctx.keyHash, CH_PROBE_LIMIT),
+        // Structural (table maps in-range, pick eligible/in-range) AND the owned _total stays exact.
+        extra: (b, ctx, p) => checkConsistentHash(b, ctx.el, ctx.cap, p) || checkBoundedLoad(b, ctx.inflight, ctx.cap),
+    },
     ConsistentHash: {
         weighted: true, loadAware: false, usesSetWeight: true, keyed: true,
         make: (cap, el, _inf, w) => new ConsistentHashBalancer(cap, el, w, CH_FUZZ_M, 0xC0FFEE),
@@ -156,12 +170,25 @@ function runOne(name, seed, cap, steps) {
     const el = new Uint8Array(cap);
     for (let i = 0; i < cap; i++) el[i] = (rnd() % 10) >= 3 ? 1 : 0; // ~70% up
     const inflight = new Uint32Array(cap);
-    if (spec.loadAware) for (let i = 0; i < cap; i++) inflight[i] = rnd() % 16;
+    // BoundedLoad owns _total (sole writer note()), so its inflight MUST start at 0 and change only
+    // through note() -- a preseed would desync _total from sum(inflight) at step 0 (the UB contract).
+    if (spec.loadAware && !spec.boundedLoad) for (let i = 0; i < cap; i++) inflight[i] = rnd() % 16;
     const weights = new Uint32Array(cap);
     if (spec.weighted) for (let i = 0; i < cap; i++) weights[i] = drawWeight(rnd);
 
     const b = spec.make(cap, el, inflight, weights);
     const ctx = { b, cap, el, inflight, weights, keyHash: 0 };
+    // For BoundedLoad, every inflight change goes through note() so _total stays in lockstep; for the
+    // other load-aware strategies inflight is mutated directly (the shared-counter seam).
+    const applyInflight = (i, newVal) => {
+        if (spec.boundedLoad) {
+            const d = newVal - inflight[i];
+            inflight[i] = newVal;
+            if (d !== 0) b.note(i, d);
+        } else {
+            inflight[i] = newVal;
+        }
+    };
     // A monotonic caller clock for the latency-aware strategy (pick(now) + recordRtt(...,now)).
     let now = 0;
 
@@ -172,9 +199,11 @@ function runOne(name, seed, cap, steps) {
             b.setEligible(rnd() % cap, (rnd() & 1) === 0);
         } else if (r < 45 && spec.loadAware) {
             const i = rnd() % cap, kind = rnd() % 3;
-            if (kind === 0) inflight[i] = (inflight[i] + 1) >>> 0;             // dispatch
-            else if (kind === 1) inflight[i] = inflight[i] > 0 ? inflight[i] - 1 : 0; // settle
-            else inflight[i] = rnd() % 32;                                     // jump
+            let nv;
+            if (kind === 0) nv = (inflight[i] + 1) >>> 0;                      // dispatch
+            else if (kind === 1) nv = inflight[i] > 0 ? inflight[i] - 1 : 0;   // settle
+            else nv = rnd() % 32;                                              // jump
+            applyInflight(i, nv);
         } else if (r < 60 && spec.weighted) {
             const i = rnd() % cap, w = drawWeight(rnd);
             if (spec.usesSetWeight) b.setWeight(i, w); else weights[i] = w;    // live vs sole-writer
@@ -201,8 +230,8 @@ function runOne(name, seed, cap, steps) {
         const extraErr = spec.extra(b, ctx, p);
         if (extraErr) return { name, seed, cap, step, reason: extraErr };
 
-        // Keep the closed loop moving so LeastConn/SED/NQ explore the pool.
-        if (spec.loadAware && p !== PICK_NONE && (rnd() & 1)) inflight[p] = (inflight[p] + 1) >>> 0;
+        // Keep the closed loop moving so the load-aware strategies explore the pool.
+        if (spec.loadAware && p !== PICK_NONE && (rnd() & 1)) applyInflight(p, (inflight[p] + 1) >>> 0);
     }
     return null;
 }
@@ -235,7 +264,7 @@ function pathological() {
         const bs = [
             new RoundRobinBalancer(1, el), new SmoothWRRBalancer(1, el, w), new P2cBalancer(1, el, inf),
             new LeastConnBalancer(1, el, inf), new SedBalancer(1, el, inf, w), new NqBalancer(1, el, inf, w),
-            new PeakEwmaBalancer(1, el, inf, 1e6),
+            new PeakEwmaBalancer(1, el, inf, 1e6), new BoundedLoadBalancer(1, el, inf, 0.25, null, 2),
         ];
         for (const b of bs) if (b.pick() !== 0) fails.push('single-node ' + b.constructor.name + ' did not return 0');
         el[0] = 0;

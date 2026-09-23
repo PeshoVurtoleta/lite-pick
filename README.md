@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.8.0 ships eight strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family, the latency-aware `PeakEwmaBalancer`, and the sticky/affinity `ConsistentHashBalancer` (a Maglev lookup table)** -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view), plus a **`@zakkster/lite-pick/pool`** subpath: the async dispatch/settle counter layer with distinct-endpoint failover and a duck-typed query-cache fetcher. The rest of the roster -- BoundedLoad, WeightedRandom -- lands one per session.
+> Zero-GC load-balancing **selection kernel**: one hot `pick()` that returns an endpoint **index** over a fixed pool and allocates **0 B/op** on the steady-state path. A pure selector, never a proxy -- it consumes health and circuit state, it never owns them. **v0.9.0 ships nine strategies -- `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family, the latency-aware `PeakEwmaBalancer`, the sticky/affinity `ConsistentHashBalancer` (a Maglev lookup table), and the hotspot-protecting `BoundedLoadBalancer` (consistent hashing with bounded loads -- sticky routing + an occupancy cap that overflows a hot backend to its neighbours)** -- on the substrate seams (`VERSION`, `PICK_NONE`, a deterministic `Prng`, and `BalancerBase`'s shared read-only eligibility view), plus a **`@zakkster/lite-pick/pool`** subpath: the async dispatch/settle counter layer with distinct-endpoint failover and a duck-typed query-cache fetcher. The rest of the roster -- WeightedRandom -- lands next session.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-pick.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-pick)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -21,7 +21,7 @@ The npm landscape has old algorithm libraries (`load-balancers`, `loadbalance`, 
 - **Two pieces of evidence, both shipped.** A **0 B/op** witness on the pick path (no object, closure, string, or array created per pick), and a measured **balance-quality anchor** -- peak-to-average load within the strategy's theoretical ceiling (for P2C, the Azar-Broder-Karlin-Upfal `ln ln n / ln 2` bound) and strictly better than a random foil.
 - **A pure selector, not a proxy.** It **consumes** health and circuit state; it never owns them. Health is a shared read-only bitmap written by [`@zakkster/lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health); circuit state comes from [`@zakkster/lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart); load counters are caller-owned typed arrays. `pick()` only reads.
 
-> **Status: M8 (v0.8.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family, the latency-aware `PeakEwmaBalancer`, and the sticky/affinity `ConsistentHashBalancer` (a Maglev table)**, the **`@zakkster/lite-pick/pool`** request layer (now with an opt-in latency-feedback hook), and the **benchmark suite** -- the balance anchor + GC blast-radius headlines, a seeded/version-stamped `results.json`, a `bench:verify` drift check with teeth, and the vs-AWS positioning (see *Evidence* below). This session APPENDS one class: the other strategies in `Pick.js` are byte-identical, only the header roster/count and the `VERSION` stamp change. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), **SED tracks weight within 1%**, **PeakEWMA steers around a 10x-slow node** (it takes <= 25% of P2C's share for it and cuts service p99), and **ConsistentHash remaps only ~1.6% of keys on a scale event** (vs ~98% for naive modulo) -- all held under a **seeded invariant fuzzer** (`test/fuzz.mjs`) that checks state-synchronisation after *every* op. See [ROADMAP.md](./ROADMAP.md) for the M8 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), the RoundRobin (0003), SmoothWRR (0004), P2C (0005), LeastConn-family (0006), pool-adapter (0007), benchmark-suite (0008), PeakEWMA (0009), and ConsistentHash (0010) design forks.
+> **Status: M9 (v0.9.0).** Ships the substrate seams **plus `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family, the latency-aware `PeakEwmaBalancer`, the sticky/affinity `ConsistentHashBalancer` (a Maglev table), and the hotspot-protecting `BoundedLoadBalancer` (consistent hashing with bounded loads)**, the **`@zakkster/lite-pick/pool`** request layer (with opt-in latency-feedback, occupancy-feedback, and keyed-routing hooks), and the **benchmark suite** -- the balance anchor + GC blast-radius headlines, a seeded/version-stamped `results.json`, a `bench:verify` drift check with teeth, and the vs-AWS positioning (see *Evidence* below). This session APPENDS one class: the other strategies in `Pick.js` are byte-identical, only the header roster/count and the `VERSION` stamp change. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), **SED tracks weight within 1%**, **PeakEWMA steers around a 10x-slow node** (it takes <= 25% of P2C's share for it and cuts service p99), **ConsistentHash remaps only ~1.6% of keys on a scale event** (vs ~98% for naive modulo), and **BoundedLoad tames a hotspot plain consistent hashing can't** (under a skewed key stream ConsistentHash spikes a hot backend to ~13x the mean occupancy while BoundedLoad's `(1+eps)` cap holds it near the mean by overflowing to neighbours -- keeping the same ~1.6% minimal disruption) -- all held under a **seeded invariant fuzzer** (`test/fuzz.mjs`) that checks state-synchronisation after *every* op. See [ROADMAP.md](./ROADMAP.md) for the M9 -> M10 path to 1.0.0, and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), the RoundRobin (0003), SmoothWRR (0004), P2C (0005), LeastConn-family (0006), pool-adapter (0007), benchmark-suite (0008), PeakEWMA (0009), ConsistentHash (0010), and BoundedLoad/CHBL (0011) design forks.
 
 ```bash
 npm install @zakkster/lite-pick
@@ -204,6 +204,40 @@ function fnv1a(s) { let h = 0x811c9dc5; for (let k = 0; k < s.length; k++) { h ^
 - **Cost & bound.** The lookup table is `M x 4` bytes -- `~256KB` at the `65537` default -- a **cold, one-time** allocation (disclosed in the cost table below; `M` is configurable **down** for small pools). `pick()` is `O(1)`, `0 B/op`. Fail-closed: `PICK_NONE` when the pool is down or no eligible backend is reachable within the probe bound (a near-total outage may return `PICK_NONE` even if a far eligible slot exists -- safe, never a dead pick).
 - **Deferred seams (import nothing).** A `@zakkster/lite-filter` hot-key / known-key oracle at the key-routing layer (warm/cold only, never the pick path) and a `@zakkster/lite-o1` `EliasFano` ring alternative to the table are optional-peer seams -- `peerDependencies` **stays `{}`** until a shipped path imports one ([ADR 0010](./decisions/0010-consistenthash.md)).
 
+## BoundedLoad -- consistent hashing with bounded loads (v0.9.0)
+
+Plain consistent hashing is sticky and minimally-disruptive, but it has one failure mode: a **hot key**. If a handful of keys carry most of the traffic, consistent hashing pins each one's *entire* load on its one hashed backend -- an unbounded **hotspot**. `BoundedLoadBalancer` is [`ConsistentHashBalancer`](#consistenthash--sticky--cache-affinity-routing-v080) (the Maglev table) **plus a per-backend occupancy cap** `cap = (1 + eps) x mean` (the mean occupancy `_total / live`, with slack `eps`): a key sticks to its hashed home **unless** that backend is over cap, in which case the request **overflows** along the same bounded probe to the next eligible, under-cap backend (Mirrokni et al. *Consistent Hashing with Bounded Loads*, Google Research; Vimeo's `eps = 0.25` -- [ADR 0011](./decisions/0011-boundedload.md)). You keep stickiness + minimal disruption **and** gain the hotspot protection consistent hashing lacks.
+
+```js
+import { BoundedLoadBalancer } from '@zakkster/lite-pick';
+
+const eligible = Uint8Array.from([1, 1, 1, 1]);
+const inflight = new Uint32Array(4);            // YOU own this; read live as per-backend OCCUPANCY
+
+// eps = 0.25 -> a backend over 1.25x the mean occupancy overflows the key to a neighbour.
+const bl = new BoundedLoadBalancer(4, eligible, inflight, 0.25);
+
+const key = fnv1a(sessionId);                    // any integer hash (cold) -- lite-pick adds none
+const i = bl.pick(key >>> 0);                    // sticky home, or the overflow target if it's hot
+inflight[i]++;   bl.note(i, +1);                 // dispatch: bump the counter AND tell the balancer
+// ... await the request ...
+inflight[i]--;   bl.note(i, -1);                 // settle: net-zero on both
+```
+
+- **Sticky + overflow.** `pick(keyHash)` maps the integer key to its Maglev home; if that backend is under cap it wins (the common, sticky path). If it is over cap, the request overflows along the bounded probe to the first eligible, under-cap backend. If nothing in the window is under cap, it falls back to the first eligible seen -- **sticky wins; the cap is a soft preference, never a dead pick**. When `_total === 0` the cap is skipped entirely, so it behaves as pure `ConsistentHashBalancer`.
+- **`note()` is the sole writer of the mean.** BoundedLoad **owns** a running occupancy sum `_total` and keeps it O(1)-current through `note(i, +1)` on dispatch / `note(i, -1)` on settle -- so the cap's mean never needs a scan; `inflight` is your live-read per-backend occupancy. **Contract:** mutate the mirrored counter **only** through `note()` (or the `/pool` adapter, which does it for you) -- direct mutation desyncs `_total` (UB, the same asymmetry `SmoothWRRBalancer` has for its weights). `note()` clamps `_total` at 0, and `totalInflight` exposes it.
+- **Inherits the Maglev table.** It extends `ConsistentHashBalancer`, so `setWeight(i, w)` / `rebuild()` / `tableSize` and the whole weighted-Maglev build + bounded-probe walk are reused verbatim; the `weights` / `m` / `seed` constructor args are the same. `pick()` and `note()` are both **0 B/op**, `O(1)`. `PICK_NONE` only when no eligible backend is reachable in the probe window -- never merely because backends are over cap.
+- **Why not "P2C with a cap"?** A note on the design (the honest one): power-of-two-choices over in-flight *plus* a `(1+eps) x mean` cap is **byte-identical to plain P2C** -- an under-cap draw always has lower in-flight than an over-cap one, so "prefer under-cap" and "lower-of-two" pick the same node. The cap is a no-op there. It is only *load-bearing* when the primary choice is fixed by something other than load -- a **hash**. That is CHBL, and it is why BoundedLoad is built on consistent hashing ([ADR 0011](./decisions/0011-boundedload.md)).
+
+The proof (from `test/balance.mjs`, a Zipfian-skewed key stream over 64 backends, one fixed concurrency window):
+
+| lane | mean occupancy | max backend occupancy |
+|---|---|---|
+| **BoundedLoad (CHBL)** | 10 | **13** (cap = 12.5 -- overflow holds it near the mean) |
+| ConsistentHash (no cap) | 10 | **129** (~13x -- the hotspot) |
+
+BoundedLoad caps the hot backend near `(1 + eps) x mean` while plain consistent hashing lets it run away, and both reroute only **~1.6%** of keys on a scale event (`test/balance.mjs`). See [`ConsistentHashBalancer`](#consistenthash--sticky--cache-affinity-routing-v080) above for the integer-key contract and the FNV-1a helper.
+
 ## Evidence -- the two headlines (v0.6.0 benchmark suite)
 
 > **Framing: parity on speed, superiority on the contract + balance + tail.** A trivial `i++ % n` round-robin -- or `wrr` -- *matches* P2C on raw ops/sec, so `lite-pick` does **not** claim "N times faster." Throughput is claimed at **parity**; the wins are **zero-GC**, **balance quality**, **tail latency** (GC blast-radius), and **never a dead pick**. Every number below is **seeded** and regenerated by `npm run bench:report`; `npm run bench:verify` fails CI if a README number drifts from a fresh run (algorithmic exact, timing within +/-15%). Node / CPU / OS / every PRNG seed are stamped into `benchmark/results.json`.
@@ -287,7 +321,8 @@ On a scale event (add / remove a node), what fraction of keys keep their node? T
 | --- | --- |
 | ALB `least_outstanding_requests` (LOR) | `LeastConnBalancer` / `P2cBalancer` |
 | ALB anomaly mitigation / latency-aware shedding | `PeakEwmaBalancer` (latency-aware P2C) |
-| ALB `weighted_random` + anomaly mitigation | `WeightedRandom` + `BoundedLoad` (M9/M10) |
+| ALB anomaly mitigation on a sticky/affinity hash | `BoundedLoadBalancer` (consistent hashing with bounded loads -- sticky + hotspot overflow, M9) |
+| ALB `weighted_random` | `WeightedRandom` (M10) |
 | NLB flow-hash (5-tuple) | `ConsistentHashBalancer` (Maglev table -- the same family NLB flow-hash uses, at the in-process hop) |
 
 The composition: inbound traffic still enters through your **ALB/NLB -> service** (the edge hop AWS owns and bills); `lite-pick` governs the fan-out **after** that, the hop no AWS load balancer touches. Complementary, not a replacement -- "the hop your ALB/NLB never sees."
@@ -317,10 +352,10 @@ rng.nextBelow(4);     // -> a uint32 in [0, 4)
 rng.reset();          // replays the exact stream
 
 PICK_NONE;            // -> -1  (fail-closed sentinel: no endpoint, never a dead pick)
-VERSION;              // -> '0.6.0'
+VERSION;              // -> '0.9.0'
 ```
 
-`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
+`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`, `ConsistentHashBalancer`, `BoundedLoadBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
 
 ## Wiring it up -- `@zakkster/lite-pick/pool` (v0.5.0)
 

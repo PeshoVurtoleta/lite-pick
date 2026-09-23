@@ -6,7 +6,7 @@
  */
 
 import { Pool, liteQueryFetcher, VERSION } from '../../Pool.js';
-import { LeastConnBalancer } from '../../Pick.js';
+import { LeastConnBalancer, BoundedLoadBalancer } from '../../Pick.js';
 
 // VERSION is a string (re-exported from the core).
 const v: string = VERSION;
@@ -36,6 +36,21 @@ void p1; void p2;
 const ac = new AbortController();
 const p3: Promise<void> = pool.run((endpoint: number) => { void endpoint; }, { signal: ac.signal, tries: 3 });
 void p3;
+
+// run with the M7 opt-in latency clock (drives pick(now) + recordRtt feedback).
+let nowNs = 1_000;
+const p4: Promise<number> = pool.run((endpoint: number) => endpoint, { clock: () => (nowNs += 1000) });
+void p4;
+
+// run with the M9 keyed-routing option, over a bounded-load (keyed) balancer.
+const blInflight = new Uint32Array(4);
+const bl = new BoundedLoadBalancer(4, new Uint8Array(4), blInflight);
+const blPool: Pool = new Pool(bl, blInflight);
+const p5: Promise<number> = blPool.run((endpoint: number) => endpoint, { key: 0xABCD1234, tries: 2 });
+void p5;
+
+// @ts-expect-error -- key must be a number, not a string.
+blPool.run((endpoint: number) => endpoint, { key: 'nope' });
 
 // @ts-expect-error -- run needs a function.
 pool.run(42);

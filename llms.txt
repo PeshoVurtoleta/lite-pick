@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.8.0
+Version: 0.9.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,17 +14,38 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.8.0 ships the substrate seams + eight strategies: RoundRobin, SmoothWRR (the weighted
+0.9.0 ships the substrate seams + nine strategies: RoundRobin, SmoothWRR (the weighted
 default), P2C (power-of-two-choices -- also the O(1) least-connections APPROXIMATION), the
-EXACT LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C), and ConsistentHash
-(a Maglev lookup table -- sticky/affinity routing). It exports `VERSION`, the fail-closed
+EXACT LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C), ConsistentHash
+(a Maglev lookup table -- sticky/affinity routing), and BoundedLoad (Consistent Hashing with Bounded
+Loads -- sticky routing + a per-backend occupancy cap that overflows a hotspot to neighbours). It
+exports `VERSION`, the fail-closed
 sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (the shared
 read-only eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`,
 `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`,
-`ConsistentHashBalancer`, and the ConsistentHash constants `CH_DEFAULT_M` (65537) / `CH_PROBE_LIMIT`
-(64). The remaining strategies land one per session (see ROADMAP.md): BoundedLoad, WeightedRandom.
-The EXACT-O(log n) fewest-in-flight variant is a deferred @zakkster/lite-logn `BinaryHeap`
-optional-peer seam (decisions/0006), not this exact-O(cap) scan.
+`ConsistentHashBalancer`, `BoundedLoadBalancer`, and the ConsistentHash constants `CH_DEFAULT_M`
+(65537) / `CH_PROBE_LIMIT` (64). The remaining strategy lands next session (see ROADMAP.md):
+WeightedRandom. The EXACT-O(log n) fewest-in-flight variant is a deferred @zakkster/lite-logn
+`BinaryHeap` optional-peer seam (decisions/0006), not this exact-O(cap) scan.
+
+M9 (0.9.0) adds BoundedLoadBalancer (decisions/0011): Consistent Hashing with Bounded Loads (CHBL --
+Mirrokni et al. / Google Research; Vimeo eps=0.25). It is `ConsistentHashBalancer` (the Maglev table)
+PLUS a per-backend occupancy cap `cap = (1 + eps) x _total / live`: `pick(keyHash)` sticks a key to its
+hashed home UNLESS that backend is over cap, in which case the request OVERFLOWS along the same bounded
+probe to the next eligible under-cap backend -- consistent hashing's stickiness + minimal disruption
+PLUS the HOTSPOT protection plain CH lacks. If none in the window is under cap it FALLS BACK to the
+first eligible (sticky wins; PICK_NONE is pool-down ONLY, never for over-cap); `_total === 0` skips the
+cap -> pure ConsistentHash. It extends ConsistentHashBalancer (reusing the Maglev build + probe +
+setWeight/rebuild/tableSize VERBATIM) and OWNS a running `_total` whose SOLE writer is the warm
+`note(i, delta)` seam (dispatch +1 / settle -1); `inflight` is the caller's Uint32Array read LIVE as
+the per-backend occupancy. `pick()` and `note()` are both O(1) / 0 B/op. CONTRACT: when using
+BoundedLoad the mirrored counter is mutated ONLY through `note()` / /pool -- direct mutation desyncs
+`_total` (UB, the SmoothWRR-weights asymmetry). THE PIVOT (decisions/0011): P2C-over-inflight with a
+`(1+eps) x mean` cap is byte-identical to plain P2C (an under-cap draw always has lower inflight than an
+over-cap one), so the cap is only LOAD-BEARING when the primary choice is a HASH -- CHBL is that. The
+hotspot anchor (test/balance.mjs): under a skewed key stream, plain ConsistentHash spikes a hot backend
+to ~13x the mean occupancy while CHBL caps it near (1+eps) x mean by overflow -- and both keep ~1/N
+minimal disruption on a scale event.
 
 M8 (0.8.0) adds ConsistentHashBalancer (decisions/0010): a prebuilt Maglev lookup table (IPVS `mh`,
 Meta Katran, Cilium) mapping a caller-supplied INTEGER key to a backend, O(1) / 0 B/op, with minimal
@@ -184,6 +205,37 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     in-process hop. DEFERRED optional-peer seams (import nothing, peerDependencies STAYS `{}`): a
     @zakkster/lite-filter hot-key oracle at the key-routing layer (warm/cold only), and a
     @zakkster/lite-o1 `EliasFano` ring alternative to the table (decisions/0010).
+- `BoundedLoadBalancer extends ConsistentHashBalancer` -- class. Consistent Hashing with Bounded Loads
+  (M9, CHBL: Mirrokni et al. / Google Research; Vimeo eps=0.25). ConsistentHash (the Maglev table) PLUS
+  a per-backend occupancy cap that overflows a hot backend to its neighbours.
+  - `new BoundedLoadBalancer(capacity, eligible, inflight, eps?=0.25, weights?=null, m?=65537, seed?=0x9e3779b9)`
+    -- `inflight` is a caller-owned Uint32Array (length >= capacity) read LIVE as the per-backend
+    OCCUPANCY; `eps` is the bounded-load slack (finite, > 0). Validates inflight + eps typeof-first
+    BEFORE super() allocates the Maglev table (TypeError non-number eps, RangeError non-finite / <= 0).
+    `weights` / `m` / `seed` are the ConsistentHash args (copied weights, prime m >= capacity, COLD
+    build). The running occupancy sum `_total` is BALANCER-OWNED (starts at 0) and written SOLELY by
+    `note`; when using BoundedLoad, the mirrored inflight counter is mutated ONLY through `note` / /pool
+    (direct mutation desyncs `_total` -- UB, the SmoothWRR-weights asymmetry).
+  - `pick(keyHash)` -> number. slot = (keyHash >>> 0) % M; walk the probe window (home + CH_PROBE_LIMIT
+    slots) and return the FIRST backend that is ELIGIBLE AND under `cap = (1 + eps) * _total / live`
+    (a hot home OVERFLOWS to a neighbour). If none in the window is under cap, fall back to the FIRST
+    eligible seen (sticky wins; the cap is a soft preference). `_total === 0` skips the cap -> pure
+    ConsistentHash. O(1), 0 B/op, NEVER throws. `PICK_NONE` ONLY when no eligible backend is reachable
+    in the window -- NEVER merely because backends are over cap (fail OPEN on overload).
+  - `note(i, delta)` -> void. WARM feedback path (not the hot pick path): the SOLE writer of `_total`
+    (dispatch note(i,+1) / settle note(i,-1)), so the cap's mean stays O(1)-current without a scan.
+    `i` is validated in range (RangeError), `delta` typeof-first as an integer; `_total` clamps at 0.
+    0 B/op on the success path.
+  - `totalInflight` -- readonly number. The owned running occupancy sum (for tests / observability).
+  - `setWeight(i, w)` / `rebuild()` / `tableSize` -- inherited from ConsistentHashBalancer (COLD
+    rebuild of the Maglev table; the readonly prime table size).
+  - THE PIVOT (decisions/0011): P2C-over-inflight with a `(1+eps) x mean` cap is byte-identical to
+    plain P2C (an under-cap draw always has lower inflight than an over-cap one), so the cap is only
+    LOAD-BEARING when the primary choice is a HASH -- CHBL is that. The hotspot anchor
+    (test/balance.mjs): under a skewed key stream, plain ConsistentHash spikes a hot backend to ~13x
+    the mean occupancy while CHBL caps it near (1+eps) x mean by overflow; both keep ~1/N minimal
+    disruption. `Pool.run` mirrors dispatch/settle into `note` when the balancer duck-types it, and
+    `Pool.run(fn, { key })` drives `pick(key)` for keyed CHBL routing (both inert otherwise).
 
 ## Subpath: @zakkster/lite-pick/pool -- the ergonomic request layer (M5, Pool.js)
 
@@ -212,7 +264,14 @@ duck-typed and imports NOTHING from lite-query.
     `opts.clock` (a caller-owned nanosecond source) is supplied AND the balancer duck-types
     `recordRtt` (PeakEwmaBalancer), Pool drives `pick(now)` and records the settled rtt on success;
     otherwise the hook is inert -- Pool stays generic, in-flight stays net-zero, abort/failover
-    unchanged.
+    unchanged. OPT-IN occupancy feedback: when the balancer duck-types `note` (BoundedLoadBalancer),
+    Pool mirrors each dispatch as `note(i, +1)` and each settle as `note(i, -1)` so its owned mean
+    stays current; inert otherwise. The hooks are independent -- a balancer may duck-type neither,
+    one, or both; a BoundedLoad + Pool round is net-zero on BOTH the inflight array and `_total`.
+    OPT-IN keyed routing: `opts.key` (a caller INTEGER) drives `pick(key)` for a keyed balancer
+    (ConsistentHash / BoundedLoad -- CHBL); failover re-picks with the SAME key, and because the failed
+    backend's occupancy stays elevated a CHBL re-pick naturally OVERFLOWS to the next backend. Without
+    `opts.key`, `pick()` / `pick(now)` behaviour is unchanged.
 - `liteQueryFetcher(pool, perEndpoint, opts?)` -> a `({ key, signal }) => Promise` fetcher for a
   query cache (lite-query's `fetcher`, or any fetcher-shaped consumer). `perEndpoint({ endpoint,
   key, signal })` -> the per-endpoint work. `opts.tries` (default 1) is the spatial failover count.

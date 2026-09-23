@@ -17,7 +17,7 @@
  * The random-foil peak/avg baseline (what P2C must beat at M3) is printed for context.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, Prng } from '../Pick.js';
 
 let failed = false;
 function check(cond, msg) {
@@ -352,6 +352,109 @@ process.stdout.write('lite-pick balance (M8: ConsistentHash -- disruption anchor
     check(chRemapPct <= anchor, 'ConsistentHash remap ' + chRemapPct.toFixed(2) + '% <= ' + anchor.toFixed(2) + '% (2/N)');
     check(deadPicks === 0, 'ConsistentHash never routes to the removed backend (dead picks = ' + deadPicks + ')');
     check(foilPct >= 95, 'naive-modulo foil remap ' + foilPct.toFixed(1) + '% >= 95% (the trap ConsistentHash avoids)');
+}
+
+// --- BoundedLoad (CHBL): THE hotspot anchor -- the cap tames a hot key plain ConsistentHash can't ---
+// BoundedLoad is Consistent Hashing with Bounded Loads: ConsistentHash (the Maglev table) + an
+// occupancy cap = (1+eps) x mean that OVERFLOWS a hot backend to its neighbours. The distinct value
+// over plain ConsistentHash is HOTSPOT PROTECTION: under SKEWED key popularity (a few very hot keys),
+// plain consistent hashing pins ALL of a hot key's load on ONE backend -- an unbounded hotspot --
+// while CHBL spills the excess to neighbours, capping every backend near (1+eps) x mean, and keeps
+// consistent hashing's stickiness + minimal disruption for everything else.
+//
+// The harness models a closed-loop with a fixed concurrency WINDOW W: dispatching request r settles
+// request r-W (so total in-flight ~ W is constant), keys are Zipfian-skewed (a small HOT set carries
+// most traffic), and BOTH lanes see the IDENTICAL seeded request stream. The CHBL lane drives its
+// owned _total through note() on dispatch(+1)/settle(-1) (its documented contract). We measure each
+// backend's occupancy over time.
+//   (1) Plain ConsistentHash suffers the hotspot: its max/p99 backend occupancy is FAR above the mean
+//       (the foil FAILS any bounded-occupancy gate).
+//   (2) CHBL caps it: max backend occupancy <= ~(1+eps) x mean + small integer/probe slack, and
+//       materially below ConsistentHash's max. Thresholds are measured from a correct run + a small
+//       margin (noted here + in ADR 0011) -- the impl is never bent to a number.
+//   (3) CHBL inherits minimal disruption: removing a backend reroutes only ~1/N keys. Deterministic.
+process.stdout.write('lite-pick balance (M9: BoundedLoad -- CHBL hotspot anchor)\n');
+{
+    const n = 64;
+    const M = 8191;            // a prime table size, smooth at n=64
+    const W = 640;             // fixed concurrency window -> mean occupancy ~ W/n = 10
+    const REQ = 120000;
+    const H = 6;               // number of very hot keys
+    const HOT_PCT = 85;        // % of requests that hit a hot key (the skew)
+    const EPS = 0.25;
+    const seed = 0xABCDEF;
+    const reqSeed = 0xBEEF1234;
+
+    function runLane(kind) {
+        const el = new Uint8Array(n); el.fill(1);
+        const inflight = new Uint32Array(n);      // occupancy, maintained for measurement (and read by CHBL)
+        const outstanding = new Int32Array(W);    // ring of the last W dispatched backends (for settle)
+        const isBL = kind === 'chbl';
+        const bal = isBL
+            ? new BoundedLoadBalancer(n, el, inflight, EPS, null, M, seed)
+            : new ConsistentHashBalancer(n, el, null, M, seed);
+
+        const rng = new Prng(reqSeed);            // identical request stream per lane (same seed + order)
+        const hot = new Uint32Array(H);
+        for (let h = 0; h < H; h++) hot[h] = rng.next();
+
+        const occ = new Uint32Array(n * (REQ >> 2));
+        let oc = 0;
+        for (let r = 0; r < REQ; r++) {
+            if (r >= W) {                         // settle the request that leaves the window
+                const b = outstanding[r % W];
+                if (b >= 0 && inflight[b] > 0) { inflight[b]--; if (isBL) bal.note(b, -1); }
+            }
+            const key = rng.nextBelow(100) < HOT_PCT ? hot[rng.nextBelow(H)] : rng.next();
+            const p = bal.pick(key);
+            if (p >= 0) { inflight[p] = (inflight[p] + 1) >>> 0; if (isBL) bal.note(p, 1); outstanding[r % W] = p; }
+            else outstanding[r % W] = -1;
+            if (r >= W && (r & 3) === 0) for (let j = 0; j < n; j++) occ[oc++] = inflight[j];
+        }
+        const view = occ.subarray(0, oc);
+        view.sort();
+        let sum = 0, max = 0;
+        for (let k = 0; k < oc; k++) { sum += view[k]; if (view[k] > max) max = view[k]; }
+        return { mean: sum / oc, p99: view[Math.floor(0.99 * oc)], max };
+    }
+
+    const bl = runLane('chbl');
+    const ch = runLane('ch');
+
+    process.stdout.write('  occupancy mean/p99/max: CHBL=' + bl.mean.toFixed(2) + '/' + bl.p99 + '/' + bl.max +
+        '  ConsistentHash=' + ch.mean.toFixed(2) + '/' + ch.p99 + '/' + ch.max + '\n');
+
+    // (1) Plain ConsistentHash suffers an unbounded hotspot: its max occupancy is many x the mean.
+    check(ch.max >= 3 * ch.mean,
+        'ConsistentHash hotspot: max occupancy ' + ch.max + ' >= 3 x mean ' + (3 * ch.mean).toFixed(1) +
+        ' (the hotspot plain consistent hashing cannot avoid)');
+    // (2) CHBL caps the hot backend near (1+eps) x mean. Band = 1.5 x mean: tight against the
+    // (1+eps)=1.25 continuous cap plus a small integer/probe-quantization slack (measured max sits at
+    // ~1.3 x mean on a correct run), and ConsistentHash's hotspot FAILS it by an order of magnitude.
+    const capBand = 1.5 * bl.mean;
+    check(bl.max <= capBand,
+        'CHBL max occupancy ' + bl.max + ' <= 1.5 x mean ' + capBand.toFixed(1) +
+        ' (cap=' + ((1 + EPS) * bl.mean).toFixed(1) + '; ConsistentHash max was ' + ch.max + ')');
+    check(bl.max < ch.max / 2,
+        'CHBL max occupancy ' + bl.max + ' is materially below ConsistentHash max ' + ch.max);
+
+    // (3) Minimal disruption inherited from ConsistentHash: remove a backend -> only ~1/N keys move.
+    {
+        const N = 64, DM = 8191, KEYS = 100000;
+        const el = new Uint8Array(N); el.fill(1);
+        const chbl = new BoundedLoadBalancer(N, el, new Uint32Array(N), EPS, null, DM, seed);
+        const krng = new Prng(0xD15121B);
+        const keys = new Uint32Array(KEYS);
+        for (let i = 0; i < KEYS; i++) keys[i] = krng.next();
+        const before = new Int32Array(KEYS);
+        for (let i = 0; i < KEYS; i++) before[i] = chbl.pick(keys[i]);   // _total 0 -> pure ConsistentHash
+        chbl.setEligible(7, false);
+        let moved = 0;
+        for (let i = 0; i < KEYS; i++) if (chbl.pick(keys[i]) !== before[i]) moved++;
+        const pct = moved / KEYS * 100, anchor = 2 / N * 100;
+        process.stdout.write('  disruption: CHBL remaps ' + pct.toFixed(2) + '% on remove (anchor <= ' + anchor.toFixed(2) + '%)\n');
+        check(pct <= anchor, 'CHBL remap ' + pct.toFixed(2) + '% <= ' + anchor.toFixed(2) + '% (inherits ConsistentHash minimal disruption)');
+    }
 }
 
 if (failed) {

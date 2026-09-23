@@ -1,9 +1,10 @@
 /**
  * @zakkster/lite-pick -- zero-GC load-balancing SELECTION KERNEL.
  *
- * M8 (0.8.0): substrate seams + eight strategies -- RoundRobin, SmoothWRR, P2C, the exact
- * LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C), and ConsistentHash
- * (a Maglev lookup table). This file ships:
+ * M9 (0.9.0): substrate seams + nine strategies -- RoundRobin, SmoothWRR, P2C, the exact
+ * LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C), ConsistentHash
+ * (a Maglev lookup table), and BoundedLoad (Consistent Hashing with Bounded Loads: the
+ * Maglev table + an occupancy cap that overflows a hot backend). This file ships:
  *
  *   - VERSION        the single source-of-truth version stamp (3-place sync).
  *   - PICK_NONE      the fail-closed sentinel (-1): "no endpoint", never a dead pick.
@@ -38,6 +39,14 @@
  *                    caller-supplied INTEGER (no per-pick string hashing = the one zero-GC hazard);
  *                    the balancer OWNS the Uint32Array table + weights, rebuilt COLD on membership /
  *                    weight change (health flap is handled by the probe, never a rebuild).
+ *   - BoundedLoadBalancer  Consistent Hashing with Bounded Loads (CHBL, Mirrokni et al. / Google
+ *                    Research; Vimeo eps=0.25): ConsistentHash (the Maglev table) PLUS an occupancy
+ *                    cap. pick(keyHash) sticks a key to its hashed home UNLESS that backend is over
+ *                    cap = (1+eps) x _total / live, in which case the request OVERFLOWS along the same
+ *                    bounded probe to the next eligible under-cap backend -- consistent hashing's
+ *                    stickiness + minimal disruption PLUS the hotspot protection plain CH lacks. It
+ *                    extends ConsistentHashBalancer (reusing its Maglev build + probe VERBATIM) and
+ *                    OWNS a running `_total` (sole writer: the warm note(i, delta) seam). O(1), 0 B/op.
  *
  * The identity (decisions/0001): lite-pick OWNS NO mutable state it can avoid owning.
  * It reads pre-allocated views (eligibility, inflight, weights, scores) that siblings or
@@ -45,7 +54,7 @@
  * counters live OUTSIDE the kernel. The steady-state pick path allocates 0 B/op.
  *
  * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [M1], SmoothWRR [M2],
- *   P2C [M3], LeastConn/SED/NQ [M4], PeakEWMA [M7], ConsistentHash [M8], BoundedLoad,
+ *   P2C [M3], LeastConn/SED/NQ [M4], PeakEWMA [M7], ConsistentHash [M8], BoundedLoad [M9],
  *   WeightedRandom [planned]. The EXACT-O(log n) fewest-in-flight variant is a deferred
  *   @zakkster/lite-logn BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan.
  *
@@ -58,7 +67,7 @@
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.8.0';
+export const VERSION = '0.9.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -974,5 +983,138 @@ export class ConsistentHashBalancer extends BalancerBase {
             if (el[i]) return i;
         }
         return PICK_NONE;
+    }
+}
+
+/**
+ * BoundedLoadBalancer -- Consistent Hashing with Bounded Loads (M9, CHBL: Mirrokni-Thorup-
+ * Zadimoghaddam, Google Research 2016; Vimeo's eps ~ 0.25). This is `ConsistentHashBalancer` (the M8
+ * Maglev table) PLUS an occupancy CAP: a key sticks to its hashed home backend UNLESS that backend is
+ * over the cap, in which case the request OVERFLOWS along the same bounded forward-probe to the next
+ * eligible, under-cap backend. It keeps consistent hashing's stickiness + minimal disruption AND adds
+ * the HOTSPOT protection plain consistent hashing lacks: a few very hot keys can pile unbounded load
+ * on one backend, so the cap spreads the overflow to neighbours while everything else stays put.
+ *
+ * Why this is the REAL bounded-load strategy (ADR 0011): P2C-over-inflight with a `(1+eps) x mean` cap
+ * is byte-identical to plain P2C (an under-cap draw ALWAYS has lower inflight than an over-cap one, so
+ * "prefer under-cap" and "lower-of-two" pick the same node) -- the cap is a no-op there. The cap is
+ * only LOAD-BEARING when the primary choice is fixed by something OTHER than load: a hash. CHBL is
+ * that -- the hashed home is sticky, and the cap is what lets a hot home overflow.
+ *
+ * `pick(keyHash)` (HOT, 0 B/op, NEVER throws): k = keyHash >>> 0; slot = k % M; walk the M8 probe
+ * window (home + CH_PROBE_LIMIT slots) and return the FIRST backend that is ELIGIBLE AND UNDER cap
+ * (`inflight[b] < cap`). If none in the window is under cap, FALL BACK to the first eligible seen
+ * (sticky wins; the cap is a soft preference, never a dead pick). When `_total === 0` the cap test is
+ * skipped entirely -> behaves as pure ConsistentHash. `cap = (1 + eps) x _total / live`.
+ *
+ * Ownership (ADR 0001, ADR 0004, ADR 0010, ADR 0011): the Maglev lookup table + weights are
+ * BALANCER-OWNED and built COLD (reused from ConsistentHashBalancer VERBATIM -- `_build`, `setWeight`,
+ * `rebuild`, `tableSize`, the probe walk, `chMix32`, `CH_DEFAULT_M`, `CH_PROBE_LIMIT`). `inflight` is
+ * the CALLER's Uint32Array, read LIVE as the per-backend OCCUPANCY source. The running occupancy sum
+ * `_total` is BALANCER-OWNED and its SOLE writer is the warm `note(i, delta)` feedback path
+ * (dispatch +1 / settle -1), so the cap's mean stays O(1)-current without a scan.
+ *
+ * CONTRACT (the SmoothWRR-weights asymmetry): when using BoundedLoad the mirrored inflight counter is
+ * mutated ONLY through `note()` / the /pool adapter. Direct mutation desyncs `_total` from the true
+ * sum, so the cap goes wrong -- UB. `note()` clamps `_total` at 0; `totalInflight` exposes it.
+ *
+ * Bound: O(1) per pick (modulo + table read + bounded cap-aware probe), 0 B/op on BOTH `pick()` and
+ * `note()` (torture + PerfGate). Fails closed (PICK_NONE) ONLY when no eligible backend is reachable
+ * within the probe window (M8's contract) -- NEVER merely because backends are over cap.
+ */
+export class BoundedLoadBalancer extends ConsistentHashBalancer {
+    /**
+     * @param {number} capacity  backend count (fixed; add/remove is a cold rebuild).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array} inflight  per-backend OCCUPANCY (length >= capacity), caller-owned and read
+     *   LIVE -- but mutated EXCLUSIVELY via note() / the /pool adapter (direct mutation desyncs the
+     *   owned _total -- UB).
+     * @param {number} [eps=0.25]  the bounded-load slack over the mean: finite, > 0. cap =
+     *   (1 + eps) x mean occupancy. Default 0.25 (Vimeo).
+     * @param {Uint32Array|null} [weights=null]  optional per-backend weights (COPIED); null = equal.
+     * @param {number} [m=CH_DEFAULT_M]  the Maglev table size: a prime, > 1, and >= capacity.
+     * @param {number} [seed=0x9e3779b9]  deterministic salt for the permutation mix (reproducible).
+     */
+    constructor(capacity, eligible, inflight, eps = 0.25, weights = null, m = CH_DEFAULT_M, seed = 0x9e3779b9) {
+        // Validate inflight + eps typeof-first, BEFORE super() allocates the (cold, ~256KB) Maglev
+        // table (fail closed early -- the PeakEWMA / ConsistentHash precedent). These read the args
+        // only (no `this`), so they may run before super().
+        if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
+            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+        }
+        if (typeof eps !== 'number') {
+            throw new TypeError('[lite-pick] eps must be a number');
+        }
+        if (!Number.isFinite(eps) || eps <= 0) {
+            throw new RangeError('[lite-pick] eps must be a finite number > 0');
+        }
+        // super() validates capacity/eligible/weights/m, copies weights, and builds the Maglev table.
+        super(capacity, eligible, weights, m, seed);
+        this._inflight = inflight;
+        this._eps = eps;
+        // The running occupancy sum the balancer OWNS. Starts at 0: note() is its sole writer, so a
+        // caller must drive dispatch/settle through note() (or /pool) -- inflight seeded non-zero
+        // BEFORE construction would desync it (UB, as documented).
+        this._total = 0;
+    }
+
+    /** The balancer-owned running sum of in-flight the mean/cap is computed from. Readonly. */
+    get totalInflight() {
+        return this._total;
+    }
+
+    /**
+     * Warm feedback path (NOT the hot pick path): adjust the owned running occupancy sum by `delta`
+     * for backend `i`. This is the SOLE writer of `_total`: dispatch is note(i, +1), settle is
+     * note(i, -1), so the cap's mean stays O(1)-current without scanning inflight. `i` is validated in
+     * range (like setEligible); `delta` is validated typeof-first as an integer. `_total` clamps at 0
+     * (an over-decrement never drives the mean negative). Zero-alloc on the success path.
+     * @param {number} i  backend index (validated in range)
+     * @param {number} delta  integer occupancy change (+1 dispatch, -1 settle)
+     */
+    note(i, delta) {
+        if (i < 0 || i >= this._cap) throw new RangeError('[lite-pick] index out of range: ' + i);
+        if (typeof delta !== 'number') throw new TypeError('[lite-pick] delta must be a number');
+        if (!Number.isInteger(delta)) throw new RangeError('[lite-pick] delta must be an integer: ' + delta);
+        const t = this._total + delta;
+        this._total = t > 0 ? t : 0;   // clamp: over-decrement never drives the mean negative
+    }
+
+    /**
+     * Map an INTEGER key to a backend, honouring the occupancy cap, or PICK_NONE (fail closed). O(1),
+     * 0 B/op, never throws. slot = (keyHash >>> 0) % M; walk the M8 probe window (home + CH_PROBE_LIMIT
+     * slots) and return the FIRST backend that is ELIGIBLE AND under cap = (1+eps) x _total / live. If
+     * none in the window is under cap, fall back to the FIRST eligible seen (sticky wins -- the cap is
+     * a soft preference, never a dead pick). `_total === 0` skips the cap test -> pure ConsistentHash.
+     * PICK_NONE ONLY when no eligible backend is reachable within the window.
+     * @param {number} keyHash  a caller-supplied integer key hash (coerced to uint32)
+     * @returns {number}
+     */
+    pick(keyHash) {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const M = this._m, el = this._eligible, lookup = this._lookup, inf = this._inflight;
+        const total = this._total;
+        // cap is only meaningful once occupancy is known; _total === 0 -> pure ConsistentHash.
+        const capActive = total > 0;
+        const cap = capActive ? (1 + this._eps) * total / this._live : 0;   // finite: total>0, live>0
+        let slot = (keyHash >>> 0) % M;           // integer key; NaN >>> 0 = 0 (never throws)
+        let firstEligible = -1;                   // the pure-ConsistentHash sticky fallback answer
+        let i = lookup[slot];
+        if (el[i]) {
+            if (!capActive || inf[i] < cap) return i;   // sticky home, under cap: the common fast path
+            firstEligible = i;
+        }
+        // Bounded forward-probe (M8's exact walk): the first eligible AND under-cap backend wins; a hot
+        // home OVERFLOWS to its neighbours. Past the window we fall back to the sticky first-eligible.
+        for (let p = 0; p < CH_PROBE_LIMIT; p++) {
+            slot++;
+            if (slot >= M) slot = 0;
+            i = lookup[slot];
+            if (el[i]) {
+                if (!capActive || inf[i] < cap) return i;   // eligible + under cap: overflow target
+                if (firstEligible < 0) firstEligible = i;    // remember the first eligible (fallback)
+            }
+        }
+        return firstEligible;   // -1 (PICK_NONE) iff NO eligible backend was reachable in the window
     }
 }

@@ -25,8 +25,8 @@ wiring proven zero-GC parts, not new low-level code.
 | **M5** | **The `/pool` request layer** (dispatch/settle counters + distinct-endpoint failover + a duck-typed lite-query fetcher) | 0.5.0 | -- | SHIPPED |
 | **M6** | **Benchmark suite** (ecosystem MVP: balance + GC blast-radius headlines, trust gates, vs-AWS positioning) | 0.6.0 | -- | planned |
 | **M7** | **PeakEWMA** (latency-aware P2C) | 0.7.0 | O(d)=O(1) | planned |
-| **M8** | **ConsistentHash** (Maglev table) | 0.8.0 | O(1) lookup | planned |
-| **M9** | **BoundedLoad** (occupancy / Little's Law) | 0.9.0 | O(d)=O(1) | planned |
+| **M8** | **ConsistentHash** (Maglev table) | 0.8.0 | O(1) lookup | shipped |
+| **M9** | **BoundedLoad** (CHBL: ConsistentHash + occupancy cap) | 0.9.0 | O(1) lookup | built |
 | **M10** | **WeightedRandom** (rides lite-o1 AliasTable) + docs/GUIDE capstone | 1.0.0 | O(1) | planned |
 
 **1.0.0 = eight strategies (RoundRobin, SmoothWRR, P2C, LeastConn, PeakEWMA,
@@ -174,8 +174,19 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
   seam -- a cheap "known-key / hot-key?" oracle for warm-affinity + admission decisions (BlockedBloom's
   one-cache-line query is the throughput fit). WARM/COLD only; the integer `pick()` never consults it.
   Duck-typed / optional-peer like every sibling; declared only if a shipped path imports it.
-- **M9 BoundedLoad:** consistent-hashing-with-bounded-loads (eps cap) vs occupancy/Little's
-  Law (Zalando). Windowed staleness is a labeled trade (bench dim 5), not a cliff.
+- **M9 BoundedLoad:** SHIPPED as CHBL (ADR 0011) -- consistent-hashing-with-bounded-loads
+  (Mirrokni et al.), NOT the "P2C with a cap" this row originally read. FINDING (ADR 0011
+  Fork 0): P2C-over-inflight + a `(1+eps)*mean` cap is provably byte-identical to plain P2C
+  (with two free choices the cap never changes the pick), so the cap is only load-bearing on
+  a STICKY hash. `BoundedLoadBalancer extends ConsistentHashBalancer` (M8 Maglev table reused
+  verbatim) and overrides `pick(keyHash)` with a cap-aware overflow probe: return the first
+  eligible AND under-cap backend, fall back to the first eligible (sticky) if all are over cap,
+  PICK_NONE only when none is reachable (pool-down; never for overload). eps 0.25 (Vimeo). Owns
+  `_total` (running inflight sum via `note(i,delta)`, the PeakEWMA writer-seam precedent); Pool
+  gained `opts.key`. The distinct-value anchor is HOTSPOT PROTECTION: under Zipfian-skewed keys
+  plain ConsistentHash spikes (~13x mean) while CHBL holds max occupancy near `(1+eps)*mean` by
+  overflowing, keeping ConsistentHash's minimal disruption (~1/N). Windowed staleness is a
+  labeled trade (bench dim 5), not a cliff.
 - **M10 WeightedRandom:** rides lite-o1 `AliasTable` verbatim (O(1) sample, O(n) rebuild);
   dynamic-weight callers are pointed at a lite-logn Fenwick instead. Docs/GUIDE capstone.
 

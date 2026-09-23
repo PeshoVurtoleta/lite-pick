@@ -104,6 +104,31 @@ export function reachableWithinBound(b, eligible, keyHash, bound) {
     return 0;
 }
 
+/** Sum of inflight over ALL endpoints [0, cap) -- the manual BoundedLoad `_total` recompute. */
+export function recomputeInflightSum(inflight, cap) {
+    let t = 0;
+    for (let i = 0; i < cap; i++) t += inflight[i];
+    return t;
+}
+
+/**
+ * BoundedLoad state invariant (M9): the balancer-owned `_total` (its `totalInflight`) is EXACTLY the
+ * sum of inflight over ALL endpoints [0, cap). This holds ONLY while the mirrored counter is driven
+ * solely through note() (dispatch +1 / settle -1) -- the documented contract; the fuzzer routes every
+ * inflight change through note() so a desync here flags a note()/_total bug, not caller UB. Returns
+ * null or the first violated invariant as a string.
+ */
+export function checkBoundedLoad(b, inflight, cap) {
+    const want = recomputeInflightSum(inflight, cap);
+    if (b.totalInflight !== want) {
+        return 'totalInflight ' + b.totalInflight + ' != recomputed sum(inflight) ' + want;
+    }
+    if (!Number.isFinite(b.totalInflight) || b.totalInflight < 0) {
+        return 'totalInflight is not a finite non-negative number: ' + b.totalInflight;
+    }
+    return null;
+}
+
 /** The exact minimum of scoreFn(i) over eligible i (candidateFn gates candidacy). Infinity if none. */
 export function minEligibleScore(eligible, cap, scoreFn, candidateFn) {
     let best = Infinity;

@@ -1,9 +1,10 @@
 /**
  * @zakkster/lite-pick -- TypeScript declarations.
  *
- * M8 (0.8.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
- * (LeastConn/SED/NQ) + PeakEWMA (latency-aware P2C) + ConsistentHash (Maglev table). The
- * remaining strategy classes (BoundedLoad, WeightedRandom) are added one per session.
+ * M9 (0.9.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
+ * (LeastConn/SED/NQ) + PeakEWMA (latency-aware P2C) + ConsistentHash (Maglev table) +
+ * BoundedLoad (P2C with a dynamic occupancy cap). The remaining strategy class (WeightedRandom)
+ * is added one per session.
  */
 
 /** The single source-of-truth version stamp. */
@@ -222,5 +223,51 @@ export class ConsistentHashBalancer extends BalancerBase {
     /** Cold path: rebuild the lookup table from the current owned weights. */
     rebuild(): void;
     /** Map an integer `keyHash` to a backend index (bounded probe past down slots), or `PICK_NONE`. */
+    pick(keyHash?: number): number;
+}
+
+/**
+ * BoundedLoadBalancer -- Consistent Hashing with Bounded Loads (M9, CHBL: Mirrokni et al. / Google
+ * Research; Vimeo eps ~ 0.25). `ConsistentHashBalancer` (the Maglev table) PLUS an occupancy cap: a
+ * key sticks to its hashed home backend UNLESS that backend is over `cap = (1 + eps) * _total / live`,
+ * in which case the request OVERFLOWS along the same bounded forward-probe to the next eligible,
+ * under-cap backend -- keeping consistent hashing's stickiness + minimal disruption AND adding the
+ * HOTSPOT protection plain consistent hashing lacks. `pick(keyHash)` returns the first eligible,
+ * under-cap backend in the probe window, else falls back to the first eligible seen (sticky wins; the
+ * cap is a soft preference, never a dead pick); `_total === 0` skips the cap -> pure ConsistentHash.
+ * `inflight` is the caller-owned Uint32Array read LIVE as the per-backend OCCUPANCY; the running
+ * occupancy sum `_total` is BALANCER-OWNED and written ONLY by `note` (dispatch +1 / settle -1), so
+ * when using BoundedLoad the mirrored counter must be mutated exclusively through `note` / the /pool
+ * adapter (direct mutation desyncs `_total` -- UB). It inherits the Maglev table + `setWeight` /
+ * `rebuild` / `tableSize` from ConsistentHashBalancer (reused verbatim). `pick()` and `note()` are
+ * both 0 B/op / O(1). Fails closed (`PICK_NONE`) ONLY when no eligible backend is reachable within
+ * the probe window -- NEVER merely because backends are over cap. NOT the P2C-with-cap "overload"
+ * variant (that is byte-identical to P2C; the cap is only load-bearing on a sticky hash -- ADR 0011).
+ */
+export class BoundedLoadBalancer extends ConsistentHashBalancer {
+    /**
+     * @param capacity backend count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param inflight per-backend OCCUPANCY (length >= capacity), caller-owned, read live; mutated
+     *   EXCLUSIVELY via `note` / the /pool adapter (direct mutation desyncs `_total` -- UB).
+     * @param eps the bounded-load slack over the mean (finite, > 0); default 0.25 (Vimeo).
+     * @param weights optional per-backend weights (length >= capacity), COPIED; null = equal weight.
+     * @param m the Maglev table size: a prime, > 1, and >= capacity (default 65537).
+     * @param seed deterministic salt for the permutation mix (default 0x9e3779b9); reproducible.
+     */
+    constructor(
+        capacity: number,
+        eligible: Uint8Array,
+        inflight: Uint32Array,
+        eps?: number,
+        weights?: Uint32Array | null,
+        m?: number,
+        seed?: number,
+    );
+    /** The balancer-owned running sum of in-flight the mean/cap is computed from. */
+    readonly totalInflight: number;
+    /** Warm feedback path: adjust the owned occupancy sum (dispatch +1 / settle -1). Clamps at 0. 0 B/op. */
+    note(i: number, delta: number): void;
+    /** Map an integer `keyHash` to a backend, honouring the occupancy cap (overflow past a hot home), or `PICK_NONE`. O(1). */
     pick(keyHash?: number): number;
 }

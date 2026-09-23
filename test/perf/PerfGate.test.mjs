@@ -22,6 +22,7 @@ import { zgcSuite } from '@zakkster/lite-perf-gate';
 import {
     Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
     LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer,
+    BoundedLoadBalancer,
 } from '../../Pick.js';
 
 const CAP = 1 << 14;      // pool capacity 16384 (O(1)/O(d) scenarios: size is irrelevant)
@@ -314,9 +315,67 @@ const consistentHashPick = {
     },
 };
 
+/**
+ * boundedload-pick: reused BoundedLoadBalancer (CHBL) over a half-eligible pool + a caller-owned
+ * inflight array. Each op is slot = key % M, a prebuilt-table read, and a bounded cap-aware probe --
+ * a PURE read (pick NEVER writes the owned _total). O(1), a small M (257) keeps the cold build cheap.
+ * `_total` is seeded ONCE in setup (cold notes) so the cap branch (over-cap homes overflowing) runs on
+ * the hot path. The `grows` counter covers the eligibility + inflight + the owned weights + lookup
+ * table (none reallocates -> 0 delta).
+ */
+const boundedLoadPick = {
+    name: 'BoundedLoadBalancer.pick(keyHash)',
+    setup() {
+        const el = new Uint8Array(CH_CAP);
+        for (let i = 0; i < CH_CAP; i += 2) el[i] = 1; // half eligible -> exercise the probe / overflow
+        const inflight = new Uint32Array(CH_CAP);
+        let total = 0;
+        for (let i = 0; i < CH_CAP; i++) { inflight[i] = i & 15; total += inflight[i]; }
+        const bl = new BoundedLoadBalancer(CH_CAP, el, inflight, 0.25, null, CH_M, 0xABCDEF);
+        bl.note(0, total);                     // seed _total to the true inflight sum (cold)
+        return { el, inflight, bl, key: 0, acc: 0 };
+    },
+    hot(s, n) {
+        const bl = s.bl;
+        // Stride 97 (coprime to M=257) walks every slot; masked to 30 bits so `key` stays a Smi.
+        let acc = s.acc | 0, key = s.key | 0;
+        for (let i = 0; i < n; i++) { key = (key + 97) & 0x3fffffff; acc = (acc + bl.pick(key)) | 0; }
+        s.acc = acc | 0; s.key = key | 0;
+    },
+    statsOf(s) {
+        return { grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength + s.bl._weights.buffer.byteLength + s.bl._lookup.buffer.byteLength };
+    },
+};
+
+/**
+ * boundedload-note: the WARM feedback path. Each op is one add + one clamp compare over the owned
+ * scalar _total; the typeof/range guards only construct an Error on the (untaken) failure branch, so
+ * the success path allocates nothing.
+ */
+const boundedLoadNote = {
+    name: 'BoundedLoadBalancer.note()',
+    setup() {
+        const el = new Uint8Array(CH_CAP);
+        for (let i = 0; i < CH_CAP; i += 2) el[i] = 1;
+        const inflight = new Uint32Array(CH_CAP);
+        const bl = new BoundedLoadBalancer(CH_CAP, el, inflight, 0.25, null, CH_M, 0xFEEDBEEF);
+        return { el, inflight, bl, i: 0 };
+    },
+    hot(s, n) {
+        const bl = s.bl;
+        let i = s.i | 0;
+        for (let k = 0; k < n; k++) { i = (i + 1) % CH_CAP; bl.note(i, (k & 1) ? -1 : 1); }
+        s.i = i | 0;
+    },
+    statsOf(s) {
+        return { grows: s.el.buffer.byteLength + s.inflight.buffer.byteLength + s.bl._weights.buffer.byteLength + s.bl._lookup.buffer.byteLength };
+    },
+};
+
 const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
     leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord, consistentHashPick,
+    boundedLoadPick, boundedLoadNote,
 ];
 
 /**
@@ -479,6 +538,27 @@ const chMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** BoundedLoad teeth: pick(keyHash) boxed into a fresh [] each op -- MUST trip the gate. */
+const blMustFailAlloc = {
+    name: 'BoundedLoad.pick(keyHash) boxed into fresh array (MUST allocate)',
+    setup() {
+        const el = new Uint8Array(CH_CAP);
+        for (let i = 0; i < CH_CAP; i += 2) el[i] = 1;
+        const inflight = new Uint32Array(CH_CAP);
+        for (let i = 0; i < CH_CAP; i++) inflight[i] = i & 15;
+        const bl = new BoundedLoadBalancer(CH_CAP, el, inflight, 0.25, null, CH_M, 1);
+        bl.note(0, CH_CAP * 8);
+        return { el, inflight, base: bl, key: 0 };
+    },
+    hot(s, n) {
+        const bl = s.base;
+        let sink = 0, key = s.key | 0;
+        for (let i = 0; i < n; i++) { key = (key + 97) & 0x3fffffff; const arr = [bl.pick(key)]; sink += arr[0]; }
+        s.sink = sink; s.key = key | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -491,5 +571,6 @@ zgcSuite({
     mustFail: [
         drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc, p2cMustFailAlloc,
         lcMustFailAlloc, sedMustFailAlloc, nqMustFailAlloc, peMustFailAlloc, chMustFailAlloc,
+        blMustFailAlloc,
     ],
 });

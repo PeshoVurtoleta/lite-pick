@@ -6,7 +6,7 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../../Pick.js';
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -170,3 +170,38 @@ new ConsistentHashBalancer(4, new Uint8Array(4), [1, 1, 1, 1]);
 
 // @ts-expect-error -- tableSize is readonly.
 ch.tableSize = 5;
+
+// BoundedLoadBalancer (CHBL): capacity + eligibility + inflight + optional eps + optional weights + m + seed.
+const bl: BoundedLoadBalancer = new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4));
+const blEps: BoundedLoadBalancer = new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4), 0.25);
+const blFull: BoundedLoadBalancer = new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4), 0.5, new Uint32Array(4), 257, 123);
+const blNullW: BoundedLoadBalancer = new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4), 0.5, null);
+void blEps; void blFull; void blNullW;
+const blCh: ConsistentHashBalancer = bl; // CHBL is-a ConsistentHashBalancer (reuses the Maglev table)
+const blBase: BalancerBase = bl;         // ...and is-a BalancerBase
+void blCh; void blBase;
+const blPick: number = bl.pick(0xdeadbeef); // keyed pick
+void blPick;
+const blTotal: number = bl.totalInflight;
+void blTotal;
+const blSize: number = bl.tableSize;        // inherited from ConsistentHashBalancer
+void blSize;
+bl.note(0, 1);
+bl.note(0, -1);
+bl.setWeight(0, 5);                          // inherited COLD reweight + rebuild
+bl.rebuild();                               // inherited COLD rebuild
+
+// @ts-expect-error -- inflight must be a Uint32Array, not a number[].
+new BoundedLoadBalancer(4, new Uint8Array(4), [0, 0, 0, 0]);
+
+// @ts-expect-error -- inflight arg is required.
+new BoundedLoadBalancer(4, new Uint8Array(4));
+
+// @ts-expect-error -- weights must be a Uint32Array or null, not a number.
+new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4), 0.25, 123);
+
+// @ts-expect-error -- note needs a numeric delta.
+bl.note(0, 'x');
+
+// @ts-expect-error -- totalInflight is readonly.
+bl.totalInflight = 5;

@@ -10,11 +10,14 @@ export const VERSION: string;
 
 /** The minimal balancer shape Pool drives (any lite-pick strategy satisfies it). */
 export interface Balancer {
-    pick(now?: number): number;
+    /** `now` (PeakEwma clock) or `keyHash` (ConsistentHash/BoundedLoad) when supplied via opts. */
+    pick(arg?: number): number;
     readonly capacity: number;
     readonly live: number;
     /** Optional latency-feedback sink (PeakEwmaBalancer); fed on settle when a clock is supplied. */
     recordRtt?(i: number, sampleNs: number, now: number): void;
+    /** Optional occupancy sink (BoundedLoadBalancer); fed +1 on dispatch, -1 on settle. */
+    note?(i: number, delta: number): void;
 }
 
 /** Options for `Pool.run`. */
@@ -28,6 +31,12 @@ export interface RunOptions {
      * `recordRtt` latency feedback for a latency-aware balancer (PeakEwma); otherwise inert.
      */
     clock?: () => number;
+    /**
+     * An integer routing key for a keyed balancer (ConsistentHash / BoundedLoad). When present,
+     * `run` calls `pick(key)`; the opt-in `note` occupancy hook is driven on dispatch/settle for
+     * a bounded-load balancer. Ignored by non-keyed strategies.
+     */
+    key?: number;
 }
 
 /**

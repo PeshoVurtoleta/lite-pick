@@ -4,6 +4,68 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-23
+
+### Added
+
+- **`BoundedLoadBalancer` (M9)** -- **Consistent Hashing with Bounded Loads** (CHBL: Mirrokni et al.,
+  Google Research; Vimeo's `eps = 0.25`). It **extends `ConsistentHashBalancer`** (the Maglev table) and
+  adds a per-backend occupancy cap `cap = (1 + eps) x _total / live`: `pick(keyHash)` sticks a key to its
+  hashed home **unless** that backend is over cap, in which case the request **overflows** along the same
+  bounded forward-probe to the next eligible, under-cap backend. If none in the probe window is under cap
+  it falls back to the first eligible seen (**sticky wins; the cap is a soft preference, never a dead
+  pick**); `_total === 0` skips the cap entirely, behaving as pure consistent hashing. This keeps
+  consistent hashing's stickiness + minimal disruption **and** adds the **hotspot protection** plain
+  consistent hashing lacks. The Maglev build, probe walk, and `setWeight` / `rebuild` / `tableSize` are
+  reused verbatim. The running occupancy sum `_total` is **balancer-owned** (starts at 0) and written
+  **solely** via the warm `note(i, delta)` seam (dispatch `+1` / settle `-1`), so the cap's mean stays
+  O(1)-current without a scan; `inflight` is the caller's `Uint32Array`, read **live** as the per-backend
+  occupancy. `pick()` and `note()` are both **O(1)** / **0 B/op**. `eps` is validated typeof-first
+  (TypeError non-number, RangeError non-finite / `<= 0`) before the table is allocated; `note()` validates
+  `i` in range and `delta` as an integer, and clamps `_total` at 0. `totalInflight` exposes `_total`.
+  `PICK_NONE` only when no eligible backend is reachable within the probe window -- **never** for
+  over-cap (fail open on overload). **Contract:** the mirrored inflight counter is mutated **only** through
+  `note()` / the `/pool` adapter -- direct mutation desyncs `_total` (UB, the SmoothWRR-weights asymmetry).
+  ([ADR 0011](./decisions/0011-boundedload.md)).
+- **The pivot** (ADR 0011): the first M9 draft built the "overload" reading -- P2C-over-inflight with a
+  `(1 + eps) x mean` cap -- and it was proven **byte-identical to plain P2C** (an under-cap draw always
+  has lower inflight than an over-cap one, so "prefer under-cap" and "lower-of-two" pick the same node).
+  The cap is only *load-bearing* when the primary choice is a **hash**, so M9 is CHBL -- the algorithm
+  the roadmap cited. The P2C-with-cap reading is withdrawn as non-distinct.
+- **Hotspot anchor** (`test/balance.mjs`) -- 64 backends, a Zipfian-skewed key stream (6 hot keys, 85% of
+  traffic), a fixed concurrency window: plain ConsistentHash pins a hot key on one backend -- measured
+  **max occupancy 129** vs a mean of **10** (a ~13x hotspot) -- while CHBL's cap holds **max occupancy 13**
+  (`cap = (1 + eps) x mean = 12.5`) by overflowing to neighbours, materially below ConsistentHash's max
+  (the foil FAILS the bounded-occupancy band). Both keep **~1.55%** minimal disruption on a scale event
+  (`<= 2/N`). Thresholds are measured from a correct run with a small margin and noted -- the impl is
+  never bent to a number.
+- Gates extended for the new strategy: `test/BoundedLoad.test.js` boundary suite (ctor + eps validation,
+  sticky same-key routing, overflow when a home is over cap, fail-open, PICK_NONE only pool-down,
+  pure-ConsistentHash when `_total === 0`, `note()` validation + clamp, `totalInflight` tracking, minimal
+  disruption, a Pool `opts.key` net-zero round-trip); `test/fuzz.mjs` keyed note-driven subject +
+  `checkBoundedLoad` (`totalInflight === sum(inflight)` after every op) + the ConsistentHash structural
+  invariant; `test/torture.mjs` retention (small-instance CHBL loop) + `pick(keyHash)` and `note()` 0 B/op
+  phases; `test/perf/PerfGate.test.mjs` `boundedLoadPick` + `boundedLoadNote` zero-alloc scenarios + a
+  `mustFail` alloc tooth; `test/witness.mjs` O(1) const flat-work keyed subject; `benchmark/Matrix.mjs`
+  subject (dims throughput/balance/gc over the skewed-cost workload); `Pick.d.ts` +
+  `test/types/pick.test-d.ts` typed surface.
+
+### Changed
+
+- `Pool.run` gains an **inert-unless-duck-typed `note` hook** (mirror each dispatch as `note(i, +1)` and
+  each settle as `note(i, -1)`, net-zero per run) paralleling the PeakEWMA `recordRtt` wiring, and an
+  **`opts.key`** option -- when supplied, Pool drives `pick(key)` (keyed / CHBL routing); failover
+  re-picks with the same key, and because the failed backend's occupancy stays elevated a CHBL re-pick
+  naturally overflows to the next backend. All hooks are inert when not applicable -- Pool stays generic,
+  in-flight stays net-zero, abort/failover unchanged.
+- `Pick.js`: STRATEGY-APPEND only -- the other eight strategies are **byte-identical**; the sole changes
+  are the header roster/count (eight -> nine), the `VERSION` bump, and the appended `BoundedLoadBalancer`
+  (which **extends `ConsistentHashBalancer`**, reusing its Maglev build + probe verbatim; ConsistentHash
+  itself is unchanged).
+- `VERSION` bumped 0.8.0 -> **0.9.0** across the three sync sites (package.json, `Pick.js`, llms.txt);
+  package `description` roster updated (keywords already carried `bounded-load`). `peerDependencies`
+  stays `{}` (CHBL reuses M8 -- imports nothing new).
+
 ## [0.8.0] - 2026-09-23
 
 ### Added

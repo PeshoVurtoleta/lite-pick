@@ -77,13 +77,27 @@ export class Pool {
      * Pool stays generic, the in-flight counter stays net-zero, and abort/failover are unaffected.
      * The kernel `pick()` remains 0 B/op; this wrapper is not held to that bar.
      *
+     * An OCCUPANCY-AWARE balancer (BoundedLoadBalancer -- anything duck-typing `note`) has each
+     * dispatch mirrored as `note(i, +1)` and each settle as `note(i, -1)`, so its owned running mean
+     * stays current; against a balancer with no `note` the hook is fully INERT (same net-zero,
+     * generic behaviour). The two hooks are independent -- a balancer may duck-type neither, one, or
+     * both.
+     *
+     * A KEYED balancer (ConsistentHashBalancer / BoundedLoadBalancer -- CHBL) routes by an INTEGER
+     * key. When `opts.key` is supplied, Pool drives `pick(key)` (sticky / bounded-load routing);
+     * failover re-picks with the SAME key, and because the failed backend's occupancy stays elevated
+     * (its `note(+1)` held across attempts) a CHBL re-pick naturally OVERFLOWS to the next backend.
+     * Without `opts.key`, `pick()` / `pick(now)` behaviour is unchanged.
+     *
      * @template T
      * @param {(endpoint: number, signal?: AbortSignal) => (Promise<T>|T)} fn  the per-endpoint work.
-     * @param {{ signal?: AbortSignal, tries?: number, clock?: () => number }} [opts]  `tries`
-     *   (default 1 = no failover) is the max number of distinct-endpoint attempts; `signal` is
+     * @param {{ signal?: AbortSignal, tries?: number, clock?: () => number, key?: number }} [opts]
+     *   `tries` (default 1 = no failover) is the max number of distinct-endpoint attempts; `signal` is
      *   passed to `fn` and, when already aborted after a failure, stops failover (the abort
      *   propagates, no re-pick); `clock` is a caller-owned nanosecond source that, when present,
-     *   drives `pick(now)` and the opt-in `recordRtt` latency feedback for a latency-aware balancer.
+     *   drives `pick(now)` and the opt-in `recordRtt` latency feedback for a latency-aware balancer;
+     *   `key` is a caller-supplied INTEGER key that, when present, drives `pick(key)` for a keyed
+     *   balancer (sticky / CHBL routing).
      * @returns {Promise<T>}
      */
     async run(fn, opts) {
@@ -92,16 +106,27 @@ export class Pool {
         const tries = rawTries > 0 ? rawTries : 1;
         const signal = opts ? opts.signal : undefined;
         const clock = opts && typeof opts.clock === 'function' ? opts.clock : undefined;
+        // A keyed balancer (ConsistentHash / BoundedLoad -- CHBL) picks by an INTEGER key. When
+        // `opts.key` is supplied, pick(key) drives selection; otherwise the existing pick()/pick(now)
+        // behaviour is unchanged. `keyed` is true exactly when a key was passed.
+        const keyed = opts !== undefined && opts.key !== undefined;
+        const key = keyed ? opts.key : undefined;
         const inflight = this._inflight, b = this._b;
         // Opt-in latency feedback: only when BOTH a clock is supplied AND the balancer duck-types
         // recordRtt. Otherwise inert -- Pool stays generic and byte-for-byte behaviour is unchanged.
         const rtt = clock !== undefined && typeof b.recordRtt === 'function';
+        // Opt-in occupancy feedback (BoundedLoadBalancer): when the balancer duck-types note(), Pool
+        // mirrors each dispatch(+1)/settle(-1) into it so the balancer's owned _total mean stays
+        // O(1)-current. Otherwise inert -- Pool stays generic, in-flight stays net-zero, and
+        // abort/failover are unchanged. Follows the exact opt-in shape the recordRtt hook uses.
+        const notes = typeof b.note === 'function';
         const held = [];                 // endpoints incremented this run (kept elevated across failover)
         let lastErr;
         try {
             for (let attempt = 0; attempt < tries; attempt++) {
                 const now = clock !== undefined ? clock() : undefined;
-                const i = b.pick(now);
+                // A keyed pick (opts.key) takes precedence -- sticky/CHBL routing; else pick(now)/pick().
+                const i = keyed ? b.pick(key) : b.pick(now);
                 if (i === PICK_NONE) {
                     if (attempt === 0) {
                         const e = new Error('[lite-pick] no eligible endpoint');
@@ -112,6 +137,7 @@ export class Pool {
                 }
                 inflight[i] = (inflight[i] + 1) >>> 0;
                 held.push(i);
+                if (notes) b.note(i, 1);       // mirror the dispatch into the balancer's occupancy sum
                 try {
                     const out = await fn(i, signal);
                     if (rtt) {           // successful settle: feed the measured rtt back to the balancer
@@ -130,6 +156,7 @@ export class Pool {
             for (let k = 0; k < held.length; k++) {
                 const j = held[k];
                 inflight[j] = inflight[j] > 0 ? inflight[j] - 1 : 0;
+                if (notes) b.note(j, -1);      // net-zero settle -- keeps _total in lockstep per run
             }
         }
     }

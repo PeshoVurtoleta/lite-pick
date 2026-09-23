@@ -16,7 +16,7 @@
  * PARITY check -- a strategy within noise of the foil while holding the contract has passed.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, Prng } from '../Pick.js';
 
 export const SIZES = [8, 64, 512, 4096];
 export const OPS = 2_000_000;
@@ -209,6 +209,25 @@ export const SUBJECTS = [
             const ch = new ConsistentHashBalancer(n, el, null, 4099, 0xABCDEF); // M=4099 prime >= max n
             let key = 0; // stride 97 keeps key a Smi (a value >= 2^31 would box as a HeapNumber)
             return () => { key = (key + 97) & 0x3fffffff; return ch.pick(key); };
+        },
+    },
+    {
+        // BoundedLoad (CHBL): ConsistentHash (Maglev table) + an occupancy cap. pick(keyHash) is
+        // slot = key % M, a table read, and a bounded cap-aware probe -- O(1), 0 B/op; it inherits
+        // consistent hashing's minimal disruption AND caps a hot backend by overflowing to neighbours
+        // (balance.mjs). Built over the SKEWED-COST workload (a hot minority carrying heavy standing
+        // inflight -- the hotspot case) so its _total mean reflects real skew; _total is seeded once
+        // (cold) from that workload's inflight, the note() sole-writer seam.
+        name: 'BoundedLoad',
+        dims: ['throughput', 'balance', 'gc'],
+        make(n) {
+            const { eligible, inflight } = buildWorkload('skewed-cost', n);
+            const bl = new BoundedLoadBalancer(n, eligible, inflight, 0.25, null, 4099, 0xABCDEF); // M=4099 prime >= max n
+            let total = 0;
+            for (let i = 0; i < n; i++) total += inflight[i];
+            bl.note(0, total); // seed _total to the workload's inflight sum (cold, note is sole writer)
+            let key = 0; // stride 97 keeps `key` a Smi (a value >= 2^31 would box as a HeapNumber)
+            return () => { key = (key + 97) & 0x3fffffff; return bl.pick(key); };
         },
     },
 ];

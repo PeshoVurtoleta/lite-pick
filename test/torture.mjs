@@ -44,6 +44,7 @@ async function main() {
     const {
         Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
         LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer,
+        BoundedLoadBalancer,
     } = await import('../Pick.js');
 
     const CAP = 1 << 12;    // pool capacity 4096
@@ -99,19 +100,25 @@ async function main() {
     }
     fillTracker();
 
-    // ConsistentHash owns a Maglev table + weights but no external kernel (no timer / listener /
-    // shared view retained beyond the caller), so it must finalize like every sibling. Its COLD
-    // build is O(M x N), so this churns SMALL instances (capacity 64, M 257) -- enough to prove
-    // finalization without a slow build storm. The cleanup closes over NOTHING.
+    // ConsistentHash + BoundedLoad (CHBL, which extends it) own a Maglev table + weights but no
+    // external kernel (no timer / listener / shared view retained beyond the caller), so they must
+    // finalize like every sibling. Their COLD build is O(M x N), so this churns SMALL instances
+    // (capacity 64, M 257) -- enough to prove finalization without a slow build storm. The cleanup
+    // closes over NOTHING.
     const CH_CAP = 64, CH_M = 257, CH_CYCLES = 256;
     function fillTrackerCH() {
         const el = new Uint8Array(CH_CAP).fill(1);
         const w = new Uint32Array(CH_CAP).fill(3);
+        const inf = new Uint32Array(CH_CAP);
         for (let c = 0; c < CH_CYCLES; c++) {
             const ch = new ConsistentHashBalancer(CH_CAP, el, w, CH_M, c);
             ch.pick(c * 2654435761);
             ch.setEligible(c & (CH_CAP - 1), (c & 1) === 0);
             tracker.track(ch, noop, 'consistenthash', { audit: true });
+            const bl = new BoundedLoadBalancer(CH_CAP, el, inf, 0.25, w, CH_M, c);
+            bl.note(c & (CH_CAP - 1), 1);
+            bl.pick(c * 2654435761);
+            tracker.track(bl, noop, 'boundedload', { audit: true });
         }
         return tracker.size();
     }
@@ -254,11 +261,37 @@ async function main() {
     const chAllocBytes = Math.max(0, Math.round(chBpc));
     const chAllocOk = chAllocBytes === 0;
 
+    // ---- phase 12: BoundedLoad.pick(keyHash) per-call allocation (0 B/op) --
+    // CHBL: the Maglev TABLE is built ONCE here (the COLD, disclosed cost -- excluded from the hot
+    // measurement). Steady-state pick(keyHash) is slot = key % M, a table read, and a bounded cap-aware
+    // probe -- integer/float locals, no object/closure/array created. _total is seeded ONCE (cold notes)
+    // so the cap branch is exercised on the hot path (over-cap homes overflow along the probe).
+    const bl = new BoundedLoadBalancer(CAP, chEl, inflight, 0.25, null, 65537, 0xB0DED10A); // COLD build, not measured
+    let blTotal = 0;
+    for (let i = 0; i < CAP; i++) blTotal += inflight[i];
+    bl.note(0, blTotal);                                 // seed _total to the true inflight sum (cold)
+    let blSink = 0, blKey = 0x2468ace0 >>> 0;
+    const blStep = () => { blKey = (Math.imul(blKey, 1664525) + 1013904223) >>> 0; blSink = (blSink + bl.pick(blKey)) | 0; };
+    const blAllocRes = measureAllocs(blStep, { iterations: 100000, batches: 8 });
+    const blBpc = blAllocRes.bytesPerCall === null ? 0 : blAllocRes.bytesPerCall;
+    const blAllocBytes = Math.max(0, Math.round(blBpc));
+    const blAllocOk = blAllocBytes === 0;
+
+    // ---- phase 13: BoundedLoad.note() per-call allocation (0 B/op) ---------
+    // The warm feedback path: one add + one clamp compare over the owned scalar _total; the typeof/
+    // range guards only construct an Error on the (untaken) failure branch, so success allocates nothing.
+    let noteI = 0;
+    const noteStep = () => { noteI = (noteI + 1) & (CAP - 1); bl.note(noteI, (noteI & 1) ? -1 : 1); };
+    const noteAllocRes = measureAllocs(noteStep, { iterations: 100000, batches: 8 });
+    const noteBpc = noteAllocRes.bytesPerCall === null ? 0 : noteAllocRes.bytesPerCall;
+    const noteAllocBytes = Math.max(0, Math.round(noteBpc));
+    const noteAllocOk = noteAllocBytes === 0;
+
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void peSink; void chSink;
+    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void peSink; void chSink; void blSink;
 
-    process.stdout.write('lite-pick torture (M8: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ + PeakEWMA + ConsistentHash)\n');
+    process.stdout.write('lite-pick torture (M9: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ + PeakEWMA + ConsistentHash + BoundedLoad)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
@@ -282,9 +315,14 @@ async function main() {
         (rttAllocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  ConsistentHash.pick(keyHash) allocs: ' + chAllocBytes + ' B/op -> ' +
         (chAllocOk ? 'PASS' : 'FAIL') + ' (Maglev table build is the disclosed COLD cost)\n');
+    process.stdout.write('  BoundedLoad.pick(keyHash) allocs: ' + blAllocBytes + ' B/op -> ' +
+        (blAllocOk ? 'PASS' : 'FAIL') + ' (CHBL Maglev table build is the disclosed COLD cost)\n');
+    process.stdout.write('  BoundedLoad.note() allocs: ' + noteAllocBytes + ' B/op -> ' +
+        (noteAllocOk ? 'PASS' : 'FAIL') + '\n');
 
     if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk ||
-        !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk || !chAllocOk) {
+        !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk || !chAllocOk ||
+        !blAllocOk || !noteAllocOk) {
         process.stderr.write('torture: FAIL\n');
         process.exit(1);
     }

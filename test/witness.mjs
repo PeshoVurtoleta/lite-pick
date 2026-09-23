@@ -15,7 +15,7 @@
  * on tiny pools while still catching a real complexity regression.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -123,11 +123,25 @@ const SUBJECTS = [
             return () => { key = (key + 97) & 0x3fffffff; return ch.pick(key); };
         },
     },
+    {
+        name: 'BoundedLoad',
+        complexity: 'const', // CHBL: slot = key % M + a table read + a bounded cap-aware probe -> flat with n
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            let total = 0;
+            for (let i = 0; i < n; i++) { inflight[i] = i & 15; total += inflight[i]; }
+            const bl = new BoundedLoadBalancer(n, el, inflight, 0.25, null, 4099, 0xABCDEF); // M=4099 prime >= max n
+            bl.note(0, total); // seed _total so the cap branch runs (cold)
+            let key = 0; // stride 97 keeps `key` a Smi (a value >= 2^31 would box as a HeapNumber)
+            return () => { key = (key + 97) & 0x3fffffff; return bl.pick(key); };
+        },
+    },
 ];
 
 let failed = false;
 for (const subj of SUBJECTS) {
-    process.stdout.write('lite-pick witness (M8: ' + subj.name + ', ' + subj.complexity + ')\n');
+    process.stdout.write('lite-pick witness (M9: ' + subj.name + ', ' + subj.complexity + ')\n');
     const rows = SIZES.map((n) => ({ n, opsPerMs: timePicks(subj.make(n)) }));
     // The series that MUST stay flat depends on the advertised complexity.
     const series = rows.map((r) => (subj.complexity === 'linear' ? r.opsPerMs * r.n : r.opsPerMs));

@@ -1,0 +1,158 @@
+{
+  "schema": "lite-pick-bench/1",
+  "version": "0.6.0",
+  "generatedAt": "2026-09-23T02:08:15.817Z",
+  "env": {
+    "node": "v26.8.2",
+    "v8": "14.6.202.34-node.28",
+    "cpu": "Apple M4 Pro",
+    "cores": 12,
+    "arch": "arm64",
+    "os": "Darwin 27.0.0",
+    "platform": "darwin"
+  },
+  "seeds": {
+    "workload": 305441741,
+    "p2c": 11259375,
+    "foil": 12648430,
+    "gc": 85596141,
+    "disruption": 3203338804
+  },
+  "results": {
+    "balance": [
+      {
+        "n": 64,
+        "p2cGap": 3,
+        "rndGap": 13,
+        "ceiling": 12.224784511105034
+      },
+      {
+        "n": 1024,
+        "p2cGap": 2,
+        "rndGap": 21,
+        "ceiling": 15.17264688776986
+      },
+      {
+        "n": 4096,
+        "p2cGap": 2,
+        "rndGap": 25,
+        "ceiling": 16.224784511105035
+      }
+    ],
+    "gc": {
+      "cap": 1024,
+      "requests": 2000000,
+      "seed": 85596141,
+      "litePick": {
+        "major": 0,
+        "minor": 2,
+        "maxPauseMs": 0.1433749981224537,
+        "bpop": 0,
+        "serviceP999Ms": 0.00008400000000108321,
+        "serviceMaxMs": 0.09658400000000711,
+        "gateOk": true
+      },
+      "foil": {
+        "major": 13,
+        "minor": 79,
+        "maxPauseMs": 2.8679169975221157,
+        "serviceP999Ms": 0.0015829999999823485,
+        "serviceMaxMs": 2.875083000000018
+      }
+    },
+    "disruption": {
+      "keys": 100000,
+      "seed": 3203338804,
+      "naiveModulo": [
+        {
+          "event": "remove-node (64->63)",
+          "remapPct": 98.41499999999999,
+          "idealPct": 1.5625
+        },
+        {
+          "event": "add-node (64->65)",
+          "remapPct": 98.504,
+          "idealPct": 1.5384615384615385
+        }
+      ],
+      "consistentHash": {
+        "status": "SKIP",
+        "reason": "ConsistentHash (Maglev) lands at M8"
+      }
+    },
+    "fairness": {
+      "smoothwrr": {
+        "weights": [
+          10,
+          3,
+          2,
+          1
+        ],
+        "cycles": 500,
+        "exactFair": true,
+        "smoothMaxRun": 3,
+        "burstyMaxRun": 10
+      },
+      "sed": {
+        "weights": [
+          1,
+          2,
+          3,
+          4,
+          6,
+          8,
+          12,
+          16
+        ],
+        "total": 200000,
+        "worstShareDrift": 0.0000026923076922868994,
+        "weightedImbalance": 0.00004000000000008626,
+        "randomImbalance": 5.5145599999999995
+      }
+    },
+    "competitors": [
+      {
+        "family": "P2C (power-of-two-choices)",
+        "litePick": {
+          "strategy": "P2cBalancer",
+          "status": "ok",
+          "opsPerMs": 59591.20433823905
+        },
+        "competitor": {
+          "pkg": "load-balancers",
+          "version": "1.3.52",
+          "status": "ok",
+          "opsPerMs": 60956.40848742399
+        }
+      },
+      {
+        "family": "RoundRobin",
+        "litePick": {
+          "strategy": "RoundRobinBalancer",
+          "status": "ok",
+          "opsPerMs": 260168.28725492902
+        },
+        "competitor": {
+          "pkg": "loadbalance",
+          "version": "1.0.0",
+          "status": "ok",
+          "opsPerMs": 334541.2502743422
+        }
+      },
+      {
+        "family": "Weighted-random",
+        "litePick": {
+          "strategy": "WeightedRandom",
+          "status": "pending",
+          "milestone": "M10"
+        },
+        "competitor": {
+          "pkg": "wrr",
+          "version": "1.0.0",
+          "status": "ok",
+          "opsPerMs": 158394.91463623015
+        }
+      }
+    ]
+  }
+}

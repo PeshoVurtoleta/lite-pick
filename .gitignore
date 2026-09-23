@@ -1,6 +1,8 @@
 /node_modules
 /package-lock.json
 
-# generated benchmark artifacts (machine/time-specific; regenerate with `npm run bench:report`)
-/benchmark/results.json
+# results.json is COMMITTED: it is the timing source-of-truth bench:verify reads (the
+# stored, machine-independent baseline -- verify does no fresh timing run). Regenerate with
+# `npm run bench:report`. Only the per-run generated logs below are ignored.
 /benchmark/report.html
+/benchmark/soak.jsonl

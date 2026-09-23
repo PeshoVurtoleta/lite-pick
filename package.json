@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-pick",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, plus PeakEWMA and consistent hashing; the /pool subpath adds dispatch/settle counters + failover and a duck-typed query-cache fetcher.",
   "type": "module",
   "main": "./Pick.js",
@@ -40,7 +40,12 @@
     "fuzz": "node test/fuzz.mjs",
     "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
     "bench": "node benchmark/Matrix.mjs",
-    "bench:report": "node benchmark/Matrix.mjs && node benchmark/Report.mjs",
+    "bench:gc": "node --expose-gc benchmark/GcBlastRadius.mjs",
+    "bench:fairness": "node benchmark/Fairness.mjs",
+    "bench:disruption": "node benchmark/Disruption.mjs",
+    "bench:report": "node benchmark/Matrix.mjs && node --expose-gc benchmark/Report.mjs",
+    "bench:verify": "node benchmark/Report.mjs --verify",
+    "soak": "node --expose-gc benchmark/Soak.mjs",
     "demo": "node demo/fanout.mjs",
     "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run balance && npm run fuzz && npm run test:perf"
   },
@@ -103,7 +108,10 @@
     "@zakkster/lite-gc-profiler": "^1.16.0",
     "@zakkster/lite-leak": "^1.10.0",
     "@zakkster/lite-perf-gate": "^1.4.2",
-    "typescript": "^7.0.2"
+    "load-balancers": "1.3.52",
+    "loadbalance": "1.0.0",
+    "typescript": "^7.0.2",
+    "wrr": "1.0.0"
   },
   "peerDependencies": {},
   "peerDependenciesMeta": {},

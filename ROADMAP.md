@@ -155,12 +155,25 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
   Dedicated session; do not fold in piecemeal.
 - **M7 PeakEWMA:** EWMA half-life; score = inflight x ewmaRtt; the Float64Array ring
   substrate (lite-o1). The documented "FE profile" (PeakEWMA + health only) is defined here.
+  LATENCY-SOURCE SEAM (lite-sketch, PUBLISHED 0.3.0 2026-09-23): the base signal is an EWMA
+  scalar (lite-o1 RingLog), but @zakkster/lite-sketch `DDSketch` is the optional-peer TAIL-AWARE
+  complement -- `add(rtt)` is worst-case O(1) / 0 B/op (warm settle path), `quantile(q)` carries a
+  HARD per-query relative-error bound `|v-v_true| <= alpha*v_true` with collapsing-lowest keeping
+  p50/p90/p99 tail-accurate. Enables a p99-aware score (inflight x p99Rtt) beside the EWMA-mean
+  score, and feeds the viz's real peak/avg latency header. Optional peer, declared only if a shipped
+  path imports it; EWMA stays the zero-peer default.
 - **M8 ConsistentHash:** Maglev table (O(1) lookup, minimal disruption, O(n) build --
   fits lite-o1's static build-once contract) vs ring-with-vnodes (now viable on lite-o1's
   `EliasFano` -- a ring lookup IS a `nextGEQ` successor query over the sorted vnode hashes,
   O(1) typical / O(log n) clustered). Lean Maglev -- it is the
   in-kernel/production choice (Linux IPVS `mh`, Meta Katran, Cilium). Key MUST be an integer /
   buffer view -- NO per-pick string hashing (the one zero-GC hazard). Disruption disclosed.
+  OPTIONAL PEER SEAM (lite-filter, added when M8 lands, never on the pick path): the KEY-routing
+  layer is where @zakkster/lite-filter (zero-GC approximate-membership family: Bloom / BlockedBloom
+  / Cuckoo / Quotient / XorFilter / BinaryFuse, `keys:'int'` zero-alloc, 0 false negatives) earns a
+  seam -- a cheap "known-key / hot-key?" oracle for warm-affinity + admission decisions (BlockedBloom's
+  one-cache-line query is the throughput fit). WARM/COLD only; the integer `pick()` never consults it.
+  Duck-typed / optional-peer like every sibling; declared only if a shipped path imports it.
 - **M9 BoundedLoad:** consistent-hashing-with-bounded-loads (eps cap) vs occupancy/Little's
   Law (Zalando). Windowed staleness is a labeled trade (bench dim 5), not a cliff.
 - **M10 WeightedRandom:** rides lite-o1 `AliasTable` verbatim (O(1) sample, O(n) rebuild);
@@ -228,7 +241,22 @@ The zero-GC proof is TWO complementary tools, kept separate exactly as lite-o1 d
 | Post-1.0 #2 | **lite-await hedging combinator** (`hedged()`) | The async power-of-two: race the P2C second choice past a percentile. The lite-await face of the kernel. | 1.2.0 |
 | Post-1.0 #3 | **AZ-aware / zone-affinity** wrapper (sched-domains model) | Local-first, threshold-to-escalate -- modeled on Linux CFS scheduler domains (SMT->socket->NUMA, escalate a level only when imbalanced) with a latency-health escape hatch (Zalando: suppress local to a 1% probe floor at >35% rtt drift). A wrapper over PeakEWMA + a zone tag array. | 1.3.0 |
 | Post-1.0 #4 | **Subsetting** (Google SRE deterministic subset) | Cap connection fan-out from a large client set to a large pool. A cold-path pool-shaping helper. Substrate: lite-o1 `Reservoir` (Vitter Algo R, O(1)/item uniform k-sampling) -- pick k of N endpoints uniformly, zero-GC. | 1.4.0 |
-| Post-1.0 #5 | **The visual demo -- an `htop` for the endpoint pool** (lite-lru style) | A live process-monitor panel: each endpoint a row with a real-time load bar (its `inflight`), color-coded by state (live / hot / flapping / down); a header of aggregates (picks/sec, imbalance vs the P2C ceiling, live count, RSS/GC); a STRATEGY SWITCH flipped live so you WATCH the distribution snap between shapes (random's lopsided piles -> RoundRobin's flat comb -> P2C's tight band -> LeastConn's exact even fill -> SED's weighted staircase), plus interactive chaos (kill a node, watch traffic redistribute; flap storm; add load). Reads `dump()` on a throttled ~10Hz rAF tick so the panel NEVER perturbs the 0 B/op pick path (lite-law: no per-pick telemetry). Composes the suite's canvas bricks -- lite-hud / lite-charts(-gl) / lite-canvas-graph / lite-fps-meter / lite-signal(+dom) -- NO new low-level code. Doubles as the LIVE FACE of the #8 endurance soak (leave it on `caffeinate -i`, the panel is the overnight dashboard). THE pitch artifact for an evaluator: "my selector vs random, live, killing nodes on demand." | 1.5.0 |
+| Post-1.0 #5 | **The visual demo -- an `htop` for the endpoint pool** (lite-lru style) | A live process-monitor panel: each endpoint a row with a real-time load bar (its `inflight`), color-coded by state (live / hot / flapping / down); a header of aggregates (picks/sec, imbalance vs the P2C ceiling, live count, RSS/GC); a STRATEGY SWITCH flipped live so you WATCH the distribution snap between shapes (random's lopsided piles -> RoundRobin's flat comb -> P2C's tight band -> LeastConn's exact even fill -> SED's weighted staircase), plus interactive chaos (kill a node, watch traffic redistribute; flap storm; add load). Reads `dump()` on a throttled ~10Hz rAF tick so the panel NEVER perturbs the 0 B/op pick path (lite-law: no per-pick telemetry). Composes the suite's canvas bricks -- lite-hud / lite-charts(-gl) / lite-canvas-graph / lite-fps-meter / lite-signal(+dom) -- NO new low-level code. Doubles as the LIVE FACE of the #8 endurance soak (leave it on `caffeinate -i`, the panel is the overnight dashboard). THE pitch artifact for an evaluator: "my selector vs random, live, killing nodes on demand." NICHE
+POSITIONING (user, 2026-09-23, after admiring btop): borrow btop/htop's AESTHETIC (density, braille/
+block sub-cell bars, color discipline) but DO NOT compete on their turf -- btop/htop visualize RESOURCES
+("how is my machine doing?"); this visualizes a DECISION ("where is each pick going, and can I SEE the
+policy working?"), the empty niche no monitor fills. Two core primitives from the user's mockups: (1) a
+LOAD panel -- per-endpoint inflight as a filling bar over a TIME axis + an aggregate header (per-queue
+depth, total rebalances, peak/avg latency); (2) a DECISION/REBALANCE STREAM -- a scrolling `A -> D` feed,
+every failover/rebalance as an event (the "why" narrative a resource monitor has no equivalent for, since
+it makes no decisions). The HERO mechanic = the live STRATEGY SWITCH morphing the distribution into a
+strategy FINGERPRINT (random piles -> RR comb -> SmoothWRR staircase -> P2C tight band -> LeastConn level
+fill -> NQ idle-first) -- watching random snap into P2C's band IS the pitch. Unique-not-clone mechanics:
+GHOST-MORPH afterimage of the previous distribution on switch; the `ln ln n` CEILING line overlaid on the
+P2C distribution (the balance.mjs proof over live data); a FLOW/PARTICLE fan-out (picks streaming
+source->endpoint, the fan-out made literal); color by STATE (live/hot/flapping/down) not utilization.
+Open before build: a dedicated RESEARCH pass on LB/distribution-viz prior art + "eye-catchy in our niche"
+(user wants to research WHAT to visualize + HOW before building). | 1.5.0 |
 | Post-1.0 #6 | **AdaptiveWeight** (WLM-style goal/feedback) | Recompute per-endpoint weights from observed latency vs a target (IBM z/OS WLM composite weight 0-64). The feedback-driven parent of PeakEWMA/bounded-load; a Tier-3 strategy. Weights written cold, read hot -- ADR 0001 ownership. | 1.6.0 |
 | Post-1.0 #7 | **Observability adapter** (lite-di-signal) | Expose balancer status (per-endpoint eligibility/load, live imbalance) as DI-wired reactive signals/computeds with deterministic teardown -- the reactivity pillar beside lite-di-health. FE dashboards use lite-signal-decorators instead. WARM/COLD only, never the pick path. | 1.7.0 |
 | Post-1.0 #8 | **The endurance soak** (`benchmark/Soak.mjs`, multi-hour `caffeinate -i` burn-in) | The UNBOUNDED cousin of torture: run a continuous mixed-chaos workload (heavy pick streams + eligibility flap storms + whole-pool-down + load feedback + weight retuning + idle troughs) over a realistic pool for HOURS/DAYS, snapshotting RSS / GC pauses / ops-sec + RUNNING the M4 invariant checker (test/invariants.mjs, reused) at every checkpoint to catch slow drift no bounded gate can: RSS creep, GC-pause degradation, a one-in-a-billion aggregate desync, throughput decay. Emits a time-series (JSONL) + a headline summary ("ran 6h, 14B picks, RSS flat, GC major 0, invariants green at all N checkpoints") -- the A+ evidence artifact for an evaluator replacing a paid lib. Scaffold opportunistically at M6 (shares the sustained-load GC machinery), grow a lane per strategy. | any |

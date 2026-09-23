@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.5.0
+Version: 0.6.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,7 +14,7 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.4.0 ships the substrate seams + six strategies: RoundRobin, SmoothWRR (the weighted
+0.6.0 ships the substrate seams + six strategies: RoundRobin, SmoothWRR (the weighted
 default), P2C (power-of-two-choices -- also the O(1) least-connections APPROXIMATION), and the
 EXACT LeastConn family (LeastConn, SED, NQ). It exports `VERSION`, the fail-closed sentinel
 `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (the shared read-only
@@ -23,6 +23,16 @@ eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`, 
 session (see ROADMAP.md): PeakEWMA, ConsistentHash, BoundedLoad, WeightedRandom. The EXACT-O(log
 n) fewest-in-flight variant is a deferred @zakkster/lite-logn `BinaryHeap` optional-peer seam
 (decisions/0006), not this exact-O(cap) scan.
+
+M6 (0.6.0) adds the BENCHMARK SUITE -- an evidence session, no API change: Pick.js / Pool.js are
+byte-identical to 0.5.0 apart from the VERSION stamp. It lives entirely under benchmark/ (NOT in
+the published tarball): the balance anchor + GC blast-radius headlines, weighted-fairness and
+consistent-hash-disruption trust gates, a seeded + Node/CPU/OS-stamped results.json, a
+bench:verify drift check (algorithmic EXACT, timing +/-15%), the naive-modulo disruption foil
+with an explicit ConsistentHash SKIP row (Maglev lands at M8), the endurance Soak.mjs scaffold
+(reuses test/invariants.mjs:checkBase), and REAL pinned npm competitors (load-balancers,
+loadbalance, wrr) as devDeps beside our in-repo foils. Framing: parity on speed, superiority on
+the contract + balance + tail -- never an "N times faster" headline (decisions/0008).
 
 ## Design ownership (decisions/0001, 0002)
 

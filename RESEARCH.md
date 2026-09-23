@@ -140,6 +140,11 @@ serves one of those two, or is a trust gate a paying evaluator needs more than a
    zero-GC contract to a business outcome and is the chart an AWS-paying evaluator has never been shown.
 4. **Decision tail latency.** p50/p90/p99/p99.9/max of `pick()` itself, with and without forced GC, so a
    hidden per-pick allocation spike shows as a tall bar. (The microbench complement to dimension 3.)
+   MEASUREMENT SEAM (lite-sketch, PUBLISHED 0.3.0 2026-09-23): `@zakkster/lite-sketch` `DDSketch` is the
+   bench-harness quantile instrument for dims 3+4 -- `add(latencyNs)` is 0 B/op / O(1) so the measurement
+   loop never perturbs what it measures, and `quantile(q)` gives p99.9 with a HARD relative-error bound
+   (`|v-v_true| <= alpha*v_true`, per-query not statistical) at bounded memory. A bench DEVDEP only (the
+   kernel imports nothing); it can replace GcProfiler-pause-only tails with true service-latency percentiles.
 5. **Failover behaviour + anti-flap (trust gate).** time/picks to route away from a node whose health bit
    drops, and to fade a recovered node back in -- does it thundering-herd the healed node, or ramp (ADR
    0002)? Includes the fail-closed proof: under adversarial eligibility churn, `pick()` NEVER returns a
@@ -246,7 +251,7 @@ broadly useful first, novel/attention strategies later.
 
 | Strategy         | pick() signature        | Bound | Why it earns a slot |
 |------------------|-------------------------|-------|---------------------|
-| PeakEWMA         | `pick(now)`             | O(d)=O(1) | Latency-aware P2C: score = inflight x EWMA(rtt), pick the lower. Twitter Finagle's "peak-EWMA". A Float64Array EWMA ring per node; zero-alloc. The strategy the multi-region FE case wants. |
+| PeakEWMA         | `pick(now)`             | O(d)=O(1) | Latency-aware P2C: score = inflight x EWMA(rtt), pick the lower. Twitter Finagle's "peak-EWMA". A Float64Array EWMA ring per node; zero-alloc. The strategy the multi-region FE case wants. Optional TAIL-aware complement: lite-sketch `DDSketch` (published 0.3.0) per node -> a p99-aware score (inflight x p99Rtt), 0 B/op add; EWMA-mean stays the zero-peer default. |
 | ConsistentHash   | `pick(keyHash)`         | O(1) via lookup table | Karger ring OR Maglev table (Eisenbud, NSDI 2016 -- O(1) lookup, minimal disruption on membership change). Sticky routing / cache affinity. Hash is caller-supplied INTEGER (no per-pick string hashing -- the one zero-GC hazard, section 5). |
 | BoundedLoad      | `pick()`                | O(d)=O(1) | P2C with a cap: skip a node whose occupancy exceeds `(1+eps) x mean` (consistent-hashing-with-bounded-loads, Mirrokni et al.; the occupancy/Little's-Law variant Zalando shipped). The overload-protection layer. |
 | WeightedRandom   | `pick()`                | O(1) | Vose alias-table sampling (one PRNG draw + one compare). Rides `@zakkster/lite-o1`'s `AliasTable` directly -- do NOT re-implement it (section 6). Static weights, rebuild on reweight. |
@@ -361,7 +366,11 @@ proven zero-GC parts, not new low-level code.
   add/remove/sample, maintained in setEligible, the right fit for a MUTATING eligibility set),
   `SparseSet` (the eligible-node set with O(1) add/remove/clear), `AliasTable` (WeightedRandom sampling --
   reused verbatim, not re-implemented), `RingLog`/`MonoDeque` (EWMA + sliding-window latency for
-  PeakEWMA/BoundedLoad). Three newer members map to specific milestones: **`Reservoir`** (Vitter's Algo R,
+  PeakEWMA/BoundedLoad). The TAIL-latency sibling substrate is `@zakkster/lite-sketch` (published 0.3.0):
+  its `DDSketch` (relative-error quantiles, 0 B/op add, hard per-query bound) is the optional-peer p99
+  source for a tail-aware PeakEWMA (M7) and the bench harness's service-latency dims -- lite-o1 owns the
+  EWMA scalar, lite-sketch owns the quantile; both optional peers, never hard deps.
+  Three newer members map to specific milestones: **`Reservoir`** (Vitter's Algo R,
   O(1)/item uniform k-sampling) is the substrate for **Subsetting** (post-1.0 #4 -- pick k of N endpoints
   uniformly); **`EliasFano`** (`nextGEQ` successor over a monotone integer sequence) makes the
   **ring-with-vnodes** option for **M8 ConsistentHash** viable (a ring lookup IS a successor query), an

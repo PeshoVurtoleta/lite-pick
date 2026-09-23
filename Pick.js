@@ -46,7 +46,7 @@
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.5.0';
+export const VERSION = '0.6.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.

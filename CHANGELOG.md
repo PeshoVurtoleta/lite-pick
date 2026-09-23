@@ -4,6 +4,68 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-23
+
+M6: the benchmark suite (ROADMAP.md M6). An EVIDENCE session -- no API change. `Pick.js` and
+`Pool.js` are byte-identical to 0.5.0 apart from the `VERSION` stamp; the kernel gates
+(torture / PerfGate / witness / balance / fuzz) are unchanged and green. Everything added lives
+under `benchmark/` and is NOT in the published tarball (`files[]` unchanged).
+
+### Added
+
+- `benchmark/GcBlastRadius.mjs` -- the GC blast-radius headline (dimension 3). The same sustained
+  mixed workload (n=1024, 2,000,000 requests) through two lanes: the lite-pick lane (`P2cBalancer`
+  over caller-owned typed arrays) measures `major=0`, pick `B/op=0`, `maxPause` ~0.1-0.3ms; the
+  allocating foil lane (collect-candidates-sort idiom with a retained in-flight request context)
+  measures `major=13-14`, `maxPause` ~2.5-4ms. GC sampled via `@zakkster/lite-gc-profiler`
+  (`GcProfiler` + `checkNoGc`, the torture.mjs machinery); `B/op` via `measureAllocs`.
+- `benchmark/Fairness.mjs` -- weighted convergence + burstiness (dimension 8). SmoothWRR weights
+  [10,3,2,1]: exact fairness (counts == k*weight) over 500 cycles, max-run 3 vs the bursty
+  weight-expansion foil's 10. SED weights [1,2,3,4,6,8,12,16]: worst share drift < 0.0001 from the
+  weight target; weighted-imbalance ~0.00 vs a weight-blind random foil's ~5.5.
+- `benchmark/Disruption.mjs` -- consistent-hash disruption (dimension 7). Naive-modulo foil over
+  100,000 seeded keys remaps 98.4% (remove node 64->63) / 98.5% (add node 64->65) of keys vs a good
+  consistent hash's ~1.6% / ~1.5% ideal. Explicit SKIP row for `ConsistentHash` (Maglev, M8) -- no
+  stub in `Pick.js`.
+- `benchmark/Report.mjs` -- emits `benchmark/results.json` stamping Node version, V8, CPU model,
+  core count, arch, OS, and every PRNG seed alongside the measured numbers; renders the README
+  `<!-- bench:ID -->` fenced tables from it. `--verify` mode is the `bench:verify` drift check:
+  ALGORITHMIC numbers (balance peak-gap, disruption remap %) recomputed FRESH and compared EXACT;
+  TIMING numbers (GC pauses) compared to `results.json` within +/-15%. Exits non-zero on any drift.
+  (Fixes the previously-broken `bench:report` script, which pointed at an absent `Report.mjs`.)
+- `benchmark/Soak.mjs` -- the endurance-soak scaffold (post-1.0 #8): ONE P2C lane, continuous
+  mixed-chaos load (flap storms + whole-pool-down troughs + load feedback), emits a JSONL
+  time-series to `benchmark/soak.jsonl`, and RUNS `test/invariants.mjs:checkBase` at every
+  checkpoint. `tracker.size()` returns to 0 after each cycle; invariants green at all checkpoints.
+  `SOAK_CYCLES=0` runs forever -- the harness the `caffeinate -i` overnight burn-in plugs into.
+- `benchmark/Matrix.mjs` -- extended (not rewritten): each SUBJECT gained a `dims` flag, and the
+  file now exports the SHARED SEEDED workload matrix (`buildWorkload` over uniform / skewed-weight
+  / skewed-cost), `SEEDS`, `SUBJECTS`, `SIZES`, and `measureThroughput`, reused by every dimension
+  file. The standalone throughput runner is behind a main guard so importing it runs no sweep.
+- `decisions/0008-benchmark-suite.md` -- the ADR: the parity framing, the real-competitors + foils
+  baseline, the drift-check teeth, and the ConsistentHash SKIP.
+- README: the *Evidence* section -- balance anchor + GC blast-radius headlines (fenced), the
+  consistent-hash disruption trust gate, the honest COLD-path cost table, and the vs-AWS NLB/ALB
+  "complementary, not a competitor" positioning.
+- devDependencies: `load-balancers@1.3.52`, `loadbalance@1.0.0`, `wrr@1.0.0` -- REAL npm
+  competitors, pinned to exact versions, loaded via `createRequire` (all three are CommonJS) and
+  timed into `results.json` beside our in-repo foils; a package that fails to load becomes a
+  labeled `unavailable` row rather than being silently dropped. Each incumbent is rendered side by
+  side with the SAME-complexity lite-pick strategy on the SAME n=1024 pool in the README
+  `<!-- bench:competitors -->` throughput fence. Parity is claimed only on EQUAL-work rows: P2C is
+  parity (~60k vs ~61k ops/ms); RoundRobin is ~22% slower (~260k vs ~335k) and the gap is OWNED --
+  `loadbalance` is a bare `i++ % n` with no liveness, while lite-pick's `RoundRobinBalancer`
+  forward-scans the eligibility bitmap to skip down nodes (never a dead pick), and that scan is the
+  constant-factor cost of a guarantee the incumbents do not offer. The weighted-random row is a
+  disclosed SKIP -- lite-pick's O(1) `WeightedRandom` (alias table) lands at M10, so `wrr` is not
+  raced against our O(cap) `SmoothWRRBalancer` (a different complexity class). No "faster"/"Nx".
+- Scripts: `bench:gc`, `bench:fairness`, `bench:disruption`, `bench:verify`, `soak`.
+
+### Changed
+
+- Version bumped to 0.6.0 in the three sync sites (`package.json`, `Pick.js` `VERSION`, `llms.txt`).
+  `peerDependencies` stays `{}`.
+
 ## [0.5.0] - 2026-09-23
 
 M5: the ergonomic request layer at the `@zakkster/lite-pick/pool` subpath -- dispatch/settle

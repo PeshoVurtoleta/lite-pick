@@ -15,7 +15,7 @@
  * on tiny pools while still catching a real complexity regression.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer } from '../Pick.js';
 
 const SIZES = [8, 64, 512, 4096];
 const OPS = 2_000_000;
@@ -135,6 +135,17 @@ const SUBJECTS = [
             bl.note(0, total); // seed _total so the cap branch runs (cold)
             let key = 0; // stride 97 keeps `key` a Smi (a value >= 2^31 would box as a HeapNumber)
             return () => { key = (key + 97) & 0x3fffffff; return bl.pick(key); };
+        },
+    },
+    {
+        name: 'WeightedRandom',
+        complexity: 'const', // one alias-column draw + one compare (expected O(1) rejection) -> flat with n
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) w[i] = 1 + (i & 15); // skewed 1..16, all eligible -> no rejection
+            const wr = new WeightedRandomBalancer(n, el, w, 0xABCDEF);
+            return () => wr.pick();
         },
     },
 ];

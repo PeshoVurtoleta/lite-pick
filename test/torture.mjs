@@ -44,7 +44,7 @@ async function main() {
     const {
         Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
         LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer,
-        BoundedLoadBalancer,
+        BoundedLoadBalancer, WeightedRandomBalancer,
     } = await import('../Pick.js');
 
     const CAP = 1 << 12;    // pool capacity 4096
@@ -95,6 +95,9 @@ async function main() {
             pe.pick(c);
             pe.recordRtt(c & (CAP - 1), 1000, c);
             tracker.track(pe, noop, 'peakewma', { audit: true });
+            const wr = new WeightedRandomBalancer(CAP, el, weights, c);
+            wr.pick();
+            tracker.track(wr, noop, 'weightedrandom', { audit: true });
         }
         return tracker.size();
     }
@@ -287,11 +290,45 @@ async function main() {
     const noteAllocBytes = Math.max(0, Math.round(noteBpc));
     const noteAllocOk = noteAllocBytes === 0;
 
+    // ---- phase 14: WeightedRandom.pick() per-call allocation (0 B/op) ------
+    // One reused WeightedRandomBalancer over a half-eligible, weighted pool: each pick() is one
+    // alias-column draw + one probability compare (rejection-sampled over eligibility) -- integer/
+    // float locals only, no object/closure/array created. The alias table is built ONCE (COLD) in the
+    // ctor. The instance is created OUTSIDE the measured loop and stepped inside; nothing closes over it.
+    const wrEl = new Uint8Array(CAP);
+    for (let i = 0; i < CAP; i += 2) wrEl[i] = 1;             // half eligible (exercise rejection)
+    const wrWeights = new Uint32Array(CAP);
+    for (let i = 0; i < CAP; i++) wrWeights[i] = 1 + (i & 15);
+    const wrand = new WeightedRandomBalancer(CAP, wrEl, wrWeights, 0x5EED1E55);
+    let wrandSink = 0;
+    const wrandStep = () => { wrandSink = (wrandSink + wrand.pick()) | 0; };
+    const wrandAllocRes = measureAllocs(wrandStep, { iterations: 100000, batches: 8 });
+    const wrandBpc = wrandAllocRes.bytesPerCall === null ? 0 : wrandAllocRes.bytesPerCall;
+    const wrandAllocBytes = Math.max(0, Math.round(wrandBpc));
+    const wrandAllocOk = wrandAllocBytes === 0;
+
+    // ---- phase 14b: WeightedRandom.pick() HEAVY-OUTAGE fallback (0 B/op) ---
+    // EXACTLY ONE eligible positive-weight node in the CAP pool (all others down), so the 64-try
+    // rejection loop misses ~every time and each pick() runs the rotated linear-scan FALLBACK -- the
+    // branch the half-eligible phase 14 never reaches. It must be 0 B/op too (integer locals only). The
+    // instance is created OUTSIDE the measured loop and stepped inside; nothing closes over it.
+    const wrFbEl = new Uint8Array(CAP);
+    wrFbEl[1] = 1;                                            // one eligible node -> exhaust rejection, scan
+    const wrFbWeights = new Uint32Array(CAP);
+    for (let i = 0; i < CAP; i++) wrFbWeights[i] = 1 + (i & 15);
+    const wrandFb = new WeightedRandomBalancer(CAP, wrFbEl, wrFbWeights, 0x0FF0DEAD);
+    let wrandFbSink = 0;
+    const wrandFbStep = () => { wrandFbSink = (wrandFbSink + wrandFb.pick()) | 0; };
+    const wrandFbAllocRes = measureAllocs(wrandFbStep, { iterations: 100000, batches: 8 });
+    const wrandFbBpc = wrandFbAllocRes.bytesPerCall === null ? 0 : wrandFbAllocRes.bytesPerCall;
+    const wrandFbAllocBytes = Math.max(0, Math.round(wrandFbBpc));
+    const wrandFbAllocOk = wrandFbAllocBytes === 0;
+
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void peSink; void chSink; void blSink;
+    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void peSink; void chSink; void blSink; void wrandSink; void wrandFbSink;
 
-    process.stdout.write('lite-pick torture (M9: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ + PeakEWMA + ConsistentHash + BoundedLoad)\n');
+    process.stdout.write('lite-pick torture (M10: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ + PeakEWMA + ConsistentHash + BoundedLoad + WeightedRandom)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
@@ -319,10 +356,14 @@ async function main() {
         (blAllocOk ? 'PASS' : 'FAIL') + ' (CHBL Maglev table build is the disclosed COLD cost)\n');
     process.stdout.write('  BoundedLoad.note() allocs: ' + noteAllocBytes + ' B/op -> ' +
         (noteAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  WeightedRandom.pick() allocs: ' + wrandAllocBytes + ' B/op -> ' +
+        (wrandAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  WeightedRandom.pick() heavy-outage fallback allocs: ' + wrandFbAllocBytes + ' B/op -> ' +
+        (wrandFbAllocOk ? 'PASS' : 'FAIL') + '\n');
 
     if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk ||
         !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk || !chAllocOk ||
-        !blAllocOk || !noteAllocOk) {
+        !blAllocOk || !noteAllocOk || !wrandAllocOk || !wrandFbAllocOk) {
         process.stderr.write('torture: FAIL\n');
         process.exit(1);
     }

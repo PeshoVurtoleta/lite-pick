@@ -1,8 +1,8 @@
 {
   "name": "@zakkster/lite-pick",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.9.0",
-  "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, PeakEWMA (latency-aware peak-EWMA), ConsistentHash (Maglev sticky/affinity routing, minimal disruption), and BoundedLoad (consistent hashing with bounded loads -- sticky routing with a per-backend occupancy cap that overflows a hotspot to neighbours); the /pool subpath adds dispatch/settle counters + failover and a duck-typed query-cache fetcher.",
+  "version": "1.0.0",
+  "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster of ten strategies: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, PeakEWMA (latency-aware peak-EWMA), ConsistentHash (Maglev sticky/affinity routing, minimal disruption), BoundedLoad (consistent hashing with bounded loads -- sticky routing with a per-backend occupancy cap that overflows a hotspot to neighbours), and WeightedRandom (O(1) Vose alias-table sampling with rejection-sampling eligibility); the /pool subpath adds dispatch/settle counters + failover and a duck-typed query-cache fetcher. See GUIDE.md to choose a strategy.",
   "type": "module",
   "main": "./Pick.js",
   "module": "./Pick.js",
@@ -29,6 +29,7 @@
     "llms.txt",
     "README.md",
     "RECIPES.md",
+    "GUIDE.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
@@ -79,6 +80,8 @@
     "maglev",
     "bounded-load",
     "weighted-random",
+    "alias-method",
+    "vose",
     "sticky-routing",
     "client-side-load-balancing",
     "in-process",

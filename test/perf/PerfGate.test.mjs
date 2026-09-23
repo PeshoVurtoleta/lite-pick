@@ -22,7 +22,7 @@ import { zgcSuite } from '@zakkster/lite-perf-gate';
 import {
     Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
     LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer,
-    BoundedLoadBalancer,
+    BoundedLoadBalancer, WeightedRandomBalancer,
 } from '../../Pick.js';
 
 const CAP = 1 << 14;      // pool capacity 16384 (O(1)/O(d) scenarios: size is irrelevant)
@@ -372,10 +372,70 @@ const boundedLoadNote = {
     },
 };
 
+/**
+ * weightedrandom-pick: reused WeightedRandomBalancer over a half-eligible, weighted pool. Each op is
+ * one alias-column draw + one probability compare, rejection-sampled over eligibility -- integer/float
+ * locals only, a PURE read (the alias table is built ONCE, COLD, in setup). O(1), so CAP is fine. The
+ * `grows` counter covers the eligibility + weights + the owned _prob / _alias table (none reallocates
+ * -> 0 delta).
+ */
+const weightedRandomPick = {
+    name: 'WeightedRandomBalancer.pick()',
+    setup() {
+        const el = makePool();                     // half eligible -> exercise rejection
+        const weights = new Uint32Array(CAP);
+        for (let i = 0; i < CAP; i++) weights[i] = 1 + (i & 15);
+        const wr = new WeightedRandomBalancer(CAP, el, weights, 0x5EED1E55);
+        return { el, weights, wr, acc: 0 };
+    },
+    hot(s, n) {
+        const wr = s.wr;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + wr.pick()) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) {
+        return {
+            grows: s.el.buffer.byteLength + s.weights.buffer.byteLength +
+                s.wr._prob.buffer.byteLength + s.wr._alias.buffer.byteLength,
+        };
+    },
+};
+
+/**
+ * weightedrandom-pick-fallback: the HEAVY-OUTAGE path. EXACTLY ONE eligible positive-weight node in the
+ * CAP pool (all others down), so the 64-try rejection loop misses ~every time (hit prob ~64/CAP) and each
+ * pick() runs the rotated linear-scan FALLBACK -- the branch the dense/half scenario never reaches. It must
+ * be 0 B/op too (the scan uses only integer locals). Same `grows` counter (nothing reallocates -> 0 delta).
+ */
+const weightedRandomPickFallback = {
+    name: 'WeightedRandomBalancer.pick() heavy-outage fallback scan',
+    setup() {
+        const el = new Uint8Array(CAP);            // all DOWN...
+        el[1] = 1;                                 // ...except exactly ONE eligible node -> fallback path
+        const weights = new Uint32Array(CAP);
+        for (let i = 0; i < CAP; i++) weights[i] = 1 + (i & 15); // every node positive-weight
+        const wr = new WeightedRandomBalancer(CAP, el, weights, 0x0FF0DEAD);
+        return { el, weights, wr, acc: 0 };
+    },
+    hot(s, n) {
+        const wr = s.wr;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + wr.pick()) | 0;   // ~every pick exhausts rejection -> scan
+        s.acc = acc | 0;
+    },
+    statsOf(s) {
+        return {
+            grows: s.el.buffer.byteLength + s.weights.buffer.byteLength +
+                s.wr._prob.buffer.byteLength + s.wr._alias.buffer.byteLength,
+        };
+    },
+};
+
 const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
     leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord, consistentHashPick,
-    boundedLoadPick, boundedLoadNote,
+    boundedLoadPick, boundedLoadNote, weightedRandomPick, weightedRandomPickFallback,
 ];
 
 /**
@@ -559,6 +619,24 @@ const blMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** WeightedRandom teeth: pick() boxed into a fresh [] each op -- MUST trip the gate. */
+const wrMustFailAlloc = {
+    name: 'WeightedRandom.pick() boxed into fresh array (MUST allocate)',
+    setup() {
+        const el = makePool();
+        const weights = new Uint32Array(CAP);
+        for (let i = 0; i < CAP; i++) weights[i] = 1 + (i & 15);
+        return { el, weights, base: new WeightedRandomBalancer(CAP, el, weights, 1) };
+    },
+    hot(s, n) {
+        const wr = s.base;
+        let sink = 0;
+        for (let i = 0; i < n; i++) { const arr = [wr.pick()]; sink += arr[0]; }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -571,6 +649,6 @@ zgcSuite({
     mustFail: [
         drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc, p2cMustFailAlloc,
         lcMustFailAlloc, sedMustFailAlloc, nqMustFailAlloc, peMustFailAlloc, chMustFailAlloc,
-        blMustFailAlloc,
+        blMustFailAlloc, wrMustFailAlloc,
     ],
 });

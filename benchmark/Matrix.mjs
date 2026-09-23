@@ -16,7 +16,7 @@
  * PARITY check -- a strategy within noise of the foil while holding the contract has passed.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, Prng } from '../Pick.js';
 
 export const SIZES = [8, 64, 512, 4096];
 export const OPS = 2_000_000;
@@ -228,6 +228,19 @@ export const SUBJECTS = [
             bl.note(0, total); // seed _total to the workload's inflight sum (cold, note is sole writer)
             let key = 0; // stride 97 keeps `key` a Smi (a value >= 2^31 would box as a HeapNumber)
             return () => { key = (key + 97) & 0x3fffffff; return bl.pick(key); };
+        },
+    },
+    {
+        // O(1) weighted-random via a Vose alias table: one column draw + one compare. dims include
+        // 'fairness' -- like SmoothWRR/SED it converges to the configured weight ratios, but by SAMPLING
+        // (law of large numbers) rather than a deterministic O(cap) scan. Built over the SKEWED-WEIGHT
+        // workload (weights fan 1..16) so the parity throughput is measured on a real weighted table.
+        name: 'WeightedRandom',
+        dims: ['throughput', 'fairness'],
+        make(n) {
+            const { eligible, weights } = buildWorkload('skewed-weight', n);
+            const wr = new WeightedRandomBalancer(n, eligible, weights, SEEDS.p2c);
+            return () => wr.pick();
         },
     },
 ];

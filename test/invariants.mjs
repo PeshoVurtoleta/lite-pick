@@ -129,6 +129,50 @@ export function checkBoundedLoad(b, inflight, cap) {
     return null;
 }
 
+/**
+ * WeightedRandom alias-table invariant (M10): the balancer-owned Vose table (`_prob` / `_alias`) is
+ * well-formed and CONSISTENT with the caller weights.
+ *   1. STRUCTURAL: every `_prob` cell is finite in [0, 1]; every `_alias` cell is an in-range index.
+ *   2. NO WEIGHT-0 COLUMN: a weight-0 node has `_prob === 0` (it always redirects), and any column that
+ *      can redirect (`_prob < 1`) redirects to a POSITIVE-weight node -- so pick() never returns a weight-0.
+ *   3. SUM INVARIANT: each node's reconstructed selection probability -- `_prob[j]/cap` (as its own
+ *      column) + the redirected mass of every column aliasing to it -- equals `weights[j] / total`.
+ * The all-zero-weight table (total 0) is degenerate and unused (pick short-circuits on `_psum === 0`),
+ * so only the structural check applies there. PURE: reconstruction is O(cap^2) over scalars, no allocation.
+ * Returns null or the first violated invariant as a string.
+ */
+export function checkWeightedRandom(b, weights, cap) {
+    const prob = b._prob, alias = b._alias;
+    let total = 0;
+    for (let i = 0; i < cap; i++) total += weights[i];
+    for (let i = 0; i < cap; i++) {
+        if (!Number.isFinite(prob[i]) || prob[i] < 0 || prob[i] > 1) {
+            return '_prob[' + i + '] out of [0,1]: ' + prob[i];
+        }
+        if (alias[i] < 0 || alias[i] >= cap) return '_alias[' + i + '] out of range: ' + alias[i];
+    }
+    if (b._psum !== total) return '_psum ' + b._psum + ' != recomputed sum(weights) ' + total;
+    if (total === 0) return null;   // degenerate all-zero: table unused, pick fails closed on _psum===0
+    for (let i = 0; i < cap; i++) {
+        if (weights[i] === 0 && prob[i] !== 0) {
+            return 'weight-0 node ' + i + ' has _prob ' + prob[i] + ' (could be returned as itself)';
+        }
+        if (prob[i] < 1 && weights[alias[i]] === 0) {
+            return 'column ' + i + ' redirects to weight-0 node ' + alias[i];
+        }
+    }
+    for (let j = 0; j < cap; j++) {
+        let m = prob[j];                        // j drawn as its own column
+        for (let i = 0; i < cap; i++) if (i !== j && alias[i] === j) m += (1 - prob[i]);
+        const share = m / cap;                  // columns are drawn uniformly
+        const want = weights[j] / total;
+        if (Math.abs(share - want) > 1e-9) {
+            return 'node ' + j + ' reconstructed share ' + share + ' != weight share ' + want;
+        }
+    }
+    return null;
+}
+
 /** The exact minimum of scoreFn(i) over eligible i (candidateFn gates candidacy). Infinity if none. */
 export function minEligibleScore(eligible, cap, scoreFn, candidateFn) {
     let best = Infinity;

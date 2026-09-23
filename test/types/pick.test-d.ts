@@ -6,7 +6,7 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../../Pick.js';
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -205,3 +205,23 @@ bl.note(0, 'x');
 
 // @ts-expect-error -- totalInflight is readonly.
 bl.totalInflight = 5;
+
+// WeightedRandomBalancer: capacity + eligibility + a required weights arg + optional seed; a BalancerBase subclass.
+const wr: WeightedRandomBalancer = new WeightedRandomBalancer(4, new Uint8Array(4), new Uint32Array(4));
+const wrSeeded: WeightedRandomBalancer = new WeightedRandomBalancer(4, new Uint8Array(4), new Uint32Array(4), 123);
+void wrSeeded;
+const wrBase: BalancerBase = wr; // is-a BalancerBase
+void wrBase;
+const wrCap: number = wr.capacity;
+const wrLive: number = wr.live;
+const wrPick: number = wr.pick();
+void wrCap; void wrLive; void wrPick;
+wr.setWeight(0, 5);
+wr.rebuild();
+wr.setEligible(1, false);
+
+// @ts-expect-error -- weights must be a Uint32Array, not a number[].
+new WeightedRandomBalancer(4, new Uint8Array(4), [1, 1, 1, 1]);
+
+// @ts-expect-error -- weights arg is required.
+new WeightedRandomBalancer(4, new Uint8Array(4));

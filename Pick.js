@@ -1,10 +1,11 @@
 /**
  * @zakkster/lite-pick -- zero-GC load-balancing SELECTION KERNEL.
  *
- * M9 (0.9.0): substrate seams + nine strategies -- RoundRobin, SmoothWRR, P2C, the exact
- * LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C), ConsistentHash
- * (a Maglev lookup table), and BoundedLoad (Consistent Hashing with Bounded Loads: the
- * Maglev table + an occupancy cap that overflows a hot backend). This file ships:
+ * M10 (1.0.0): substrate seams + TEN strategies (the roster-complete release) -- RoundRobin,
+ * SmoothWRR, P2C, the exact LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C),
+ * ConsistentHash (a Maglev lookup table), BoundedLoad (Consistent Hashing with Bounded Loads:
+ * the Maglev table + an occupancy cap that overflows a hot backend), and WeightedRandom (O(1)
+ * Vose alias-table sampling with rejection-sampling eligibility). This file ships:
  *
  *   - VERSION        the single source-of-truth version stamp (3-place sync).
  *   - PICK_NONE      the fail-closed sentinel (-1): "no endpoint", never a dead pick.
@@ -47,6 +48,16 @@
  *                    stickiness + minimal disruption PLUS the hotspot protection plain CH lacks. It
  *                    extends ConsistentHashBalancer (reusing its Maglev build + probe VERBATIM) and
  *                    OWNS a running `_total` (sole writer: the warm note(i, delta) seam). O(1), 0 B/op.
+ *   - WeightedRandomBalancer  O(1) weighted-random selection via a Vose/Walker ALIAS TABLE (one
+ *                    column draw + one probability compare -> a candidate), with rejection-sampling
+ *                    eligibility (retry an ineligible candidate up to a bounded count, then a 0-B/op
+ *                    rotated linear eligible scan). The alias table is built COLD over the eligible-
+ *                    INDEPENDENT weights (a weight-0 node is NEVER a column), so rejection over the
+ *                    bitmap renormalizes the weight distribution across the SURVIVING eligible mass.
+ *                    The balancer OWNS its derived table (_prob/_alias) and is its SOLE writer via cold
+ *                    setWeight/rebuild (the SmoothWRR precedent); an eligibility flap never rebuilds.
+ *                    The stateless O(1) sample (no accumulators to desync) for VERY LARGE pools where
+ *                    SmoothWRR's O(cap) scan hurts. O(1), 0 B/op. (Vose 1991 / Walker alias method.)
  *
  * The identity (decisions/0001): lite-pick OWNS NO mutable state it can avoid owning.
  * It reads pre-allocated views (eligibility, inflight, weights, scores) that siblings or
@@ -55,8 +66,11 @@
  *
  * Roster (one strategy per session -- see ROADMAP.md): RoundRobin [M1], SmoothWRR [M2],
  *   P2C [M3], LeastConn/SED/NQ [M4], PeakEWMA [M7], ConsistentHash [M8], BoundedLoad [M9],
- *   WeightedRandom [planned]. The EXACT-O(log n) fewest-in-flight variant is a deferred
- *   @zakkster/lite-logn BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan.
+ *   WeightedRandom [M10] -- roster complete for now (NOT closed: AZ-aware routing, hedging, and
+ *   subsetting are queued post-1.0). The EXACT-O(log n) fewest-in-flight variant is a deferred
+ *   @zakkster/lite-logn BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan;
+ *   a lite-logn Fenwick tree is the deferred DYNAMIC-weight complement to WeightedRandom's static
+ *   alias table, and lite-o1 AliasTable a deferred duck-typed optional-peer upgrade for the build.
  *
  * M5 (0.5.0) adds the ergonomic request layer at the @zakkster/lite-pick/pool subpath (a
  * SEPARATE file, Pool.js -- the async dispatch/settle counter wrapper + distinct-endpoint
@@ -67,7 +81,7 @@
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '0.9.0';
+export const VERSION = '1.0.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -1116,5 +1130,179 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
             }
         }
         return firstEligible;   // -1 (PICK_NONE) iff NO eligible backend was reachable in the window
+    }
+}
+
+/**
+ * WeightedRandomBalancer -- O(1) weighted-random selection via a Vose/Walker ALIAS TABLE (M10),
+ * the roster-completing strategy.
+ *
+ * `pick()` draws ONE column uniformly (`prng.nextBelow(cap)`), compares one fresh uniform against
+ * `_prob[col]`, and takes `col` or `_alias[col]` -- a constant handful of integer/float ops that
+ * return an endpoint proportional to its weight. This is the STATELESS O(1) weighted selector: no
+ * per-endpoint accumulator to desync (SmoothWRR's `_current`), just a static table sampled with a
+ * PRNG -- the fit for VERY LARGE pools where SmoothWRR's O(cap)-per-pick scan hurts. It trades
+ * SmoothWRR's deterministic low-variance smoothness for sampling variance (any single pick is
+ * random; the LAW OF LARGE NUMBERS delivers the weight ratios over a run -- balance.mjs anchors it).
+ *
+ * ELIGIBILITY is REJECTION SAMPLING over the shared bitmap (the ADR 0005 / P2C discipline, not a
+ * table rebuild): if the drawn candidate is ineligible, redraw up to a bounded 64 times, then fall
+ * back to a 0-B/op rotated linear scan from a random start for the degenerate heavy-outage case.
+ * Because the alias table is built over the ELIGIBLE-INDEPENDENT weights and a candidate is ALWAYS
+ * a positive-weight node (a weight-0 node is never a column -- see _build), rejecting the ineligible
+ * draws RENORMALIZES the weight distribution over the SURVIVING eligible mass: each eligible node's
+ * long-run share converges to weight[i] / sum(eligible weights) (ADR 0012 Fork 1). The rare fallback
+ * scan returns the first eligible positive-weight node from a random offset (unbiased first-after-
+ * offset), a correctness net, not a proportional path.
+ *
+ * Ownership (ADR 0001, ADR 0004, ADR 0012): `weights` is the CALLER's Uint32Array (length >= capacity)
+ * -- the SmoothWRR / SED weight seam -- and the balancer is the SOLE writer of its DERIVED alias table
+ * (`_prob` Float64Array + `_alias` Int32Array, both balancer-owned) via the cold `setWeight` / `rebuild`
+ * (which read `weights` and rebuild the table); mutating `weights` directly desyncs the table (UB, the
+ * SmoothWRR asymmetry). The alias build reuses COLD scratch worklists allocated once in the ctor -- the
+ * build allocates nothing per call, and pick() allocates nothing per call.
+ *
+ * Fail-closed (ADR 0012 Fork 2): `pick()` returns PICK_NONE (-1) IFF `live === 0` OR no eligible node
+ * has a positive weight (all-zero weights, or every eligible node's weight is 0). NEVER a dead pick,
+ * a weight-0 return, or an out-of-range index. `pick()` never throws.
+ *
+ * Bound: O(1) per pick (one column draw + one compare, expected O(1) rejection draws when eligibility
+ * is dense), 0 B/op (integer/float locals only) -- proven by test/torture.mjs + test/perf/PerfGate.test.mjs.
+ *
+ * DEFERRED optional-peer seams (import NOTHING; peerDependencies STAYS `{}` until a shipped path imports
+ * one): a `@zakkster/lite-o1` `AliasTable` as a duck-typed drop-in for the inline Vose build, and a
+ * `@zakkster/lite-logn` Fenwick/BinaryIndexedTree for the DYNAMIC-weight case (O(log n) update + sample)
+ * -- the mutable-weight complement to this static table's O(1) sample / O(cap) rebuild (ADR 0012).
+ *
+ * NOT `@zakkster/lite-random`: that sibling is a GAME RNG (Mulberry32; loot tables, particles, gaussian)
+ * whose `weighted(items, weights)` returns an ITEM one-shot, is NOT eligibility-aware, holds no reusable
+ * table, and uses a different PRNG. lite-pick's WeightedRandom returns an endpoint INDEX, honours the
+ * shared eligibility bitmap (fail-closed), owns a persistent alias table rebuilt only on reweight, and
+ * uses the in-repo xorshift32. Different domain + contract -- not a peer, not a substrate (ADR 0012 / GUIDE.md).
+ */
+export class WeightedRandomBalancer extends BalancerBase {
+    /**
+     * @param {number} capacity  endpoint count (fixed; add/remove is a cold rebuild).
+     * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param {Uint32Array} weights  caller-owned per-endpoint weights (length >= capacity); the balancer
+     *   is the sole writer of the DERIVED alias table via setWeight (direct mutation desyncs it -- UB).
+     * @param {number} [seed=0x9e3779b9]  deterministic PRNG seed (reproducible benches).
+     */
+    constructor(capacity, eligible, weights, seed = 0x9e3779b9) {
+        super(capacity, eligible);
+        // Validate typeof-first, BEFORE allocating the owned table / scratch (fail closed early -- the
+        // PeakEWMA / ConsistentHash / BoundedLoad discipline).
+        if (!(weights instanceof Uint32Array) || weights.length < capacity) {
+            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+        }
+        this._weights = weights;
+        this._rng = new Prng(seed);
+        // Balancer-owned derived table: _prob (the split probability per column) + _alias (the column's
+        // alternate). A candidate is ALWAYS a positive-weight node (see _build), so pick() never returns
+        // a weight-0 index.
+        this._prob = new Float64Array(capacity);
+        this._alias = new Int32Array(capacity);
+        // COLD scratch worklists for the Vose build (small/large index stacks + the scaled probabilities),
+        // allocated ONCE here and reused by every _build -- the build never allocates per call.
+        this._small = new Int32Array(capacity);
+        this._large = new Int32Array(capacity);
+        this._scaled = new Float64Array(capacity);
+        this._psum = 0;      // sum of ALL weights (the eligible-independent normalizer); 0 => degenerate.
+        this._builds = 0;    // COLD rebuild counter (observability / the anti-flap gate: a flap adds 0).
+        this._build();
+    }
+
+    /**
+     * COLD: (re)build the Vose/Walker alias table from the current caller weights. The standard
+     * small/large worklist over `scaled[i] = weights[i] * cap / total` (mean-1 normalization): pair a
+     * deficient (< 1) column with a surplus (>= 1) one until one worklist empties, then drain the
+     * residue (numerically ~1 full columns) to prob 1. A weight-0 node has scaled 0, so it is popped
+     * once, assigned prob 0 + a POSITIVE-weight alias, and NEVER reaches the prob-1 drain -- it can
+     * never be returned as its own column. All-zero weights (total 0) leaves _psum 0 and pick() fails
+     * closed. Reuses the cold scratch worklists -- allocates nothing. ~15 lines (do NOT re-implement
+     * lite-o1's AliasTable; this is the inline standard build, ADR 0012 Fork 0).
+     */
+    _build() {
+        this._builds++;
+        const cap = this._cap, wt = this._weights, prob = this._prob, alias = this._alias;
+        const scaled = this._scaled, small = this._small, large = this._large;
+        let total = 0;
+        for (let i = 0; i < cap; i++) total += wt[i];
+        this._psum = total;
+        if (total <= 0) {
+            // Degenerate all-zero weights: no positive-weight column. pick() short-circuits on _psum===0
+            // (PICK_NONE), so the table is never read -- fill it defensively (each column self-referential).
+            for (let i = 0; i < cap; i++) { prob[i] = 0; alias[i] = i; }
+            return;
+        }
+        const scale = cap / total;
+        let ns = 0, nl = 0;                       // small / large stack heights (indices into the scratch)
+        for (let i = 0; i < cap; i++) {
+            const v = wt[i] * scale;
+            scaled[i] = v;
+            if (v < 1) small[ns++] = i; else large[nl++] = i;
+        }
+        while (ns > 0 && nl > 0) {
+            const s = small[--ns];
+            const l = large[--nl];
+            prob[s] = scaled[s];
+            alias[s] = l;                         // l is surplus (scaled >= 1) => positive weight
+            const rem = (scaled[l] + scaled[s]) - 1;
+            scaled[l] = rem;
+            if (rem < 1) small[ns++] = l; else large[nl++] = l;
+        }
+        while (nl > 0) { const l = large[--nl]; prob[l] = 1; alias[l] = l; }   // full columns
+        while (ns > 0) { const s = small[--ns]; prob[s] = 1; alias[s] = s; }   // float residue ~1
+    }
+
+    /**
+     * COLD: reconfigure endpoint i's weight (uint32) and REBUILD the alias table from the new weights.
+     * The balancer is the sole writer of the derived table (the SmoothWRR / ConsistentHash precedent).
+     * @param {number} i
+     * @param {number} w  new weight (uint32)
+     */
+    setWeight(i, w) {
+        if (i < 0 || i >= this._cap) throw new RangeError('[lite-pick] index out of range: ' + i);
+        const nw = w >>> 0;
+        if (nw !== w) throw new RangeError('[lite-pick] weight must be a uint32: ' + w);
+        if (nw === this._weights[i]) return;
+        this._weights[i] = nw;
+        this._build();
+    }
+
+    /** COLD: rebuild the alias table from the current caller weights (e.g. after a membership change). */
+    rebuild() {
+        this._build();
+    }
+
+    /**
+     * Pick an endpoint index proportional to weight, or PICK_NONE (fail closed). O(1), 0 B/op, never
+     * throws. One column draw + one probability compare yields a positive-weight candidate; an
+     * ineligible candidate is rejection-redrawn up to 64 times (renormalizing the weight distribution
+     * over the eligible mass), then a rotated linear scan from a random start returns the first eligible
+     * positive-weight node. PICK_NONE IFF live === 0 OR no eligible node has a positive weight.
+     * @returns {number}
+     */
+    pick() {
+        if (this._live === 0 || this._psum === 0) return PICK_NONE;   // pool down / no positive weight
+        const cap = this._cap, el = this._eligible, prob = this._prob, alias = this._alias, rng = this._rng;
+        // Fast path: alias draw + rejection on eligibility. A candidate is always positive-weight, so
+        // rejecting the ineligible ones renormalizes weight-proportionality over the surviving mass.
+        for (let t = 0; t < 64; t++) {
+            const col = rng.nextBelow(cap);
+            const u = rng.next() / 4294967296;    // fresh uniform in [0, 1)
+            const cand = u < prob[col] ? col : alias[col];
+            if (el[cand]) return cand;
+        }
+        // Degenerate (very sparse eligibility): scan from a random start for the first eligible,
+        // positive-weight node. Zero-alloc; returns PICK_NONE only if none exists.
+        const wt = this._weights;
+        let i = rng.nextBelow(cap);
+        for (let k = 0; k < cap; k++) {
+            if (el[i] && wt[i] > 0) return i;
+            i++;
+            if (i >= cap) i = 0;
+        }
+        return PICK_NONE;                         // no eligible positive-weight node
     }
 }

@@ -21,7 +21,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import os from 'node:os';
-import { P2cBalancer, RoundRobinBalancer, Prng, VERSION } from '../Pick.js';
+import { P2cBalancer, RoundRobinBalancer, WeightedRandomBalancer, Prng, VERSION } from '../Pick.js';
 import { SEEDS } from './Matrix.mjs';
 import { measureGcBlastRadius } from './GcBlastRadius.mjs';
 import { measureDisruption } from './Disruption.mjs';
@@ -117,17 +117,18 @@ function measureCompetitors() {
             }),
         });
     }
-    // Weighted-random family -- wrr is O(1) weighted-RANDOM. lite-pick's O(1) weighted-random
-    // (WeightedRandom, alias table) lands at M10, so its parity cell is a PENDING SKIP, NOT a
-    // race against our shipped SmoothWRR (which is O(cap) smooth weighted round-robin -- a
-    // different, stronger-smoothness guarantee, and a different complexity class). Pairing
-    // those two would be apples-to-oranges. SmoothWRR's own O(cap) throughput is measured by
-    // the witness + the throughput matrix; it is NOT force-fit into this parity table. The wrr
-    // incumbent stays visible; the honest lite-pick counterpart is disclosed as pending.
+    // Weighted-random family -- lite-pick WeightedRandomBalancer (M10, O(1) Vose alias table) vs wrr's
+    // O(1) weighted-RANDOM engine. SAME complexity class (both O(1) weighted-random) -- a TRUE parity
+    // comparison. (This is the honest counterpart the M6 report deferred to M10: NOT our O(cap) SmoothWRR,
+    // which is a different, stronger-smoothness guarantee measured by the witness + throughput matrix.)
     {
+        const el = new Uint8Array(n).fill(1);
+        const weights = new Uint32Array(n);
+        for (let i = 0; i < n; i++) weights[i] = 1 + (i & 7);
+        const wr = new WeightedRandomBalancer(n, el, weights, SEEDS.p2c);
         rows.push({
             family: 'Weighted-random',
-            litePick: { strategy: 'WeightedRandom', status: 'pending', milestone: 'M10' },
+            litePick: { strategy: 'WeightedRandomBalancer', status: 'ok', opsPerMs: timeLoop(() => wr.pick()) },
             competitor: timeCompetitor('wrr', '1.0.0', (m) => {
                 const entries = []; for (let i = 0; i < n; i++) entries.push({ weight: 1 + (i & 7), item: i });
                 const next = m(entries); return () => next();

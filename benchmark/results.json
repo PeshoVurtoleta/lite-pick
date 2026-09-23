@@ -1,7 +1,7 @@
 {
   "schema": "lite-pick-bench/1",
-  "version": "0.8.0",
-  "generatedAt": "2026-09-23T08:09:46.774Z",
+  "version": "1.0.0",
+  "generatedAt": "2026-09-23T16:22:46.892Z",
   "env": {
     "node": "v26.8.2",
     "v8": "14.6.202.34-node.28",
@@ -46,27 +46,27 @@
       "litePick": {
         "major": 0,
         "minor": 3,
-        "maxPauseMs": 0.14625000208616257,
+        "maxPauseMs": 0.18450000137090683,
         "bpop": 0,
-        "serviceP999Ms": 0.00012500000000059686,
-        "serviceMaxMs": 0.16575000000000273,
+        "serviceP999Ms": 0.00012499999999704414,
+        "serviceMaxMs": 0.18662499999999937,
         "gateOk": true
       },
       "peakEwma": {
         "major": 0,
         "minor": 1,
-        "maxPauseMs": 0.07308299839496613,
+        "maxPauseMs": 0.07145800068974495,
         "bpop": 0,
-        "serviceP999Ms": 0.00020900000004075991,
-        "serviceMaxMs": 0.06604099999998425,
+        "serviceP999Ms": 0.0002089999999839165,
+        "serviceMaxMs": 0.8137909999999806,
         "gateOk": true
       },
       "foil": {
         "major": 13,
         "minor": 81,
-        "maxPauseMs": 2.8537909984588623,
-        "serviceP999Ms": 0.0018329999999195934,
-        "serviceMaxMs": 2.8737499999999727
+        "maxPauseMs": 1.7600420005619526,
+        "serviceP999Ms": 0.0027920000001131484,
+        "serviceMaxMs": 1.771208999999999
       }
     },
     "disruption": {
@@ -139,6 +139,12 @@
           "slowShare": 0.06177,
           "p99": 39143100
         }
+      },
+      "weightedrandom": {
+        "weightsRange": "1..16",
+        "draws": 8000000,
+        "worstShareDev": 0.008422999999999958,
+        "randomWorstShareDev": 7.5187
       }
     },
     "competitors": [
@@ -147,13 +153,13 @@
         "litePick": {
           "strategy": "P2cBalancer",
           "status": "ok",
-          "opsPerMs": 53009.14916710918
+          "opsPerMs": 57019.317460524566
         },
         "competitor": {
           "pkg": "load-balancers",
           "version": "1.3.52",
           "status": "ok",
-          "opsPerMs": 59484.57095147058
+          "opsPerMs": 59777.62246223
         }
       },
       {
@@ -161,27 +167,27 @@
         "litePick": {
           "strategy": "RoundRobinBalancer",
           "status": "ok",
-          "opsPerMs": 246431.7908838983
+          "opsPerMs": 229911.4840786399
         },
         "competitor": {
           "pkg": "loadbalance",
           "version": "1.0.0",
           "status": "ok",
-          "opsPerMs": 303459.37619677605
+          "opsPerMs": 261301.2803762895
         }
       },
       {
         "family": "Weighted-random",
         "litePick": {
-          "strategy": "WeightedRandom",
-          "status": "pending",
-          "milestone": "M10"
+          "strategy": "WeightedRandomBalancer",
+          "status": "ok",
+          "opsPerMs": 73673.41077980534
         },
         "competitor": {
           "pkg": "wrr",
           "version": "1.0.0",
           "status": "ok",
-          "opsPerMs": 163481.0209978248
+          "opsPerMs": 172136.83087832338
         }
       }
     ]

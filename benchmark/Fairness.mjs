@@ -16,7 +16,7 @@
  * Convergence + burstiness are ALGORITHMIC and seeded -- exact, reproducible, drift-checked.
  */
 
-import { SmoothWRRBalancer, SedBalancer, PeakEwmaBalancer, P2cBalancer, Prng } from '../Pick.js';
+import { SmoothWRRBalancer, SedBalancer, PeakEwmaBalancer, P2cBalancer, WeightedRandomBalancer, Prng } from '../Pick.js';
 import { SEEDS } from './Matrix.mjs';
 
 const maxRun = (seq) => {
@@ -136,9 +136,43 @@ function measurePeakEwmaSteering() {
     return { n, slowNode: SLOW, peakewma: runLane('peakewma'), p2c: runLane('p2c'), random: runLane('random') };
 }
 
+/**
+ * WeightedRandom (M10): O(1) Vose alias-table sampling converges to the configured weight ratios by
+ * SAMPLING (law of large numbers) rather than SmoothWRR's deterministic O(cap) scan. Reports the worst
+ * per-node RELATIVE share deviation from weight[i]/sum over a seeded run, and the same weight-blind
+ * random foil for contrast. Seeded + deterministic; the trade vs SmoothWRR is sampling variance (any
+ * single pick is random) for a stateless O(1) sample.
+ */
+function measureWeightedRandom() {
+    const n = 64;
+    const weights = new Uint32Array(n);
+    let sum = 0;
+    for (let i = 0; i < n; i++) { weights[i] = 1 + (i & 15); sum += weights[i]; } // 1..16, skewed
+    const el = new Uint8Array(n); el.fill(1);
+    const wr = new WeightedRandomBalancer(n, el, weights, SEEDS.p2c);
+    const N = 8_000_000; // sized so the lightest weight-1 nodes hold within a tight relative band
+    const counts = new Uint32Array(n);
+    for (let i = 0; i < N; i++) counts[wr.pick()]++;
+    const rndLoad = new Uint32Array(n);
+    const rng = new Prng(SEEDS.foil);
+    for (let i = 0; i < N; i++) rndLoad[rng.nextBelow(n)]++;
+    let worst = 0, rndWorst = 0;
+    for (let i = 0; i < n; i++) {
+        const target = weights[i] / sum;
+        worst = Math.max(worst, Math.abs(counts[i] / N - target) / target);
+        rndWorst = Math.max(rndWorst, Math.abs(rndLoad[i] / N - target) / target);
+    }
+    return { weightsRange: '1..16', draws: N, worstShareDev: worst, randomWorstShareDev: rndWorst };
+}
+
 /** Measure all; returns the structured result Report.mjs stamps + renders. */
 export function measureFairness() {
-    return { smoothwrr: measureSmoothWRR(), sed: measureSed(), peakewma: measurePeakEwmaSteering() };
+    return {
+        smoothwrr: measureSmoothWRR(),
+        sed: measureSed(),
+        peakewma: measurePeakEwmaSteering(),
+        weightedrandom: measureWeightedRandom(),
+    };
 }
 
 if (import.meta.url === 'file://' + process.argv[1]) {
@@ -162,11 +196,17 @@ if (import.meta.url === 'file://' + process.argv[1]) {
     process.stdout.write('  PeakEWMA service p99 (ns): PeakEWMA=' + pe.peakewma.p99.toFixed(0) +
         '  P2C=' + pe.p2c.p99.toFixed(0) + '  random=' + pe.random.p99.toFixed(0) + '\n');
 
+    const wr = r.weightedrandom;
+    process.stdout.write('  WeightedRandom weights [1..16] (' + wr.draws + ' draws): worst share dev=' +
+        (wr.worstShareDev * 100).toFixed(2) + '% vs weight-blind random=' +
+        (wr.randomWorstShareDev * 100).toFixed(2) + '%\n');
+
     const peOk = pe.peakewma.slowShare <= 0.25 * pe.p2c.slowShare &&
         pe.peakewma.p99 <= 0.8 * pe.p2c.p99 &&
         pe.random.p99 > pe.peakewma.p99 && pe.random.p99 > pe.p2c.p99;
+    const wrOk = wr.worstShareDev < 0.02 && wr.worstShareDev < wr.randomWorstShareDev / 2;
     const ok = s.exactFair && s.smoothMaxRun < s.burstyMaxRun &&
-        d.worstShareDrift < 0.01 && d.weightedImbalance < d.randomImbalance / 2 && peOk;
+        d.worstShareDrift < 0.01 && d.weightedImbalance < d.randomImbalance / 2 && peOk && wrOk;
     process.stdout.write('  fairness (exact + smooth + weight-proportional + latency-steering) -> ' +
         (ok ? 'PASS' : 'FAIL') + '\n');
     if (!ok) { process.stderr.write('bench:fairness: FAIL\n'); process.exit(1); }

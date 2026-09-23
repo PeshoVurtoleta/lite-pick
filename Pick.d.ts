@@ -1,10 +1,10 @@
 /**
  * @zakkster/lite-pick -- TypeScript declarations.
  *
- * M9 (0.9.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
+ * M10 (1.0.0): substrate seams + RoundRobin + SmoothWRR + P2C + the exact LeastConn family
  * (LeastConn/SED/NQ) + PeakEWMA (latency-aware P2C) + ConsistentHash (Maglev table) +
- * BoundedLoad (P2C with a dynamic occupancy cap). The remaining strategy class (WeightedRandom)
- * is added one per session.
+ * BoundedLoad (consistent hashing with bounded loads) + WeightedRandom (O(1) Vose alias-table
+ * sampling). Roster complete for now (NOT closed: AZ-aware routing, hedging, subsetting post-1.0).
  */
 
 /** The single source-of-truth version stamp. */
@@ -270,4 +270,35 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
     note(i: number, delta: number): void;
     /** Map an integer `keyHash` to a backend, honouring the occupancy cap (overflow past a hot home), or `PICK_NONE`. O(1). */
     pick(keyHash?: number): number;
+}
+
+/**
+ * WeightedRandomBalancer -- O(1) weighted-random selection via a Vose/Walker ALIAS TABLE (M10). `pick()`
+ * draws one column + one probability compare to return an endpoint proportional to its weight, with
+ * REJECTION-SAMPLING eligibility (retry an ineligible candidate up to a bounded count, then a 0-B/op
+ * rotated linear eligible scan). The alias table is built COLD over the eligible-INDEPENDENT weights
+ * (a weight-0 node is NEVER a column), so rejection renormalizes the weight distribution across the
+ * surviving eligible mass. `weights` is the caller-owned Uint32Array; the balancer is the SOLE writer of
+ * its derived table via cold `setWeight` / `rebuild` (direct weight mutation desyncs the table -- UB).
+ * An eligibility flap NEVER rebuilds. The stateless O(1) sample (no accumulators to desync) for VERY
+ * LARGE pools where SmoothWRR's O(cap) scan hurts -- trading smoothness for sampling variance. O(1),
+ * 0 B/op, never throws. Fails closed (`PICK_NONE`) IFF `live === 0` OR no eligible node has a positive
+ * weight. NOT `@zakkster/lite-random` (a game RNG returning an item; use lite-random for loot tables --
+ * this is the eligibility-aware LB index selector; see GUIDE.md / ADR 0012).
+ */
+export class WeightedRandomBalancer extends BalancerBase {
+    /**
+     * @param capacity endpoint count (fixed).
+     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param weights caller-owned per-endpoint weights (length >= capacity); mutate only via setWeight
+     *   (the balancer is the sole writer of the derived alias table -- direct mutation is UB).
+     * @param seed deterministic PRNG seed (default 0x9e3779b9); reproducible benches.
+     */
+    constructor(capacity: number, eligible: Uint8Array, weights: Uint32Array, seed?: number);
+    /** Cold path: reconfigure endpoint `i`'s weight (uint32) and rebuild the alias table. */
+    setWeight(i: number, w: number): void;
+    /** Cold path: rebuild the alias table from the current caller weights (e.g. after a membership change). */
+    rebuild(): void;
+    /** Pick an endpoint index proportional to weight (eligibility by rejection sampling), or `PICK_NONE`. O(1). */
+    pick(): number;
 }

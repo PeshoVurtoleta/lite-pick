@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 0.9.0
+Version: 1.0.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,19 +14,42 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-0.9.0 ships the substrate seams + nine strategies: RoundRobin, SmoothWRR (the weighted
-default), P2C (power-of-two-choices -- also the O(1) least-connections APPROXIMATION), the
-EXACT LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C), ConsistentHash
-(a Maglev lookup table -- sticky/affinity routing), and BoundedLoad (Consistent Hashing with Bounded
-Loads -- sticky routing + a per-backend occupancy cap that overflows a hotspot to neighbours). It
-exports `VERSION`, the fail-closed
+1.0.0 -- the ROSTER-COMPLETE release -- ships the substrate seams + TEN strategies: RoundRobin,
+SmoothWRR (the weighted default), P2C (power-of-two-choices -- also the O(1) least-connections
+APPROXIMATION), the EXACT LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C),
+ConsistentHash (a Maglev lookup table -- sticky/affinity routing), BoundedLoad (Consistent Hashing
+with Bounded Loads -- sticky routing + a per-backend occupancy cap that overflows a hotspot to
+neighbours), and WeightedRandom (O(1) Vose alias-table sampling with rejection-sampling eligibility).
+It exports `VERSION`, the fail-closed
 sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (the shared
 read-only eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`,
 `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`,
-`ConsistentHashBalancer`, `BoundedLoadBalancer`, and the ConsistentHash constants `CH_DEFAULT_M`
-(65537) / `CH_PROBE_LIMIT` (64). The remaining strategy lands next session (see ROADMAP.md):
-WeightedRandom. The EXACT-O(log n) fewest-in-flight variant is a deferred @zakkster/lite-logn
-`BinaryHeap` optional-peer seam (decisions/0006), not this exact-O(cap) scan.
+`ConsistentHashBalancer`, `BoundedLoadBalancer`, `WeightedRandomBalancer`, and the ConsistentHash
+constants `CH_DEFAULT_M` (65537) / `CH_PROBE_LIMIT` (64). Roster complete FOR NOW, not closed:
+AZ-aware routing, the lite-await hedging combinator, and subsetting are queued post-1.0 (ROADMAP.md).
+GUIDE.md is the "which of the ten strategies do I pick?" decision guide. The EXACT-O(log n)
+fewest-in-flight variant is a deferred @zakkster/lite-logn `BinaryHeap` optional-peer seam
+(decisions/0006), not this exact-O(cap) scan.
+
+M10 (1.0.0) adds WeightedRandomBalancer (decisions/0012): O(1) weighted-random selection via an inline
+Vose/Walker ALIAS TABLE (one column draw + one probability compare -> a candidate), with REJECTION-
+SAMPLING eligibility (retry an ineligible candidate up to a bounded 64, then a 0-B/op rotated linear
+eligible scan) -- the ADR 0005 / P2C discipline. The alias table is built COLD over the ELIGIBLE-
+INDEPENDENT weights, so a weight-0 node is NEVER a column (never returned) and rejecting the ineligible
+draws RENORMALIZES the weight distribution over the SURVIVING eligible mass (each eligible node's share
+converges to weight[i] / sum(eligible weights)). `weights` is the caller's Uint32Array (the SmoothWRR/
+SED seam); the balancer is the SOLE writer of its DERIVED table (`_prob`/`_alias`) via cold setWeight/
+rebuild -- an eligibility flap NEVER rebuilds (anti-flap). Fail-closed (PICK_NONE) IFF live === 0 OR no
+eligible node has a positive weight. O(1), 0 B/op, never throws. It is the STATELESS O(1) weighted
+sampler (no accumulator to desync) for VERY LARGE pools where SmoothWRR's O(cap) scan hurts -- trading
+smoothness for sampling variance. `peerDependencies` STAYS `{}`: the Vose build is inlined; a lite-o1
+`AliasTable` (duck-typed drop-in for the build) and a lite-logn Fenwick tree (the DYNAMIC-weight
+complement -- O(log n) update + sample) are DEFERRED optional peers, imported by NOTHING. NOT
+@zakkster/lite-random: that is a GAME RNG (Mulberry32; loot tables, particles, gaussian) whose
+`weighted(items, weights)` returns an ITEM one-shot, is not eligibility-aware, and holds no reusable
+table -- lite-pick's WeightedRandom returns an endpoint INDEX, honours the shared eligibility bitmap
+(fail-closed), and owns a persistent alias table rebuilt only on reweight. Different domain + contract
+-- not a peer, not a substrate (GUIDE.md / ADR 0012).
 
 M9 (0.9.0) adds BoundedLoadBalancer (decisions/0011): Consistent Hashing with Bounded Loads (CHBL --
 Mirrokni et al. / Google Research; Vimeo eps=0.25). It is `ConsistentHashBalancer` (the Maglev table)
@@ -236,6 +259,35 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     the mean occupancy while CHBL caps it near (1+eps) x mean by overflow; both keep ~1/N minimal
     disruption. `Pool.run` mirrors dispatch/settle into `note` when the balancer duck-types it, and
     `Pool.run(fn, { key })` drives `pick(key)` for keyed CHBL routing (both inert otherwise).
+- `WeightedRandomBalancer extends BalancerBase` -- class. O(1) weighted-random via a Vose/Walker ALIAS
+  TABLE (M10, decisions/0012). The roster-completing strategy.
+  - `new WeightedRandomBalancer(capacity, eligible, weights, seed?=0x9e3779b9)` -- `weights` is the
+    CALLER's Uint32Array (length >= capacity, the SmoothWRR/SED seam); the balancer is the SOLE writer
+    of its DERIVED alias table (`_prob` Float64Array + `_alias` Int32Array) via cold setWeight/rebuild
+    (direct weight mutation desyncs the table -- UB). Validates typeof-first (RangeError) BEFORE
+    allocating the table. Builds the table COLD in the ctor (the standard small/large Vose worklist over
+    the eligible-INDEPENDENT weights, ~15 lines -- NOT a re-implementation of lite-o1's AliasTable). The
+    build reuses cold scratch worklists -- it allocates nothing per rebuild.
+  - `pick()` -> number. Draws one column (`prng.nextBelow(cap)`) + one probability compare against a
+    fresh `prng.next()` uniform -> a candidate (`col` or `_alias[col]`), which is ALWAYS a positive-
+    weight node (a weight-0 node is NEVER a column). REJECTION SAMPLING on eligibility: if the candidate
+    is ineligible, redraw up to a bounded 64, then fall back to a 0-B/op rotated linear scan from a
+    random start for the first eligible positive-weight node. Because a candidate is always positive-
+    weight, rejecting the ineligible draws RENORMALIZES the weight distribution over the SURVIVING
+    eligible mass (each eligible node's share converges to weight[i] / sum(eligible weights)). O(1),
+    0 B/op, NEVER throws. `PICK_NONE` IFF live === 0 OR no eligible node has a positive weight. NEVER a
+    dead pick, a weight-0 return, or an out-of-range index.
+  - `setWeight(i, w)` -> void. COLD. Set endpoint i's weight (uint32) and REBUILD the alias table (the
+    SmoothWRR sole-writer precedent). `rebuild()` -> void. COLD. Re-derive the table from the current
+    caller weights. An eligibility flap NEVER rebuilds (anti-flap; only setWeight/rebuild/membership).
+  - vs SmoothWRR: SmoothWRR is deterministic/smooth/low-variance but O(cap)/pick and owns accumulator
+    state; WeightedRandom is a STATELESS O(1) sample (no accumulator to desync) with sampling variance --
+    the fit for VERY LARGE pools where SmoothWRR's O(cap) scan hurts. vs @zakkster/lite-random: that is a
+    GAME RNG (Mulberry32; loot tables) returning an ITEM one-shot, not eligibility-aware, no reusable
+    table; WeightedRandom returns an endpoint INDEX, honours the shared eligibility bitmap (fail-closed),
+    and owns a persistent alias table -- different domain, NOT a peer (see GUIDE.md / ADR 0012). DEFERRED
+    optional-peer seams (import NOTHING; `peerDependencies` STAYS `{}`): a lite-o1 `AliasTable` duck-typed
+    drop-in for the Vose build, and a lite-logn Fenwick/BinaryIndexedTree for DYNAMIC weights.
 
 ## Subpath: @zakkster/lite-pick/pool -- the ergonomic request layer (M5, Pool.js)
 
@@ -293,7 +345,10 @@ duck-typed and imports NOTHING from lite-query.
 
 @zakkster/lite-di-health (eligibility writer), lite-statechart (breaker), lite-o1
 (RandomSet / AliasTable / RingLog substrate), lite-logn (exact least-conn heap / Fenwick
-weights), lite-lru (sticky affinity), lite-fastbit32 (optional small-pool bitset peer),
+dynamic weights -- the mutable-weight complement to WeightedRandom's static alias table),
+lite-random (a SEPARATE domain -- a GAME RNG for loot tables / particles that returns an ITEM,
+NOT an eligibility-aware LB index selector; use lite-pick WeightedRandom for load balancing),
+lite-lru (sticky affinity), lite-fastbit32 (optional small-pool bitset peer),
 lite-query (the fetcher adapter), lite-await (hedging), lite-worker-pool (in-process
 consumer), lite-di-signal / lite-signal-decorators (observability). None is a HARD
 dependency -- each is an OPTIONAL PEER dep (peerDependenciesMeta.optional, the LiteQuery

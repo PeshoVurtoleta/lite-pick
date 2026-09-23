@@ -17,7 +17,7 @@
  * The random-foil peak/avg baseline (what P2C must beat at M3) is printed for context.
  */
 
-import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, Prng } from '../Pick.js';
+import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, Prng, PICK_NONE } from '../Pick.js';
 
 let failed = false;
 function check(cond, msg) {
@@ -454,6 +454,107 @@ process.stdout.write('lite-pick balance (M9: BoundedLoad -- CHBL hotspot anchor)
         const pct = moved / KEYS * 100, anchor = 2 / N * 100;
         process.stdout.write('  disruption: CHBL remaps ' + pct.toFixed(2) + '% on remove (anchor <= ' + anchor.toFixed(2) + '%)\n');
         check(pct <= anchor, 'CHBL remap ' + pct.toFixed(2) + '% <= ' + anchor.toFixed(2) + '% (inherits ConsistentHash minimal disruption)');
+    }
+}
+
+// --- WeightedRandom: THE weighted-random anchor -- O(1) alias sampling, weight-proportional --------
+// WeightedRandom draws one alias column + one compare (O(1)) to return an endpoint proportional to its
+// weight, with rejection-sampling over eligibility. We assert: (1) FAIRNESS -- over >=2e6 seeded draws
+// every node's observed share is within 2% RELATIVE of weight[i]/sum, and a cumsum-linear O(n) foil
+// matches the SAME fairness (proving correctness, not luck); (2) the O(1) alias sample BEATS that O(n)
+// foil by >=3x ops/ms at n=4096 (the reason to prefer it over an O(cap) scan at scale); (3) under half
+// the pool down, rejection RENORMALIZES over the surviving eligible mass -- 0 ineligible / 0 weight-0
+// returns, survivor shares within 3% of weight[i]/sum(eligible), and all-zero weights -> PICK_NONE.
+process.stdout.write('lite-pick balance (M10: WeightedRandom -- weighted-random anchor)\n');
+{
+    // The cumsum-linear O(n) foil: the same weight-proportional distribution, but an O(n) scan per draw.
+    const cumsumPick = (rng, weights, total, n) => {
+        let x = (rng.next() / 4294967296) * total;
+        for (let i = 0; i < n; i++) { x -= weights[i]; if (x < 0) return i; }
+        return n - 1;
+    };
+
+    // (1) FAIRNESS: n=64, skewed weights 1..16, >=2e6 draws (N sized so the lightest weight-1 nodes hold
+    // 2% relative with margin -- the band is NEVER widened to pass). The foil matches the same fairness.
+    {
+        const n = 64;
+        const el = new Uint8Array(n).fill(1);
+        const weights = new Uint32Array(n);
+        let sum = 0; for (let i = 0; i < n; i++) { weights[i] = 1 + (i & 15); sum += weights[i]; }
+        const N = 8_000_000;
+        const wr = new WeightedRandomBalancer(n, el, weights, 0xABCDEF);
+        const wCounts = new Uint32Array(n);
+        for (let i = 0; i < N; i++) wCounts[wr.pick()]++;
+        const fCounts = new Uint32Array(n);
+        const frng = new Prng(0xABCDEF);
+        for (let i = 0; i < N; i++) fCounts[cumsumPick(frng, weights, sum, n)]++;
+        let wWorst = 0, fWorst = 0;
+        for (let i = 0; i < n; i++) {
+            const t = weights[i] / sum;
+            wWorst = Math.max(wWorst, Math.abs(wCounts[i] / N - t) / t);
+            fWorst = Math.max(fWorst, Math.abs(fCounts[i] / N - t) / t);
+        }
+        process.stdout.write('  n=64 weights[1..16] (' + N + ' draws): WeightedRandom worst share dev=' +
+            (wWorst * 100).toFixed(2) + '%  cumsum-linear foil=' + (fWorst * 100).toFixed(2) + '%\n');
+        check(wWorst < 0.02, 'WeightedRandom shares within 2% relative of weight (worst ' + (wWorst * 100).toFixed(2) + '%)');
+        check(fWorst < 0.02, 'cumsum-linear O(n) foil matches the SAME fairness (worst ' + (fWorst * 100).toFixed(2) + '%)');
+    }
+
+    // (2) O(1) WINS AT SCALE: at n=4096 the alias sample beats the O(n) cumsum foil by >=3x ops/ms.
+    {
+        const n = 4096;
+        const el = new Uint8Array(n).fill(1);
+        const weights = new Uint32Array(n);
+        let sum = 0; for (let i = 0; i < n; i++) { weights[i] = 1 + (i & 15); sum += weights[i]; }
+        const wr = new WeightedRandomBalancer(n, el, weights, 0xABCDEF);
+        const frng = new Prng(0xABCDEF);
+        const time = (fn) => {
+            let s = 0;
+            for (let i = 0; i < 500000; i++) s = (s + fn()) | 0;   // warmup
+            const t0 = performance.now();
+            for (let i = 0; i < 1_000_000; i++) s = (s + fn()) | 0;
+            void s;
+            return 1_000_000 / (performance.now() - t0);
+        };
+        const wOps = time(() => wr.pick());
+        const fOps = time(() => cumsumPick(frng, weights, sum, n));
+        const ratio = wOps / fOps;
+        process.stdout.write('  n=4096 ops/ms: WeightedRandom=' + wOps.toFixed(0) +
+            '  cumsum-linear foil=' + fOps.toFixed(0) + '  ratio=' + ratio.toFixed(1) + 'x\n');
+        check(ratio >= 3, 'WeightedRandom O(1) beats the O(n) cumsum-linear foil by >=3x at n=4096 (ratio ' + ratio.toFixed(1) + 'x)');
+    }
+
+    // (3) PARTIAL POOL: half the pool down. Rejection renormalizes over the survivors -- 0 ineligible,
+    // 0 weight-0, survivor shares within 3% of weight/sum(eligible); all-zero weights -> PICK_NONE.
+    {
+        const n = 64;
+        const el = new Uint8Array(n);
+        for (let i = 0; i < n; i++) el[i] = (i % 2 === 0) ? 1 : 0;   // half eligible
+        const weights = new Uint32Array(n);
+        for (let i = 0; i < n; i++) weights[i] = 1 + (i & 15);
+        let esum = 0; for (let i = 0; i < n; i++) if (el[i]) esum += weights[i];
+        const wr = new WeightedRandomBalancer(n, el, weights, 0xABCDEF);
+        let ineligible = 0, zero = 0;
+        for (let i = 0; i < 1_000_000; i++) {
+            const p = wr.pick();
+            if (p < 0 || p >= n || !el[p]) ineligible++;
+            else if (weights[p] === 0) zero++;
+        }
+        check(ineligible === 0, 'half-down: 0 ineligible returns over 1e6 picks');
+        check(zero === 0, 'half-down: 0 weight-0 returns over 1e6 picks');
+        const M = 2_000_000;
+        const counts = new Uint32Array(n);
+        for (let i = 0; i < M; i++) counts[wr.pick()]++;
+        let worst = 0;
+        for (let i = 0; i < n; i++) if (el[i]) {
+            const t = weights[i] / esum;
+            worst = Math.max(worst, Math.abs(counts[i] / M - t) / t);
+        }
+        process.stdout.write('  half-down survivor worst share dev=' + (worst * 100).toFixed(2) +
+            '% (renormalized over the eligible mass)\n');
+        check(worst < 0.03, 'half-down survivor shares within 3% relative of weight/sum(eligible) (worst ' + (worst * 100).toFixed(2) + '%)');
+        const z = new WeightedRandomBalancer(n, new Uint8Array(n).fill(1), new Uint32Array(n));
+        check(z.pick() === PICK_NONE, 'WeightedRandom all-zero weights -> PICK_NONE');
     }
 }
 

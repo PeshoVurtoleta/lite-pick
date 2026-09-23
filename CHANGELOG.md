@@ -4,6 +4,62 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-09-23
+
+The **roster-complete** release: ten selection strategies + the `/pool` request layer + the benchmark
+suite + the docs/GUIDE capstone. Roster complete **for now, not closed** -- AZ-aware routing, the
+lite-await hedging combinator, and subsetting are queued post-1.0 (see [ROADMAP.md](./ROADMAP.md)).
+
+### Added
+
+- **`WeightedRandomBalancer` (M10)** -- O(1) weighted-random selection via an inline **Vose/Walker alias
+  table** (one column draw + one probability compare -> a candidate) with **rejection-sampling
+  eligibility** (retry an ineligible candidate up to a bounded 64, then a 0-B/op rotated linear eligible
+  scan) -- the ADR 0005 / P2C discipline. The alias table is built **cold** over the eligible-independent
+  weights, so a **weight-0 node is never a column** (never returned) and rejecting the ineligible draws
+  **renormalizes** the weight distribution over the surviving eligible mass (each eligible node's share
+  converges to `weight[i] / sum(eligible weights)`). `weights` is the caller's `Uint32Array` (the
+  SmoothWRR/SED seam); the balancer is the **sole writer** of its derived table (`_prob` / `_alias`) via
+  cold `setWeight` / `rebuild` -- an eligibility flap **never** rebuilds (anti-flap). Validates
+  typeof-first before allocating the table. `pick()` is **O(1)**, **0 B/op**, never throws; `PICK_NONE`
+  only when `live === 0` or no eligible node has a positive weight. It is the **stateless** O(1) weighted
+  sampler (no accumulator to desync) for very large pools where SmoothWRR's O(cap) scan hurts -- trading
+  smoothness for sampling variance. `peerDependencies` stays `{}` (the Vose build is inlined; a lite-o1
+  `AliasTable` and a lite-logn Fenwick tree are deferred optional peers, imported by nothing).
+  ([ADR 0012](./decisions/0012-weightedrandom.md)).
+- **Fairness anchor** (`test/balance.mjs`) -- n=64, skewed weights [1..16], 8e6 seeded draws: every node's
+  observed share is within **2% relative** of `weight[i]/sum` (measured worst ~0.84%), and a cumsum-linear
+  O(n) foil matches the same fairness. The O(1) alias sample beats that O(n) foil by **~107x ops/ms** at
+  n=4096 (gate: >=3x). Under half the pool down (1e6 picks): **0 ineligible / 0 weight-0** returns,
+  survivor shares within **3% relative** of `weight[i]/sum(eligible)` (measured worst ~1.77%), and all-zero
+  weights -> `PICK_NONE`. Thresholds are the sampling-variance floor from a correct run (N sized so the
+  band holds with margin) -- the band is never widened to pass.
+- **`GUIDE.md`** -- the "which of the ten strategies do I pick?" decision guide (a decision tree + table
+  keyed by keyed-vs-load-vs-latency-vs-weighted, O(1) vs O(cap), state owned, and when each wins),
+  distinct from `RECIPES.md` (how-to wiring). Added to the published `files[]` (the tarball is now 11 files).
+- Gates extended for the new strategy: `test/WeightedRandom.test.js` boundary + behaviour suite;
+  `test/fuzz.mjs` keyed-agnostic subject + `checkWeightedRandom` (structural + no-weight-0-column + the
+  sum-reconstruction invariant, after every op) + a 1000-flap **0-rebuild** anti-flap assertion;
+  `test/torture.mjs` retention + a `pick()` 0 B/op phase (phase 14); `test/perf/PerfGate.test.mjs`
+  `weightedRandomPick` zero-alloc scenario + a boxed `mustFail` tooth; `test/witness.mjs` 'const'
+  flat-work subject; `benchmark/Matrix.mjs` throughput + fairness subject; `benchmark/Report.mjs`
+  Weighted-random parity row now times `WeightedRandomBalancer` vs `wrr` (both O(1) weighted-random --
+  previously a pending SKIP); `Pick.d.ts` + `test/types/pick.test-d.ts` typed surface.
+
+### Changed
+
+- **`Pick.js` header roster/count** nine -> **ten**, and the `VERSION` stamp `0.9.0` -> `1.0.0` (the
+  three-place sync: `package.json`, the `VERSION` const, `llms.txt`). This session appends **one** class;
+  every other strategy in `Pick.js` is byte-identical.
+- **`package.json`** version `1.0.0`, the description roster gains WeightedRandom + a GUIDE.md pointer,
+  keywords gain `alias-method` / `vose` (`weighted-random` was already present), and `files[]` gains
+  `GUIDE.md`. `peerDependencies` stays `{}`.
+- Sibling boundary documented explicitly (so 1.0.0's WeightedRandom does not look duplicative with
+  `@zakkster/lite-random`): lite-random is a **game RNG** returning an item, not eligibility-aware, no
+  reusable table; lite-pick WeightedRandom returns an endpoint index, honours the shared eligibility
+  bitmap (fail-closed), and owns a persistent alias table -- different domain, not a peer (GUIDE.md,
+  llms.txt, ADR 0012).
+
 ## [0.9.0] - 2026-09-23
 
 ### Added

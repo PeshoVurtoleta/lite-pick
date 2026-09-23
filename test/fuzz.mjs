@@ -21,12 +21,12 @@
 import {
     RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer,
     LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer,
-    ConsistentHashBalancer, BoundedLoadBalancer, PICK_NONE, CH_PROBE_LIMIT,
+    ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, PICK_NONE, CH_PROBE_LIMIT,
 } from '../Pick.js';
 import {
     checkBase, recomputeEligibleWeight, recomputeEligibleWeighted,
     allFinite, minEligibleScore, checkConsistentHash, reachableWithinBound,
-    checkBoundedLoad,
+    checkBoundedLoad, checkWeightedRandom,
 } from './invariants.mjs';
 
 /** A small PRIME Maglev table size for the fuzzer -- large enough for CAPS max (63), fast to rebuild. */
@@ -149,6 +149,17 @@ const SPECS = {
         // Structural (table maps in-range, pick eligible/in-range) AND the owned _total stays exact.
         extra: (b, ctx, p) => checkConsistentHash(b, ctx.el, ctx.cap, p) || checkBoundedLoad(b, ctx.inflight, ctx.cap),
     },
+    WeightedRandom: {
+        // O(1) Vose alias-table sampling with rejection-sampling eligibility. State-owning: the balancer
+        // OWNS its derived alias table, rebuilt SOLELY via setWeight/rebuild (the SmoothWRR sole-writer
+        // precedent). Fail-closed IFF no eligible node has a positive weight (like SED/NQ -- the eligible-
+        // positive-weight COUNT). The extra invariant asserts the alias table stays consistent with the
+        // caller weights after every op (structural + no-weight-0-column + the sum reconstruction).
+        weighted: true, loadAware: false, usesSetWeight: true,
+        make: (cap, el, _inf, w) => new WeightedRandomBalancer(cap, el, w, 0xC0FFEE),
+        mass: (ctx) => recomputeEligibleWeighted(ctx.el, ctx.weights, ctx.cap),
+        extra: (b, ctx) => checkWeightedRandom(b, ctx.weights, ctx.cap),
+    },
     ConsistentHash: {
         weighted: true, loadAware: false, usesSetWeight: true, keyed: true,
         make: (cap, el, _inf, w) => new ConsistentHashBalancer(cap, el, w, CH_FUZZ_M, 0xC0FFEE),
@@ -251,12 +262,30 @@ function pathological() {
         if (b._totalEligibleWeight !== want) fails.push('pathological max-weight total desync ' + b._totalEligibleWeight + ' != ' + want);
         if (!allFinite(b._current, cap)) fails.push('pathological max-weight _current non-finite');
     }
-    // 2. All-zero weight while live > 0: SmoothWRR / SED / NQ all fail closed.
+    // 2. All-zero weight while live > 0: SmoothWRR / SED / NQ / WeightedRandom all fail closed.
     {
         const cap = 4, el = new Uint8Array(cap).fill(1), w = new Uint32Array(cap), inf = new Uint32Array(cap);
-        for (const b of [new SmoothWRRBalancer(cap, el, w), new SedBalancer(cap, el, inf, w), new NqBalancer(cap, el, inf, w)]) {
+        for (const b of [new SmoothWRRBalancer(cap, el, w), new SedBalancer(cap, el, inf, w), new NqBalancer(cap, el, inf, w), new WeightedRandomBalancer(cap, el, w)]) {
             if (b.pick() !== PICK_NONE) fails.push('all-zero-weight ' + b.constructor.name + ' did not fail closed (live=' + b.live + ')');
         }
+    }
+    // 2b. WeightedRandom: an eligibility flap NEVER rebuilds the alias table (anti-flap, ADR 0002/0012).
+    {
+        const cap = 8, el = new Uint8Array(cap).fill(1), w = Uint32Array.from([1, 2, 3, 4, 5, 6, 7, 8]);
+        const b = new WeightedRandomBalancer(cap, el, w, 0xC0FFEE);
+        const buildsAfterCtor = b._builds;                 // exactly 1 (the cold ctor build)
+        let s = 0x1234abcd >>> 0;
+        for (let k = 0; k < 1000; k++) {
+            s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+            b.setEligible(s % cap, (s & 1) === 0);
+            b.pick();
+        }
+        if (b._builds !== buildsAfterCtor) {
+            fails.push('WeightedRandom eligibility flaps rebuilt the table ' + (b._builds - buildsAfterCtor) + ' times (expected 0)');
+        }
+        // A setWeight, by contrast, DOES rebuild exactly once (the sole-writer path).
+        b.setWeight(0, 99);
+        if (b._builds !== buildsAfterCtor + 1) fails.push('WeightedRandom setWeight did not rebuild exactly once');
     }
     // 3. Single node: every strategy returns it while up, PICK_NONE when down.
     {
@@ -265,6 +294,7 @@ function pathological() {
             new RoundRobinBalancer(1, el), new SmoothWRRBalancer(1, el, w), new P2cBalancer(1, el, inf),
             new LeastConnBalancer(1, el, inf), new SedBalancer(1, el, inf, w), new NqBalancer(1, el, inf, w),
             new PeakEwmaBalancer(1, el, inf, 1e6), new BoundedLoadBalancer(1, el, inf, 0.25, null, 2),
+            new WeightedRandomBalancer(1, el, w),
         ];
         for (const b of bs) if (b.pick() !== 0) fails.push('single-node ' + b.constructor.name + ' did not return 0');
         el[0] = 0;

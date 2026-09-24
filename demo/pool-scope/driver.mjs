@@ -21,6 +21,7 @@ import {
     NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer,
     WeightedRandomBalancer, Prng, PICK_NONE,
 } from '../../Pick.js';
+import { SKETCH, ADAPTIVE } from './siblings.mjs';
 
 /** The ten strategy names (cycle order for the interactive keys). */
 export const STRATEGIES = [
@@ -29,7 +30,7 @@ export const STRATEGIES = [
 ];
 
 const DEFAULT_N = 12;
-const DEFAULT_CONC = 108;         // target concurrent in-flight (per-worker ~9 at N=12, under SAT 16)
+const DEFAULT_CONC = 72;          // target concurrent in-flight (per-worker ~6 at N=12; keeps weighted top workers < SAT)
 const PEND = 512;                 // pending-request slot pool (power of two, >> CONC)
 // The simulated clock advances 1 UNIT per tick and is kept in V8 SMI range (never a boxed HeapNumber),
 // so PeakEWMA's clock arithmetic on the hot path stays 0-alloc -- a large ns-magnitude clock would box
@@ -47,7 +48,15 @@ const PP_HI = 14;                 // ping-pong square-wave high / low (both < SA
 const PP_LO = 2;
 const PP_HALF = 8;                // ping-pong half-period in ticks
 const FLAP_PERIOD = 3;            // flapStorm toggles the worker's eligibility every N ticks
-const UNFAIR_HOT_WEIGHT = 12;     // makeUnfair weight on the hot worker (others 1)
+const UNFAIR_HOT_WEIGHT = 12;     // makeUnfair top weight (diverging ramp head; see makeUnfair)
+// Default MILD weight skew (a gentle deterministic tier ramp across the pool) so the WEIGHT-AWARE
+// strategies (SmoothWRR / SED / NQ / WeightedRandom + weighted ConsistentHash / BoundedLoad) render
+// their signature STAIRCASE by default, not only after `u`. WEIGHT_TIERS steps over the cap -> weight
+// 1..WEIGHT_TIERS. Mild on purpose: a weight-BLIND strategy's flat load over this skew stays UNDER the
+// weight-aware fairness threshold (an honest "RR ignores weights" read, not a flagged fault), while a
+// weight-aware strategy tracks it (proportional -> fair). makeUnfair replaces it with a wide diverging
+// ramp that DOES cross the threshold for a weight-blind policy.
+const WEIGHT_TIERS = 3;           // default skew: weights 1,2,3 in equal tiers across the pool
 
 // Workload REALISM (so an exact strategy -- LeastConn/SED/NQ -- breathes instead of freezing at a
 // perfect static fixed point). Service time is an EXPONENTIAL draw around a per-worker base (heavy
@@ -60,6 +69,26 @@ const SVC_TAIL_CAP = 48;         // cap on the exponential tail (a single reques
 const ARRIVAL_JITTER = 10;       // per-tick fill target wobbles conc +/- this many in-flight
 
 const CH_KEYS = new Set(['consistenthash', 'boundedload']);
+
+// ---- keyed-workload model (PS2: the keyed strategies route by an INTEGER key) -----------------
+// PS1 fed the keyed strategies a fresh FULL-RANGE random key per dispatch -- a real key, but UNIFORM
+// over 2^31, so every dispatch hit an independent Maglev slot and NO key ever dominated (a consistent-
+// hash pool's whole reason for existing -- affinity to a bounded, SKEWED key set -- was invisible). PS2
+// fixes it: a BOUNDED keyspace (KEYSPACE keys) so stickiness is meaningful, drawn UNIFORM by default and
+// ZIPFIAN under the `hotkeys` scenario so a few keys dominate -> a real hotspot the HOT-KEY panel shows
+// (plain ConsistentHash overloads the hot key's backend; BoundedLoad caps it and overflows to neighbours).
+const KEYSPACE = 256;            // bounded key set (power of two): uniform spreads evenly over 12 workers
+                                 // (no false starvation), zipf concentrates on the head (a real hotspot)
+const KEY_MASK = KEYSPACE - 1;
+const ZIPF_RES = 4096;           // zipf lookup-table resolution (a draw indexes it -> a key, 0-alloc)
+const ZIPF_S = 1.15;             // zipf exponent for the `hotkeys` scenario (heavier -> sharper hotspot)
+const KEY_DECAY = 0.99;          // per-frame decay of the inline per-key frequency (recent-weighted share)
+
+// ---- sibling-backed layer knobs (PS2) ---------------------------------------------------------
+const LAT_ALPHA = 0.01;          // DDSketch relative accuracy: p50/p95/p99 within +-1% of truth (HARD)
+const LAT_ROLL_FRAMES = 96;      // clear the latency sketches every N frames -> recent latency, not all-time
+const FD_HALFLIFE = 64;          // ForwardDecay half-life (tick units) for the decayed per-worker share
+const HK_K = 8;                  // HeavyKeeper / hot-key top-k tracked (panel shows the top ~5)
 
 /**
  * Driver -- the traffic engine. Construct once, then drive it: beginFrame(dt) -> tick() x M -> read
@@ -78,7 +107,10 @@ export class Driver {
         // ---- caller-owned substrate lite-pick reads --------------------------------------
         this.eligible = new Uint8Array(cap).fill(1);
         this.inflight = new Uint32Array(cap);
-        this.weights = new Uint32Array(cap).fill(1);
+        // Default MILD weight skew: a deterministic tier ramp (1..WEIGHT_TIERS) so weighted strategies
+        // show a staircase out of the box. weight[i] = 1 + floor(i * TIERS / cap) -> equal-size tiers.
+        this.weights = new Uint32Array(cap);
+        for (let i = 0; i < cap; i++) this.weights[i] = 1 + ((i * WEIGHT_TIERS / cap) | 0);
 
         // ---- derived / display state -----------------------------------------------------
         this.shareDecay = new Float64Array(cap);   // decayed pick counts -> rolling share
@@ -103,11 +135,58 @@ export class Driver {
         this.pCount = 0;
 
         // ---- latency ring (pre-filled so percentiles are valid from frame 0) -------------
+        // The inline FALLBACK path: a fixed ring the snapshot pre-alloc-sorts for p50/p95/p99.
         this.latRing = new Float32Array(512).fill(3);
         this.latHead = 0;
 
+        // ---- sibling-backed latency (lite-sketch DDSketch), else the inline ring ----------
+        // DDSketch.add(rtt) on settle is 0 B/op and gives a HARD +-alpha relative-error quantile off the
+        // render tick (cold walk). Global sketch is the minimum; per-worker sketches (12) enable a
+        // per-worker tail (SED / NQ / PeakEWMA) via latWorkerQuantile(). Cleared every LAT_ROLL_FRAMES so
+        // the header reflects RECENT latency, not all-time. hasLatSketch gates the whole path.
+        this.hasLatSketch = !!SKETCH;
+        this.latSketch = null;
+        this.latWorker = null;
+        if (SKETCH) {
+            this.latSketch = new SKETCH.DDSketch(LAT_ALPHA);
+            this.latWorker = new Array(cap);
+            for (let i = 0; i < cap; i++) this.latWorker[i] = new SKETCH.DDSketch(LAT_ALPHA);
+        }
+
+        // ---- sibling-backed decayed per-worker share (lite-adaptive ForwardDecay) ---------
+        // ForwardDecay.add(now) on each pick is 0 B/op; rate(now) on the render tick is a RECENCY-weighted
+        // pick rate (recent picks weigh more -- what a live monitor wants). shareOf() prefers it, else the
+        // inline decayed shareDecay counter below. hasFd gates it.
+        this.hasFd = !!ADAPTIVE;
+        this.fd = null;
+        if (ADAPTIVE) {
+            this.fd = new Array(cap);
+            for (let i = 0; i < cap; i++) this.fd[i] = new ADAPTIVE.ForwardDecay(FD_HALFLIFE);
+        }
+
+        // ---- keyed workload + the HOT-KEY layer (lite-adaptive HeavyKeeper, else inline) --
+        // keyFreq is a decayed per-key frequency (always maintained: it supplies the panel SHARE + is the
+        // inline top-k fallback). keyWorker records the backend each key last routed to (captured at
+        // dispatch -- no pick() replay, no kernel perturbation). HeavyKeeper.add(key) is 0 B/op and, when
+        // present, IDENTIFIES the top-k hot keys (decayed top-k = "hot right now", native decay so it
+        // tracks the CURRENT hot set + far lower error than Space-Saving on a Zipfian/drifting stream;
+        // that recency is exactly the live-monitor need, so it is preferred over lite-sketch SpaceSaving).
+        this.keyDist = 'uniform';                  // 'uniform' (default) | 'zipf' (the hotkeys scenario)
+        this.keyFreq = new Float64Array(KEYSPACE);
+        this.keyWorker = new Int32Array(KEYSPACE).fill(-1);
+        this._zipf = new Uint16Array(ZIPF_RES);
+        this._buildZipf();
+        this.hasHeavyKeeper = !!ADAPTIVE;
+        this.hk = null;
+        this._hkPairs = null;
+        if (ADAPTIVE) {
+            this.hk = new ADAPTIVE.HeavyKeeper(4, 64, HK_K);
+            this._hkPairs = new Float64Array(2 * HK_K);   // topKInto scratch (0-alloc render read)
+        }
+
         // ---- clocks / counters -----------------------------------------------------------
         this.tickCount = 0;
+        this.frameCount = 0;
         this.nowNs = 0;
         this.conc = DEFAULT_CONC;
         this.frameSettles = 0;
@@ -156,19 +235,120 @@ export class Driver {
         this._resetSim();
     }
 
-    /** Clear the in-flight simulation (load + pending + share) for a clean strategy morph. */
+    /** Clear the in-flight simulation (load + pending + share + sibling state) for a clean morph. */
     _resetSim() {
         this.inflight.fill(0);
         this.shareDecay.fill(0);
         for (let i = 0; i < PEND; i++) { this.sActive[i] = 0; this.freeStack[i] = i; }
         this.freeTop = PEND;
         this.pCount = 0;
+        // Sibling + keyed state: reset so a strategy switch is a clean morph (no stale latency / share /
+        // hot-key carry-over from the previous policy). All clear() calls are 0-alloc (pool reuse).
+        this.keyFreq.fill(0);
+        this.keyWorker.fill(-1);
+        if (this.latSketch) {
+            this.latSketch.clear();
+            for (let i = 0; i < this.cap; i++) this.latWorker[i].clear();
+        }
+        if (this.fd) for (let i = 0; i < this.cap; i++) this.fd[i].clear();
+        if (this.hk) this.hk.clear();
     }
+
+    /** Precompute the zipf lookup table: index a uniform draw -> a key, weighted 1/(rank^ZIPF_S). Cold. */
+    _buildZipf() {
+        let norm = 0;
+        for (let r = 1; r <= KEYSPACE; r++) norm += 1 / Math.pow(r, ZIPF_S);
+        let acc = 0, key = 0;
+        for (let slot = 0; slot < ZIPF_RES; slot++) {
+            const target = (slot + 0.5) / ZIPF_RES;
+            while (key < KEYSPACE - 1) {
+                const next = acc + (1 / Math.pow(key + 1, ZIPF_S)) / norm;
+                if (target <= next) break;
+                acc = next; key++;
+            }
+            this._zipf[slot] = key;
+        }
+    }
+
+    /** Draw the next request key (bounded keyspace). Zero-alloc: a masked draw or one table read. */
+    _nextKey() {
+        if (this.keyDist === 'zipf') return this._zipf[this.rng.nextBelow(ZIPF_RES)];
+        return this.rng.nextBelow(KEYSPACE) & KEY_MASK;
+    }
+
+    /**
+     * Switch the keyed workload to a skewed (zipfian) key stream -> a hotspot the panel shows. Raise the
+     * offered load so the hot backend clearly OVERLOADS (ConsistentHash piles the head keys on one node)
+     * -- the lower default concurrency keeps healthy weighted workers under SAT, so the hotspot scenario
+     * restores the pressure that makes the overload signature visible.
+     */
+    makeHotKeys() { this.keyDist = 'zipf'; this.conc = 132; }
 
     /* ------------------------------------------------------------------ snapshot read surface -- */
 
     isEligible(i) { return this.balancer.isEligible(i); }
     weightOf(i) { return this.weights[i]; }
+
+    /**
+     * Raw per-worker share magnitude the snapshot normalises over the live mass. Prefers the
+     * ForwardDecay RECENCY-weighted pick rate (recent picks weigh more); falls back to the inline
+     * decayed pick counter. Same interface either way -- a swap, not a rewrite.
+     */
+    shareOf(i) {
+        const fd = this.fd;
+        if (fd) { const f = fd[i]; return f.mode === 'explicit' ? f.rate(this.nowNs) : 0; }
+        return this.shareDecay[i];
+    }
+
+    /** Global latency quantile (q in [0,1]) from the DDSketch, or NaN when no sketch / empty. Cold. */
+    latQuantile(q) { return this.latSketch ? this.latSketch.quantile(q) : NaN; }
+
+    /** Per-worker latency quantile from the per-worker DDSketch (tail for SED/NQ/PeakEWMA). Cold. */
+    latWorkerQuantile(i, q) { return this.latWorker ? this.latWorker[i].quantile(q) : NaN; }
+
+    /**
+     * Fill outKeys (Int32Array) with the top hot keys, newest-hot first; returns the count (<= len).
+     * Prefers HeavyKeeper.topKInto (0-alloc, decayed top-k = hot RIGHT NOW); else a partial selection
+     * over the inline decayed keyFreq. Cold (render tick). Keys route via keyWorker[key]; share via keyFreq.
+     */
+    hotKeys(outKeys) {
+        const n = outKeys.length;
+        if (this.hk) {
+            const c = this.hk.topKInto(this._hkPairs);
+            let m = 0;
+            for (let e = 0; e < c && m < n; e++) outKeys[m++] = this._hkPairs[e * 2] | 0;
+            // topKInto is unordered by share; sort the small result by decayed keyFreq (cold, tiny).
+            for (let a = 0; a < m; a++) {
+                let best = a;
+                for (let b = a + 1; b < m; b++) if (this.keyFreq[outKeys[b]] > this.keyFreq[outKeys[best]]) best = b;
+                if (best !== a) { const t = outKeys[a]; outKeys[a] = outKeys[best]; outKeys[best] = t; }
+            }
+            return m;
+        }
+        // Inline fallback: partial selection of the top n keys over the whole (tens-wide) keyspace.
+        let m = 0;
+        for (let slot = 0; slot < n; slot++) {
+            let best = -1, bestF = 0;
+            for (let k = 0; k < KEYSPACE; k++) {
+                const f = this.keyFreq[k];
+                if (f <= 0) continue;
+                let taken = false;
+                for (let j = 0; j < m; j++) if (outKeys[j] === k) { taken = true; break; }
+                if (taken) continue;
+                if (best < 0 || f > bestF) { best = k; bestF = f; }
+            }
+            if (best < 0) break;
+            outKeys[m++] = best;
+        }
+        return m;
+    }
+
+    /** Total decayed key mass (denominator for the hot-key panel share). Cold, KEYSPACE-small. */
+    keyMass() {
+        let s = 0;
+        for (let k = 0; k < KEYSPACE; k++) s += this.keyFreq[k];
+        return s;
+    }
 
     /** BoundedLoad occupancy cap = (1+eps) x total/live, else NaN when the strategy has none. */
     capOf(i) {
@@ -208,27 +388,46 @@ export class Driver {
     }
 
     /**
-     * Skew the weights so a weight-aware strategy distributes unfairly (high Gini). setWeight() is
+     * Force a GENUINE weight-disproportion: replace the mild default skew with a WIDE diverging ramp
+     * (weight 1..UNFAIR_HOT_WEIGHT across the pool). Under the WEIGHT-AWARE fairness detector this is
+     * the honest unfair signature (design section 5: load NOT proportional to weight): a weight-BLIND
+     * policy (RoundRobin / P2C / LeastConn / PeakEWMA -- the `unfair` scenario default) spreads load
+     * FLAT over this steep ramp, so load-over-weight fans out and the Gini crosses the threshold; a
+     * weight-AWARE policy tracks the ramp and stays proportional (correctly NOT flagged). setWeight() is
      * called BEFORE drv.weights is mutated, because an owning strategy's _weights ALIASES that array
      * (SmoothWRR / WeightedRandom) -- pre-mutating it would make setWeight() see "no change" and skip
      * the cold rebuild. Strategies that read weights live (SED / NQ) get the update from drv.weights.
      */
     makeUnfair() {
         const b = this.balancer;
+        const span = this.cap > 1 ? this.cap - 1 : 1;
         for (let i = 0; i < this.cap; i++) {
-            const tw = i === 0 ? UNFAIR_HOT_WEIGHT : 1;
+            // Diverging ramp: worker 0 -> 1, last worker -> UNFAIR_HOT_WEIGHT (the tilted weight-ghost).
+            const tw = 1 + Math.round(i * (UNFAIR_HOT_WEIGHT - 1) / span);
             if (typeof b.setWeight === 'function') b.setWeight(i, tw);
             this.weights[i] = tw;
         }
-        this.conc = 24;   // keep the hot worker's inflight under SAT while Gini stays > threshold
+        // Keep even the highest weight-share worker's inflight under OVERLOAD_SAT for a weight-aware
+        // policy, so `unfair` reads UNFAIR alone (no incidental OVERLOAD from the steep ramp head).
+        this.conc = 90;
     }
 
     /* -------------------------------------------------------------------------------- engine --- */
 
-    /** Reset the per-frame counters before a batch of ticks. */
+    /** Reset the per-frame counters before a batch of ticks; roll the latency sketches for recency. */
     beginFrame(seconds) {
         this.frameSettles = 0;
         this.frameSeconds = seconds > 0 ? seconds : TICK_S;
+        // Roll (clear) the latency sketches every LAT_ROLL_FRAMES frames so p50/p95/p99 reflect RECENT
+        // latency, not all-time. clear() is 0-alloc (pool reuse); the inline latRing is the empty-window
+        // safety net the snapshot uses until the sketch repopulates (which is within one busy frame).
+        this.frameCount++;
+        if (this.latSketch && (this.frameCount % LAT_ROLL_FRAMES) === 0) {
+            this.latSketch.clear();
+            for (let i = 0; i < this.cap; i++) this.latWorker[i].clear();
+        }
+        // Decay the inline per-key frequency (recency weighting for the panel share + the fallback top-k).
+        if (this.keyed) for (let k = 0; k < KEYSPACE; k++) this.keyFreq[k] *= KEY_DECAY;
     }
 
     /** One simulation tick: injectors -> settle -> dispatch -> enforce pins -> decay -> advance. */
@@ -256,6 +455,9 @@ export class Driver {
                 const rtt = t - this.sDisp[s];
                 this.latRing[this.latHead] = rtt;
                 this.latHead = (this.latHead + 1) & 511;
+                // Sibling latency: DDSketch.add(rtt) is 0 B/op (rtt is a small SMI). Global + per-worker
+                // so the header p50/p95/p99 carry a HARD +-alpha bound and a per-worker tail is available.
+                if (this.latSketch && rtt > 0) { this.latSketch.add(rtt); this.latWorker[w].add(rtt); }
                 if (this.hasRtt) this.balancer.recordRtt(w, rtt * TICK_NS, this.nowNs);
                 this.sActive[s] = 0;
                 this.freeStack[this.freeTop++] = s;
@@ -273,13 +475,24 @@ export class Driver {
         if (target < 1) target = 1;
         let guard = target + PEND;      // hard bound so a fully-down pool never spins
         while (this.pCount < target && this.freeTop > 0 && guard-- > 0) {
-            // Key masked to 31 bits so it stays a V8 SMI (a full uint32 > 2^31 boxes a HeapNumber per
-            // dispatch); the Maglev table takes key % M, so the dropped top bit does not skew routing.
-            const i = this.keyed ? this.balancer.pick(this.rng.next() & 0x7fffffff) : this.balancer.pick(this.nowNs);
+            // Keyed strategies route by a BOUNDED-keyspace key (uniform, or zipfian under `hotkeys`) so
+            // stickiness + hotspots are real; a small SMI key never boxes. Non-keyed strategies take the
+            // SMI sim clock. The hot-key structures are fed with the SAME key the balancer routed on.
+            let key = 0;
+            const i = this.keyed ? this.balancer.pick(key = this._nextKey()) : this.balancer.pick(this.nowNs);
             if (i === PICK_NONE) break;
             this.inflight[i] = (this.inflight[i] + 1) >>> 0;
             if (this.hasNote) this.balancer.note(i, 1);
             this.shareDecay[i] += 1;
+            // Sibling decayed share: ForwardDecay.add(now) is 0 B/op (now is a SMI); rate(now) is read cold.
+            if (this.fd) this.fd[i].add(this.nowNs);
+            // Hot-key layer (keyed only): record the routed backend + feed the top-k (HeavyKeeper, 0 B/op)
+            // and the inline decayed frequency (panel share + fallback ranking). All 0-alloc.
+            if (this.keyed) {
+                this.keyWorker[key] = i;
+                this.keyFreq[key] += 1;
+                if (this.hk) this.hk.add(key);
+            }
             const s = this.freeStack[--this.freeTop];
             // Service time: an EXPONENTIAL draw around the per-worker base (mean ~ base, heavy tail),
             // capped, plus the overload tail. u in (0,1) from the seeded Prng -> deterministic, 0-alloc.

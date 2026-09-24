@@ -19,11 +19,30 @@
  * knob. evaluate() is zero-alloc (number locals + reads over the snapshot rings only).
  */
 
+import { ADAPTIVE } from './siblings.mjs';
+
 /* ------------------------------------------------------------------ thresholds (tune here) ---- */
 
-/** Oscillation: eligibility transitions over the window to fire; and the count that reads full red. */
+/** Oscillation (INLINE fallback): eligibility transitions over the window to fire; full-red count. */
 export const OSC_FLAPS_WARN = 6;
 export const OSC_FLAPS_CRIT = 12;
+
+/**
+ * Oscillation (lite-adaptive ADWIN path). One ADWIN per worker consumes that worker's ELIGIBILITY
+ * stream (0/1). The flap signature lives in the eligibility bit, and it is a STATIONARY oscillation:
+ * ADWIN2's variance-aware cut can never split a symmetric oscillation (equal sub-window means at every
+ * boundary), so a raw drift-fire count is empirically 0 -- the SIGNAL is ADWIN's windowed VARIANCE. A
+ * flapping worker's eligibility variance -> 0.25 (Bernoulli), a stable worker's -> 0 (constant up OR
+ * constant down: a killed worker reads 0, NOT oscillation). ADWIN earns its place via the ADAPTIVE
+ * WINDOW: the eligible->flapping (and flapping->recovered) regime change DOES fire a cut, so the window
+ * -- and thus the variance -- stays scoped to the RECENT eligibility, clearing fast on recovery (the
+ * recency a fixed 48-frame window lacks). The score is an EMA of that windowed variance for hysteresis.
+ * ADWIN_DELTA bounds the stationary false-alarm rate; WARN/CRIT are variance-score thresholds.
+ */
+export const ADWIN_DELTA = 0.05;
+export const OSC_VAR_EMA = 0.6;   // EMA weight on the previous variance score (hysteresis)
+export const OSC_DRIFT_WARN = 0.06;
+export const OSC_DRIFT_CRIT = 0.15;
 
 /** Ping-pong: fire when a live pair's Pearson load-correlation is at or below this (hard anti-phase) */
 export const PINGPONG_CORR = -0.6;
@@ -36,8 +55,15 @@ export const STARVE_BUSY_MEAN = 2.0;
 /** ...and stably eligible + starved for this many recent frames (excludes flapping / bursty rows). */
 export const STARVE_STABLE = 6;
 
-/** Unfair: Gini over the live decision-share at or above this. */
-export const UNFAIR_GINI = 0.40;
+/**
+ * Unfair: WEIGHT-AWARE Gini at or above this (design section 5 -- unfair = load NOT proportional to
+ * weight, not raw spread). snap.curGini is the Gini over each live worker's share/weight ratio, so a
+ * weight-PROPORTIONAL distribution reads ~0 (FAIR) even under a skewed weight set. Tuned to sit ABOVE
+ * every healthy strategy under the default mild skew (the weight-blind policies read ~0.24-0.33 -- an
+ * honest "they ignore weights" read, not a fault) and BELOW the genuine disproportions: makeUnfair's
+ * wide ramp on a weight-blind policy (~0.44-0.52) and the keyed ConsistentHash hotspot (~0.42).
+ */
+export const UNFAIR_GINI = 0.38;
 
 /** Overload: a worker's inflight over this saturation, SUSTAINED (a transient random spike is not it) */
 export const OVERLOAD_SAT = 18;
@@ -56,6 +82,26 @@ export class Detectors {
         this.unfair = false; this.unfairGini = 0;
         this.over = false; this.overWorker = -1; this.overLoad = 0;
         this.activeCount = 0;
+
+        // Sibling-backed oscillation: one ADWIN per worker + a per-worker decayed drift-fire score.
+        // Absent -> _adwin stays null and evaluate() uses the inline eligibility flap-count. hasAdwin is
+        // the on-screen detector backing.
+        this.hasAdwin = !!ADAPTIVE;
+        this._adwin = null;
+        this._driftScore = null;
+        if (ADAPTIVE) {
+            this._adwin = new Array(cap);
+            for (let i = 0; i < cap; i++) this._adwin[i] = new ADAPTIVE.ADWIN(ADWIN_DELTA);
+            this._driftScore = new Float64Array(cap);
+        }
+    }
+
+    /** Reset the sibling detector state (called on a strategy morph so a switch does not blip drift). */
+    reset() {
+        if (this._adwin) {
+            for (let i = 0; i < this.cap; i++) this._adwin[i].clear();
+            this._driftScore.fill(0);
+        }
     }
 
     /**
@@ -66,22 +112,43 @@ export class Detectors {
         const cap = this.cap;
         const win = snap.frames < 48 ? snap.frames : 48;   // match snapshot WINDOW ceiling
 
-        // ---- oscillation: eligibility flap-count per worker over the window -----------------
-        let oscW = -1, oscFlaps = 0;
-        for (let w = 0; w < cap; w++) {
-            let flaps = 0, prev = snap.eligAt(w, 0);
-            for (let k = 1; k < win; k++) {
-                const e = snap.eligAt(w, k);
-                if (e !== prev) flaps++;
-                prev = e;
+        // ---- oscillation --------------------------------------------------------------------
+        if (this._adwin) {
+            // lite-adaptive ADWIN: feed each worker's eligibility (0/1 SMI, add is 0 B/op). The windowed
+            // variance is the flap signal (0.25 flapping, 0 stable); the adaptive window keeps it recent.
+            // An EMA over frames adds hysteresis. The worst score names the oscillating worker. Blind to
+            // the injector -- it measures the eligibility stream, never asks whether flapStorm is active.
+            let oscW = -1, best = 0;
+            for (let w = 0; w < cap; w++) {
+                this._adwin[w].add(snap.wEligible[w]);
+                const v = this._adwin[w].variance;
+                const sc = this._driftScore[w] * OSC_VAR_EMA + v * (1 - OSC_VAR_EMA);
+                this._driftScore[w] = sc;
+                if (sc > best) { best = sc; oscW = w; }
             }
-            if (flaps > oscFlaps) { oscFlaps = flaps; oscW = w; }
+            this.oscFlaps = best;          // repurposed: the worst EMA'd eligibility-variance score
+            this.oscWorker = oscW;
+            this.osc = best >= OSC_DRIFT_WARN;
+            this.oscSev = best >= OSC_DRIFT_CRIT ? 1 :
+                (best <= OSC_DRIFT_WARN ? 0 : (best - OSC_DRIFT_WARN) / (OSC_DRIFT_CRIT - OSC_DRIFT_WARN));
+        } else {
+            // Inline fallback: eligibility flap-count per worker over the window.
+            let oscW = -1, oscFlaps = 0;
+            for (let w = 0; w < cap; w++) {
+                let flaps = 0, prev = snap.eligAt(w, 0);
+                for (let k = 1; k < win; k++) {
+                    const e = snap.eligAt(w, k);
+                    if (e !== prev) flaps++;
+                    prev = e;
+                }
+                if (flaps > oscFlaps) { oscFlaps = flaps; oscW = w; }
+            }
+            this.oscFlaps = oscFlaps;
+            this.oscWorker = oscW;
+            this.osc = oscFlaps >= OSC_FLAPS_WARN;
+            this.oscSev = oscFlaps >= OSC_FLAPS_CRIT ? 1 :
+                (oscFlaps <= OSC_FLAPS_WARN ? 0 : (oscFlaps - OSC_FLAPS_WARN) / (OSC_FLAPS_CRIT - OSC_FLAPS_WARN));
         }
-        this.oscFlaps = oscFlaps;
-        this.oscWorker = oscW;
-        this.osc = oscFlaps >= OSC_FLAPS_WARN;
-        this.oscSev = oscFlaps >= OSC_FLAPS_CRIT ? 1 :
-            (oscFlaps <= OSC_FLAPS_WARN ? 0 : (oscFlaps - OSC_FLAPS_WARN) / (OSC_FLAPS_CRIT - OSC_FLAPS_WARN));
 
         // ---- ping-pong: the most-negative live pair correlation (both rows swinging) ----------
         let bestCorr = 1, pa = -1, pb = -1;
@@ -123,7 +190,7 @@ export class Detectors {
         this.starvWorker = starvW;
         this.starv = starvW >= 0;
 
-        // ---- unfair: Gini over the live decision-share ---------------------------------------
+        // ---- unfair: WEIGHT-AWARE Gini (share/weight ratio spread; snap.curGini) --------------
         this.unfairGini = snap.curGini;
         this.unfair = snap.curGini >= UNFAIR_GINI;
 

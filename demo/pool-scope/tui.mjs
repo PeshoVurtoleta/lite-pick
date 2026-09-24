@@ -28,6 +28,7 @@ import { LitePickSnapshot } from './snapshot.mjs';
 import {
     Detectors, OVERLOAD_SAT, UNFAIR_GINI,
 } from './detectors.mjs';
+import { LATENCY_BACKING, DETECTOR_BACKING, HOTKEY_BACKING } from './siblings.mjs';
 
 /* ------------------------------------------------------------------- ANSI + glyph constants ---- */
 
@@ -48,9 +49,18 @@ const C_CYAN = fg(0x7d, 0xd3, 0xfc);
 const C_AMBER = fg(0xf5, 0xb9, 0x42);
 const C_MAGENTA = fg(0xe8, 0x79, 0xa8);
 const C_RED = fg(0xf8, 0x71, 0x71);
-const C_DIM = fg(0x8b, 0x8d, 0x94);
-const C_FAINT = fg(0x55, 0x59, 0x60);
-const C_TEXT = fg(0xd8, 0xd6, 0xd2);
+// Readability-first ramp (btop model: keep ALL text bright, do hierarchy with COLOR + BOLD, not dimming).
+// btop's main_fg is #c5c8c6 (~197); earlier grey-dimming (faint 0x55/0x83, dim 0x8b/0xa6) sat too low-contrast
+// on the dark bg. These tiers are all comfortably readable; faint is merely the least-bright, not "dim".
+const C_TEXT = fg(0xea, 0xe8, 0xe4);  // primary values -- near white
+const C_DIM = fg(0xc6, 0xc9, 0xd0);   // labels -- btop main_fg brightness, clearly readable
+const C_FAINT = fg(0x9c, 0xa2, 0xae); // structural/decoration (axis, rules, empty cells) -- still clearly legible
+
+// Sibling-backing indicator colours (computed once): green when a witnessed peer is live, amber on the
+// inline (fallback) path. The header prints which backing is live so the lego-thesis wiring is visible.
+const DET_COL = DETECTOR_BACKING === 'lite-adaptive' ? C_GREEN : C_AMBER;
+const LAT_COL = LATENCY_BACKING === 'lite-sketch' ? C_GREEN : C_AMBER;
+const HK_COL = HOTKEY_BACKING === 'lite-adaptive' ? C_GREEN : C_AMBER;
 
 // Value-driven gradient: green -> amber -> red. Precomputed once (no per-cell alloc).
 const GRAD_N = 24;
@@ -88,7 +98,15 @@ const G_OVER = '▲';         // triangle
 const BAR_ROWS = 8;
 const HEAT_COLS = 48;
 const GAUGE_W = 24;
-const SCALE_FLOOR = 20;          // bar/heat colour scale floor so an overloaded bar reads red
+const SCALE_FLOOR = 20;          // heat colour scale floor so an overloaded cell reads red
+// FINGERPRINT vertical scale. The hero's job is to make each policy's SHAPE read, not to show absolute
+// load -- absolute inflight saturates every bar near the panel top, crushing the characteristic shapes
+// into 1-2 rows of jitter. So the comb is scaled to a small MULTIPLE OF THE LIVE MEAN: the mean line
+// lands low-mid (~1/FP_MEAN_MULT of the panel), a tight band sits around it, a weighted staircase steps
+// across it, and an overload spikes clean to the top. Sub-cell eighth-blocks keep within-band deltas
+// visible. Colour tracks the same normalised height (green low -> amber mean -> red overshoot).
+const FP_MEAN_MULT = 2.3;        // fingerprint full-scale = live-mean load x this (mean sits ~43% up)
+const FP_SCALE_FLOOR = 4;        // fingerprint scale floor (avoid a divide-by-tiny on an idle pool)
 const TICKS_PER_FRAME = 3;
 const FRAME_SECONDS = TICKS_PER_FRAME * 0.001;
 const MORPH_FRAMES = 14;         // ghost-trail fade length after a strategy switch
@@ -112,6 +130,7 @@ class Renderer {
         this.ghostRow = new Int32Array(cap);
         this.morphRow = new Int32Array(cap).fill(-1);
         this.morphFrames = 0;
+        this.hotKeyBuf = new Int32Array(5);   // top-5 hot-key scratch (keyed strategies only)
     }
 
     /** Capture the current bar tops as the fading ghost-trail (called just before a strategy switch). */
@@ -132,26 +151,34 @@ class Renderer {
     render(snap, det, drv, frame, dataBpo, interactive) {
         const cap = this.cap;
         const NL = CLR_EOL + '\n';
-        const scale = snap.maxLoad > SCALE_FLOOR ? snap.maxLoad : SCALE_FLOOR;
+        const scale = snap.maxLoad > SCALE_FLOOR ? snap.maxLoad : SCALE_FLOOR;   // HEAT-strip colour scale
         const pulse = det.activeCount > 0 && (frame & 4) !== 0;
 
         // ---- per-worker bar geometry (scratch; no alloc) --------------------------------
+        // Live weight sum + mean/std of the live inflight, then a MEAN-RELATIVE fingerprint scale so the
+        // shape reads instead of saturating (see FP_MEAN_MULT). fpScale maps the mean to ~1/FP_MEAN_MULT
+        // of the panel; deviations from the mean -- the whole signal -- fill the rest with headroom above.
         let sumW = 0;
-        for (let i = 0; i < cap; i++) sumW += drv.weights[i];
+        for (let i = 0; i < cap; i++) if (snap.wEligible[i]) sumW += drv.weights[i];
         let meanLoad = 0, liveN = 0;
         for (let i = 0; i < cap; i++) if (snap.wEligible[i]) { meanLoad += snap.wInflight[i]; liveN++; }
         meanLoad = liveN > 0 ? meanLoad / liveN : 0;
         let sig = 0;
         for (let i = 0; i < cap; i++) if (snap.wEligible[i]) { const d = snap.wInflight[i] - meanLoad; sig += d * d; }
         sig = liveN > 0 ? Math.sqrt(sig / liveN) : 0;
-        const meanRow = clampi(((meanLoad / scale) * BAR_ROWS) | 0, 0, BAR_ROWS - 1);
-        const bandHi = clampi((((meanLoad + sig) / scale) * BAR_ROWS) | 0, 0, BAR_ROWS - 1);
-        const bandLo = clampi((((meanLoad - sig) / scale) * BAR_ROWS) | 0, 0, BAR_ROWS - 1);
+        let fpScale = meanLoad * FP_MEAN_MULT;
+        if (fpScale < FP_SCALE_FLOOR) fpScale = FP_SCALE_FLOOR;
+        const meanRow = clampi(((meanLoad / fpScale) * BAR_ROWS) | 0, 0, BAR_ROWS - 1);
+        const bandHi = clampi((((meanLoad + sig) / fpScale) * BAR_ROWS) | 0, 0, BAR_ROWS - 1);
+        const bandLo = clampi((((meanLoad - sig) / fpScale) * BAR_ROWS) | 0, 0, BAR_ROWS - 1);
         for (let i = 0; i < cap; i++) {
-            const v = snap.wInflight[i] / scale;
+            const v = snap.wInflight[i] / fpScale;
             this.eighths[i] = clampi((v * BAR_ROWS * 8) | 0, 0, BAR_ROWS * 8);
-            const ghostLoad = sumW > 0 ? (drv.weights[i] / sumW) * snap.totalInflight : 0;
-            this.ghostRow[i] = clampi(((ghostLoad / scale) * BAR_ROWS) | 0, 0, BAR_ROWS - 1);
+            // Weight-GHOST: where a weight-PROPORTIONAL load would sit (target share x live inflight),
+            // on the SAME mean-relative scale -- so a weighted staircase's bars land ON their ghost and a
+            // weight-blind flat comb visibly does NOT match the skewed ghost (the honest actual-vs-weight).
+            const ghostLoad = sumW > 0 ? (drv.weights[i] / sumW) * (meanLoad * liveN) : 0;
+            this.ghostRow[i] = clampi(((ghostLoad / fpScale) * BAR_ROWS) | 0, 0, BAR_ROWS - 1);
         }
 
         let s = interactive ? HOME : '';
@@ -181,11 +208,16 @@ class Renderer {
             C_DIM + '   p50 ' + C_TEXT + snap.p50.toFixed(0) +
             C_DIM + ' p95 ' + C_TEXT + snap.p95.toFixed(0) +
             C_DIM + ' p99 ' + C_TEXT + snap.p99.toFixed(0) + 'ms' +
+            (drv.hasLatSketch ? C_FAINT + ' (+-1%)' : '') +
             C_DIM + '   frame ' + C_TEXT + frame + RESET + NL;
+        // Sibling-backing indicator: which witnessed peer (or the inline fallback) backs each layer.
+        s += C_FAINT + 'backing  ' + C_DIM + 'detectors ' + DET_COL + DETECTOR_BACKING + C_FAINT +
+            ' · ' + C_DIM + 'latency ' + LAT_COL + LATENCY_BACKING + C_FAINT +
+            ' · ' + C_DIM + 'hot-keys ' + HK_COL + HOTKEY_BACKING + RESET + NL;
         s += C_FAINT + this._rule(64) + RESET + NL;
 
         // ---- HERO: bar-comb ------------------------------------------------------------
-        s += C_DIM + 'FINGERPRINT ' + C_FAINT + 'bar=load  ' + DASH + '=mean  ' + GHOST +
+        s += BOLD + C_DIM + 'FINGERPRINT ' + RESET + C_FAINT + 'bar=load  ' + DASH + '=mean  ' + GHOST +
             '=weight-ghost' + (this.morphFrames > 0 ? '  ' + GHOST + '=morph-trail' : '') + RESET + NL;
         const morphOn = this.morphFrames > 0;
         const morphCol = morphOn ? (this.morphFrames > MORPH_FRAMES / 2 ? C_FAINT : C_FAINT) : C_FAINT;
@@ -198,9 +230,9 @@ class Renderer {
                 }
                 const e = this.eighths[w] - r * 8;
                 if (e >= 8) {
-                    line += GRAD[gradIdx(snap.wInflight[w] / scale)] + FULL + RESET + ' ';
+                    line += GRAD[gradIdx(snap.wInflight[w] / fpScale)] + FULL + RESET + ' ';
                 } else if (e >= 1) {
-                    line += GRAD[gradIdx(snap.wInflight[w] / scale)] + EIGHTHS[e] + RESET + ' ';
+                    line += GRAD[gradIdx(snap.wInflight[w] / fpScale)] + EIGHTHS[e] + RESET + ' ';
                 } else if (morphOn && this.morphRow[w] === r) {
                     line += morphCol + GHOST + RESET + ' ';
                 } else if (this.ghostRow[w] === r) {
@@ -221,7 +253,7 @@ class Renderer {
 
         // ---- HEAT-STRIP ----------------------------------------------------------------
         s += C_FAINT + this._rule(64) + RESET + NL;
-        s += C_DIM + 'HEAT ' + C_FAINT + 'worker x time  (dark=starved  strobe=oscillation  ' +
+        s += BOLD + C_DIM + 'HEAT ' + RESET + C_FAINT + 'worker x time  (dark=starved  strobe=oscillation  ' +
             'checkerboard=ping-pong  hot=overload)' + RESET + NL;
         for (let w = 0; w < cap; w++) {
             let line = C_FAINT + 'w' + (w < 10 ? ' ' : '') + w + ' ' + RESET;
@@ -239,6 +271,36 @@ class Renderer {
             s += line + NL;
         }
 
+        // ---- HOT KEYS (keyed strategies only) ------------------------------------------
+        // The payoff visual for the keyed roster (#8 ConsistentHash, #9 BoundedLoad): the top keys by
+        // RECENT share and the worker each maps to. Under the `hotkeys` (zipfian) scenario a few keys
+        // dominate -- ConsistentHash piles them on one backend (a hotspot: UNFAIR + OVERLOAD), while
+        // BoundedLoad caps the hot backend and OVERFLOWS to neighbours (fairer). Backed by HeavyKeeper
+        // (decayed top-k = "hot right now") when lite-adaptive is present, else the inline decayed freq.
+        if (drv.keyed) {
+            s += C_FAINT + this._rule(64) + RESET + NL;
+            s += BOLD + C_DIM + 'HOT KEYS ' + RESET + C_FAINT + '(' + HOTKEY_BACKING + ')  top keys by recent share ' +
+                DASH + '> mapped worker' + RESET + NL;
+            const n = drv.hotKeys(this.hotKeyBuf);
+            const mass = drv.keyMass();
+            if (n === 0 || mass <= 0) {
+                s += C_FAINT + '  (warming up)' + RESET + NL;
+            } else {
+                for (let e = 0; e < n; e++) {
+                    const key = this.hotKeyBuf[e];
+                    const share = mass > 0 ? drv.keyFreq[key] / mass : 0;
+                    const w = drv.keyWorker[key];
+                    const barW = clampi((share * GAUGE_W) | 0, 0, GAUGE_W);
+                    let bar = '';
+                    for (let i = 0; i < GAUGE_W; i++) bar += i < barW ? (GRAD[gradIdx(share * 3)] + FULL) : (C_FAINT + SHADE);
+                    bar += RESET;
+                    s += '  ' + C_CYAN + 'key ' + C_TEXT + ('' + key).padStart(4) + RESET + ' [' + bar + '] ' +
+                        C_TEXT + (share * 100).toFixed(1) + '%' + C_DIM + ' ' + DASH + '> ' +
+                        C_FAINT + 'w' + (w >= 0 ? w : '?') + RESET + NL;
+                }
+            }
+        }
+
         // ---- FAIRNESS ------------------------------------------------------------------
         s += C_FAINT + this._rule(64) + RESET + NL;
         const g = snap.curGini;
@@ -248,7 +310,7 @@ class Renderer {
         for (let i = 0; i < GAUGE_W; i++) gauge += i < filled ? gcol + FULL : C_FAINT + SHADE;
         gauge += RESET;
         const press = g >= UNFAIR_GINI ? (C_RED + 'MONOPOLY') : (g >= UNFAIR_GINI * 0.6 ? (C_AMBER + 'SKEWED') : (C_GREEN + 'BALANCED'));
-        s += C_DIM + 'FAIRNESS ' + C_FAINT + 'gini ' + gcol + g.toFixed(3) + RESET + ' [' + gauge + '] ' +
+        s += BOLD + C_DIM + 'FAIRNESS ' + RESET + C_FAINT + 'gini ' + gcol + g.toFixed(3) + RESET + ' [' + gauge + '] ' +
             C_FAINT + 'pressure ' + press + RESET + NL;
 
         // ---- ALARM + badges ------------------------------------------------------------
@@ -289,7 +351,7 @@ class Renderer {
 
 /* ------------------------------------------------------------------------- scenario wiring ---- */
 
-const SCENARIOS = ['healthy', 'killworker', 'overload', 'flapstorm', 'pingpong', 'unfair'];
+const SCENARIOS = ['healthy', 'killworker', 'overload', 'flapstorm', 'pingpong', 'unfair', 'hotkeys'];
 
 /** Apply a named scenario's conditions to the driver (the injectors the detectors then notice). */
 function applyScenario(drv, name) {
@@ -303,6 +365,7 @@ function applyScenario(drv, name) {
     if (name === 'flapstorm') { drv.flapStorm((drv.cap / 3) | 0); return; }
     if (name === 'pingpong') { drv.forcePingPong(2, drv.cap - 4); return; }
     if (name === 'unfair') { drv.makeUnfair(); return; }
+    if (name === 'hotkeys') { drv.makeHotKeys(); return; }   // zipfian keys -> a keyed-strategy hotspot
     throw new Error('[pool-scope] unknown scenario: ' + name + ' (one of ' + SCENARIOS.join(', ') + ')');
 }
 
@@ -449,6 +512,7 @@ function runInteractive(argv) {
     function switchTo(idx) {
         rend.beginMorph();
         drv.setStrategy(STRATEGIES[idx]);
+        det.reset();   // clear the sibling detector state so a morph does not blip the ADWIN oscillation
         dataBpo = measureDataPath(STRATEGIES[idx], seed);   // re-prove the new strategy's data path
     }
 
@@ -463,8 +527,10 @@ function runInteractive(argv) {
         drv.weights.set(fresh.weights);
         drv.pin.fill(0); drv.ceil.fill(-1); drv.slow.fill(0);
         drv.flapEnabled = false; drv.ppEnabled = false;
+        drv.keyDist = 'uniform';
         drv.conc = 108;
         drv.setStrategy(cur);
+        det.reset();
     }
 
     process.on('SIGINT', quit);

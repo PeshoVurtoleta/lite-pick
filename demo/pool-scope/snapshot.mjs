@@ -106,6 +106,7 @@ export class LitePickSnapshot {
 
         // ---- scratch (pre-allocated, reused; never grows) ------------------
         this._giniScratch = new Int32Array(cap);
+        this._ratio = new Float64Array(cap);   // per-worker share/weight scratch (weight-aware Gini)
         this._lat = new Float64Array(LAT_SIZE);
     }
 
@@ -137,17 +138,20 @@ export class LitePickSnapshot {
     build(driver) {
         const cap = this.cap;
         const inflight = driver.inflight;
-        const shareDecay = driver.shareDecay;
         let live = 0, total = 0, shareSum = 0, maxLoad = 1;
 
-        // First pass: eligibility + inflight + raw share mass over the LIVE set.
+        // First pass: eligibility + inflight + raw share mass over the LIVE set. The raw share is read
+        // through driver.shareOf() -- ForwardDecay's recency-weighted rate when the sibling is present,
+        // else the inline decayed counter -- and stashed into wShare for the normalise pass.
         for (let i = 0; i < cap; i++) {
             const el = driver.isEligible(i) ? 1 : 0;
             this.wEligible[i] = el;
             const inf = inflight[i];
             this.wInflight[i] = inf;
             if (inf > maxLoad) maxLoad = inf;
-            if (el) { live++; total += inf; shareSum += shareDecay[i]; }
+            const raw = driver.shareOf(i);
+            this.wShare[i] = raw;
+            if (el) { live++; total += inf; shareSum += raw; }
             this.wWeight[i] = driver.weightOf(i);
             this.wCap[i] = driver.capOf(i);
             this.wEwma[i] = driver.ewmaOf(i);
@@ -155,23 +159,45 @@ export class LitePickSnapshot {
         // Second pass: normalised rolling share over the live mass (0 for a down/idle worker).
         const inv = shareSum > 0 ? 1 / shareSum : 0;
         for (let i = 0; i < cap; i++) {
-            this.wShare[i] = this.wEligible[i] ? shareDecay[i] * inv : 0;
+            this.wShare[i] = this.wEligible[i] ? this.wShare[i] * inv : 0;
         }
         this.live = live;
         this.totalInflight = total;
         this.maxLoad = maxLoad;
 
-        // Fairness: Gini over the live workers' rolling share (the decision distribution).
-        const g = giniLive(this.wShare, this.wEligible, this._giniScratch, cap);
+        // Fairness: WEIGHT-AWARE Gini (design section 5 -- unfair = load NOT proportional to weight, not
+        // raw spread). We take the Gini over each live worker's share/weight ratio: a distribution that
+        // is proportional to weight has a constant ratio -> Gini 0 (FAIR) even under a skewed weight set,
+        // and only a genuine disproportion (a weight-blind policy on a steep ramp, or a keyed hotspot)
+        // fans the ratios out and lifts the Gini. wWeight is >= 1 for every worker, so the divide is safe.
+        for (let i = 0; i < cap; i++) {
+            const w = this.wWeight[i];
+            this._ratio[i] = w > 0 ? this.wShare[i] / w : 0;
+        }
+        const g = giniLive(this._ratio, this.wEligible, this._giniScratch, cap);
         this.curGini = g;
         this.curFairness = 1 - g;
 
-        // Latency percentiles from the driver's pre-filled ring: copy -> sort in place -> index.
-        this._lat.set(driver.latRing);
-        this._lat.sort();
-        this.p50 = this._lat[LAT_SIZE >> 1];
-        this.p95 = this._lat[(LAT_SIZE * 95 / 100) | 0];
-        this.p99 = this._lat[(LAT_SIZE * 99 / 100) | 0];
+        // Latency percentiles: PREFER the lite-sketch DDSketch (a HARD +-alpha relative-error quantile,
+        // cold walk off the hot path). It rolls for recency, so on the frame right after a roll it may be
+        // momentarily empty (quantile -> NaN); the inline pre-alloc-sort of the ring is the safety net and
+        // the full fallback when the sibling is absent. Same three fields either way -- a swap, not a rewrite.
+        let p50 = NaN;
+        if (driver.hasLatSketch) {
+            p50 = driver.latQuantile(0.5);
+            if (p50 === p50) {          // not NaN: sketch has samples
+                this.p50 = p50;
+                this.p95 = driver.latQuantile(0.95);
+                this.p99 = driver.latQuantile(0.99);
+            }
+        }
+        if (!(p50 === p50)) {           // no sketch, or an empty (just-rolled) sketch: inline sort
+            this._lat.set(driver.latRing);
+            this._lat.sort();
+            this.p50 = this._lat[LAT_SIZE >> 1];
+            this.p95 = this._lat[(LAT_SIZE * 95 / 100) | 0];
+            this.p99 = this._lat[(LAT_SIZE * 99 / 100) | 0];
+        }
 
         // Throughput (settles/sec) the driver measured over the frame.
         this.curThroughput = driver.frameSeconds > 0 ? driver.frameSettles / driver.frameSeconds : 0;

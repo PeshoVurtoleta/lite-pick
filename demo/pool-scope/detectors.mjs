@@ -52,6 +52,10 @@ export const PINGPONG_STD = 3.0;
 /** Starvation: a live worker SUSTAINED under this share while the pool is busy (mean inflight > MIN) */
 export const STARVE_SHARE = 0.02;
 export const STARVE_BUSY_MEAN = 2.0;
+/** ...AND genuinely idle: occupancy below this fraction of the pool mean inflight. A worker with 0 new
+ *  share but a HIGH in-flight backlog (an overloaded node the balancer is correctly draining) is NOT
+ *  starved -- starvation is low-share AND low-occupancy, so this excludes the overload double-signal. */
+export const STARVE_IDLE_FRAC = 1.0;
 /** ...and stably eligible + starved for this many recent frames (excludes flapping / bursty rows). */
 export const STARVE_STABLE = 6;
 
@@ -174,12 +178,17 @@ export class Detectors {
         // Sustained + stably-eligible over STARVE_STABLE frames, so a flapping row (down part of the
         // time) and a merely-bursty row (occasional real traffic) are BOTH excluded -- only a worker
         // that is up throughout yet consistently ignored counts. Honest and injector-agnostic.
-        const busy = snap.live > 0 && (snap.totalInflight / snap.live) >= STARVE_BUSY_MEAN;
+        const meanInf = snap.live > 0 ? snap.totalInflight / snap.live : 0;
+        const busy = meanInf >= STARVE_BUSY_MEAN;
+        const idleCap = meanInf * STARVE_IDLE_FRAC;
         const look = win < STARVE_STABLE ? win : STARVE_STABLE;
         let starvW = -1;
         if (busy && look >= STARVE_STABLE) {
             for (let w = 0; w < cap; w++) {
                 if (!snap.wEligible[w]) continue;
+                // Genuinely idle: an overloaded/draining node (in-flight backlog >= the pool mean) has 0 new
+                // share but is NOT starved -- exclude it so overload never double-fires as starvation.
+                if (snap.wInflight[w] >= idleCap) continue;
                 let starved = true;
                 for (let k = 0; k < look; k++) {
                     if (!snap.eligAt(w, k) || snap.shareAt(w, k) >= STARVE_SHARE) { starved = false; break; }

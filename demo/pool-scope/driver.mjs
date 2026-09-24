@@ -49,6 +49,8 @@ const PP_LO = 2;
 const PP_HALF = 8;                // ping-pong half-period in ticks
 const FLAP_PERIOD = 3;            // flapStorm toggles the worker's eligibility every N ticks
 const UNFAIR_HOT_WEIGHT = 12;     // makeUnfair top weight (diverging ramp head; see makeUnfair)
+const STARVE_CONC = 72;           // makeStarve offered load: busy pool (meanInf >> STARVE_BUSY_MEAN) but
+                                  // the top-weight worker stays under OVERLOAD_SAT -> STARVATION alone, no overload
 // Default MILD weight skew (a gentle deterministic tier ramp across the pool) so the WEIGHT-AWARE
 // strategies (SmoothWRR / SED / NQ / WeightedRandom + weighted ConsistentHash / BoundedLoad) render
 // their signature STAIRCASE by default, not only after `u`. WEIGHT_TIERS steps over the cap -> weight
@@ -123,6 +125,7 @@ export class Driver {
         this.slow = new Uint8Array(cap);           // long-service (overload) marker
         this.flapEnabled = false; this.flapWorker = -1;
         this.ppEnabled = false; this.ppA = -1; this.ppB = -1;
+        this.starveWorker = -1; this.starveWeightWas = -1;   // makeStarve target + prior weight (for reset)
 
         // ---- pending-request slot pool (fixed; free-list; zero-alloc dispatch) -----------
         this.sWorker = new Uint32Array(PEND);
@@ -410,6 +413,32 @@ export class Driver {
         // Keep even the highest weight-share worker's inflight under OVERLOAD_SAT for a weight-aware
         // policy, so `unfair` reads UNFAIR alone (no incidental OVERLOAD from the steep ramp head).
         this.conc = 90;
+    }
+
+    /**
+     * Force a GENUINE policy starvation: set ONE eligible worker's weight to 0 through the balancer's
+     * sole-writer setWeight() path. Under a WEIGHT-AWARE strategy (SmoothWRR / SED / NQ / WeightedRandom)
+     * a weight-0 node is correctly NEVER routed to even though it stays UP -- the honest "node is healthy
+     * but weight 0, silently gets nothing" misconfiguration. Its in-flight then drains to ~0 and its share
+     * to ~0 while the pool is busy, and the starvation detector lights on that low-share + low-occupancy
+     * signature -- NOT because traffic was force-zeroed (that would be dishonest); the POLICY starves it.
+     * Under a weight-BLIND strategy (RoundRobin / P2C / LeastConn / PeakEWMA) a weight-0 node is still
+     * picked, so starvation legitimately does NOT show (honest). Remembers the worker + its prior weight
+     * so reset() restores it. setWeight() is called BEFORE drv.weights is mutated because an owning
+     * strategy's _weights ALIASES that array (SmoothWRR / WeightedRandom) -- pre-mutating it would make
+     * setWeight() see "no change" and skip the cold rebuild. SED / NQ read weights live from drv.weights.
+     * @param {number} [i]  the worker to starve (default a stable mid worker).
+     */
+    makeStarve(i = (this.cap / 2) | 0) {
+        if (i < 0 || i >= this.cap) return;
+        const b = this.balancer;
+        this.starveWorker = i;
+        this.starveWeightWas = this.weights[i];
+        if (typeof b.setWeight === 'function') b.setWeight(i, 0);
+        this.weights[i] = 0;
+        // Hold a busy offered load so meanInf clears STARVE_BUSY_MEAN, but low enough that the top-weight
+        // worker stays under OVERLOAD_SAT -> the starve scenario reads STARVATION alone (no overload).
+        this.conc = STARVE_CONC;
     }
 
     /* -------------------------------------------------------------------------------- engine --- */

@@ -31,11 +31,81 @@ npm run scope:frames
 ```
 
 Flags: `--frames N`, `--scenario <name>`, `--strategy <name>`, `--seed S`.
-Scenarios: `healthy`, `killworker`, `overload`, `flapstorm`, `pingpong`, `unfair`, `hotkeys`.
+Scenarios: `healthy`, `killworker`, `overload`, `flapstorm`, `pingpong`, `unfair`, `starve`, `hotkeys`.
+`starve` zeroes one eligible worker's weight under a weight-aware strategy (it auto-selects `smoothwrr`
+if the current strategy is weight-blind) -- the policy then correctly never routes to the healthy-but-
+weight-0 node, and the `∅ STARVATION` detector lights (see "The five pathologies" below).
 `hotkeys` skews the KEYED workload zipfian -- run it with `consistenthash` or `boundedload` to see the
 HOT KEYS panel and the hotspot (see "HOT KEYS panel" below).
 Strategies (the ten): `roundrobin`, `smoothwrr`, `p2c`, `leastconn`, `sed`, `nq`, `peakewma`,
 `consistenthash`, `boundedload`, `weightedrandom` (default `p2c`).
+
+## Browser target (PS3)
+
+The **"richer pitch"** render target: the same live decision-monitor, served as a static browser page. It
+reuses the **same renderer-agnostic bricks and detectors as the TUI** (`snapshot.mjs`, `detectors.mjs`,
+`driver.mjs`, `siblings.mjs`) over the real `Pick.js` kernel -- **only the renderer differs** (the TUI's
+`tui.mjs` is Node/ANSI; PS3 is `web/main.mjs`, a browser renderer that paints with `@zakkster/lite-charts`).
+The driver runs in-browser on a throttled ~12 Hz tick appending to the snapshot ring and running the
+detectors each tick -- the identical zero-alloc data path.
+
+Run it:
+
+```
+npm run scope:web
+# -> serving ... open http://localhost:8137/
+```
+
+`scope:web` starts a **zero-dependency** static file server (Node built-in `http`, no bundler, no `serve`
+dep -- `web/serve.mjs`). Open the printed URL; the page **auto-runs the healthy scenario on load**.
+
+### Scene tabs
+
+`overview` (all panels) | `fingerprint` | `heat` | `fairness` | `killer graph`. The side panel (controls,
+worker table, inspector, alarm, hot-keys) stays visible across scenes.
+
+### Controls (mirror the TUI)
+
+Buttons **and** keyboard: `1`-`9`,`0` strategy, `n` next, `k` kill, `o` overload, `f` flap, `p` ping-pong,
+`u` unfair, `s` starve, `r` reset (plus a `hot-keys` button). State is reactive via `@zakkster/lite-signal`.
+
+### Panels (the lego thesis -- ride the siblings)
+
+- **Fingerprint** -- a hand-rolled `<canvas>` hero (bar per worker on the green->amber->red ramp + drawn
+  mean line + `±1σ` band + the dotted **weight-ghost** overlay). Canvas, because the ghost/band *overlay*
+  does not compose cleanly on a lite-charts bar; every other chart panel rides lite-charts.
+- **Heat** -- the lite-charts **heatmap** kernel (worker x time, load = colour).
+- **Fairness** -- the lite-charts **area/line** kernel as a Lorenz curve + a weight-aware **Gini gauge**.
+- **Killer graph** -- the lite-charts **scatter** kernel (x = service latency p50 from DDSketch, y = picks/sec).
+- **Alarm tally** + section-5 glyph badges, **hot keys** (keyed strategies, from HeavyKeeper), a sortable
+  per-worker **table** (share / load / p95; click a row for the **inspector**).
+
+Every chart is created behind a `try/catch`; if a kernel fails to load it degrades to a small `<canvas>`
+fallback for **that panel only**, so the page always loads live with no uncaught console error. The
+calm-baseline **inverted colour budget** holds (green baseline; warm colour + motion reserved for
+pathologies) and a `prefers-reduced-motion` variant suppresses the alarm pulse/glow while keeping state
+legible.
+
+### esm.sh import map + GitHub-Pages-ready
+
+The bricks and the kernel load as **relative ESM** straight from the static server (zero CDN for lite-pick).
+Only the bare specifiers -- `@zakkster/lite-signal`, `@zakkster/lite-charts`, `@zakkster/lite-sketch`,
+`@zakkster/lite-adaptive` -- resolve via an HTML **import map** to `https://esm.sh/...` (pinned:
+lite-charts@1.24.0, lite-signal@1.5.2, lite-sketch@1.1.2, lite-adaptive@1.0.0). lite-charts is loaded with
+`?external=@zakkster/lite-signal` so it **shares the page's lite-signal instance** (one reactive registry
+across the chart layer + the control/state signals). This makes the page **pure static** -- it runs on any
+file server AND is **GitHub-Pages-ready** with no bundler and no vendoring. `peerDependencies` stays `{}`
+(the libs are CDN-loaded in the browser, listed only in `devDependencies` for local reference).
+
+Caveat: the esm.sh panels require network access on first load (or a warm CDN cache). Offline / blocked, the
+`try/catch` guards drop every chart to its canvas fallback and the page still runs.
+
+### Backing indicator (optional-peer wiring, proven in the browser too)
+
+The header prints which backing is live -- `detectors lite-adaptive · latency lite-sketch · hot-keys
+lite-adaptive · render lite-charts` -- each green when the witnessed peer loaded, amber `(fallback)`
+otherwise. Force the inline fallbacks from the URL: `?noadaptive` (detectors / share / hot-keys) and
+`?nosketch` (latency), the browser equivalent of the TUI's `POOL_SCOPE_NO_*` env vars.
 
 ## Controls (interactive)
 
@@ -48,6 +118,7 @@ Strategies (the ten): `roundrobin`, `smoothwrr`, `p2c`, `leastconn`, `sed`, `nq`
 | `f`       | flap-storm a worker (rapid eligibility toggling)     |
 | `p`       | force two workers into anti-phase (ping-pong)        |
 | `u`       | skew the weights (unfair -- needs a weight-aware strategy) |
+| `s`       | starve a worker (set its weight to 0 -- needs a weight-aware strategy) |
 | `r`       | reset all injectors                                  |
 | `q` / Ctrl-C | quit (restores the cursor + terminal)             |
 
@@ -60,13 +131,28 @@ reading the snapshot's rolling series -- it never asks which injector is active.
 |-------|-------------|------------------------------------------------------|------------------------------------|
 | `∿`   | oscillation | a heat-strip row STROBING hot/cold                   | eligibility flap-count over a window |
 | `⇄`   | ping-pong   | two rows in hard ANTI-PHASE (checkerboard)           | strong negative load correlation   |
-| `∅`   | starvation  | a DARK row -- a live worker sustained at ~0 share    | live + busy pool + ~0 rolling share |
+| `∅`   | starvation  | a DARK row -- a live worker sustained at ~0 share    | live + busy pool + ~0 rolling share + low occupancy |
 | `⚖`   | unfair      | the Gini gauge bows red                               | Gini over the live decision-share  |
 | `▲`   | overload    | a pinned-HOT row over saturation                     | inflight sustained over saturation |
 
 The corner tally flips from green **SYSTEM NOMINAL** to a pulsing red **PATHOLOGY DETECTED / N faults**
 with the active badges the instant any detector fires. Thresholds are constants at the top of
 `detectors.mjs` (tune by eye).
+
+**Genuine starvation (the `starve` scenario / `s` key).** Starvation is honest and *policy-driven*: a
+LIVE (eligible) worker that receives ~0 share **and** stays near-idle (low in-flight) while the pool is
+busy. The `starve` scenario reproduces the real "node is healthy but weight 0, silently gets nothing"
+misconfiguration -- it sets one eligible worker's weight to `0` via the balancer's sole-writer
+`setWeight()` under a **weight-aware** strategy (SmoothWRR / SED / NQ / WeightedRandom). The policy then
+*correctly* never routes to that node, so it starves -- the detector lights because the POLICY starves
+it, not because any traffic was force-zeroed. Under a **weight-blind** strategy (RoundRobin / P2C /
+LeastConn / PeakEWMA) a weight-0 node is still picked, so starvation legitimately **clears** -- honest.
+The low-occupancy gate (`STARVE_IDLE_FRAC`) keeps an overloaded/draining node -- 0 new share but a HIGH
+in-flight backlog -- out of the starvation signal, so overload never double-fires as starvation.
+
+```
+node demo/pool-scope/tui.mjs --frames 30 --scenario starve --strategy smoothwrr   # -> ∅ STARVATION(w6)
+```
 
 ## Layout
 

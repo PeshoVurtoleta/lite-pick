@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pool Scope -- live load-balancing decision monitor (browser)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+
+<!--
+  Import map (PS3 architecture): the renderer-agnostic bricks (snapshot/detectors/driver/siblings)
+  and the kernel (../../Pick.js) load as RELATIVE ESM straight from this static server -- zero CDN for
+  lite-pick. Only the SIBLING + charting libs are bare specifiers: they resolve to esm.sh, pinned.
+  lite-charts is loaded with ?external=@zakkster/lite-signal so it SHARES this page's lite-signal
+  instance (one reactive registry across the chart layer + our control/state signals). Pure static ->
+  runs on any file server AND is GitHub-Pages-ready with no bundler and no vendoring.
+-->
+<!--
+  Set the sibling-fallback overrides from the URL BEFORE any module evaluates, so siblings.mjs (loaded
+  transitively by driver.mjs) reads them at eval time. ?nosketch -> inline latency; ?noadaptive ->
+  inline detectors/share/hot-keys. Proves the optional-peer graceful degradation in the browser too.
+-->
+<script>
+  var q = new URLSearchParams(location.search);
+  if (q.has('nosketch')) globalThis.POOL_SCOPE_NO_SKETCH = 1;
+  if (q.has('noadaptive')) globalThis.POOL_SCOPE_NO_ADAPTIVE = 1;
+</script>
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-signal": "https://esm.sh/@zakkster/lite-signal@1.5.2",
+    "@zakkster/lite-charts": "https://esm.sh/@zakkster/lite-charts@1.24.0?external=@zakkster/lite-signal",
+    "@zakkster/lite-sketch": "https://esm.sh/@zakkster/lite-sketch@1.1.2",
+    "@zakkster/lite-adaptive": "https://esm.sh/@zakkster/lite-adaptive@1.0.0"
+  }
+}
+</script>
+
+<style>
+:root {
+  /* --- oscilloscope DARK house style (design brief section 6 palette) --- */
+  --bg0: #07090d; --bg1: #0d1117; --bg2: #131922; --bg3: #1a2230;
+  --bg0-k: oklch(0.16 0.01 260); --bg1-k: oklch(0.2 0.015 260);
+  --text: #eae8e4; --dim: #c6c9d0; --faint: #9ca2ae; --line: #232b38;
+  --green: #5fe39f;   /* healthy baseline */
+  --amber: #f5b942;   /* oscillation / warn */
+  --red: #f87171;     /* overload / critical */
+  --magenta: #e879a8; /* ping-pong */
+  --cyan: #7dd3fc;    /* decisions */
+  --mono: 'JetBrains Mono', ui-monospace, monospace;
+  --eyebrow: 'Space Mono', ui-monospace, monospace;
+  --r: 0.5rem;
+  --pulse-ms: 900ms;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg0);
+  background: var(--bg0-k);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  min-height: 100dvh;
+  padding: 1rem 1.25rem 2rem;
+  background:
+    radial-gradient(120% 80% at 50% -10%, #131922 0%, #0d1117 45%, #07090d 100%);
+}
+
+.eyebrow { font-family: var(--eyebrow); text-transform: uppercase; letter-spacing: 0.14em; font-size: 0.72rem; color: var(--faint); }
+
+header.scope-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem 1.5rem;
+  padding-bottom: 0.75rem; border-bottom: 1px solid var(--line); margin-bottom: 0.75rem;
+}
+header.scope-head h1 {
+  margin: 0; font-size: 1.25rem; font-weight: 700; letter-spacing: 0.02em; color: var(--green);
+}
+header.scope-head .subtitle { color: var(--dim); font-size: 0.85rem; }
+.head-stats { display: flex; flex-wrap: wrap; gap: 0.4rem 1.1rem; margin-left: auto; font-size: 0.82rem; }
+.head-stats .k { color: var(--faint); }
+.head-stats .v { color: var(--text); font-weight: 500; }
+.head-stats .v.cyan { color: var(--cyan); }
+
+.backing { display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; font-size: 0.78rem; margin-bottom: 0.75rem; }
+.backing .lbl { color: var(--faint); }
+.backing .b { font-weight: 500; }
+.backing .b.live { color: var(--green); }
+.backing .b.fallback { color: var(--amber); }
+.badge-alloc { font-size: 0.78rem; }
+.badge-alloc .ok { color: var(--green); } .badge-alloc .warn { color: var(--amber); }
+
+/* --- scene tabs --- */
+nav.tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.9rem; }
+nav.tabs button {
+  font-family: var(--eyebrow); text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.72rem;
+  background: var(--bg1); color: var(--faint); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 0.4rem 0.8rem; cursor: pointer; transition: color 120ms, border-color 120ms;
+}
+nav.tabs button[aria-selected="true"] { color: var(--green); border-color: var(--green); }
+@media (hover: hover) { nav.tabs button:hover { color: var(--text); border-color: var(--faint); } }
+
+/* --- main layout: STAGE + side PANEL --- */
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 22rem; gap: 1rem; align-items: start; }
+@media (max-width: 60rem) { .layout { grid-template-columns: minmax(0, 1fr); } }
+
+.stage { position: relative; display: grid; gap: 1rem; }
+.panel {
+  background: var(--bg1); background: var(--bg1-k);
+  border: 1px solid var(--line); border-radius: var(--r); padding: 0.8rem 0.9rem;
+}
+.panel h2 {
+  margin: 0 0 0.55rem; font-family: var(--eyebrow); text-transform: uppercase; letter-spacing: 0.12em;
+  font-size: 0.74rem; color: var(--dim); font-weight: 700;
+}
+.panel h2 .hint { color: var(--faint); font-weight: 400; letter-spacing: 0.04em; margin-left: 0.5rem; }
+.chart-host { width: 100%; height: var(--h, 220px); position: relative; }
+
+/* scene visibility: default show all (overview); a selected non-"all" scene isolates one panel */
+.stage[data-scene="all"] .panel { display: block; }
+.stage:not([data-scene="all"]) .panel { display: none; }
+.stage[data-scene="fingerprint"] .panel[data-panel="fingerprint"],
+.stage[data-scene="heat"] .panel[data-panel="heat"],
+.stage[data-scene="fairness"] .panel[data-panel="fairness"],
+.stage[data-scene="latency"] .panel[data-panel="latency"] { display: block; }
+
+/* --- side panel --- */
+.side { display: grid; gap: 1rem; }
+
+/* alarm overlay */
+.alarm {
+  border-radius: var(--r); border: 1px solid var(--line); padding: 0.7rem 0.85rem;
+  background: var(--bg2); transition: border-color 200ms, box-shadow 200ms;
+}
+.alarm.nominal { border-color: color-mix(in oklab, var(--green) 45%, var(--line)); }
+.alarm.alert { border-color: var(--red); }
+.alarm .status { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; letter-spacing: 0.03em; }
+.alarm .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; background: var(--green); }
+.alarm.nominal .status { color: var(--green); }
+.alarm.alert .status { color: var(--red); }
+.alarm.alert .dot { background: var(--red); }
+.alarm .sub { color: var(--faint); font-size: 0.8rem; margin-top: 0.2rem; }
+.badges { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.55rem; }
+.badge {
+  font-size: 0.76rem; padding: 0.2rem 0.5rem; border-radius: 0.35rem;
+  border: 1px solid currentColor; display: inline-flex; align-items: center; gap: 0.3rem;
+}
+.badge.osc { color: var(--amber); } .badge.ping { color: var(--magenta); }
+.badge.starv { color: var(--amber); } .badge.unfair { color: var(--cyan); }
+.badge.over { color: var(--red); }
+
+/* pulsing alert -- reserved for pathology, reduced-motion suppresses it */
+.alarm.alert { animation: alarmpulse var(--pulse-ms) ease-in-out infinite; }
+@keyframes alarmpulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklab, var(--red) 0%, transparent); }
+  50% { box-shadow: 0 0 1.4rem 0 color-mix(in oklab, var(--red) 35%, transparent); }
+}
+
+/* controls */
+.controls .grp { margin-bottom: 0.7rem; }
+.controls .grp:last-child { margin-bottom: 0; }
+.ctl-row { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+button.ctl {
+  font-family: var(--mono); font-size: 0.78rem; background: var(--bg2); color: var(--dim);
+  border: 1px solid var(--line); border-radius: 0.35rem; padding: 0.32rem 0.55rem; cursor: pointer;
+}
+button.ctl .key { color: var(--faint); font-size: 0.7rem; }
+button.ctl[aria-pressed="true"] { color: var(--green); border-color: var(--green); }
+button.ctl.inject { color: var(--amber); }
+@media (hover: hover) { button.ctl:hover { border-color: var(--faint); color: var(--text); } }
+select.ctl { font-family: var(--mono); background: var(--bg2); color: var(--text); border: 1px solid var(--line); border-radius: 0.35rem; padding: 0.32rem 0.4rem; }
+
+/* worker table (Activity-Monitor idiom) */
+.wtable { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+.wtable th { text-align: right; color: var(--faint); font-weight: 400; font-size: 0.7rem; padding: 0.2rem 0.35rem; cursor: pointer; user-select: none; }
+.wtable th:first-child, .wtable td:first-child { text-align: left; }
+.wtable td { padding: 0.18rem 0.35rem; text-align: right; color: var(--text); border-top: 1px solid var(--line); }
+.wtable tr { cursor: pointer; }
+.wtable tr[aria-selected="true"] td { background: color-mix(in oklab, var(--cyan) 12%, transparent); }
+.wtable tr[data-down="1"] td { color: var(--faint); }
+@media (hover: hover) { .wtable tr:hover td { background: color-mix(in oklab, var(--cyan) 8%, transparent); } }
+.minibar { display: inline-block; height: 0.55rem; border-radius: 1px; vertical-align: middle; background: var(--green); }
+
+/* worker inspector */
+.inspector .kv { display: flex; justify-content: space-between; font-size: 0.8rem; padding: 0.15rem 0; }
+.inspector .kv .k { color: var(--faint); }
+.inspector .empty { color: var(--faint); font-size: 0.8rem; }
+
+/* hot-keys */
+.hotkeys .hk { display: grid; grid-template-columns: 3.5rem 1fr auto; gap: 0.4rem; align-items: center; font-size: 0.78rem; margin-bottom: 0.25rem; }
+.hotkeys .hk .track { height: 0.55rem; background: var(--bg3); border-radius: 1px; overflow: hidden; }
+.hotkeys .hk .fill { height: 100%; background: var(--cyan); }
+.hotkeys .empty { color: var(--faint); font-size: 0.8rem; }
+
+canvas.fallback { display: block; width: 100%; height: 100%; }
+
+footer.foot { margin-top: 1.25rem; color: var(--faint); font-size: 0.76rem; border-top: 1px solid var(--line); padding-top: 0.7rem; }
+footer.foot code { color: var(--dim); }
+
+@media (prefers-reduced-motion: reduce) {
+  .alarm.alert { animation: none; box-shadow: 0 0 0 1px var(--red) inset; }
+  * { transition: none !important; }
+}
+</style>
+</head>
+<body>
+<header class="scope-head">
+  <h1>POOL SCOPE</h1>
+  <span class="subtitle">decision monitor (not resource monitor) &mdash; <span id="head-workers">12</span> workers &mdash; browser target</span>
+  <div class="head-stats">
+    <span><span class="k">strategy</span> <span class="v cyan" id="head-strategy">p2c</span></span>
+    <span><span class="k">live</span> <span class="v" id="head-live">-</span></span>
+    <span><span class="k">inflight</span> <span class="v" id="head-inflight">-</span></span>
+    <span><span class="k">thr</span> <span class="v" id="head-thr">-</span>/s</span>
+    <span><span class="k">p50/p95/p99</span> <span class="v" id="head-lat">-</span></span>
+    <span class="badge-alloc" id="head-alloc"></span>
+  </div>
+</header>
+
+<div class="backing">
+  <span class="lbl">backing</span>
+  <span><span class="lbl">detectors</span> <span class="b" id="back-det">-</span></span>
+  <span><span class="lbl">latency</span> <span class="b" id="back-lat">-</span></span>
+  <span><span class="lbl">hot-keys</span> <span class="b" id="back-hk">-</span></span>
+  <span><span class="lbl">render</span> <span class="b" id="back-render">-</span></span>
+</div>
+
+<nav class="tabs" id="tabs">
+  <button data-scene="all" aria-selected="true">overview</button>
+  <button data-scene="fingerprint" aria-selected="false">fingerprint</button>
+  <button data-scene="heat" aria-selected="false">heat</button>
+  <button data-scene="fairness" aria-selected="false">fairness</button>
+  <button data-scene="latency" aria-selected="false">killer graph</button>
+</nav>
+
+<div class="layout">
+  <section class="stage" id="stage" data-scene="all">
+    <div class="panel" data-panel="fingerprint">
+      <h2>Fingerprint <span class="hint">per-worker load &mdash; mean line + weight-ghost</span></h2>
+      <div class="chart-host" id="host-fingerprint" style="--h: 220px;"></div>
+    </div>
+    <div class="panel" data-panel="heat">
+      <h2>Heat <span class="hint">worker &times; time &mdash; green&rarr;amber&rarr;red load ramp</span></h2>
+      <div class="chart-host" id="host-heat" style="--h: 260px;"></div>
+    </div>
+    <div class="panel" data-panel="fairness">
+      <h2>Fairness <span class="hint">Lorenz curve + weight-aware Gini gauge</span></h2>
+      <div class="chart-host" id="host-fairness" style="--h: 240px;"></div>
+      <div id="gini-gauge" style="margin-top:0.6rem;"></div>
+    </div>
+    <div class="panel" data-panel="latency">
+      <h2>The killer graph <span class="hint">throughput vs latency &mdash; picks/sec over p50</span></h2>
+      <div class="chart-host" id="host-latency" style="--h: 240px;"></div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <div class="alarm nominal" id="alarm">
+      <div class="status"><span class="dot"></span><span id="alarm-text">SYSTEM NOMINAL</span></div>
+      <div class="sub" id="alarm-sub">no pathology detected</div>
+      <div class="badges" id="badges"></div>
+    </div>
+
+    <div class="panel controls">
+      <h2>Controls</h2>
+      <div class="grp">
+        <div class="eyebrow" style="margin-bottom:0.35rem;">strategy</div>
+        <div class="ctl-row"><select class="ctl" id="strategy-select"></select>
+          <button class="ctl" id="btn-next">next <span class="key">[n]</span></button></div>
+      </div>
+      <div class="grp">
+        <div class="eyebrow" style="margin-bottom:0.35rem;">inject fault</div>
+        <div class="ctl-row">
+          <button class="ctl inject" data-inject="kill">kill <span class="key">[k]</span></button>
+          <button class="ctl inject" data-inject="overload">overload <span class="key">[o]</span></button>
+          <button class="ctl inject" data-inject="flap">flap <span class="key">[f]</span></button>
+          <button class="ctl inject" data-inject="pingpong">ping-pong <span class="key">[p]</span></button>
+          <button class="ctl inject" data-inject="unfair">unfair <span class="key">[u]</span></button>
+          <button class="ctl inject" data-inject="starve">starve <span class="key">[s]</span></button>
+          <button class="ctl inject" data-inject="hotkeys">hot-keys</button>
+          <button class="ctl" data-inject="reset">reset <span class="key">[r]</span></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel hotkeys" id="hotkeys-panel" hidden>
+      <h2>Hot keys <span class="hint" id="hk-backing"></span></h2>
+      <div id="hotkeys-list"><div class="empty">warming up&hellip;</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>Workers <span class="hint">click a row for detail</span></h2>
+      <table class="wtable" id="wtable">
+        <thead><tr>
+          <th data-sort="w">w</th><th data-sort="share">share</th>
+          <th data-sort="load">load</th><th data-sort="lat">p95</th>
+        </tr></thead>
+        <tbody id="wtable-body"></tbody>
+      </table>
+    </div>
+
+    <div class="panel inspector" id="inspector">
+      <h2>Inspector</h2>
+      <div class="empty">select a worker to inspect</div>
+    </div>
+  </aside>
+</div>
+
+<footer class="foot">
+  Reuses the SAME renderer-agnostic bricks as the TUI (<code>snapshot.mjs</code>, <code>detectors.mjs</code>,
+  <code>driver.mjs</code>, <code>siblings.mjs</code>) over the real <code>Pick.js</code> kernel &mdash; only the
+  renderer differs. Panels ride <code>@zakkster/lite-charts</code> via esm.sh; a per-panel canvas fallback keeps
+  the page live if a chart kernel fails to load. Kernel <code>pick()</code> is never called by the view.
+</footer>
+
+<script type="module" src="./main.mjs"></script>
+</body>
+</html>

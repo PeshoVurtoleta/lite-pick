@@ -20,8 +20,13 @@
  *   POOL_SCOPE_NO_ADAPTIVE=1  -> detectors / decayed-share / hot-keys fall back to the inline math.
  */
 
-const noSketch = process.env.POOL_SCOPE_NO_SKETCH === '1';
-const noAdaptive = process.env.POOL_SCOPE_NO_ADAPTIVE === '1';
+// Isomorphic override read: Node uses the env var, the browser a globalThis flag (set from a URL
+// ?nosketch / ?noadaptive query by the page). Guard `process` so this file loads in BOTH runtimes --
+// a bare `process.env` throws ReferenceError in the browser and would abort the whole demo.
+const noSketch = (typeof process !== 'undefined' && process.env && process.env.POOL_SCOPE_NO_SKETCH === '1') ||
+    (typeof globalThis !== 'undefined' && globalThis.POOL_SCOPE_NO_SKETCH);
+const noAdaptive = (typeof process !== 'undefined' && process.env && process.env.POOL_SCOPE_NO_ADAPTIVE === '1') ||
+    (typeof globalThis !== 'undefined' && globalThis.POOL_SCOPE_NO_ADAPTIVE);
 
 let _sketch = null;
 if (!noSketch) {

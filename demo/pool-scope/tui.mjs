@@ -12,10 +12,10 @@
  *   interactive : `node demo/pool-scope/tui.mjs`
  *                 raw-mode TTY, live keys, ~12 Hz cursor-home repaint. Hides the cursor, restores on
  *                 exit. Keys: 1-9,0 switch strategy, n cycles; k kill / o overload / f flap /
- *                 p ping-pong / u unfair / r reset; q or Ctrl-C quit.
+ *                 p ping-pong / u unfair / s starve / r reset; q or Ctrl-C quit.
  *   scripted    : `node demo/pool-scope/tui.mjs --frames N --scenario <name> --strategy <name> [--seed S]`
  *                 deterministic, renders N frames to stdout, exits 0. Scenarios: healthy, killworker,
- *                 overload, flapstorm, pingpong, unfair. Strategy: one of the ten (default p2c).
+ *                 overload, flapstorm, pingpong, unfair, starve, hotkeys. Strategy: one of the ten (default p2c).
  *
  * Hot-path law: driver.tick()/snapshot.build()/detectors.evaluate() are the measured DATA path and
  * allocate no array/object/closure per frame (proven by the `alloc delta` badge, sampled around it).
@@ -334,7 +334,7 @@ class Renderer {
         s += C_FAINT + this._rule(64) + RESET + NL;
         if (interactive) {
             s += C_FAINT + '  [1-9,0] strategy  [n] next  [k] kill  [o] overload  [f] flap  ' +
-                '[p] ping-pong  [u] unfair  [r] reset  [q] quit' + RESET + NL;
+                '[p] ping-pong  [u] unfair  [s] starve  [r] reset  [q] quit' + RESET + NL;
         } else {
             s += C_FAINT + '  kernel unchanged -- Pool Scope reads dump() off the hot path' + RESET + NL;
         }
@@ -351,7 +351,10 @@ class Renderer {
 
 /* ------------------------------------------------------------------------- scenario wiring ---- */
 
-const SCENARIOS = ['healthy', 'killworker', 'overload', 'flapstorm', 'pingpong', 'unfair', 'hotkeys'];
+const SCENARIOS = ['healthy', 'killworker', 'overload', 'flapstorm', 'pingpong', 'unfair', 'starve', 'hotkeys'];
+
+/** The weight-aware strategies: they route proportional to weight, so a weight-0 node is starved. */
+const WEIGHT_AWARE = new Set(['smoothwrr', 'sed', 'nq', 'weightedrandom', 'consistenthash', 'boundedload']);
 
 /** Apply a named scenario's conditions to the driver (the injectors the detectors then notice). */
 function applyScenario(drv, name) {
@@ -365,6 +368,14 @@ function applyScenario(drv, name) {
     if (name === 'flapstorm') { drv.flapStorm((drv.cap / 3) | 0); return; }
     if (name === 'pingpong') { drv.forcePingPong(2, drv.cap - 4); return; }
     if (name === 'unfair') { drv.makeUnfair(); return; }
+    if (name === 'starve') {
+        // Genuine POLICY starvation: a weight-aware strategy correctly never routes to a weight-0 but UP
+        // node. Ensure a weight-aware strategy is active (under a weight-blind one a weight-0 node is still
+        // picked, so starvation would honestly not show), then zero one eligible worker's weight.
+        if (!WEIGHT_AWARE.has(drv.strategyName)) drv.setStrategy('smoothwrr');
+        drv.makeStarve();
+        return;
+    }
     if (name === 'hotkeys') { drv.makeHotKeys(); return; }   // zipfian keys -> a keyed-strategy hotspot
     throw new Error('[pool-scope] unknown scenario: ' + name + ' (one of ' + SCENARIOS.join(', ') + ')');
 }
@@ -505,6 +516,7 @@ function runInteractive(argv) {
             else if (ch === 'f') { drv.flapStorm((drv.cap / 3) | 0); }
             else if (ch === 'p') { drv.forcePingPong(2, drv.cap - 4); }
             else if (ch === 'u') { drv.makeUnfair(); }
+            else if (ch === 's') { drv.makeStarve(); }
             else if (ch === 'r') { resetAll(); }
         }
     }

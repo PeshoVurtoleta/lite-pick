@@ -58,7 +58,10 @@ import {
 //   { type:"cycle", ... }       per lane per cycle (coarse charting series): rss/heap min/mean/max, gc deltas,
 //                               gcMaxPauseMs, opsPerSec, invariant status, trackerSize after retention gc.
 //   { type:"summary", ... }     gate-margin payload: at bounded-run end, periodically in forever mode, and on
-//                               SIGINT/SIGTERM. Reports each gate's observed value, bound, and margin ratio.
+//                               SIGINT/SIGTERM. Reports each gate's observed value, bound, and margin.
+// Log volume is throttled by SOAK_LOG: `full` emits every record kind; `cycle` SUPPRESSES per-checkpoint
+// records (header+cycle+summary only). Default: `cycle` for forever runs, `full` for bounded. The throttle
+// affects EMISSION ONLY -- invariant/retention checks + gate sampling run every checkpoint regardless.
 const JSONL = fileURLToPath(new URL('./soak.jsonl', import.meta.url));
 
 const CAP = 256;                                          // pool capacity (power of 2 -> pow2 mask)
@@ -70,14 +73,21 @@ const CHECKPOINTS = 5;
 const CHECK_EVERY = Math.max(1, (PICKS_PER_CYCLE / CHECKPOINTS) | 0);
 
 // --- drift-gate bounds (named consts -> one-line tunable; NEVER widen a bound to pass a gate) -------
-const GATE_RSS_MULT = 1.25;          // late mean RSS <= early baseline * this ...
-const GATE_RSS_ADD_MB = 8;           //   ... + this many MB of slack
-const GATE_GC_MAJOR_MAX = 0;         // hard: zero major collections
-const GATE_THROUGHPUT_RATIO = 0.60;  // late opsPerSec must stay >= this fraction of early
+// Recalibrated from a 4h/67k-cycle run: heapUsed was FLAT (~22->24MB) under a benign RSS fragmentation
+// band (~125-158MB that OSCILLATES over a flat heap). The PRIMARY memory gate is therefore heapUsed (the
+// true leak signal), and RSS is a GENEROUS runaway guard tolerant of arena oscillation. Both read the
+// coarse CYCLE-ROLLUP series (median/p95 over per-lane-cycle means), never the noisy per-checkpoint series.
+const GATE_HEAP_MULT = 1.25;         // PRIMARY: late-quarter MEDIAN heap <= early-quarter MEDIAN * this ...
+const GATE_HEAP_SLACK_MB = 8;        //   ... + this many MB slack (a real heap climb to 100MB+ trips it)
+const GATE_RSS_MULT = 1.75;          // RUNAWAY GUARD: late-quarter p95 RSS <= band-center MEDIAN * this ...
+const GATE_RSS_SLACK_MB = 16;        //   ... + this many MB slack (tolerates fragmentation, catches a climb)
+const GATE_GC_MAJOR_MAX = 0;         // hard: zero WORKLOAD major collections
+const GATE_THROUGHPUT_RATIO = 0.60;  // late opsPerSec must stay >= this fraction of early (per lane)
 
 // --- SOAK_MUSTFAIL teeth-proof injection knobs (cold-boundary only) --------------------------------
 const THROTTLE_MS = 12;              // decay: busy-spin at each late checkpoint
-const RSS_LEAK_MB = 4;               // rss: MB retained per cycle to force process RSS creep
+const RSS_LEAK_MB = 4;               // rss: accelerating MB retained per cycle -> RSS runaway
+const LEAK_ARRAY_LEN = 700000;       // leak: plain-array length retained per lane-cycle -> heapUsed climb
 
 const WARMUP_CYCLES = 1;             // drift gates drop cycle 0 (JIT/alloc settling) from all math
 // Forever-mode memory bound: the in-memory checkpoint series feeds the gate/summary math only (the
@@ -264,14 +274,32 @@ function stats(xs) {
     return { min: +((lo === Infinity ? 0 : lo)).toFixed(1), mean: +(s / n).toFixed(1), max: +((hi === -Infinity ? 0 : hi)).toFixed(1) };
 }
 
+/** Median of a numeric array (cold; robust to GC-timing noise vs mean). 0 if empty. */
+function median(xs) {
+    if (!xs.length) return 0;
+    const s = xs.slice().sort((a, b) => a - b);
+    const m = s.length >> 1;
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+/** Nearest-rank percentile of a numeric array (cold; p in [0,1]). 0 if empty. */
+function percentile(xs, p) {
+    if (!xs.length) return 0;
+    const s = xs.slice().sort((a, b) => a - b);
+    const idx = Math.min(s.length - 1, Math.max(0, Math.ceil(p * s.length) - 1));
+    return s[idx];
+}
+
 /**
- * Cold: compute the drift-gate verdicts + fine-tuning MARGINS from the checkpoint series (cycle 0
- * dropped as warmup). The PASS/FAIL logic and exact breach strings are UNCHANGED -- this also reports,
- * for each gate, the observed value, the bound, and the margin as a ratio, plus the per-lane throughput
- * breakdown. Returns { breaches, gcMajor, gcPass, rss, throughput }.
+ * Cold: compute the drift-gate verdicts + fine-tuning MARGINS (cycle 0 dropped as warmup). The MEMORY
+ * gates (heap PRIMARY, rss RUNAWAY-GUARD) read the coarse CYCLE-ROLLUP series (per-lane-cycle means) --
+ * median/p95, robust to noise and to per-checkpoint EMISSION being throttled. gcMajor + throughput read
+ * the per-checkpoint series unchanged. Too-short windows are marked insufficient-data (neither vacuous-
+ * pass nor false-fail). Returns { breaches, gcMajor, gcPass, heap, rss, throughput }.
  */
-function computeGates(series) {
+function computeGates(series, cycleSeries) {
     const gated = series.filter((r) => r.cycle >= WARMUP_CYCLES);
+    const cycles = cycleSeries.filter((r) => r.cycle >= WARMUP_CYCLES);
     const breaches = [];
 
     // GC (hard, global): the max WORKLOAD-induced (in-cycle) major count; forced retention gc() excluded.
@@ -280,27 +308,46 @@ function computeGates(series) {
     const gcPass = gcMajor <= GATE_GC_MAJOR_MAX;
     if (!gcPass) breaches.push('gc: workload major=' + gcMajor + ' > ' + GATE_GC_MAJOR_MAX);
 
-    // RSS creep (global, time-ordered): late mean vs early baseline.
-    let rss = null;
-    if (gated.length >= 2) {
-        const xs = gated.map((r) => r.rssMB);
-        const half = xs.length >> 1;
-        const early = mean(xs.slice(0, half));
-        const late = mean(xs.slice(xs.length - half));
-        const limit = early * GATE_RSS_MULT + GATE_RSS_ADD_MB;
-        const pass = late <= limit;
-        rss = {
-            earlyMB: +early.toFixed(1), lateMB: +late.toFixed(1), limitMB: +limit.toFixed(1),
-            observedRatio: +(early > 0 ? late / early : 0).toFixed(3), boundMult: GATE_RSS_MULT,
-            addMB: GATE_RSS_ADD_MB, headroomMB: +(limit - late).toFixed(1), pass,
+    // MEMORY gates over the cycle-rollup means. Need >= 4 rollups to form early/late quarters.
+    let heap = null, rss = null;
+    if (cycles.length >= 4) {
+        const q = Math.max(1, Math.floor(cycles.length / 4));
+        const heapMeans = cycles.map((r) => r.heapUsedMB.mean);
+        const rssMeans = cycles.map((r) => r.rssMB.mean);
+
+        // PRIMARY -- heapUsed (the true leak signal): late-quarter median vs early-quarter median.
+        const earlyMed = median(heapMeans.slice(0, q));
+        const lateMed = median(heapMeans.slice(heapMeans.length - q));
+        const heapLimit = earlyMed * GATE_HEAP_MULT + GATE_HEAP_SLACK_MB;
+        const heapPass = lateMed <= heapLimit;
+        heap = {
+            earlyMedianMB: +earlyMed.toFixed(1), lateMedianMB: +lateMed.toFixed(1), limitMB: +heapLimit.toFixed(1),
+            mult: GATE_HEAP_MULT, slackMB: GATE_HEAP_SLACK_MB, headroomMB: +(heapLimit - lateMed).toFixed(1), pass: heapPass,
         };
-        if (!pass) {
-            breaches.push('rss: late=' + late.toFixed(1) + 'MB > limit=' + limit.toFixed(1) +
-                'MB (early baseline=' + early.toFixed(1) + 'MB)');
+        if (!heapPass) {
+            breaches.push('heap: late-quarter median=' + lateMed.toFixed(1) + 'MB > limit=' + heapLimit.toFixed(1) +
+                'MB (early-quarter median=' + earlyMed.toFixed(1) + 'MB, mult=' + GATE_HEAP_MULT + ', slack=' + GATE_HEAP_SLACK_MB + 'MB)');
         }
+
+        // RUNAWAY GUARD -- rss: late-quarter p95 vs the post-warmup band-center (median), fragmentation-tolerant.
+        const bandCenter = median(rssMeans);
+        const lateP95 = percentile(rssMeans.slice(rssMeans.length - q), 0.95);
+        const rssLimit = bandCenter * GATE_RSS_MULT + GATE_RSS_SLACK_MB;
+        const rssPass = lateP95 <= rssLimit;
+        rss = {
+            guard: 'runaway', bandCenterMB: +bandCenter.toFixed(1), lateP95MB: +lateP95.toFixed(1), limitMB: +rssLimit.toFixed(1),
+            mult: GATE_RSS_MULT, slackMB: GATE_RSS_SLACK_MB, headroomMB: +(rssLimit - lateP95).toFixed(1), pass: rssPass,
+        };
+        if (!rssPass) {
+            breaches.push('rss-runaway: late-quarter p95=' + lateP95.toFixed(1) + 'MB > limit=' + rssLimit.toFixed(1) +
+                'MB (band-center median=' + bandCenter.toFixed(1) + 'MB, mult=' + GATE_RSS_MULT + ', slack=' + GATE_RSS_SLACK_MB + 'MB)');
+        }
+    } else {
+        heap = { insufficientData: true, rollups: cycles.length };
+        rss = { insufficientData: true, rollups: cycles.length };
     }
 
-    // Throughput decay (PER LANE): late opsPerSec vs early opsPerSec for that strategy.
+    // Throughput decay (PER LANE, unchanged): late opsPerSec vs early opsPerSec over the checkpoint series.
     const perLane = [];
     let minRatio = Infinity;
     for (const lane of LANES) {
@@ -326,7 +373,7 @@ function computeGates(series) {
         pass: perLane.every((p) => p.pass), perLane,
     };
 
-    return { breaches, gcMajor, gcPass, rss, throughput };
+    return { breaches, gcMajor, gcPass, heap, rss, throughput };
 }
 
 /** Deterministic busy-spin (cold path only) -- the decay teeth-proof throttle. */
@@ -368,6 +415,18 @@ async function main() {
     const MF_DECAY = MUSTFAIL === 'decay';
     const MF_RSS = MUSTFAIL === 'rss';
 
+    // Log-volume knob: `full` emits every record; `cycle` suppresses per-checkpoint EMISSION (a 4h run
+    // wrote 1.9GB of them). Default: `cycle` for forever/overnight, `full` for bounded qa. Emission only --
+    // invariant/retention checks + gate sampling run every checkpoint regardless (fail-closed on an unknown).
+    const LOG_ENV = process.env.SOAK_LOG;
+    if (LOG_ENV !== undefined && LOG_ENV !== 'full' && LOG_ENV !== 'cycle') {
+        process.stderr.write("soak: FAIL -- unknown SOAK_LOG '" + LOG_ENV +
+            "' (did you mean full | cycle?)\n");
+        process.exit(2);
+    }
+    const LOG_MODE = LOG_ENV !== undefined ? LOG_ENV : (CYCLES === 0 ? 'cycle' : 'full');
+    const LOG_FULL = LOG_MODE === 'full';
+
     const { GcProfiler } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
 
@@ -379,9 +438,10 @@ async function main() {
     const gc = new GcProfiler().start();
     writeFileSync(JSONL, ''); // fresh time-series
 
-    const series = [];        // COLD: checkpoint records for the drift gates (bounded; see SERIES_CAP)
-    const leakSink = [];      // MF_LEAK: retains balancers so tracker.size() cannot return to 0
-    const rssSink = [];       // MF_RSS: retains per-cycle buffers so process RSS creeps
+    const series = [];        // COLD: checkpoint records for gcMajor + throughput gates (bounded; see SERIES_CAP)
+    const cycleSeries = [];   // COLD: cycle-rollup records for the MEMORY gates (heap + rss); bounded likewise
+    const leakSink = [];      // MF_LEAK: retains balancers + heap arrays so tracker.size() != 0 AND heap climbs
+    const rssSink = [];       // MF_RSS: retains per-cycle buffers so process RSS runs away
     let invariantFailures = 0;
     let sizeFailures = 0;
     let totalPicks = 0;
@@ -395,12 +455,12 @@ async function main() {
         appendFileSync(JSONL, JSON.stringify(rec) + '\n');
     }
 
-    /** Push a checkpoint into the in-memory series, bounding it (forever mode) by dropping the middle. */
-    function pushSeries(rec) {
-        series.push(rec);
-        if (series.length > SERIES_CAP) {
+    /** Push into an in-memory gate series, bounding it (forever mode) by dropping the middle. */
+    function pushBounded(arr, rec) {
+        arr.push(rec);
+        if (arr.length > SERIES_CAP) {
             const keepEarly = SERIES_CAP >> 2;          // preserve the early baseline window ...
-            series.splice(keepEarly, series.length - SERIES_CAP);   // ... drop the middle, keep the recent tail
+            arr.splice(keepEarly, arr.length - SERIES_CAP);   // ... drop the middle, keep the recent tail
         }
     }
 
@@ -421,8 +481,10 @@ async function main() {
         warmupCyclesDropped: WARMUP_CYCLES,
         seriesCap: SERIES_CAP,
         mustFail: MUSTFAIL ?? null,
+        logMode: LOG_MODE,
         gates: {
-            rssMult: GATE_RSS_MULT, rssAddMB: GATE_RSS_ADD_MB,
+            heapMult: GATE_HEAP_MULT, heapSlackMB: GATE_HEAP_SLACK_MB,
+            rssMult: GATE_RSS_MULT, rssSlackMB: GATE_RSS_SLACK_MB,
             gcMajorMax: GATE_GC_MAJOR_MAX, throughputRatio: GATE_THROUGHPUT_RATIO,
         },
         seedFormula: {
@@ -442,27 +504,24 @@ async function main() {
      * { gate, findings, pass } so the terminal path can drive the headline + exit code.
      */
     function writeSummary(reason, final) {
-        const gate = computeGates(series);
+        const gate = computeGates(series, cycleSeries);
         const findings = tracker.audit();
         const invariantsGreen = invariantFailures === 0;
         const pass = invariantsGreen && sizeFailures === 0 && findings.length === 0 &&
             warns.length === 0 && gate.breaches.length === 0;
-        const rssBaselineMB = series.length ? series[0].rssMB : 0;
-        const rssEndMB = series.length ? series[series.length - 1].rssMB : 0;
+        const rssBaselineMB = cycleSeries.length ? cycleSeries[0].rssMB.mean : 0;
+        const rssEndMB = cycleSeries.length ? cycleSeries[cycleSeries.length - 1].rssMB.mean : 0;
         writeRecord({
             type: 'summary',
             ts: new Date().toISOString(),
             reason, final,
             wallSec: +((performance.now() - t0) / 1000).toFixed(1),
-            totalPicks, lanes: LANES.length, cyclesRun, checkpoints: series.length,
+            totalPicks, lanes: LANES.length, cyclesRun, cycleRollups: cycleSeries.length, checkpoints: series.length,
             rssBaselineMB, rssEndMB,
             retentionFailures: sizeFailures, invariantFailures, findings: findings.length, warnings: warns.length,
             gateMargins: {
-                rss: gate.rss === null ? null : {
-                    observedRatio: gate.rss.observedRatio, boundMult: gate.rss.boundMult, addMB: gate.rss.addMB,
-                    earlyBaselineMB: gate.rss.earlyMB, lateMeanMB: gate.rss.lateMB, limitMB: gate.rss.limitMB,
-                    headroomMB: gate.rss.headroomMB, pass: gate.rss.pass,
-                },
+                heap: gate.heap,           // PRIMARY leak signal: early/late-quarter median heapUsed
+                rss: gate.rss,             // RUNAWAY GUARD: late-quarter p95 vs band-center median
                 gcMajor: { observed: gate.gcMajor, bound: GATE_GC_MAJOR_MAX, pass: gate.gcPass },
                 throughput: {
                     observedMinRatio: gate.throughput.observedMinRatio, bound: gate.throughput.bound,
@@ -511,7 +570,13 @@ async function main() {
         const built = lane.make(balancerSeed(cycle));
         const b = built.b, eligible = built.eligible, inflight = built.inflight, weights = built.weights;
         tracker.track(b, noop, lane.name, { audit: true });      // tag is a string; cleanup closes over nothing
-        if (MF_LEAK) leakSink.push(b);                           // teeth-proof: pin the balancer -> retention FAIL
+        if (MF_LEAK) {
+            // leak teeth-proof: pin the balancer (-> retention FAIL) AND retain a plain (on-heap) array so
+            // heapUsed climbs across lane-cycles -> the PRIMARY heap gate trips. A typed array would grow
+            // external/RSS, not heapUsed, so use a plain Array (SMI-packed) for a real heap-growth signal.
+            leakSink.push(b);
+            leakSink.push(new Array(LEAK_ARRAY_LEN).fill(cyclesRun & 255));
+        }
 
         // The chaos PRNG seed -- a pure function of lane + cycle. Echoed on every failure line so a
         // breach is one-step reproducible (the fuzzer's seed-print discipline).
@@ -615,8 +680,8 @@ async function main() {
                     trackerSize: tracker.size(),
                     invariant: reason === null ? 'ok' : reason,
                 };
-                pushSeries(rec);
-                writeRecord(rec);
+                pushBounded(series, rec);            // ALWAYS: feeds gcMajor + throughput gates
+                if (LOG_FULL) writeRecord(rec);      // EMISSION throttled by SOAK_LOG; checks above are not
                 if (reason !== null) {
                     invariantFailures++;
                     if (firstFail === null) firstFail = reason;
@@ -646,10 +711,14 @@ async function main() {
             const lane = LANES[li];
             const rollup = runCycle(lane, cycle);
 
-            // rss teeth-proof: retain an ACCELERATING per-cycle buffer on the COLD boundary (a real leak
-            // worsens over time) so process RSS creeps decisively past the *1.25 + 8MB bound even within a
-            // single gated cycle. .fill() forces the pages resident so RSS (not just heap) actually grows.
-            if (MF_RSS) rssSink.push(new Uint8Array(RSS_LEAK_MB * 1048576 * (cyclesRun + 1)).fill(cyclesRun & 255));
+            // rss teeth-proof: retain a SUPER-LINEAR (quadratic-per-cycle) buffer on the COLD boundary so
+            // cumulative RSS climbs faster than its own median band-center -> late-quarter p95 dwarfs the
+            // band center and trips the (deliberately generous) runaway guard. Capped per-buffer to avoid an
+            // absurd single alloc; .fill() forces the pages resident so RSS (not just reserved) grows.
+            if (MF_RSS) {
+                const bytes = Math.min(256 * 1048576, Math.floor(RSS_LEAK_MB * 1048576 * (cyclesRun + 1) * (cyclesRun + 1) / 16));
+                rssSink.push(new Uint8Array(bytes).fill(cyclesRun & 255));
+            }
 
             // retention proof: the cycle's balancer must be collectable -- tracker.size() -> 0.
             globalThis.gc();
@@ -668,8 +737,8 @@ async function main() {
             }
             cyclesRun++;
 
-            // CYCLE ROLLUP: the coarse per-lane-cycle series for charting hours without every checkpoint.
-            writeRecord({
+            // CYCLE ROLLUP: the coarse per-lane-cycle series -- the MEMORY gates read this (always emitted).
+            const cycleRec = {
                 type: 'cycle',
                 lane: lane.name,
                 cycle,
@@ -683,7 +752,9 @@ async function main() {
                 opsPerSec: rollup.opsPerSec,
                 invariant: rollup.invariant,
                 trackerSize: live,
-            });
+            };
+            pushBounded(cycleSeries, cycleRec);
+            writeRecord(cycleRec);
         }
         // STDOUT heartbeat: one coarse human liveness line per cycle (how a glance shows it's alive).
         const mem = process.memoryUsage();
@@ -699,9 +770,10 @@ async function main() {
 
     // --- terminal: final summary (gate margins) + headline + exit ----------------------------------
     const { gate, findings, pass } = writeSummary('end', true);
-    const rssBaseline = series.length ? series[0].rssMB : 0;
-    const rssEnd = series.length ? series[series.length - 1].rssMB : 0;
-    const rssTrend = gate.rss && !gate.rss.pass ? 'CREEP' : 'flat';
+    const rssBaseline = cycleSeries.length ? cycleSeries[0].rssMB.mean : 0;
+    const rssEnd = cycleSeries.length ? cycleSeries[cycleSeries.length - 1].rssMB.mean : 0;
+    const memCreep = (gate.heap && gate.heap.pass === false) || (gate.rss && gate.rss.pass === false);
+    const rssTrend = memCreep ? 'CREEP' : 'flat';
     const invariantsGreen = invariantFailures === 0;
     const wallS = ((performance.now() - t0) / 1000).toFixed(1);
 

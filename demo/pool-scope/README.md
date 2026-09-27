@@ -91,7 +91,7 @@ legible.
 The bricks and the kernel load as **relative ESM** straight from the static server (zero CDN for lite-pick).
 Only the bare specifiers -- `@zakkster/lite-signal`, `@zakkster/lite-charts`, `@zakkster/lite-sketch`,
 `@zakkster/lite-adaptive` -- resolve via an HTML **import map** to `https://esm.sh/...` (pinned:
-lite-charts@1.24.0, lite-signal@1.5.2, lite-sketch@1.1.2, lite-adaptive@1.0.0). lite-charts is loaded with
+lite-charts@1.24.0, lite-signal@1.5.2, lite-sketch@1.1.2, lite-adaptive@1.9.0). lite-charts is loaded with
 `?external=@zakkster/lite-signal` so it **shares the page's lite-signal instance** (one reactive registry
 across the chart layer + the control/state signals). This makes the page **pure static** -- it runs on any
 file server AND is **GitHub-Pages-ready** with no bundler and no vendoring. `peerDependencies` stays `{}`

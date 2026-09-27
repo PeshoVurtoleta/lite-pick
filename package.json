@@ -121,7 +121,7 @@
     "access": "public"
   },
   "devDependencies": {
-    "@zakkster/lite-adaptive": "^1.0.0",
+    "@zakkster/lite-adaptive": "^1.9.0",
     "@zakkster/lite-charts": "^1.24.0",
     "@zakkster/lite-gc-profiler": "^1.16.0",
     "@zakkster/lite-leak": "^1.10.0",
@@ -133,7 +133,6 @@
     "typescript": "^7.0.2",
     "wrr": "1.0.0"
   },
-  "peerDependencies": {},
   "peerDependenciesMeta": {},
   "homepage": "https://github.com/PeshoVurtoleta/lite-pick#readme",
   "repository": {

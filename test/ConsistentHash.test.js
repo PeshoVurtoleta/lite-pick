@@ -157,6 +157,16 @@ test('A7: key coercion -- >>> 0 (NaN/undefined -> 0, negatives wrap), never thro
     assert.doesNotThrow(() => b.pick());
 });
 
+test('M1: setWeight rejects a non-integer/out-of-range index; owned weights unchanged', () => {
+    const w = Uint32Array.from([1, 2, 3, 4]);
+    const b = new ConsistentHashBalancer(4, up(4), w, M);
+    const before = Uint32Array.from(b._weights);
+    for (const bad of [1.5, NaN, -1, '2', 4]) {
+        assert.throws(() => b.setWeight(bad, 9), RangeError, 'setWeight(' + String(bad) + ')');
+    }
+    assert.deepEqual(Uint32Array.from(b._weights), before, 'owned weights unchanged after a rejected setWeight');
+});
+
 test('A8: constructor validates typeof-first (before building the table)', () => {
     const el = up(4);
     assert.throws(() => new ConsistentHashBalancer(4, el, null, 'nope'), TypeError);   // M non-number

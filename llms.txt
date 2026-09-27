@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 1.0.0
+Version: 1.0.1
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,7 +14,8 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
-1.0.0 -- the ROSTER-COMPLETE release -- ships the substrate seams + TEN strategies: RoundRobin,
+1.0.1 -- the audit bug-fix release (CHANGELOG [1.0.1], decisions/0013) on top of
+1.0.0 -- the ROSTER-COMPLETE release -- which ships the substrate seams + TEN strategies: RoundRobin,
 SmoothWRR (the weighted default), P2C (power-of-two-choices -- also the O(1) least-connections
 APPROXIMATION), the EXACT LeastConn family (LeastConn, SED, NQ), PeakEWMA (latency-aware P2C),
 ConsistentHash (a Maglev lookup table -- sticky/affinity routing), BoundedLoad (Consistent Hashing
@@ -53,7 +54,9 @@ table -- lite-pick's WeightedRandom returns an endpoint INDEX, honours the share
 
 M9 (0.9.0) adds BoundedLoadBalancer (decisions/0011): Consistent Hashing with Bounded Loads (CHBL --
 Mirrokni et al. / Google Research; Vimeo eps=0.25). It is `ConsistentHashBalancer` (the Maglev table)
-PLUS a per-backend occupancy cap `cap = (1 + eps) x _total / live`: `pick(keyHash)` sticks a key to its
+PLUS a per-backend occupancy cap `cap = ceil((1 + eps) x (_total + 1) / live)` (the +1 counts the INCOMING
+request -- Mirrokni-Thorup-Zadimoghaddam per-bin capacity, so cap >= 1; NOT HAProxy's global-slot-by-weight
+definition, which is stricter): `pick(keyHash)` sticks a key to its
 hashed home UNLESS that backend is over cap, in which case the request OVERFLOWS along the same bounded
 probe to the next eligible under-cap backend -- consistent hashing's stickiness + minimal disruption
 PLUS the HOTSPOT protection plain CH lacks. If none in the window is under cap it FALLS BACK to the
@@ -61,8 +64,9 @@ first eligible (sticky wins; PICK_NONE is pool-down ONLY, never for over-cap); `
 cap -> pure ConsistentHash. It extends ConsistentHashBalancer (reusing the Maglev build + probe +
 setWeight/rebuild/tableSize VERBATIM) and OWNS a running `_total` whose SOLE writer is the warm
 `note(i, delta)` seam (dispatch +1 / settle -1); `inflight` is the caller's Uint32Array read LIVE as
-the per-backend occupancy. `pick()` and `note()` are both O(1) / 0 B/op. CONTRACT: when using
-BoundedLoad the mirrored counter is mutated ONLY through `note()` / /pool -- direct mutation desyncs
+the per-backend occupancy. `pick()` and `note()` are both O(1) / 0 B/op. CONTRACT: update `inflight[i]`
+AND call `note(i, +/-1)` in LOCKSTEP (or drive it through /pool, which does both). `note` maintains
+`_total`; it does NOT write `inflight`. A direct `inflight` write without the matching `note` desyncs
 `_total` (UB, the SmoothWRR-weights asymmetry). THE PIVOT (decisions/0011): P2C-over-inflight with a
 `(1+eps) x mean` cap is byte-identical to plain P2C (an under-cap draw always has lower inflight than an
 over-cap one), so the cap is only LOAD-BEARING when the primary choice is a HASH -- CHBL is that. The
@@ -101,8 +105,12 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
 ## Design ownership (decisions/0001, 0002)
 
 - IN-PROCESS first (workers, DI services); remote HTTP is a thin optional adapter.
-- Eligibility is a SHARED read-only `Uint8Array` (1 = pickable, 0 = down), WRITTEN by
-  @zakkster/lite-di-health / circuit breakers, only READ by `pick()`. Zero-copy.
+- Eligibility is a `Uint8Array` (1 = pickable, 0 = down) READ by `pick()`. At runtime it is
+  flipped ONLY through `setEligible(i, up)` (the sole supported writer, which keeps the cached
+  `live` count -- and SmoothWRR's eligible-weight total -- exact); @zakkster/lite-di-health /
+  circuit breakers DRIVE that call. A direct byte write desyncs the cache (fail-closed picks,
+  wrong ratios) -- UB. Each balancer needs its OWN eligibility array (a shared `Eligibility`
+  value object is deferred to 2.0; ADR 0001, amended 1.0.1). No second internal copy.
 - Load counters are CALLER-OWNED typed arrays (`Uint32Array` inflight, `Float64Array`
   rtt/EWMA); the kernel holds no request state. `pick()` is pure-read.
 - The circuit breaker is CONSUMED (@zakkster/lite-statechart), never built in.
@@ -120,14 +128,15 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - `nextBelow(n)` -> uint32 in [0, n).
   - `reset()` -> void. Replays the original seed's stream (reproducible benches).
 - `BalancerBase` -- class. The shared eligibility seam; strategies (M1+) subclass it.
-  - `new BalancerBase(capacity, eligible)` -- `eligible` is a shared `Uint8Array`
-    (length >= capacity) owned/written externally; throws `RangeError` on a bad capacity
-    or an undersized / non-Uint8Array view.
+  - `new BalancerBase(capacity, eligible)` -- `eligible` is a `Uint8Array` (length >= capacity),
+    per-balancer (not shared across balancers); throws `RangeError` on a bad capacity or an
+    undersized / non-Uint8Array view. Flip it ONLY through `setEligible` after construction.
   - `capacity` -- readonly number. Fixed endpoint count.
   - `live` -- readonly number. Currently eligible endpoints (O(1), cold-path maintained).
-  - `isEligible(i)` -> boolean. O(1); out-of-range is `false`, never a throw.
-  - `setEligible(i, up)` -> void. Cold path; keeps `live` exact and is idempotent; throws
-    `RangeError` on an out-of-range index.
+  - `isEligible(i)` -> boolean. O(1); out-of-range OR a non-integer (1.5, NaN) is `false`, never a throw.
+  - `setEligible(i, up)` -> void. Cold path; the ONLY supported eligibility writer -- keeps `live`
+    exact and is idempotent; throws `RangeError` on a non-integer or out-of-range index (incl. a
+    numeric string like '2'). A direct `eligible[i]` write desyncs `live` (UB).
   - `pick()` -> number. ABSTRACT in the base (throws); overridden by each strategy.
 - `RoundRobinBalancer extends BalancerBase` -- class. The baseline strategy (M1).
   - `new RoundRobinBalancer(capacity, eligible)` -- same shared-eligibility contract as the base.
@@ -162,7 +171,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     (length >= capacity), read LIVE each pick. No `setWeight`, no derived aggregate: the caller may
     mutate inflight directly between picks (that is the shared-counter seam).
   - `pick()` -> number. Full O(cap) scan returning the eligible node with the fewest in-flight
-    requests (lowest index on a tie), or `PICK_NONE` when the whole pool is down. 0 B/op. In a
+    requests (tie order UNSPECIFIED in 1.0.1 -- deterministic but do not depend on it; a rotating
+    tie-break is planned for 1.1.0), or `PICK_NONE` when the whole pool is down. 0 B/op. In a
     feedback loop (increment on dispatch, decrement on settle) it is greedy-optimal: max-minus-min
     load stays within 1 (balance.mjs). Without feedback it returns the same lowest-load index --
     correct by contract; the M5 lite-query adapter provides the increment/decrement.
@@ -171,7 +181,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     caller-owned Uint32Arrays (length >= capacity), read LIVE (no `setWeight`, no derived total --
     the caller may retune weights directly, UNLIKE SmoothWRR).
   - `pick()` -> number. O(cap) scan returning the eligible, positive-weight node minimizing
-    `(inflight + 1) / weight` (the new request's marginal expected delay), lowest index on a tie,
+    `(inflight + 1) / weight` (the new request's marginal expected delay), tie order UNSPECIFIED
+    (1.0.1; rotating tie-break planned for 1.1.0),
     or `PICK_NONE` when no eligible node has a positive weight. A weight-0 eligible node is NOT a
     candidate. Converges to load proportional-to-weight (balance.mjs). 0 B/op.
 - `NqBalancer extends BalancerBase` -- class. Never-queue (M4, IPVS `nq`); the worker-pool fit.
@@ -182,25 +193,33 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     O(cap) worst case, O(1) when an early node is idle. 0 B/op.
 - `PeakEwmaBalancer extends BalancerBase` -- class. Latency-aware P2C (M7, Finagle peak-EWMA).
   - `new PeakEwmaBalancer(capacity, eligible, inflight, tauNs, seed?=0x9e3779b9)` -- `inflight` is a
-    caller-owned Uint32Array (length >= capacity) read LIVE; `tauNs` is the EWMA time-constant /
-    half-life in nanoseconds (finite, > 0). The per-endpoint EWMA state (`_ewma` / `_stamp`,
-    Float64) is BALANCER-OWNED and written ONLY by `recordRtt`. Validates typeof-first BEFORE
-    allocating (RangeError/TypeError). Cold start seeds the EWMA to 1.0 with an UNSAMPLED sentinel
-    (`_stamp = -1`), so an unsampled node scores at its undecayed baseline -> graceful
-    least-connections regardless of clock magnitude (never underflows to 0).
+    caller-owned Uint32Array (length >= capacity) read LIVE; `tauNs` is the EWMA TIME CONSTANT in
+    nanoseconds (finite, > 0; half-life = tauNs x ln2). The per-endpoint EWMA state (`_ewma` /
+    `_stamp`, Float64) plus a lifetime running-mean-of-samples pair are BALANCER-OWNED and written
+    ONLY by `recordRtt`. Cold start seeds `_ewma` to 1.0 with an UNSAMPLED sentinel (`_stamp = -1`).
+    LATENCY marker (`static LATENCY = true`): /pool REQUIRES `opts.clock` for this strategy.
   - `pick(now)` -> number. Draws two DISTINCT eligible endpoints (ADR 0005's rejection sampling,
-    reused) and returns the lower `cost = (inflight + 1) * ewmaAt(now)`; a tie goes to the first
-    draw. `now` is caller-supplied nanoseconds. Decays ON READ (never writes) -> O(d)=O(1), 0 B/op.
-    `PICK_NONE` when the whole pool is down. A slow-but-up node (high EWMA rtt) is avoided even while
-    idle -- the difference from P2C-over-inflight (latency anchor in balance.mjs).
-  - `ewmaAt(i, now)` -> number. The EWMA rtt estimate for endpoint i at `now`. Pure read. An
-    unsampled node (`_stamp < 0`) returns the baseline 1.0 undecayed; otherwise exponential decay.
+    reused), lower COST wins; a tie goes to the first draw. Per-candidate cost (pure read, 0 B/op):
+    an unsampled node costs 0 WHILE IDLE (graceful least-connections; holds one probe in flight
+    until its first sample) and `(inflight+1) x lifetime-mean-sampled-rtt ONCE BUSY` (so a
+    cold-but-busy node is NOT the old 1.0 ns black hole); a sampled node costs
+    `(inflight+1) x max(decayedEWMA, dt)` while busy (a hung node -- dt grows, no completion -- gets
+    MORE expensive), else `(inflight+1) x decayedEWMA`. `dt = max(now - stamp, 0)` (clamped, L6).
+    `now` is caller-supplied nanoseconds. Decays ON READ -> O(d)=O(1), 0 B/op. `PICK_NONE` when the
+    whole pool is down. CAVEAT: an idle-then-busy node is priced by time-since-last-response until
+    that response completes (exact busy-since stamp = 1.1.0). A node that fails fast and records
+    nothing keeps winning while idle -- record failures (the /pool failure penalty does).
+  - `ewmaAt(i, now)` -> number. The decayed EWMA rtt estimate for endpoint i at `now`. Pure read. An
+    unsampled node (`_stamp < 0`) returns the baseline 1.0 undecayed; otherwise
+    `_ewma[i] x exp(-max(now - stamp, 0)/tau)`.
   - `recordRtt(i, sampleNs, now)` -> void. WARM feedback path (not the hot pick path): the FIRST
     sample initializes the EWMA EXACTLY to `sampleNs` (clock-magnitude-independent); thereafter the
-    Finagle peak rule -- the cost SNAPS UP to a larger sample instantly and DECAYS DOWN over ~tau.
-    `now` / `sampleNs` are caller-supplied nanoseconds, consistent with `pick(now)`. Validates
-    typeof-first; 0 B/op on the success path. Anti-flap = the half-life, no extra dwell (ADR 0002,
-    ADR 0009).
+    Finagle peak rule -- the cost SNAPS UP to a larger sample instantly and DECAYS DOWN over ~tau --
+    and it folds the sample into the lifetime mean. `now` / `sampleNs` are caller-supplied
+    nanoseconds, consistent with `pick(now)`. THROWS `RangeError` on a non-integer / out-of-range
+    index (incl. a numeric string like '2' -- which used to work; a string index now throws
+    RangeError, not TypeError) or a non-finite/negative `sampleNs`; 0 B/op on the success path.
+    Anti-flap = the time constant, no extra dwell (ADR 0002, ADR 0009).
   - CONTRACT: `now` and `sampleNs` MUST be FINITE numbers. `recordRtt` THROWS on a non-finite
     argument (warm path); `pick(now)` NEVER throws (fail-closed contract), so a non-finite `now`
     yields P2C-random selection, not an error.
@@ -237,10 +256,13 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     BEFORE super() allocates the Maglev table (TypeError non-number eps, RangeError non-finite / <= 0).
     `weights` / `m` / `seed` are the ConsistentHash args (copied weights, prime m >= capacity, COLD
     build). The running occupancy sum `_total` is BALANCER-OWNED (starts at 0) and written SOLELY by
-    `note`; when using BoundedLoad, the mirrored inflight counter is mutated ONLY through `note` / /pool
-    (direct mutation desyncs `_total` -- UB, the SmoothWRR-weights asymmetry).
+    `note`; when using BoundedLoad, update `inflight[i]` AND call `note(i, +/-1)` in LOCKSTEP (or drive
+    it through /pool). `note` maintains `_total`; it does NOT write `inflight`. A direct `inflight` write
+    without the matching `note` desyncs `_total` -- UB, the SmoothWRR-weights asymmetry.
   - `pick(keyHash)` -> number. slot = (keyHash >>> 0) % M; walk the probe window (home + CH_PROBE_LIMIT
-    slots) and return the FIRST backend that is ELIGIBLE AND under `cap = (1 + eps) * _total / live`
+    slots) and return the FIRST backend that is ELIGIBLE AND under `cap = ceil((1 + eps) * (_total + 1)
+    / live)` (the +1 counts the incoming request -- MTZ per-bin capacity, cap >= 1; NOT HAProxy's
+    stricter global-slot-by-weight definition)
     (a hot home OVERFLOWS to a neighbour). If none in the window is under cap, fall back to the FIRST
     eligible seen (sticky wins; the cap is a soft preference). `_total === 0` skips the cap -> pure
     ConsistentHash. O(1), 0 B/op, NEVER throws. `PICK_NONE` ONLY when no eligible backend is reachable
@@ -303,38 +325,52 @@ duck-typed and imports NOTHING from lite-query.
     live }` -- every lite-pick strategy qualifies); `inflight` is the SAME caller-owned Uint32Array
     the balancer reads (length >= balancer.capacity). Throws on a bad balancer / undersized view.
   - `balancer` / `inflight` -- readonly getters.
-  - `run(fn, opts?)` -> Promise. Picks an endpoint, increments its in-flight on DISPATCH, awaits
-    `fn(endpoint, signal)`, decrements on SETTLE (in a finally -- net-zero per run, even on throw).
-    On a thrown error it keeps the failed endpoint's count ELEVATED and re-picks, so a load-aware
-    strategy (P2C/LeastConn/SED/NQ) steers the next attempt to a DIFFERENT endpoint -- up to
-    `opts.tries` attempts (default 1 = no failover), then rejects with the LAST error. Rejects with
-    a `code:'LITE_PICK_NONE'` error when no endpoint is eligible. `opts.signal` is passed to `fn`;
-    once aborted after a failure, failover stops and the abort propagates. NOT a 0 B/op path (the
-    kernel `pick()` is): a normal async wrapper adding O(1) counter ops + one small per-run array.
-    BOUNDARY: Pool owns SPATIAL failover (across the pool); the caller / query cache owns TEMPORAL
-    retry (backoff, staleness). Never double-owned (decisions/0007). OPT-IN latency feedback: when
-    `opts.clock` (a caller-owned nanosecond source) is supplied AND the balancer duck-types
-    `recordRtt` (PeakEwmaBalancer), Pool drives `pick(now)` and records the settled rtt on success;
-    otherwise the hook is inert -- Pool stays generic, in-flight stays net-zero, abort/failover
-    unchanged. OPT-IN occupancy feedback: when the balancer duck-types `note` (BoundedLoadBalancer),
-    Pool mirrors each dispatch as `note(i, +1)` and each settle as `note(i, -1)` so its owned mean
-    stays current; inert otherwise. The hooks are independent -- a balancer may duck-type neither,
-    one, or both; a BoundedLoad + Pool round is net-zero on BOTH the inflight array and `_total`.
-    OPT-IN keyed routing: `opts.key` (a caller INTEGER) drives `pick(key)` for a keyed balancer
-    (ConsistentHash / BoundedLoad -- CHBL); failover re-picks with the SAME key, and because the failed
-    backend's occupancy stays elevated a CHBL re-pick naturally OVERFLOWS to the next backend. Without
-    `opts.key`, `pick()` / `pick(now)` behaviour is unchanged.
+  - `run(fn, opts?)` -> Promise. `opts` may be omitted or `null`. Picks an endpoint, increments its
+    in-flight on DISPATCH, awaits `fn(endpoint, signal)`, decrements on SETTLE (in a finally --
+    net-zero per run, even on throw). On a thrown error it keeps the failed endpoint's count ELEVATED
+    and fails over to a GENUINELY DISTINCT endpoint (M2): re-pick while the strategy repeats a tried
+    endpoint (bounded), then scan for an eligible UNTRIED one (key-derived start for a keyed run,
+    cursor-rotated otherwise). It STOPS with the last error as soon as no untried eligible endpoint
+    remains -- so a 1-node pool with `tries: 3` makes ONE attempt (Pool owns SPATIAL failover, not
+    temporal retry). `opts.tries` default 1 = no failover. Rejects `code:'LITE_PICK_NONE'` when no
+    endpoint is eligible.
+    ABORT (M-Item5): `opts.signal` is checked before EVERY attempt -- an already-aborted signal
+    dispatches NOTHING and rejects with the signal's `reason`, else `code:'LITE_PICK_ABORTED'`; an
+    abort after a failure stops failover and propagates.
+    CHANNELS (M3), read off static markers (Pool imports nothing new): a KEYED balancer
+    (`constructor.KEYED === true`: ConsistentHash/BoundedLoad) REQUIRES a numeric `opts.key`
+    (`code:'LITE_PICK_KEY_REQUIRED'` otherwise) and Pool drives `pick(key)`; a LATENCY balancer
+    (`constructor.LATENCY === true`: PeakEWMA) REQUIRES an `opts.clock`
+    (`code:'LITE_PICK_CLOCK_REQUIRED'` otherwise), read (validated finite) BEFORE dispatch and passed
+    as `pick(now)`. The KEY reaches ONLY a keyed pick; the CLOCK reading NEVER reaches a keyed pick; a
+    non-keyed clocked run passes the reading to `pick(now)`.
+    FEEDBACK is loud and never re-runs fn (M4): occupancy `note(i, +/-1)` mirrors dispatch/settle for
+    a note-duck-typed balancer; latency `recordRtt` is fed on settle when a clock is in use. A SUCCESS
+    whose settle feedback fails (clock throws / non-finite, or `recordRtt` throws) rejects
+    `code:'LITE_PICK_FEEDBACK'` carrying `.cause` and `.result` (fn's value -- fn ran once, nothing
+    lost). A FAILURE feeds a penalty `recordRtt(i, max(elapsed, failurePenaltyNs), done)` (H1); if THAT
+    feedback fails, Pool throws fn's original error unchanged (identity) with a non-enumerable
+    `liteFeedbackError` attached. A non-finite clock reading throws BEFORE dispatch; a
+    backwards-stepping finite reading records NO sample and resolves normally. `opts.failurePenaltyNs`
+    (finite > 0, default 1e9) is the minimum penalty rtt; a penalized node is re-probed roughly every
+    `tauNs x ln(failurePenaltyNs / healthyRttNs)`. NOT a 0 B/op path (the kernel `pick()` is): a normal
+    async wrapper adding O(1) counter ops + one small per-run array. BOUNDARY: Pool owns SPATIAL
+    failover; the caller / query cache owns TEMPORAL retry (decisions/0007).
 - `liteQueryFetcher(pool, perEndpoint, opts?)` -> a `({ key, signal }) => Promise` fetcher for a
   query cache (lite-query's `fetcher`, or any fetcher-shaped consumer). `perEndpoint({ endpoint,
-  key, signal })` -> the per-endpoint work. `opts.tries` (default 1) is the spatial failover count.
-  Imports nothing from lite-query -- duck-typed, so `peerDependencies` stays empty.
+  key, signal })` -> the per-endpoint work. `opts.tries` (default 1) is the spatial failover count;
+  `opts.clock` and `opts.failurePenaltyNs` are forwarded to `pool.run` (they feed a latency-aware
+  balancer). `ctx.key` is the query-cache key (arbitrary), NOT the integer routing key -- so this
+  generic adapter does not drive `pick(key)`; supply routing keys via `pool.run` directly. Imports
+  nothing from lite-query -- duck-typed, so `peerDependencies` stays empty.
 
 ## Gates (every session)
 
 - `npm run torture`   -- `node --expose-gc test/torture.mjs`: lite-leak retention +
-  lite-gc-profiler 0 B/op on the hot path.
-- `npm run test:perf` -- `node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs`:
-  lite-perf-gate `zgcSuite` HARD zero-alloc gate + a `mustFail` teeth-check.
+  lite-gc-profiler -- proves `pick()` RETAINS 0 B/op (reports the retained B/op).
+- `npm run test:perf` -- `node --expose-gc --min-semi-space-size=1 --max-semi-space-size=1 --test
+  test/perf/PerfGate.test.mjs`: lite-perf-gate `zgcSuite` -- proves `pick()` ALLOCATES 0 B/op by
+  scavenge counting at a pinned 1 MB semi-space + a `mustFail` teeth-check.
 - `npm run witness`   -- pick throughput flatness across a pool-size sweep.
 - `npm run balance`   -- peak-to-average load vs the strategy ceiling + random foil (the anchor).
 - `npm run fuzz`      -- the seeded invariant fuzzer (the state-machine attack): strict-mode
@@ -343,14 +379,14 @@ duck-typed and imports NOTHING from lite-query.
 
 ## Composes with
 
-@zakkster/lite-di-health (eligibility writer), lite-statechart (breaker), lite-o1
+@zakkster/lite-di-health (drives setEligible), lite-statechart (breaker), lite-o1
 (RandomSet / AliasTable / RingLog substrate), lite-logn (exact least-conn heap / Fenwick
 dynamic weights -- the mutable-weight complement to WeightedRandom's static alias table),
 lite-random (a SEPARATE domain -- a GAME RNG for loot tables / particles that returns an ITEM,
 NOT an eligibility-aware LB index selector; use lite-pick WeightedRandom for load balancing),
 lite-lru (sticky affinity), lite-fastbit32 (optional small-pool bitset peer),
 lite-query (the fetcher adapter), lite-await (hedging), lite-worker-pool (in-process
-consumer), lite-di-signal / lite-signal-decorators (observability). None is a HARD
-dependency -- each is an OPTIONAL PEER dep (peerDependenciesMeta.optional, the LiteQuery
-model), every seam is duck-typed over a shared TypedArray, and the kernel runs with zero
-peers installed. A peer is declared only when a shipped code path imports it.
+consumer), lite-di-signal / lite-signal-decorators (observability). None is a dependency of
+any kind -- `dependencies`, `peerDependencies` AND `peerDependenciesMeta` are all `{}`. Every
+seam is duck-typed over a shared TypedArray, and the kernel runs with nothing else installed.
+A peer would be declared only if a shipped code path imported it (none does today).

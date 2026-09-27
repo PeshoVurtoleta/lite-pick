@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Portable unit + type + property + balance checks across the supported matrix.
+  # The `test` script names every suite explicitly (no shell glob), so it runs identically
+  # on cmd.exe (Windows) and on Node's test runner (no glob support before Node 21).
+  test:
+    name: test (node ${{ matrix.node }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:types
+      - run: npm run fuzz
+      - run: npm run balance
+
+  # `engines` claims Node >=18, but the `test` matrix above starts at 20 (the dev tooling --
+  # @zakkster/lite-leak / lite-gc-profiler -- needs >=20, so torture/test:perf cannot run on 18).
+  # This job actually TESTS the >=18 floor: it runs ONLY `npm test`, whose unit suites depend
+  # solely on node:test + the zero-dep Pick.js/Pool.js and need none of the Node-20 tooling.
+  test-node18:
+    name: test-node18 (engines floor -- unit suites only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # The heavy, timing-sensitive gates on one pinned runner. test:perf pins its own semi-space
+  # flags in the script; torture needs --expose-gc (also in the script).
+  gates:
+    name: gates (node 22 / ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run torture
+      - run: npm run test:perf
+      - run: npm run bench:verify
+      - name: tarball is exactly the 11 whitelisted files
+        run: |
+          node -e '
+            const cp = require("child_process");
+            const out = cp.execSync("npm pack --dry-run --json").toString();
+            const files = JSON.parse(out)[0].files.map((f) => f.path).sort();
+            const expected = ["CHANGELOG.md","GUIDE.md","LICENSE","Pick.d.ts","Pick.js","Pool.d.ts","Pool.js","README.md","RECIPES.md","llms.txt","package.json"].sort();
+            const got = JSON.stringify(files), exp = JSON.stringify(expected);
+            if (got !== exp) { console.error("tarball file set mismatch\ngot:      " + got + "\nexpected: " + exp); process.exit(1); }
+            console.log("tarball OK: exactly " + files.length + " files");
+          '
+
+  # Compile a real consumer against the PACKED tarball (not the working tree) so the exports
+  # map and the typesVersions /pool mapping are exercised. ubuntu is deliberate: its filesystem
+  # is CASE-SENSITIVE, so `@zakkster/lite-pick/pool` -> Pool.d.ts only resolves via typesVersions
+  # (on a case-insensitive FS `pool` would match `Pool.d.ts` and hide a broken mapping).
+  types-compat:
+    name: types-compat (ubuntu, typescript@5)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: pack the tarball
+        run: npm pack
+      - name: install the packed tarball into the consumer fixture
+        working-directory: test/types/consumer
+        run: npm install "$GITHUB_WORKSPACE"/zakkster-lite-pick-*.tgz
+      - name: compile consumer under moduleResolution node16
+        working-directory: test/types/consumer
+        run: npx -y -p typescript@5 tsc -p tsconfig.node16.json
+      - name: compile consumer under moduleResolution node10
+        working-directory: test/types/consumer
+        run: npx -y -p typescript@5 tsc -p tsconfig.node10.json
+      - name: compile consumer under moduleResolution bundler
+        working-directory: test/types/consumer
+        run: npx -y -p typescript@5 tsc -p tsconfig.bundler.json
+      - name: compile consumer under lib ES2022 only (no DOM, no @types/node)
+        working-directory: test/types/consumer
+        run: npx -y -p typescript@5 tsc -p tsconfig.es2022.json

@@ -112,6 +112,16 @@ test('A5: setWeight validates uint32', () => {
     assert.throws(() => b.setWeight(2, 1), RangeError);
 });
 
+test('M1: setWeight rejects a non-integer/out-of-range index; total + live unchanged', () => {
+    const b = new SmoothWRRBalancer(4, up(4), Uint32Array.from([1, 1, 1, 1]));
+    const before = b._totalEligibleWeight;
+    for (const bad of [1.5, NaN, -1, '2', 4]) {
+        assert.throws(() => b.setWeight(bad, 5), RangeError, 'setWeight(' + String(bad) + ')');
+    }
+    assert.equal(b._totalEligibleWeight, before, 'total unchanged after rejected setWeight');
+    assert.equal(b.live, 4);
+});
+
 test('A5: eligibility toggle resets the accumulator (no stale credit)', () => {
     const weights = Uint32Array.from([3, 1, 1]);
     const b = new SmoothWRRBalancer(3, up(3), weights);
@@ -151,4 +161,39 @@ test('constructor validates the weights view', () => {
     assert.throws(() => new SmoothWRRBalancer(3, up(3), Uint32Array.from([1, 1])), RangeError);
     assert.throws(() => new SmoothWRRBalancer(3, up(3), [1, 1, 1]), RangeError);
     assert.throws(() => new SmoothWRRBalancer(0, new Uint8Array(1), new Uint32Array(1)), RangeError);
+});
+
+// --- H3: a weight-0 node must NEVER be returned (drain via setWeight, or a flapped 0-weight node). ---
+
+test('H3: setWeight(i, 0) drains a node -- 1000 picks never return it', () => {
+    const b = new SmoothWRRBalancer(4, up(4), Uint32Array.from([5, 4, 3, 2]));
+    b.pick();               // give node 1 residual accumulator credit before draining it
+    b.setWeight(1, 0);      // drain node 1 (the natural way to bleed a node)
+    for (let i = 0; i < 1000; i++) {
+        const p = b.pick();
+        assert.notEqual(p, 1, 'weight-0 node 1 returned at pick ' + i);
+    }
+});
+
+test('H3: a weight-0 node is never returned across an eligibility-toggle sequence', () => {
+    const n = 6;
+    const weights = Uint32Array.from([3, 0, 2, 0, 4, 1]); // nodes 1 and 3 have weight 0
+    const b = new SmoothWRRBalancer(n, up(n), weights);
+    let s = 0x1234abcd >>> 0;
+    const rnd = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0);
+    for (let step = 0; step < 20000; step++) {
+        if ((step & 3) === 0) b.setEligible(rnd() % n, (rnd() & 1) === 0);
+        const p = b.pick();
+        if (p !== PICK_NONE) {
+            assert.ok(weights[p] > 0, 'returned weight-0 node ' + p + ' at step ' + step);
+        }
+    }
+});
+
+test('H3: setWeight resets the toggled node accumulator (no stale credit)', () => {
+    const b = new SmoothWRRBalancer(3, up(3), Uint32Array.from([5, 1, 1]));
+    for (let i = 0; i < 10; i++) b.pick();
+    assert.notEqual(b._current[0], 0, 'node 0 has accumulated credit before reweight');
+    b.setWeight(0, 3);
+    assert.equal(b._current[0], 0, 'setWeight must reset _current[i] to 0');
 });

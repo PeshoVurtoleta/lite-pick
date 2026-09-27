@@ -128,3 +128,24 @@ worker-pool integration test exercises.
 - Whether `pick()` returns -1 or throws on an all-ineligible pool (lean: -1 default, configurable).
 - The exact rtt-window substrate (lite-o1 RingLog vs lite-ring-buffer) -- M7.
 - The `lite-pick-http` remote adapter's observation loop -- its own session/ADR.
+
+## Amended in 1.0.1 (2026-09-27) -- eligibility ownership tightened (audit H2)
+
+Fork 2 ratified a shared `Uint8Array` that "writers mutate at their own cadence and `pick()`
+only reads (zero-copy)". The 1.0.1 audit (audit/2026-09-26, H2) found that a DIRECT byte write
+bypasses the cached aggregates that only `setEligible` maintains -- `_live` (every strategy's
+fail-closed / `_live === 1` shortcut) and SmoothWRR's `_totalEligibleWeight` -- so a direct
+write desyncs them: a pool that is up can fail closed forever, or weight ratios collapse and one
+node takes 100% of traffic. Sharing one array across two balancers has the same failure (each
+caches its own `_live`).
+
+Tightened contract (no code-shape change; the cache stays):
+- **`setEligible(i, up)` is the ONLY supported eligibility writer.** It flips the byte AND keeps
+  `_live` (and SmoothWRR's total) exact in lockstep. A health source / breaker DRIVES that call
+  rather than writing the byte. A direct `eligible[i]` write is UB.
+- **Each balancer needs its OWN eligibility array.** Do not share one `Uint8Array` across balancers.
+- A shared `Eligibility` VALUE OBJECT (the cache lives on the object, so multiple balancers can
+  share it without desync) is deferred to **2.0** (a breaking API move; RECOMMENDATIONS 3.1
+  Option A). 1.0.x keeps the raw-`Uint8Array` seam with the single-writer rule.
+- RECIPES section 3 option (a) ("write the bitmap directly") is DELETED; every doc location that
+  described an externally-written view now states the single-writer rule.

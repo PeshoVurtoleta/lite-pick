@@ -9,9 +9,21 @@
  *                                  A balancer owns no external kernel (no timer, listener,
  *                                  or the shared eligibility view, which the CALLER owns),
  *                                  so being collected is the desired outcome.
- *   - @zakkster/lite-gc-profiler -- BUDGET: does the hot path allocate? 0 B/op on the
- *                                  substrate hot ops (Prng.next / nextBelow, isEligible)
- *                                  is the M0 gate. Strategy pick() paths join at M1+.
+ *   - @zakkster/lite-gc-profiler -- RETENTION on the hot ops: measureAllocs counts only the
+ *                                  bytes STILL ALIVE after a forced GC (the minimum across
+ *                                  batches). That is a retention reading, NOT an allocation
+ *                                  rate. It CANNOT see a transient box or a per-call object
+ *                                  that dies young. So every "B/op" figure below is labelled
+ *                                  "retained B/op": a hot op that leaks nothing per call reads
+ *                                  0. See the H6 note.
+ *
+ * WHAT PROVES WHAT (H6): the allocation-free / 0-B/op claim for the hot paths is proven by
+ * PerfGate's SCAVENGE counting under pinned semi-space flags (`npm run test:perf`), which sees
+ * transient boxes torture cannot. torture proves RETENTION: nothing the hot ops touch survives
+ * a GC, and no balancer instance outlives its owner. The MUST_FAIL control below (a pick wrapper
+ * that pushes each result object into an array outliving the batch) trips this retention lane
+ * every run -- if it ever reads 0 the lane is blind and the gate fails closed. A `null` reading
+ * ("could not measure") is an unverified state and is treated as FAIL, never coerced to 0.
  *
  * M4: the profiled hot paths are the SUBSTRATE (PRNG draw + eligibility read) that every
  * strategy rides, AND RoundRobin.pick(), SmoothWRR.pick(), P2C.pick(), LeastConn.pick(),
@@ -55,6 +67,15 @@ async function main() {
         name: 'lite-pick',
         onWarning: (w) => warns.push(w.kind + ':' + w.reason),
     });
+
+    // measureAllocs reports the bytes STILL ALIVE after a forced GC (min across batches): a
+    // RETENTION reading, not an allocation rate. `null` == "could not measure" is an unverified
+    // state -> fail closed (never coerced to 0). A hot op that retains nothing reads 0.
+    const retainedBytes = (res) => {
+        if (!res || res.bytesPerCall === null || res.bytesPerCall === undefined) return null;
+        return Math.max(0, Math.round(res.bytesPerCall));
+    };
+    const showBytes = (b) => (b === null ? 'unmeasured(null)' : String(b));
 
     // ---- phase 1: retention torture ---------------------------------------
     // A BalancerBase owns only its capacity + a reference to a CALLER-owned Uint8Array
@@ -138,9 +159,9 @@ async function main() {
     }
     const findings = tracker.audit();
 
-    // ---- phase 2: per-call allocation on the substrate hot path (0 B/op) ---
+    // ---- phase 2: substrate hot path -- 0 retained B/op --------------------
     // One reused Prng + one reused BalancerBase. Steady state: one PRNG draw + one
-    // bounded eligibility read. No object, closure, string, or array is created.
+    // bounded eligibility read. No object, closure, string, or array is retained.
     const el = new Uint8Array(CAP);
     for (let i = 0; i < CAP; i += 2) el[i] = 1;          // half eligible
     const base = new BalancerBase(CAP, el);
@@ -150,124 +171,104 @@ async function main() {
         const i = rng.nextBelow(CAP);
         if (base.isEligible(i)) sink = (sink + i) | 0;
     };
-    const allocRes = measureAllocs(step, { iterations: 100000, batches: 8 });
-    const bpc = allocRes.bytesPerCall === null ? 0 : allocRes.bytesPerCall;
-    const allocBytes = Math.max(0, Math.round(bpc));
+    const allocBytes = retainedBytes(measureAllocs(step, { iterations: 100000, batches: 8 }));
     const allocOk = allocBytes === 0;
 
-    // ---- phase 3: RoundRobin.pick() per-call allocation (0 B/op) -----------
+    // ---- phase 3: RoundRobin.pick() -- 0 retained B/op ---------------------
     // One reused RoundRobinBalancer over a half-eligible pool: every pick() is a
-    // compare-wrap loop + one cursor write, no object/closure/array created.
+    // compare-wrap loop + one cursor write, no object/closure/array retained.
     const rr = new RoundRobinBalancer(CAP, el);
     let rrSink = 0;
     const rrStep = () => { rrSink = (rrSink + rr.pick()) | 0; };
-    const rrAllocRes = measureAllocs(rrStep, { iterations: 100000, batches: 8 });
-    const rrBpc = rrAllocRes.bytesPerCall === null ? 0 : rrAllocRes.bytesPerCall;
-    const rrAllocBytes = Math.max(0, Math.round(rrBpc));
+    const rrAllocBytes = retainedBytes(measureAllocs(rrStep, { iterations: 100000, batches: 8 }));
     const rrAllocOk = rrAllocBytes === 0;
 
-    // ---- phase 4: SmoothWRR.pick() per-call allocation (0 B/op) ------------
+    // ---- phase 4: SmoothWRR.pick() -- 0 retained B/op ----------------------
     // One reused SmoothWRRBalancer: pick() is an O(cap) scan mutating the owned Float64
-    // accumulators in place + one subtract; no object/closure/array created.
+    // accumulators in place + one subtract; no object/closure/array retained.
     const weights = new Uint32Array(CAP).fill(3);
     const wrr = new SmoothWRRBalancer(CAP, el, weights);
     let wrrSink = 0;
     const wrrStep = () => { wrrSink = (wrrSink + wrr.pick()) | 0; };
-    const wrrAllocRes = measureAllocs(wrrStep, { iterations: 100000, batches: 8 });
-    const wrrBpc = wrrAllocRes.bytesPerCall === null ? 0 : wrrAllocRes.bytesPerCall;
-    const wrrAllocBytes = Math.max(0, Math.round(wrrBpc));
+    const wrrAllocBytes = retainedBytes(measureAllocs(wrrStep, { iterations: 100000, batches: 8 }));
     const wrrAllocOk = wrrAllocBytes === 0;
 
-    // ---- phase 5: P2C.pick() per-call allocation (0 B/op) ------------------
+    // ---- phase 5: P2C.pick() -- 0 retained B/op ----------------------------
     // One reused P2cBalancer over a half-eligible pool + a caller-owned inflight array:
     // pick() is a few PRNG steps + array reads (rejection draws) + one compare -- no
-    // object/closure/array created.
+    // object/closure/array retained.
     const inflight = new Uint32Array(CAP);
     for (let i = 0; i < CAP; i++) inflight[i] = i & 15;
     const p2c = new P2cBalancer(CAP, el, inflight, 0xABCDEF);
     let p2cSink = 0;
     const p2cStep = () => { p2cSink = (p2cSink + p2c.pick()) | 0; };
-    const p2cAllocRes = measureAllocs(p2cStep, { iterations: 100000, batches: 8 });
-    const p2cBpc = p2cAllocRes.bytesPerCall === null ? 0 : p2cAllocRes.bytesPerCall;
-    const p2cAllocBytes = Math.max(0, Math.round(p2cBpc));
+    const p2cAllocBytes = retainedBytes(measureAllocs(p2cStep, { iterations: 100000, batches: 8 }));
     const p2cAllocOk = p2cAllocBytes === 0;
 
-    // ---- phase 6: LeastConn.pick() per-call allocation (0 B/op) ------------
+    // ---- phase 6: LeastConn.pick() -- 0 retained B/op ----------------------
     // One reused LeastConnBalancer: pick() is an O(cap) integer-compare scan + one index
-    // write over the caller-owned inflight view; no object/closure/array created.
+    // write over the caller-owned inflight view; no object/closure/array retained.
     const lc = new LeastConnBalancer(CAP, el, inflight);
     let lcSink = 0;
     const lcStep = () => { lcSink = (lcSink + lc.pick()) | 0; };
-    const lcAllocRes = measureAllocs(lcStep, { iterations: 100000, batches: 8 });
-    const lcBpc = lcAllocRes.bytesPerCall === null ? 0 : lcAllocRes.bytesPerCall;
-    const lcAllocBytes = Math.max(0, Math.round(lcBpc));
+    const lcAllocBytes = retainedBytes(measureAllocs(lcStep, { iterations: 100000, batches: 8 }));
     const lcAllocOk = lcAllocBytes === 0;
 
-    // ---- phase 7: SED.pick() per-call allocation (0 B/op) ------------------
+    // ---- phase 7: SED.pick() -- 0 retained B/op ----------------------------
     // One reused SedBalancer: pick() is an O(cap) scan + one Float64 division per eligible
-    // node over caller-owned inflight + weights; no object/closure/array created.
+    // node over caller-owned inflight + weights; no object/closure/array retained.
     const sed = new SedBalancer(CAP, el, inflight, weights);
     let sedSink = 0;
     const sedStep = () => { sedSink = (sedSink + sed.pick()) | 0; };
-    const sedAllocRes = measureAllocs(sedStep, { iterations: 100000, batches: 8 });
-    const sedBpc = sedAllocRes.bytesPerCall === null ? 0 : sedAllocRes.bytesPerCall;
-    const sedAllocBytes = Math.max(0, Math.round(sedBpc));
+    const sedAllocBytes = retainedBytes(measureAllocs(sedStep, { iterations: 100000, batches: 8 }));
     const sedAllocOk = sedAllocBytes === 0;
 
-    // ---- phase 8: NQ.pick() per-call allocation (0 B/op) -------------------
+    // ---- phase 8: NQ.pick() -- 0 retained B/op -----------------------------
     // One reused NqBalancer over a BUSY pool (inflight all >= 1) so every pick() takes the
-    // full SED-fallback scan -- the worst case, still no object/closure/array created.
+    // full SED-fallback scan -- the worst case, still no object/closure/array retained.
     const busy = new Uint32Array(CAP);
     for (let i = 0; i < CAP; i++) busy[i] = 1 + (i & 15);
     const nq = new NqBalancer(CAP, el, busy, weights);
     let nqSink = 0;
     const nqStep = () => { nqSink = (nqSink + nq.pick()) | 0; };
-    const nqAllocRes = measureAllocs(nqStep, { iterations: 100000, batches: 8 });
-    const nqBpc = nqAllocRes.bytesPerCall === null ? 0 : nqAllocRes.bytesPerCall;
-    const nqAllocBytes = Math.max(0, Math.round(nqBpc));
+    const nqAllocBytes = retainedBytes(measureAllocs(nqStep, { iterations: 100000, batches: 8 }));
     const nqAllocOk = nqAllocBytes === 0;
 
-    // ---- phase 9: PeakEWMA.pick(now) per-call allocation (0 B/op) ----------
+    // ---- phase 9: PeakEWMA.pick(now) -- 0 retained B/op --------------------
     // One reused PeakEwmaBalancer over a half-eligible pool + caller-owned inflight: pick(now)
     // is two rejection draws + two decay-on-read exp() + a compare -- a PURE read (no write),
-    // no object/closure/array created. `now` is a monotonically advancing caller clock.
+    // no object/closure/array retained. `now` is a monotonically advancing caller clock.
     const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xBADC0DE);
     let peSink = 0, peNow = 0;
     const peStep = () => { peNow += 1000; peSink = (peSink + pe.pick(peNow)) | 0; };
-    const peAllocRes = measureAllocs(peStep, { iterations: 100000, batches: 8 });
-    const peBpc = peAllocRes.bytesPerCall === null ? 0 : peAllocRes.bytesPerCall;
-    const peAllocBytes = Math.max(0, Math.round(peBpc));
+    const peAllocBytes = retainedBytes(measureAllocs(peStep, { iterations: 100000, batches: 8 }));
     const peAllocOk = peAllocBytes === 0;
 
-    // ---- phase 10: PeakEWMA.recordRtt() per-call allocation (0 B/op) -------
+    // ---- phase 10: PeakEWMA.recordRtt() -- 0 retained B/op -----------------
     // The warm feedback path: one decay + one branch + two Float64 writes over the owned EWMA
     // state; validation is typeof/range guards that only construct an Error on the (untaken)
-    // failure branch -- the success path allocates nothing.
+    // failure branch -- the success path retains nothing.
     let rttNow = 0;
     const rttStep = () => { rttNow += 1000; pe.recordRtt(rttNow & (CAP - 1), rttNow % 500000, rttNow); };
-    const rttAllocRes = measureAllocs(rttStep, { iterations: 100000, batches: 8 });
-    const rttBpc = rttAllocRes.bytesPerCall === null ? 0 : rttAllocRes.bytesPerCall;
-    const rttAllocBytes = Math.max(0, Math.round(rttBpc));
+    const rttAllocBytes = retainedBytes(measureAllocs(rttStep, { iterations: 100000, batches: 8 }));
     const rttAllocOk = rttAllocBytes === 0;
 
-    // ---- phase 11: ConsistentHash.pick(keyHash) per-call allocation (0 B/op) -
+    // ---- phase 11: ConsistentHash.pick(keyHash) -- 0 retained B/op ---------
     // The Maglev TABLE is built ONCE here (the COLD, disclosed cost -- M x 4 bytes, ~256KB at the
     // 65537 default; excluded from the hot measurement). Steady-state pick(keyHash) is slot = key %
-    // M, a prebuilt-table read, and a bounded probe -- integer ops, no object/closure/array created.
+    // M, a prebuilt-table read, and a bounded probe -- integer ops, no object/closure/array retained.
     const chEl = new Uint8Array(CAP);
     for (let i = 0; i < CAP; i += 2) chEl[i] = 1;             // half eligible (exercise the probe)
     const ch = new ConsistentHashBalancer(CAP, chEl, null, 65537, 0xC0FFEE); // COLD build, not measured
     let chSink = 0, chKey = 0x12345678 >>> 0;
     const chStep = () => { chKey = (Math.imul(chKey, 1664525) + 1013904223) >>> 0; chSink = (chSink + ch.pick(chKey)) | 0; };
-    const chAllocRes = measureAllocs(chStep, { iterations: 100000, batches: 8 });
-    const chBpc = chAllocRes.bytesPerCall === null ? 0 : chAllocRes.bytesPerCall;
-    const chAllocBytes = Math.max(0, Math.round(chBpc));
+    const chAllocBytes = retainedBytes(measureAllocs(chStep, { iterations: 100000, batches: 8 }));
     const chAllocOk = chAllocBytes === 0;
 
-    // ---- phase 12: BoundedLoad.pick(keyHash) per-call allocation (0 B/op) --
+    // ---- phase 12: BoundedLoad.pick(keyHash) -- 0 retained B/op ------------
     // CHBL: the Maglev TABLE is built ONCE here (the COLD, disclosed cost -- excluded from the hot
     // measurement). Steady-state pick(keyHash) is slot = key % M, a table read, and a bounded cap-aware
-    // probe -- integer/float locals, no object/closure/array created. _total is seeded ONCE (cold notes)
+    // probe -- integer/float locals, no object/closure/array retained. _total is seeded ONCE (cold notes)
     // so the cap branch is exercised on the hot path (over-cap homes overflow along the probe).
     const bl = new BoundedLoadBalancer(CAP, chEl, inflight, 0.25, null, 65537, 0xB0DED10A); // COLD build, not measured
     let blTotal = 0;
@@ -275,25 +276,21 @@ async function main() {
     bl.note(0, blTotal);                                 // seed _total to the true inflight sum (cold)
     let blSink = 0, blKey = 0x2468ace0 >>> 0;
     const blStep = () => { blKey = (Math.imul(blKey, 1664525) + 1013904223) >>> 0; blSink = (blSink + bl.pick(blKey)) | 0; };
-    const blAllocRes = measureAllocs(blStep, { iterations: 100000, batches: 8 });
-    const blBpc = blAllocRes.bytesPerCall === null ? 0 : blAllocRes.bytesPerCall;
-    const blAllocBytes = Math.max(0, Math.round(blBpc));
+    const blAllocBytes = retainedBytes(measureAllocs(blStep, { iterations: 100000, batches: 8 }));
     const blAllocOk = blAllocBytes === 0;
 
-    // ---- phase 13: BoundedLoad.note() per-call allocation (0 B/op) ---------
+    // ---- phase 13: BoundedLoad.note() -- 0 retained B/op -------------------
     // The warm feedback path: one add + one clamp compare over the owned scalar _total; the typeof/
-    // range guards only construct an Error on the (untaken) failure branch, so success allocates nothing.
+    // range guards only construct an Error on the (untaken) failure branch, so success retains nothing.
     let noteI = 0;
     const noteStep = () => { noteI = (noteI + 1) & (CAP - 1); bl.note(noteI, (noteI & 1) ? -1 : 1); };
-    const noteAllocRes = measureAllocs(noteStep, { iterations: 100000, batches: 8 });
-    const noteBpc = noteAllocRes.bytesPerCall === null ? 0 : noteAllocRes.bytesPerCall;
-    const noteAllocBytes = Math.max(0, Math.round(noteBpc));
+    const noteAllocBytes = retainedBytes(measureAllocs(noteStep, { iterations: 100000, batches: 8 }));
     const noteAllocOk = noteAllocBytes === 0;
 
-    // ---- phase 14: WeightedRandom.pick() per-call allocation (0 B/op) ------
+    // ---- phase 14: WeightedRandom.pick() -- 0 retained B/op ----------------
     // One reused WeightedRandomBalancer over a half-eligible, weighted pool: each pick() is one
     // alias-column draw + one probability compare (rejection-sampled over eligibility) -- integer/
-    // float locals only, no object/closure/array created. The alias table is built ONCE (COLD) in the
+    // float locals only, no object/closure/array retained. The alias table is built ONCE (COLD) in the
     // ctor. The instance is created OUTSIDE the measured loop and stepped inside; nothing closes over it.
     const wrEl = new Uint8Array(CAP);
     for (let i = 0; i < CAP; i += 2) wrEl[i] = 1;             // half eligible (exercise rejection)
@@ -302,16 +299,14 @@ async function main() {
     const wrand = new WeightedRandomBalancer(CAP, wrEl, wrWeights, 0x5EED1E55);
     let wrandSink = 0;
     const wrandStep = () => { wrandSink = (wrandSink + wrand.pick()) | 0; };
-    const wrandAllocRes = measureAllocs(wrandStep, { iterations: 100000, batches: 8 });
-    const wrandBpc = wrandAllocRes.bytesPerCall === null ? 0 : wrandAllocRes.bytesPerCall;
-    const wrandAllocBytes = Math.max(0, Math.round(wrandBpc));
+    const wrandAllocBytes = retainedBytes(measureAllocs(wrandStep, { iterations: 100000, batches: 8 }));
     const wrandAllocOk = wrandAllocBytes === 0;
 
-    // ---- phase 14b: WeightedRandom.pick() HEAVY-OUTAGE fallback (0 B/op) ---
+    // ---- phase 14b: WeightedRandom.pick() HEAVY-OUTAGE fallback -- 0 retained B/op --
     // EXACTLY ONE eligible positive-weight node in the CAP pool (all others down), so the 64-try
     // rejection loop misses ~every time and each pick() runs the rotated linear-scan FALLBACK -- the
-    // branch the half-eligible phase 14 never reaches. It must be 0 B/op too (integer locals only). The
-    // instance is created OUTSIDE the measured loop and stepped inside; nothing closes over it.
+    // branch the half-eligible phase 14 never reaches. It must be 0 retained B/op too (integer locals
+    // only). The instance is created OUTSIDE the measured loop and stepped inside; nothing closes over it.
     const wrFbEl = new Uint8Array(CAP);
     wrFbEl[1] = 1;                                            // one eligible node -> exhaust rejection, scan
     const wrFbWeights = new Uint32Array(CAP);
@@ -319,10 +314,24 @@ async function main() {
     const wrandFb = new WeightedRandomBalancer(CAP, wrFbEl, wrFbWeights, 0x0FF0DEAD);
     let wrandFbSink = 0;
     const wrandFbStep = () => { wrandFbSink = (wrandFbSink + wrandFb.pick()) | 0; };
-    const wrandFbAllocRes = measureAllocs(wrandFbStep, { iterations: 100000, batches: 8 });
-    const wrandFbBpc = wrandFbAllocRes.bytesPerCall === null ? 0 : wrandFbAllocRes.bytesPerCall;
-    const wrandFbAllocBytes = Math.max(0, Math.round(wrandFbBpc));
+    const wrandFbAllocBytes = retainedBytes(measureAllocs(wrandFbStep, { iterations: 100000, batches: 8 }));
     const wrandFbAllocOk = wrandFbAllocBytes === 0;
+
+    // ---- MUST-FAIL control: a deliberately RETAINING pick wrapper ----------
+    // Proves the retention lane has teeth. Each call pushes a fresh result object into an array
+    // that OUTLIVES every batch, so those objects survive the forced GC and measureAllocs reports
+    // retained bytes > 0. This control MUST trip (retained > 0) on every run; if it reads 0 or null
+    // the lane is blind and the whole gate fails closed. It is the mirror of every 0-B/op phase above.
+    const retainHold = [];
+    let mustSink = 0;
+    const mustFailStep = () => {
+        const idx = rng.nextBelow(CAP);
+        retainHold.push({ idx, live: base.isEligible(idx) });   // escapes the batch -> retained
+        mustSink = (mustSink + retainHold.length) | 0;
+    };
+    const mustFailBytes = retainedBytes(measureAllocs(mustFailStep, { iterations: 20000, batches: 8 }));
+    const mustFailTrips = mustFailBytes !== null && mustFailBytes > 0;
+    void mustSink; void retainHold.length;
 
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
@@ -332,39 +341,47 @@ async function main() {
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  substrate hot-path allocs: ' + allocBytes + ' B/op -> ' +
+    process.stdout.write('  (hot-path figures are RETAINED B/op: bytes alive after a forced GC, not an alloc rate;\n' +
+        '   the 0-B/op allocation claim is proven by PerfGate scavenge counting -- npm run test:perf)\n');
+    process.stdout.write('  substrate hot-path retained: ' + showBytes(allocBytes) + ' B/op -> ' +
         (allocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  RoundRobin.pick() allocs: ' + rrAllocBytes + ' B/op -> ' +
+    process.stdout.write('  RoundRobin.pick() retained: ' + showBytes(rrAllocBytes) + ' B/op -> ' +
         (rrAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  SmoothWRR.pick() allocs: ' + wrrAllocBytes + ' B/op -> ' +
+    process.stdout.write('  SmoothWRR.pick() retained: ' + showBytes(wrrAllocBytes) + ' B/op -> ' +
         (wrrAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  P2C.pick() allocs: ' + p2cAllocBytes + ' B/op -> ' +
+    process.stdout.write('  P2C.pick() retained: ' + showBytes(p2cAllocBytes) + ' B/op -> ' +
         (p2cAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  LeastConn.pick() allocs: ' + lcAllocBytes + ' B/op -> ' +
+    process.stdout.write('  LeastConn.pick() retained: ' + showBytes(lcAllocBytes) + ' B/op -> ' +
         (lcAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  SED.pick() allocs: ' + sedAllocBytes + ' B/op -> ' +
+    process.stdout.write('  SED.pick() retained: ' + showBytes(sedAllocBytes) + ' B/op -> ' +
         (sedAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  NQ.pick() allocs: ' + nqAllocBytes + ' B/op -> ' +
+    process.stdout.write('  NQ.pick() retained: ' + showBytes(nqAllocBytes) + ' B/op -> ' +
         (nqAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  PeakEWMA.pick() allocs: ' + peAllocBytes + ' B/op -> ' +
+    process.stdout.write('  PeakEWMA.pick() retained: ' + showBytes(peAllocBytes) + ' B/op -> ' +
         (peAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  PeakEWMA.recordRtt() allocs: ' + rttAllocBytes + ' B/op -> ' +
+    process.stdout.write('  PeakEWMA.recordRtt() retained: ' + showBytes(rttAllocBytes) + ' B/op -> ' +
         (rttAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  ConsistentHash.pick(keyHash) allocs: ' + chAllocBytes + ' B/op -> ' +
+    process.stdout.write('  ConsistentHash.pick(keyHash) retained: ' + showBytes(chAllocBytes) + ' B/op -> ' +
         (chAllocOk ? 'PASS' : 'FAIL') + ' (Maglev table build is the disclosed COLD cost)\n');
-    process.stdout.write('  BoundedLoad.pick(keyHash) allocs: ' + blAllocBytes + ' B/op -> ' +
+    process.stdout.write('  BoundedLoad.pick(keyHash) retained: ' + showBytes(blAllocBytes) + ' B/op -> ' +
         (blAllocOk ? 'PASS' : 'FAIL') + ' (CHBL Maglev table build is the disclosed COLD cost)\n');
-    process.stdout.write('  BoundedLoad.note() allocs: ' + noteAllocBytes + ' B/op -> ' +
+    process.stdout.write('  BoundedLoad.note() retained: ' + showBytes(noteAllocBytes) + ' B/op -> ' +
         (noteAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  WeightedRandom.pick() allocs: ' + wrandAllocBytes + ' B/op -> ' +
+    process.stdout.write('  WeightedRandom.pick() retained: ' + showBytes(wrandAllocBytes) + ' B/op -> ' +
         (wrandAllocOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  WeightedRandom.pick() heavy-outage fallback allocs: ' + wrandFbAllocBytes + ' B/op -> ' +
+    process.stdout.write('  WeightedRandom.pick() heavy-outage fallback retained: ' + showBytes(wrandFbAllocBytes) + ' B/op -> ' +
         (wrandFbAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  MUST-FAIL control (retaining pick wrapper) retained: ' + showBytes(mustFailBytes) +
+        ' B/op -> ' + (mustFailTrips ? 'TRIPPED (lane has teeth)' : 'BLIND -- gate is broken') + '\n');
 
     if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk ||
         !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk || !chAllocOk ||
-        !blAllocOk || !noteAllocOk || !wrandAllocOk || !wrandFbAllocOk) {
+        !blAllocOk || !noteAllocOk || !wrandAllocOk || !wrandFbAllocOk || !mustFailTrips) {
         process.stderr.write('torture: FAIL\n');
+        if (!mustFailTrips) {
+            process.stderr.write('  MUST-FAIL control did not trip (retained=' + showBytes(mustFailBytes) +
+                '): the retention lane cannot see retained bytes -- gate is not trustworthy\n');
+        }
         process.exit(1);
     }
     process.stdout.write('torture: PASS\n');

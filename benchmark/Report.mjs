@@ -18,7 +18,7 @@
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import { P2cBalancer, RoundRobinBalancer, WeightedRandomBalancer, Prng, VERSION } from '../Pick.js';
@@ -180,7 +180,7 @@ function buildBlocks(data) {
     {
         const g = data.gc;
         const lines = [
-            '| lane | major GC | pick B/op | max GC pause (ms) |',
+            '| lane | major GC | pick retained B/op | max GC pause (ms) |',
             '| --- | --- | --- | --- |',
             '| lite-pick | ' + g.litePick.major + ' | ' + g.litePick.bpop + ' | ' +
                 fmt1(g.litePick.maxPauseMs) + ' |',
@@ -353,16 +353,31 @@ function verify() {
         process.exit(1);
     }
     // Recompute the ALGORITHMIC blocks FRESH; keep the TIMING blocks (gc, competitors) from
-    // results.json -- the stored, machine-independent reference the +/-15% band checks against.
+    // results.json -- the stored reference the +/-15% band checks against.
+    //
+    // M-T1: measureFairness() is deliberately NOT called here. buildBlocks() renders no
+    // `fairness` fence, so its result was measured and then discarded -- dead work that
+    // verified nothing. It stays in emit() (results.json provenance); verify() only runs
+    // what it actually checks. Per-block provenance is stated below so the output never
+    // implies a stored number was re-timed.
+    const SOURCE = {          // which blocks are RE-MEASURED fresh vs read from results.json
+        balance: 're-measured', disruption: 're-measured',
+        gc: 'stored', competitors: 'stored',
+    };
     const refData = {
-        balance: measureBalance(),
-        disruption: measureDisruption(),
-        fairness: measureFairness(),
-        gc: stored.results.gc,
-        competitors: stored.results.competitors,
+        balance: measureBalance(),        // fresh, deterministic (seeded)
+        disruption: measureDisruption(),  // fresh, deterministic (seeded Maglev)
+        gc: stored.results.gc,            // stored: exact 0/0 + timing band
+        competitors: stored.results.competitors, // stored: timing band
     };
     const blocks = buildBlocks(refData);
     const text = readFileSync(README, 'utf8');
+
+    for (const id of Object.keys(blocks)) {
+        process.stdout.write('  bench:' + id + ' -- ' + SOURCE[id] +
+            (SOURCE[id] === 'stored' ? ' (from results.json; timing band +/-15%, exact 0/0 checked verbatim)'
+                                     : ' fresh this run (deterministic, checked exact)') + '\n');
+    }
 
     const failures = [];
     for (const id of Object.keys(blocks)) {
@@ -402,12 +417,13 @@ function verify() {
         process.exit(1);
     }
     process.stdout.write('bench:verify: PASS -- all README fenced numbers match source ' +
-        '(algorithmic exact, timing within +/-15%)\n');
+        '(balance + disruption RE-MEASURED fresh & exact; gc + competitors compared against ' +
+        'STORED results.json -- exact for 0/0 lanes, timing within +/-15%)\n');
 }
 
 // --- entry ------------------------------------------------------------------------------
 
-if (import.meta.url === 'file://' + process.argv[1]) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     const mode = process.argv[2];
     try {
         if (mode === '--verify') verify();

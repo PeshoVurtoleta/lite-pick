@@ -78,3 +78,14 @@ exact-O(log n) variant. Four forks were settled.
 - Balance anchors (test/balance.mjs): LeastConn is greedy-perfect (max-minus-min <= 1, tighter than
   P2C's ln ln n gap); SED converges to load proportional-to-weight (< 1% drift, weighted-imbalance
   far below a random foil); NQ fans the first n dispatches out to n distinct idle workers.
+
+## Amended in 1.0.1 (2026-09-27) -- tie order is unspecified (audit M5)
+
+The 0.4.0 text above documented "tie-break is the lowest index (deterministic)" for LeastConn / SED
+/ NQ. The audit (M5) noted this concentrates cache and connection warm-up on node 0 under
+low/sequential traffic (nginx/HAProxy break least-conn ties round-robin). To reserve the freedom to
+add a rotating tie-break WITHOUT a breaking change, 1.0.1 DE-COMMITS the contract: **tie order among
+equal-load (LeastConn) / equal-(inflight+1)/weight (SED) / equally-idle (NQ) endpoints is
+UNSPECIFIED.** The implementation is still deterministic (it happens to keep the lowest index), but
+callers must not depend on which tied endpoint wins. A rotating-cursor tie-break (0 B/op, still
+deterministic) is planned for 1.1.0. No code change in 1.0.1 -- this is a contract de-commitment only.

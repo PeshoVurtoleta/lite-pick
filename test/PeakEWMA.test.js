@@ -38,9 +38,11 @@ test('A7: constructor validates inflight, tauNs, capacity (typeof-first)', () =>
     assert.throws(() => new PeakEwmaBalancer(3, up(3), new Uint32Array(3), Infinity), RangeError);
 });
 
-test('A7: recordRtt validates index, sample, now (typeof-first)', () => {
+test('A7: recordRtt validates index, sample, now', () => {
     const b = new PeakEwmaBalancer(4, up(4), new Uint32Array(4), TAU);
-    assert.throws(() => b.recordRtt('0', 1, 1), TypeError);
+    // M1: the index is validated by the shared _vIdx helper -> RangeError (a string index coerces to a
+    // different value under >>> 0), consolidating the old typeof-first index check.
+    assert.throws(() => b.recordRtt('0', 1, 1), RangeError);
     assert.throws(() => b.recordRtt(0, '1', 1), TypeError);
     assert.throws(() => b.recordRtt(0, 1, '1'), TypeError);
     assert.throws(() => b.recordRtt(-1, 1, 1), RangeError);
@@ -139,6 +141,80 @@ test('A6: tie-break to the first draw -- all-equal cold pool matches P2C on the 
     for (let i = 0; i < 5000; i++) {
         assert.equal(pe.pick(0), p2c.pick(), 'tie-break diverged at step ' + i);
     }
+});
+
+// --- H1 (kernel): cold-start + busy-floor pricing -- a black hole must become MORE expensive. ---
+
+test('H1: an unsampled IDLE node gets the free probe (cost 0)', () => {
+    // node 0 sampled at 1ms; node 1 unsampled and idle -> cost 0 -> the idle cold node is explored.
+    const inflight = Uint32Array.from([0, 0]);
+    const b = new PeakEwmaBalancer(2, up(2), inflight, TAU, 0xC0FFEE);
+    b.recordRtt(0, 1e6, 0);                  // node 0: a real 1ms sample; node 1 stays unsampled
+    for (let i = 0; i < 500; i++) assert.equal(b.pick(0), 1, 'the idle unsampled node (cost 0) must win');
+});
+
+test('H1: an unsampled BUSY node is priced at the pool mean, not 1.0 (no black hole)', () => {
+    // node 0 sampled at 1ms, idle; node 1 unsampled but BUSY (5 in flight). Old code priced node 1 at
+    // (5+1)*1.0 = 6 and it beat node 0 (1e6); now it is (5+1)*mean = 6e6 and loses.
+    const inflight = Uint32Array.from([0, 5]);
+    const b = new PeakEwmaBalancer(2, up(2), inflight, TAU, 0xC0FFEE);
+    b.recordRtt(0, 1e6, 0);                  // only node 0 sampled -> mean = 1e6
+    for (let i = 0; i < 500; i++) assert.equal(b.pick(0), 0, 'a busy cold node must not beat a healthy 1ms node');
+});
+
+test('H1: a hung sampled node (inflight>0, long dt) is floored at dt and loses to a healthy peer', () => {
+    const tau = 1e6;
+    const inflight = Uint32Array.from([0, 5]);   // node 1 is busy and about to hang
+    const b = new PeakEwmaBalancer(2, up(2), inflight, tau, 0xC0FFEE);
+    const t0 = 1000;
+    b.recordRtt(0, 1e6, t0);
+    b.recordRtt(1, 1e6, t0);                 // both last sampled at t0 with the same latency
+    const now = t0 + 1e9;                    // a long time passes with node 1 still in flight (hung)
+    // node 0 idle: cost ~ decayed EWMA ~ 0. node 1 busy: base = max(decayed, dt) = dt = ~1e9 -> huge.
+    for (let i = 0; i < 500; i++) assert.equal(b.pick(now), 0, 'the hung busy node must lose to the healthy peer');
+});
+
+test('H1/L6: a negative dt is clamped in pick (no exp(+x) inflation)', () => {
+    const tau = 1e6;
+    const inflight = new Uint32Array(2);
+    const b = new PeakEwmaBalancer(2, up(2), inflight, tau, 0xC0FFEE);
+    const stamp = 1e9;
+    b.recordRtt(0, 1e6, stamp);              // node 0 cheaper
+    b.recordRtt(1, 2e6, stamp);              // node 1 pricier
+    // Pick at now < stamp: unclamped dt = -1e9 -> exp(+1000) = Infinity would make both costs Inf and
+    // flip the winner ~50% of the time. Clamped dt = 0 -> node 0 (1e6) beats node 1 (2e6) every time.
+    for (let i = 0; i < 500; i++) assert.equal(b.pick(0), 0, 'clamped negative dt must not inflate/flip the pick');
+});
+
+test('L6: a negative dt is clamped in recordRtt and ewmaAt (no inflation)', () => {
+    const tau = 1e6;
+    const b = new PeakEwmaBalancer(2, up(2), new Uint32Array(2), tau);
+    b.recordRtt(0, 1e6, 1000);
+    // ewmaAt with now < stamp: clamp dt to 0 -> exactly the stored 1e6 (no exp(+x) blow-up).
+    assert.equal(b.ewmaAt(0, 500), 1e6, 'ewmaAt clamps a negative dt');
+    // recordRtt with now < previous stamp and a smaller sample: clamp -> ewma stays 1e6, never inflates.
+    b.recordRtt(0, 500, 500);
+    assert.equal(b._ewma[0], 1e6, 'recordRtt clamps a negative dt (no inflation of the stored estimate)');
+});
+
+test('H1: _samp[0] / _samp[1] (sample sum / count) stay exact across samples', () => {
+    const b = new PeakEwmaBalancer(4, up(4), new Uint32Array(4), TAU);
+    const samples = [[0, 100], [1, 250], [0, 300], [2, 50], [3, 1000]];
+    let sum = 0;
+    for (let k = 0; k < samples.length; k++) {
+        b.recordRtt(samples[k][0], samples[k][1], 10 * (k + 1));
+        sum += samples[k][1];
+    }
+    assert.equal(b._samp[0], sum, 'running sample sum exact');
+    assert.equal(b._samp[1], samples.length, 'running sample count exact');
+});
+
+test('M1: recordRtt rejects a non-integer index; no sample recorded', () => {
+    const b = new PeakEwmaBalancer(4, up(4), new Uint32Array(4), TAU);
+    for (const bad of [1.5, NaN, '2', -1, 4]) {
+        assert.throws(() => b.recordRtt(bad, 1000, 1), RangeError, 'recordRtt(' + String(bad) + ')');
+    }
+    assert.equal(b._samp[1], 0, 'no sample recorded after a rejected recordRtt');
 });
 
 test('never returns a down index under adversarial flapping', () => {

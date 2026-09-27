@@ -108,6 +108,27 @@ test('setEligible rejects an out-of-range index', () => {
     assert.throws(() => b.setEligible(-1, true), RangeError);
 });
 
+test('M1: isEligible returns false for a non-integer index (never throws)', () => {
+    const b = new BalancerBase(4, Uint8Array.from([1, 1, 1, 1]));
+    assert.equal(b.isEligible(1.5), false);
+    assert.equal(b.isEligible(NaN), false);
+    assert.equal(b.isEligible('2'), false);
+    assert.equal(b.isEligible(-1), false);
+    assert.equal(b.isEligible(4), false);
+    assert.equal(b.isEligible(0), true);
+});
+
+test('M1: setEligible rejects a non-integer/out-of-range index; live unchanged', () => {
+    const el = Uint8Array.from([1, 1, 1, 1]);
+    const b = new BalancerBase(4, el);
+    assert.equal(b.live, 4);
+    for (const bad of [1.5, NaN, -1, '2', 4, 0.5]) {
+        assert.throws(() => b.setEligible(bad, false), RangeError, 'setEligible(' + String(bad) + ')');
+    }
+    assert.equal(b.live, 4, 'live unchanged after every rejected setEligible');
+    for (let i = 0; i < 4; i++) assert.equal(el[i], 1, 'no bit flipped by a rejected setEligible');
+});
+
 test('BalancerBase.pick() is abstract until a strategy overrides it', () => {
     const b = new BalancerBase(2, Uint8Array.from([1, 1]));
     assert.throws(() => b.pick(), /abstract/);

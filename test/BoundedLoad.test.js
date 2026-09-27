@@ -159,6 +159,80 @@ test('A8: BoundedLoad + Pool keyed round-trip is net-zero on inflight AND totalI
     assert.equal(bl.totalInflight, 0, 'balancer _total net-zero after keyed runs');
 });
 
+test('M1: note() rejects a non-integer/out-of-range index; totalInflight unchanged', () => {
+    const b = new BoundedLoadBalancer(4, up(4), new Uint32Array(4), 0.25, null, 5);
+    b.note(0, 3);
+    assert.equal(b.totalInflight, 3);
+    for (const bad of [1.5, NaN, '2', -1, 4]) {
+        assert.throws(() => b.note(bad, 1), RangeError, 'note(' + String(bad) + ')');
+    }
+    assert.equal(b.totalInflight, 3, '_total unchanged after a rejected note');
+});
+
+// --- H4: the load-bearing change is the +1 that COUNTS THE INCOMING request (the old cap was
+// (1+eps)*total/live, the new is (1+eps)*(total+1)/live). The Math.ceil in the kernel matches the
+// published integer-slot definition but is a no-op for the `inf < cap` test (for integer inf,
+// `inf < ceil(x)` == `inf < x`). At n=10 / eps 0.25 old and new behave IDENTICALLY for total <= 7;
+// the +1 only bites at total >= 8, where the home's single request stops being evicted. The kernel's
+// under-cap decisions are checked against the Mirrokni-Thorup-Zadimoghaddam per-bin capacity written in
+// INTEGER arithmetic -- partially independent of the kernel's float path. It is NOT HAProxy:
+// HAProxy's hash-balance-factor shares the +1 but splits ONE global ceil((m+1)F/100) slot budget across
+// servers by weight (min 1), which is stricter (at total 8 / n 10 it would move this load-1 home). ---
+
+// Oracle: the paper's per-bin capacity ceil((1+eps)(m+1)/n) in integer form. factorPct is the percentage
+// load factor (125 == 1 + eps of 0.25); the capacity counts the incoming request and is at least 1; a
+// backend is eligible while its load is STRICTLY below its capacity.
+function mtzEligible(served, totalServed, live, factorPct) {
+    const num = (totalServed + 1) * factorPct;            // integer numerator
+    const den = 100 * live;                               // integer denominator
+    let slots = Math.floor((num + den - 1) / den);        // integer ceil(num / den)
+    if (slots < 1) slots = 1;                             // capacity is at least one
+    return served < slots;
+}
+
+test('H4: the +1 (incoming request) keeps a key on its home where the old cap evicted it', () => {
+    const n = 10, m = 17, eps = 0.25;
+    const inflight = new Uint32Array(n);
+    const bl = new BoundedLoadBalancer(n, up(n), inflight, eps, null, m, 0xABCD);
+    const key = 0xBEEF >>> 0;
+    const home = bl.pick(key);
+    // Home carries a single request; 7 more spread elsewhere so total = 8, live = 10.
+    inflight[home] = 1; bl.note(home, 1);
+    let other = 0;
+    while (bl.totalInflight < 8) { const o = (home + 1 + other) % n; inflight[o]++; bl.note(o, 1); other++; }
+    assert.equal(bl.totalInflight, 8);
+    // Old cap (no +1) = (1+eps)*total/live = 1.25*8/10 = 1.0 -> home (load 1) NOT < 1.0 -> evicted (H4 bug).
+    // New cap (+1 counts the incoming) = 1.25*9/10 = 1.125 -> home (load 1) < 1.125 -> kept. The +1 is
+    // the whole difference; the independent oracle agrees the home is eligible here.
+    const oldCap = (1 + eps) * 8 / n;   // 1.0 -- the pre-1.0.1 cap WITHOUT the +1
+    assert.equal(inflight[home] < oldCap, false, 'old cap 1.0 would have evicted a load-1 home');
+    assert.equal(mtzEligible(inflight[home], 8, n, 125), true, 'oracle: home eligible at total 8');
+    assert.equal(bl.pick(key), home, 'the +1 must keep the key on its home at this occupancy');
+});
+
+test('H4: kernel under-cap decisions agree with the integer per-bin capacity oracle over a hot-key burst', () => {
+    const n = 10, m = 17, eps = 0.25;
+    const inflight = new Uint32Array(n);
+    const bl = new BoundedLoadBalancer(n, up(n), inflight, eps, null, m, 0x1234);
+    const key = 0x99 >>> 0;
+    const home = bl.pick(key);
+    let overflowed = false;
+    for (let r = 0; r < 40; r++) {
+        const total = bl.totalInflight;
+        const p = bl.pick(key);
+        // The kernel's stick-vs-overflow decision must match the integer per-bin capacity oracle for the home.
+        if (mtzEligible(inflight[home], total, n, 125)) {
+            assert.equal(p, home, 'oracle: home eligible -> kernel must keep the key at r=' + r);
+        } else {
+            assert.notEqual(p, home, 'oracle: home over cap -> kernel must overflow at r=' + r);
+            assert.equal(mtzEligible(inflight[p], total, n, 125), true, 'overflow target must be oracle-eligible');
+            overflowed = true;
+        }
+        inflight[p]++; bl.note(p, 1);
+    }
+    assert.ok(overflowed, 'a single hot key eventually overflows its home');
+});
+
 test('never returns a down/oob index under adversarial flapping + notes', () => {
     const n = 16, m = 31;
     const el = up(n);

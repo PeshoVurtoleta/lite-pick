@@ -97,3 +97,30 @@ queue between visits, so its in-flight looks attractive again). Several forks ha
 - The latency anchor (test/balance.mjs): a node at 10x rtt receives <= 25% of P2C's share for it and
   PeakEWMA's service p99 is >= 20% below P2C-over-inflight, with the random foil worse than both.
 - Bound: O(d) = O(1) per pick; 0 B/op on BOTH `pick()` and `recordRtt()` (torture + PerfGate).
+
+## Amended in 1.0.1 (2026-09-27) -- cold-start pricing, hung-node floor, failure feedback (audit H1, L5, L6, M1)
+
+Fork 4b's cold start priced an unsampled node at `(inflight + 1) x 1.0` and Fork 2/3 decayed the
+estimate with no lower bound and no clamp. The audit (H1) showed the failure mode: a fast-failing or
+hung node that never records a sample keeps the tiny 1.0 ns baseline (or decays toward 0), so it
+becomes the CHEAPEST pick -- a black hole that doubled failure rates. Refinements:
+
+- **Cost is now three cases** (still a pure read, 0 B/op): an unsampled node costs **0 while idle**
+  (graceful least-connections; it holds one probe request in flight until its first sample) and
+  `(inflight + 1) x lifetime-mean-sampled-rtt` **once busy** (a balancer-owned running mean over all
+  samples, 1.0 only before the first), so a cold-but-busy node is not mistaken for a 1.0 ns node. A
+  sampled node costs `(inflight + 1) x max(decayedEWMA, dt)` **while busy** (else `x decayedEWMA`),
+  so a hung node -- `dt` grows, no completion -- gets MORE expensive over time, not less.
+- **`dt` is clamped `>= 0`** (L6): a non-monotonic clock can no longer inflate the estimate via
+  `exp(+x)`.
+- **Failure feedback lives in Pool** (H1): a thrown attempt feeds
+  `recordRtt(i, max(elapsed, opts.failurePenaltyNs), done)` (default 1e9 ns), so a failing node is
+  priced expensive and re-probed roughly every `tauNs x ln(failurePenaltyNs / healthyRttNs)`.
+- **"Half-life" -> "time constant"** (L5): `tau` is the EWMA time constant; half-life = `tau x ln2`.
+- **Index validation** (M1): `recordRtt` now throws `RangeError` for a non-integer / out-of-range
+  index -- INCLUDING a numeric string like `'2'` (which used to coerce and work); a string index now
+  throws `RangeError`, not `TypeError`.
+- **Accepted caveats (1.1.0 items):** an idle-then-busy node is priced by time-since-last-response
+  until that response completes (no exact per-dispatch "busy since" stamp yet -- 1.1.0); the lifetime
+  mean never forgets a latency-regime change (a decaying mean is a 1.1.0 item). The buffer-based
+  clock API that avoids boxing `now` is also 1.1.0 (see the boxing limitation in README/GUIDE).

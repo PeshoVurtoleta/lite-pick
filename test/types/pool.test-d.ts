@@ -5,8 +5,8 @@
  * runtime fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { Pool, liteQueryFetcher, VERSION } from '../../Pool.js';
-import { LeastConnBalancer, BoundedLoadBalancer } from '../../Pick.js';
+import { Pool, liteQueryFetcher, VERSION, type AbortLike, type RunOptions } from '../../Pool.js';
+import { LeastConnBalancer, BoundedLoadBalancer, PeakEwmaBalancer } from '../../Pick.js';
 
 // VERSION is a string (re-exported from the core).
 const v: string = VERSION;
@@ -26,7 +26,7 @@ pool.balancer = balancer;
 
 // run: fn (endpoint, signal?) -> T | Promise<T>; returns Promise<T>. Generic inferred.
 const p1: Promise<string> = pool.run((endpoint: number) => 'ep:' + endpoint);
-const p2: Promise<number> = pool.run(async (endpoint: number, signal?: AbortSignal) => {
+const p2: Promise<number> = pool.run(async (endpoint: number, signal?: AbortLike) => {
     void signal;
     return endpoint;
 }, { tries: 2 });
@@ -56,7 +56,7 @@ blPool.run((endpoint: number) => endpoint, { key: 'nope' });
 pool.run(42);
 
 // liteQueryFetcher: produces ({ key, signal }) -> Promise<T>.
-const fetcher = liteQueryFetcher(pool, (ctx: { endpoint: number; key: any; signal?: AbortSignal }) => {
+const fetcher = liteQueryFetcher(pool, (ctx: { endpoint: number; key: any; signal?: AbortLike }) => {
     void ctx.signal;
     return String(ctx.endpoint) + ':' + String(ctx.key[0]);
 }, { tries: 2 });
@@ -72,3 +72,37 @@ liteQueryFetcher({}, (ctx: { endpoint: number; key: any }) => String(ctx.endpoin
 
 // @ts-expect-error -- perEndpoint must be a function.
 liteQueryFetcher(pool, 'nope');
+
+// --- Batch 2 (1.0.1): failurePenaltyNs, latency clock, structural AbortLike, RunOptions ---
+
+// A latency balancer (PeakEWMA) is driven with a clock; failurePenaltyNs is an optional number.
+const peInflight = new Uint32Array(4);
+const pe = new PeakEwmaBalancer(4, new Uint8Array(4), peInflight, 1e6);
+const pePool: Pool = new Pool(pe, peInflight);
+let peNow = 0;
+const p6: Promise<number> = pePool.run((endpoint: number) => endpoint, {
+    clock: () => (peNow += 1000),
+    tries: 2,
+    failurePenaltyNs: 5e8,
+});
+void p6;
+
+// @ts-expect-error -- failurePenaltyNs must be a number.
+pool.run((endpoint: number) => endpoint, { failurePenaltyNs: 'slow' });
+
+// RunOptions is exported and structurally usable; signal is the structural AbortLike.
+const opts: RunOptions = { tries: 3, failurePenaltyNs: 1e9 };
+const sig: AbortLike = ac.signal;   // a real AbortSignal satisfies the structural AbortLike
+void opts; void sig;
+
+// liteQueryFetcher forwards a clock + failurePenaltyNs for a latency balancer.
+const latFetcher = liteQueryFetcher(pePool, (ctx: { endpoint: number; key: any; signal?: AbortLike }) => {
+    void ctx.signal; void ctx.key;
+    return ctx.endpoint;
+}, { tries: 2, clock: () => (peNow += 1000), failurePenaltyNs: 5e8 });
+const latOut: Promise<number> = latFetcher({ key: ['k'] });
+void latOut;
+
+// AbortLike carries an optional reason (thrown by run() when a pre-aborted signal has one).
+const abortReason: unknown = ({ aborted: true, reason: new Error('x') } as AbortLike).reason;
+void abortReason;

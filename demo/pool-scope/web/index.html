@@ -26,6 +26,16 @@
   if (q.has('nosketch')) globalThis.POOL_SCOPE_NO_SKETCH = 1;
   if (q.has('noadaptive')) globalThis.POOL_SCOPE_NO_ADAPTIVE = 1;
 </script>
+<!--
+  L25: every specifier is pinned to an EXACT version (no ^ / ~ / latest). Subresource-integrity
+  entries are deliberately OMITTED: esm.sh does not serve byte-stable bodies for a bare
+  `@pkg@version` URL -- it proxies/rebuilds the module and 302-redirects to an internal hashed,
+  build-tagged URL (e.g. /v135/...) that changes independently of the package version, so any SRI
+  hash pinned here would be wrong on the next esm.sh rebuild (a broken page), not a security gain.
+  We therefore do not add hashes we cannot compute stably. For a hardened deployment, vendor these
+  four modules locally and add real integrity= then. The page also degrades VISIBLY (see #cdn-error
+  below) if a CDN module fails to load, rather than showing a blank screen.
+-->
 <script type="importmap">
 {
   "imports": {
@@ -35,6 +45,20 @@
     "@zakkster/lite-adaptive": "https://esm.sh/@zakkster/lite-adaptive@1.0.0"
   }
 }
+</script>
+<script>
+  // Visible CDN-failure degradation (L25): reveal a banner instead of leaving a blank page if a
+  // module fails to load. Three signals: a <script>/<link> load error, an esm.sh/dynamic-import
+  // error/rejection, and a definitive readiness check (main.mjs sets __poolScopeReady when it starts).
+  function poolScopeCdnError() { var b = document.getElementById('cdn-error'); if (b) b.hidden = false; }
+  addEventListener('error', function (e) {
+    var t = e && e.target;
+    if (t && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) { poolScopeCdnError(); return; }
+    var f = '' + (e && (e.filename || e.message || ''));
+    if (f.indexOf('esm.sh') >= 0 || f.indexOf('dynamically imported module') >= 0) poolScopeCdnError();
+  }, true);
+  addEventListener('unhandledrejection', function () { poolScopeCdnError(); });
+  setTimeout(function () { if (!globalThis.__poolScopeReady) poolScopeCdnError(); }, 6000);
 </script>
 
 <style>
@@ -200,6 +224,18 @@ select.ctl { font-family: var(--mono); background: var(--bg2); color: var(--text
 
 canvas.fallback { display: block; width: 100%; height: 100%; }
 
+/* CDN-failure banner (L25): hidden until a module fails to load, then a calm amber alert. */
+.cdn-error {
+  margin: 0 0 0.9rem; padding: 0.7rem 0.9rem; border-radius: var(--r);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  background: #131922;
+  background: color-mix(in oklab, var(--amber) 12%, var(--bg1));
+  font-size: 0.85rem; line-height: 1.4;
+}
+.cdn-error code { color: var(--text); }
+.cdn-error[hidden] { display: none; }
+
 footer.foot { margin-top: 1.25rem; color: var(--faint); font-size: 0.76rem; border-top: 1px solid var(--line); padding-top: 0.7rem; }
 footer.foot code { color: var(--dim); }
 
@@ -210,6 +246,12 @@ footer.foot code { color: var(--dim); }
 </style>
 </head>
 <body>
+<div class="cdn-error" id="cdn-error" role="alert" hidden>
+  A CDN module failed to load (esm.sh may be blocked, rate-limited, or offline). This page loads
+  <code>@zakkster/lite-signal</code> and the chart libs from esm.sh; the charts fall back to a built-in
+  canvas renderer, but the reactive core must load for the page to run. Check your network or
+  content-security policy and reload &mdash; or vendor the modules locally.
+</div>
 <header class="scope-head">
   <h1>POOL SCOPE</h1>
   <span class="subtitle">decision monitor (not resource monitor) &mdash; <span id="head-workers">12</span> workers &mdash; browser target</span>

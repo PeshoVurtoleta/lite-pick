@@ -30,7 +30,8 @@ export const STRATEGIES = [
 ];
 
 const DEFAULT_N = 12;
-const DEFAULT_CONC = 72;          // target concurrent in-flight (per-worker ~6 at N=12; keeps weighted top workers < SAT)
+/** Default target concurrent in-flight (per-worker ~6 at N=12; keeps weighted top workers < SAT). */
+export const DEFAULT_CONC = 72;
 const PEND = 512;                 // pending-request slot pool (power of two, >> CONC)
 // The simulated clock advances 1 UNIT per tick and is kept in V8 SMI range (never a boxed HeapNumber),
 // so PeakEWMA's clock arithmetic on the hot path stays 0-alloc -- a large ns-magnitude clock would box
@@ -42,7 +43,7 @@ const TAU_NS = 20;                // PeakEWMA half-life (tick units)
 const M_TABLE = 65537;            // Maglev table size for the keyed strategies (prime; even spread)
 const EPS = 0.25;                 // BoundedLoad slack
 
-const OVERLOAD_PIN = 26;          // overloadSpike pins inflight here (> detectors OVERLOAD_SAT 16)
+const OVERLOAD_PIN = 26;          // overloadSpike pins inflight here (> detectors OVERLOAD_SAT 18)
 const OVERLOAD_SERVICE = 40;      // extra service ticks a spiked worker takes (fattens the tail too)
 const PP_HI = 14;                 // ping-pong square-wave high / low (both < SAT: no false overload)
 const PP_LO = 2;
@@ -479,8 +480,12 @@ export class Driver {
         for (let s = 0; s < PEND; s++) {
             if (this.sActive[s] && this.sDue[s] <= t) {
                 const w = this.sWorker[s];
-                if (this.inflight[w] > 0) this.inflight[w] = this.inflight[w] - 1;
-                if (this.hasNote) this.balancer.note(w, -1);
+                // Decrement in lockstep: call note(-1) ONLY when a decrement actually happened, so a
+                // counter already at 0 never desyncs BoundedLoad's totalInflight (M-D3).
+                if (this.inflight[w] > 0) {
+                    this.inflight[w] = this.inflight[w] - 1;
+                    if (this.hasNote) this.balancer.note(w, -1);
+                }
                 const rtt = t - this.sDisp[s];
                 this.latRing[this.latHead] = rtt;
                 this.latHead = (this.latHead + 1) & 511;
@@ -537,9 +542,18 @@ export class Driver {
         }
 
         // ---- enforce synthetic pins / ceilings (overload, ping-pong) -------------------
+        // Apply each clamp as a DELTA through note() alongside the inflight write, so BoundedLoad's
+        // owned totalInflight tracks sum(inflight) exactly instead of drifting (M-D3). pin is a floor,
+        // ceil is a cap; both may apply (ceil wins if pin > ceil, matching the old write order).
         for (let i = 0; i < this.cap; i++) {
-            if (this.pin[i] > 0 && this.inflight[i] < this.pin[i]) this.inflight[i] = this.pin[i];
-            if (this.ceil[i] >= 0 && this.inflight[i] > this.ceil[i]) this.inflight[i] = this.ceil[i];
+            let target = this.inflight[i];
+            if (this.pin[i] > 0 && target < this.pin[i]) target = this.pin[i];
+            if (this.ceil[i] >= 0 && target > this.ceil[i]) target = this.ceil[i];
+            const delta = target - this.inflight[i];
+            if (delta !== 0) {
+                this.inflight[i] = target >>> 0;
+                if (this.hasNote) this.balancer.note(i, delta);
+            }
         }
 
         // ---- decay the rolling share window (slow, so the share metric is smooth) -------

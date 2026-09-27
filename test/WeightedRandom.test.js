@@ -243,3 +243,15 @@ test('A9: an eligibility flap NEVER rebuilds the alias table (anti-flap)', () =>
     b.setWeight(0, 42);                                 // a reweight DOES rebuild (sole writer)
     assert.equal(b._builds, buildsAfterCtor + 1);
 });
+
+test('M1: setWeight rejects a non-integer/out-of-range index; no rebuild, caller weights unchanged', () => {
+    const weights = Uint32Array.from([1, 2, 3, 4]);
+    const b = new WeightedRandomBalancer(4, up(4), weights);
+    const builds = b._builds;
+    const before = Uint32Array.from(weights);
+    for (const bad of [1.5, NaN, -1, '2', 4]) {
+        assert.throws(() => b.setWeight(bad, 9), RangeError, 'setWeight(' + String(bad) + ')');
+    }
+    assert.equal(b._builds, builds, 'a rejected setWeight must not rebuild the alias table');
+    assert.deepEqual(Uint32Array.from(weights), before, 'caller weights unchanged after a rejected setWeight');
+});

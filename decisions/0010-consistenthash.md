@@ -87,3 +87,12 @@ brought to the in-process hop AWS never sees. Several forks had to be settled.
 - The disruption anchor (test/balance.mjs, benchmark/Disruption.mjs): removing 1 of 64 backends remaps
   ~1.6% of 1e5 keys (<= 2/N = 3.13%), versus the naive-modulo foil's ~98% -- the trap quantified.
 - Bound: O(1) per pick (modulo + table read + bounded probe), 0 B/op. Build is O(M x N), COLD, disclosed.
+
+## Amended in 1.0.1 (2026-09-27) -- clarify the cold-path allocation (audit L14)
+
+"No allocation on any path" (Fork 4) is scoped to the `chMix32` permutation MATH, which allocates
+nothing. To be exact for the honest-cost table: the weights ARE copied into a balancer-owned array
+at construction (Fork 4 already says so), and each `_build` / `setWeight` / `rebuild` allocates the
+Maglev table (`M x 4` bytes) PLUS the populate scratch (a few `Int32Array(N)` + a `Uint8Array(M)`),
+so a rebuild leaves cold garbage. This is a COLD-path cost only; `pick()` remains 0 B/op. The
+README honest-cost table is corrected to match (it no longer says weight views are "never copied").

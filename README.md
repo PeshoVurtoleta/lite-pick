@@ -21,7 +21,7 @@ The npm landscape has old algorithm libraries (`load-balancers`, `loadbalance`, 
 - **Two pieces of evidence, both shipped.** A **0 B/op** witness on the pick path (no object, closure, string, or array created per pick), and a measured **balance-quality anchor** -- peak-to-average load within the strategy's theoretical ceiling (for P2C, the Azar-Broder-Karlin-Upfal `ln ln n / ln 2` bound) and strictly better than a random foil.
 - **A pure selector, not a proxy.** It **consumes** health and circuit state; it never owns them. Health is a shared read-only bitmap written by [`@zakkster/lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health); circuit state comes from [`@zakkster/lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart); load counters are caller-owned typed arrays. `pick()` only reads.
 
-> **Status: M10 (v1.0.0) -- the roster-complete release.** Ships the substrate seams **plus all ten strategies: `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family, the latency-aware `PeakEwmaBalancer`, the sticky/affinity `ConsistentHashBalancer` (a Maglev table), the hotspot-protecting `BoundedLoadBalancer` (consistent hashing with bounded loads), and `WeightedRandomBalancer` (O(1) Vose alias-table sampling with rejection-sampling eligibility)**, the **`@zakkster/lite-pick/pool`** request layer (with opt-in latency-feedback, occupancy-feedback, and keyed-routing hooks), the **benchmark suite** -- the balance anchor + GC blast-radius headlines, a seeded/version-stamped `results.json`, a `bench:verify` drift check with teeth, and the vs-AWS positioning (see *Evidence* below) -- and the **[GUIDE.md](./GUIDE.md)** strategy-selection capstone. This session APPENDS one class: the other strategies in `Pick.js` are byte-identical, only the header roster/count and the `VERSION` stamp change. Every strategy is gated: `pick()` proven **0 B/op** (torture + PerfGate), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), **SED tracks weight within 1%**, **PeakEWMA steers around a 10x-slow node** (it takes <= 25% of P2C's share for it and cuts service p99), **ConsistentHash remaps only ~1.6% of keys on a scale event** (vs ~98% for naive modulo), **BoundedLoad tames a hotspot plain consistent hashing can't** (under a skewed key stream ConsistentHash spikes a hot backend to ~13x the mean occupancy while BoundedLoad's `(1+eps)` cap holds it near the mean by overflowing to neighbours), and **WeightedRandom holds every node's share within 2% of its weight** while its O(1) alias sample beats an O(n) cumsum foil by >=3x ops/ms at n=4096 -- all held under a **seeded invariant fuzzer** (`test/fuzz.mjs`) that checks state-synchronisation after *every* op. Roster complete **for now, not closed** (AZ-aware routing, hedging, subsetting are post-1.0). See [ROADMAP.md](./ROADMAP.md), and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), the RoundRobin (0003), SmoothWRR (0004), P2C (0005), LeastConn-family (0006), pool-adapter (0007), benchmark-suite (0008), PeakEWMA (0009), ConsistentHash (0010), BoundedLoad/CHBL (0011), and WeightedRandom (0012) design forks.
+> **Status: v1.0.1 -- the audit bug-fix release (see CHANGELOG and decisions/0013) on top of M10 (v1.0.0), the roster-complete release.** Ships the substrate seams **plus all ten strategies: `RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, the exact `LeastConnBalancer` / `SedBalancer` / `NqBalancer` family, the latency-aware `PeakEwmaBalancer`, the sticky/affinity `ConsistentHashBalancer` (a Maglev table), the hotspot-protecting `BoundedLoadBalancer` (consistent hashing with bounded loads), and `WeightedRandomBalancer` (O(1) Vose alias-table sampling with rejection-sampling eligibility)**, the **`@zakkster/lite-pick/pool`** request layer (with opt-in latency-feedback, occupancy-feedback, and keyed-routing hooks), the **benchmark suite** -- the balance anchor + GC blast-radius headlines, a seeded/version-stamped `results.json`, a `bench:verify` drift check with teeth, and the vs-AWS positioning (see *Evidence* below) -- and the **[GUIDE.md](./GUIDE.md)** strategy-selection capstone. Every strategy is gated: `pick()` **allocates 0 B/op** (PerfGate scavenge counting) and **retains 0 B/op** (torture), RoundRobin **perfectly fair** with **zero dead picks** vs the naive `i++ % n` foil, SmoothWRR **exactly weighted** and **smooth**, **P2C proves the `ln ln n` balance ceiling** (peak-to-mean gap ~2 vs a random foil's ~21 at n=1024), **LeastConn is greedy-perfect** (max-minus-min load <= 1), **SED tracks weight within 1%**, **PeakEWMA steers around a 10x-slow node** (it takes <= 25% of P2C's share for it and cuts service p99), **ConsistentHash remaps only ~1.6% of keys on a scale event** (vs ~98% for naive modulo), **BoundedLoad tames a hotspot plain consistent hashing can't** (under a skewed key stream ConsistentHash spikes a hot backend to ~13x the mean occupancy while BoundedLoad's `(1+eps)` cap holds it near the mean by overflowing to neighbours), and **WeightedRandom holds every node's share within 2% of its weight** while its O(1) alias sample beats an O(n) cumsum foil by >=3x ops/ms at n=4096 -- all held under a **seeded invariant fuzzer** (`test/fuzz.mjs`) that checks state-synchronisation after *every* op. Roster complete **for now, not closed** (AZ-aware routing, hedging, subsetting are post-1.0). See [ROADMAP.md](./ROADMAP.md), and [decisions/](./decisions) for the ownership boundary (ADR 0001), anti-flapping (ADR 0002), the RoundRobin (0003), SmoothWRR (0004), P2C (0005), LeastConn-family (0006), pool-adapter (0007), benchmark-suite (0008), PeakEWMA (0009), ConsistentHash (0010), BoundedLoad/CHBL (0011), and WeightedRandom (0012) design forks.
 
 ```bash
 npm install @zakkster/lite-pick
@@ -32,11 +32,14 @@ npm install @zakkster/lite-pick
 ```js
 import { RoundRobinBalancer, PICK_NONE } from '@zakkster/lite-pick';
 
-// A pool of 4 endpoints. The eligibility view is SHARED and read-only to pick():
-// lite-di-health probes / circuit breakers write it; the balancer only reads it.
+// A pool of 4 endpoints. The eligibility view is read-only to pick(); at runtime it is
+// flipped only through setEligible (lite-di-health / a breaker drives that call).
 const eligible = Uint8Array.from([1, 1, 0, 1]); // endpoint 2 is down
 
 const rr = new RoundRobinBalancer(4, eligible);
+// After construction, flip nodes via rr.setEligible(i, up) -- the only supported writer
+// (a direct eligible[i] = 0 at runtime desyncs the cached live count). Each balancer
+// gets its own eligibility array.
 
 rr.pick();            // -> 0
 rr.pick();            // -> 1
@@ -90,7 +93,7 @@ const p2c = new P2cBalancer(4, eligible, inflight);
 
 const i = p2c.pick();                           // the lower-loaded of two random eligibles
 inflight[i]++;                                  // you increment on dispatch...
-// ...and inflight[i]-- when the request settles (the M5 lite-query adapter will do this)
+// ...and inflight[i]-- when the request settles (or use @zakkster/lite-pick/pool, which does this)
 ```
 
 The proof (from `test/balance.mjs`, the library's analytical anchor):
@@ -148,7 +151,7 @@ import { PeakEwmaBalancer } from '@zakkster/lite-pick';
 
 const eligible = Uint8Array.from([1, 1, 1, 1]);
 const inflight = new Uint32Array(4);          // YOU own this; read live by pick()
-const TAU_NS = 30e6;                          // EWMA half-life: 30ms of latency memory
+const TAU_NS = 30e6;                          // EWMA TIME CONSTANT: 30ms of latency memory (half-life = tau x ln2)
 
 // `now` and rtt samples are CALLER-supplied nanoseconds -- deterministic, testable, zero-GC.
 const pe = new PeakEwmaBalancer(4, eligible, inflight, TAU_NS);
@@ -161,10 +164,11 @@ inflight[i]--;                                  // settle
 pe.recordRtt(i, perfNs() - now, perfNs());      // feed the observed rtt back (the warm path)
 ```
 
-- **Decay-on-read.** `pick()` *never writes* -- it applies exponential decay when it reads (`ewmaAt(i, now) = _ewma[i] x exp(-(now - _stamp[i]) / tau)`), so the hot path is a pure read and allocates nothing.
-- **The peak rule.** `recordRtt` *snaps the cost up* to a larger sample instantly (a spike is felt on the next pick) and *decays it down* over `~tau`. The half-life **is** the anti-flap smoothing -- no extra dwell ([ADR 0002](./decisions/0002-anti-flapping.md)).
-- **Balancer-owned state.** `inflight` is your live-read `Uint32Array`; the EWMA arrays are owned by the balancer and written *only* by `recordRtt`. Cold start seeds the EWMA to `1.0` with an *unsampled* sentinel (`_stamp = -1`): an unsampled node scores at its undecayed baseline, so before any sample PeakEWMA degrades gracefully to least-connections **regardless of your clock's magnitude** -- never underflowing to `0` (which a plain `_stamp = 0` would, as `exp(-now/tau)`, under a real large clock) and never `NaN`. The first `recordRtt` initializes the EWMA *exactly* to the sample; the peak rule applies from the second sample on.
-- **`now` must be finite.** `now` (for `pick(now)` / `recordRtt`) and `sampleNs` must be finite numbers. `recordRtt` throws on a non-finite argument; `pick(now)` never throws (the fail-closed contract), so a non-finite `now` yields P2C-random selection rather than an error.
+- **Decay-on-read.** `pick()` *never writes* -- it applies exponential decay when it reads (`ewmaAt(i, now) = _ewma[i] x exp(-max(now - _stamp[i], 0) / tau)`, `dt` clamped `>= 0` so a non-monotonic clock never inflates the estimate), so the hot path is a pure read and allocates 0 B/op.
+- **The peak rule.** `recordRtt` *snaps the cost up* to a larger sample instantly (a spike is felt on the next pick) and *decays it down* over `~tau`. `tau` is the EWMA **time constant** (half-life = `tau x ln2`); it **is** the anti-flap smoothing -- no extra dwell ([ADR 0002](./decisions/0002-anti-flapping.md)).
+- **Cold-start and hung-node pricing (1.0.1).** `inflight` is your live-read `Uint32Array`; the EWMA state (`_ewma` / `_stamp`) is **balancer-owned** and written *only* by `recordRtt`. Cost per candidate is three cases: an unsampled node costs **0 while idle** (graceful least-connections; it holds one probe request at a time until its first sample) and the pool's **lifetime mean sampled rtt once busy** (so a cold-but-busy node is not mistaken for a 1.0 ns node); a sampled node costs `(inflight + 1) x max(decayedEWMA, dt-while-busy)`, so a hung node (`dt` grows, no completion) gets **more** expensive over time, not less. Never `NaN`. A node that never records a sample (fails fast, caller records nothing) keeps winning while idle -- record failures too (the `/pool` layer does, see below). CAVEAT: an idle-then-busy node is priced by time-since-last-response until that response completes (an exact busy-since stamp is a 1.1.0 item).
+- **`now` must be finite.** `now` (for `pick(now)` / `recordRtt`) and `sampleNs` must be finite numbers. `recordRtt` throws on a non-finite argument (a non-integer or out-of-range index throws `RangeError`); `pick(now)` never throws (the fail-closed contract), so a non-finite `now` yields P2C-random selection rather than an error.
+- **KNOWN LIMITATION (1.0.1; buffer-based API planned for 1.1.0).** `pick(now)` / `recordRtt(..., now)` take `now` as a plain number argument. When the call is not inlined, V8 boxes a non-small-integer value into a ~16 B transient `HeapNumber` -- so a realistic nanosecond clock makes these ~16 B/op (transient, does not retain, does not force a major GC). Integer arguments within V8's small-integer range are 0 B/op; that range is build-dependent (below 2^31 on stock 64-bit Node, below 2^30 on pointer-compressed builds such as Chrome/Electron), and a value produced by `%` or division can box even when its value is a small integer. Buffer-based variants that keep `now` in a `Float64Array` slot are planned for 1.1.0.
 
 The proof (from `test/balance.mjs`, a closed-loop queue sim with one node at 10x service time):
 
@@ -206,7 +210,7 @@ function fnv1a(s) { let h = 0x811c9dc5; for (let k = 0; k < s.length; k++) { h ^
 
 ## BoundedLoad -- consistent hashing with bounded loads (v0.9.0)
 
-Plain consistent hashing is sticky and minimally-disruptive, but it has one failure mode: a **hot key**. If a handful of keys carry most of the traffic, consistent hashing pins each one's *entire* load on its one hashed backend -- an unbounded **hotspot**. `BoundedLoadBalancer` is [`ConsistentHashBalancer`](#consistenthash--sticky--cache-affinity-routing-v080) (the Maglev table) **plus a per-backend occupancy cap** `cap = (1 + eps) x mean` (the mean occupancy `_total / live`, with slack `eps`): a key sticks to its hashed home **unless** that backend is over cap, in which case the request **overflows** along the same bounded probe to the next eligible, under-cap backend (Mirrokni et al. *Consistent Hashing with Bounded Loads*, Google Research; Vimeo's `eps = 0.25` -- [ADR 0011](./decisions/0011-boundedload.md)). You keep stickiness + minimal disruption **and** gain the hotspot protection consistent hashing lacks.
+Plain consistent hashing is sticky and minimally-disruptive, but it has one failure mode: a **hot key**. If a handful of keys carry most of the traffic, consistent hashing pins each one's *entire* load on its one hashed backend -- an unbounded **hotspot**. `BoundedLoadBalancer` is [`ConsistentHashBalancer`](#consistenthash--sticky--cache-affinity-routing-v080) (the Maglev table) **plus a per-backend occupancy cap** `cap = ceil((1 + eps) x (total + 1) / live)` -- the load-bearing part is the `+ 1` that counts the **incoming** request (the Mirrokni-Thorup-Zadimoghaddam per-bin capacity), so the cap is always `>= 1`: a key sticks to its hashed home **unless** that backend is over cap, in which case the request **overflows** along the same bounded probe to the next eligible, under-cap backend (Mirrokni et al. *Consistent Hashing with Bounded Loads*, Google Research; Vimeo's `eps = 0.25` -- [ADR 0011](./decisions/0011-boundedload.md)). You keep stickiness + minimal disruption **and** gain the hotspot protection consistent hashing lacks. (Note: at small `eps` a second concurrent request for the same key still overflows the home until `(1+eps)(total+1)/live > 1`; a larger `eps` buys more low-load stickiness. HAProxy's `hash-balance-factor` shares the `+1` but splits one global slot budget by weight, which is stricter -- not the same definition.)
 
 ```js
 import { BoundedLoadBalancer } from '@zakkster/lite-pick';
@@ -225,7 +229,7 @@ inflight[i]--;   bl.note(i, -1);                 // settle: net-zero on both
 ```
 
 - **Sticky + overflow.** `pick(keyHash)` maps the integer key to its Maglev home; if that backend is under cap it wins (the common, sticky path). If it is over cap, the request overflows along the bounded probe to the first eligible, under-cap backend. If nothing in the window is under cap, it falls back to the first eligible seen -- **sticky wins; the cap is a soft preference, never a dead pick**. When `_total === 0` the cap is skipped entirely, so it behaves as pure `ConsistentHashBalancer`.
-- **`note()` is the sole writer of the mean.** BoundedLoad **owns** a running occupancy sum `_total` and keeps it O(1)-current through `note(i, +1)` on dispatch / `note(i, -1)` on settle -- so the cap's mean never needs a scan; `inflight` is your live-read per-backend occupancy. **Contract:** mutate the mirrored counter **only** through `note()` (or the `/pool` adapter, which does it for you) -- direct mutation desyncs `_total` (UB, the same asymmetry `SmoothWRRBalancer` has for its weights). `note()` clamps `_total` at 0, and `totalInflight` exposes it.
+- **`note()` maintains the running sum.** BoundedLoad **owns** a running occupancy sum `_total` and keeps it O(1)-current through `note(i, +1)` on dispatch / `note(i, -1)` on settle -- so the cap's mean never needs a scan; `inflight` is your live-read per-backend occupancy. **Contract:** update `inflight[i]` **and** call `note(i, +/-1)` in **lockstep** (or drive it through the `/pool` adapter, which does both). `note` maintains `_total`; it does **not** write `inflight`. A direct `inflight` write without the matching `note` desyncs `_total` -- UB, the same asymmetry `SmoothWRRBalancer` has for its weights. `note()` clamps `_total` at 0, validates its index (`RangeError` on a non-integer / out-of-range), and `totalInflight` exposes the sum.
 - **Inherits the Maglev table.** It extends `ConsistentHashBalancer`, so `setWeight(i, w)` / `rebuild()` / `tableSize` and the whole weighted-Maglev build + bounded-probe walk are reused verbatim; the `weights` / `m` / `seed` constructor args are the same. `pick()` and `note()` are both **0 B/op**, `O(1)`. `PICK_NONE` only when no eligible backend is reachable in the probe window -- never merely because backends are over cap.
 - **Why not "P2C with a cap"?** A note on the design (the honest one): power-of-two-choices over in-flight *plus* a `(1+eps) x mean` cap is **byte-identical to plain P2C** -- an under-cap draw always has lower in-flight than an over-cap one, so "prefer under-cap" and "lower-of-two" pick the same node. The cap is a no-op there. It is only *load-bearing* when the primary choice is fixed by something other than load -- a **hash**. That is CHBL, and it is why BoundedLoad is built on consistent hashing ([ADR 0011](./decisions/0011-boundedload.md)).
 
@@ -233,7 +237,7 @@ The proof (from `test/balance.mjs`, a Zipfian-skewed key stream over 64 backends
 
 | lane | mean occupancy | max backend occupancy |
 |---|---|---|
-| **BoundedLoad (CHBL)** | 10 | **13** (cap = 12.5 -- overflow holds it near the mean) |
+| **BoundedLoad (CHBL)** | 10 | **13** (cap = ceil((1+eps) x (total+1)/live) ~= 13 -- overflow holds it near the mean) |
 | ConsistentHash (no cap) | 10 | **129** (~13x -- the hotspot) |
 
 BoundedLoad caps the hot backend near `(1 + eps) x mean` while plain consistent hashing lets it run away, and both reroute only **~1.6%** of keys on a scale event (`test/balance.mjs`). See [`ConsistentHashBalancer`](#consistenthash--sticky--cache-affinity-routing-v080) above for the integer-key contract and the FNV-1a helper.
@@ -272,11 +276,11 @@ The proof (from `test/balance.mjs`, n=64, skewed weights 1..16, 8e6 seeded draws
 
 ## Evidence -- the two headlines (v0.6.0 benchmark suite)
 
-> **Framing: parity on speed, superiority on the contract + balance + tail.** A trivial `i++ % n` round-robin -- or `wrr` -- *matches* P2C on raw ops/sec, so `lite-pick` does **not** claim "N times faster." Throughput is claimed at **parity**; the wins are **zero-GC**, **balance quality**, **tail latency** (GC blast-radius), and **never a dead pick**. Every number below is **seeded** and regenerated by `npm run bench:report`; `npm run bench:verify` fails CI if a README number drifts from a fresh run (algorithmic exact, timing within +/-15%). Node / CPU / OS / every PRNG seed are stamped into `benchmark/results.json`.
+> **Framing: parity on speed, superiority on the contract + balance + tail.** A trivial `i++ % n` round-robin -- or `wrr` -- *matches* P2C on raw ops/sec, so `lite-pick` does **not** claim "N times faster." Throughput is claimed at **parity**; the wins are **zero-GC**, **balance quality**, **tail latency** (GC blast-radius), and **never a dead pick**. Every number below is **seeded** and regenerated by `npm run bench:report`. `npm run bench:verify` fails CI if a README number drifts from source: the balance and disruption tables are RE-MEASURED fresh each run and must match exactly; the GC and competitor throughput numbers are compared against the stored `benchmark/results.json` (exact for the 0-major / 0 B/op lanes, timing within +/-15%) and are NOT re-timed. `results.json` was recorded on one machine (see its env stamp); re-run `npm run bench:report` to refresh it.
 
 ### Throughput parity vs the incumbents (ops/ms, same pool)
 
-The real pinned npm incumbents (`load-balancers`, `loadbalance`, `wrr`) run through the **same** harness on the **same** `n=1024` pool as the matching `lite-pick` strategy of the **same complexity class** -- ops/ms side by side, not a winner. On the same-work P2C row `lite-pick` holds parity (59591 vs 60956). On the RoundRobin row `lite-pick` is ~22% slower (260168 vs 334541), and that gap is owned, not hidden: `loadbalance@1.0.0` is a bare `i++ % n` with no liveness, while `lite-pick`'s `RoundRobinBalancer` forward-scans the eligibility bitmap to skip down nodes -- so it never returns a dead pick. That scan is the constant-factor cost of a guarantee none of these incumbents offer. `lite-pick` claims parity only where the work is equal; where it is slower, it is slower for the liveness contract, and the balance + tail wins above are the reason to pay it. The weighted-random row is a disclosed **SKIP**: `lite-pick`'s O(1) weighted-random (`WeightedRandom`, alias table) lands at **M10**, so it is not raced against here -- our shipped `SmoothWRRBalancer` is O(cap) *smooth* weighted round-robin (a different, stronger-smoothness guarantee), whose throughput is measured by `npm run witness` and `npm run bench`, not force-fit into this parity table.
+The real pinned npm incumbents (`load-balancers`, `loadbalance`, `wrr`) run through the **same** harness on the **same** `n=1024` pool as the matching `lite-pick` strategy of the **same complexity class** -- ops/ms side by side, not a winner (exact ops/ms are in the table below and stamped in `results.json`). On the same-work P2C row `lite-pick` holds parity. On the RoundRobin row `lite-pick` is a little slower, and that gap is owned, not hidden: `loadbalance@1.0.0` is a bare `i++ % n` with no liveness, while `lite-pick`'s `RoundRobinBalancer` forward-scans the eligibility bitmap to skip down nodes -- so it never returns a dead pick. That scan is the constant-factor cost of a guarantee none of these incumbents offer. The weighted-random row now races the **shipped** `WeightedRandomBalancer` (M10, alias table) against `wrr@1.0.0`, and here `lite-pick` is the slower one -- about **2.3x** below `wrr` on this row. That is owned too: `wrr@1.0.0` is a bare weight-expansion cursor with no eligibility filter and no PRNG, while `WeightedRandomBalancer` draws from a Vose alias table AND applies rejection-sampling eligibility over the shared bitmap on every pick (so it never returns a down or weight-0 node) -- the eligibility contract and the O(1)-at-any-pool-size sample are what you pay for. `lite-pick` claims parity only where the work is equal; where it is slower, it is slower for the liveness contract, and the balance + tail wins above are the reason to pay it.
 
 <!-- bench:competitors -->
 
@@ -310,7 +314,7 @@ The point of zero-GC is **not** the pick's own latency -- a major GC pause freez
 
 <!-- bench:gc -->
 
-| lane | major GC | pick B/op | max GC pause (ms) |
+| lane | major GC | pick retained B/op | max GC pause (ms) |
 | --- | --- | --- | --- |
 | lite-pick | 0 | 0 | 0.2 |
 | allocating foil | 13 | allocates | 1.8 |
@@ -338,11 +342,11 @@ On a scale event (add / remove a node), what fraction of keys keep their node? T
 
 | operation | when | allocates |
 | --- | --- | --- |
-| `new <Strategy>Balancer(...)` | construction, once | the balancer object + its owned accumulators (SmoothWRR's Float64 `current`). The eligibility / inflight / weight views are **caller-owned**, never copied |
-| `new ConsistentHashBalancer(...)` / `rebuild()` / `setWeight()` | cold, on build / membership / reweight | the Maglev lookup table: **`M x 4` bytes** (`~256KB` at the `65537` default `M`), a one-time `Uint32Array` allocation + an `O(M x N)` populate. `M` is **configurable down** for small pools. A health flap does **not** rebuild -- the bounded probe absorbs it |
+| `new <Strategy>Balancer(...)` | construction, once | the balancer object + its owned state (SmoothWRR's Float64 `current`; PeakEWMA's `_ewma`/`_stamp`/lifetime-mean Float64 arrays -- **balancer-owned**, not caller-owned). The eligibility / inflight views stay caller-owned and are read live. **ConsistentHash / BoundedLoad COPY the weights** into a balancer-owned array |
+| `new ConsistentHashBalancer(...)` / `rebuild()` / `setWeight()` (ConsistentHash / BoundedLoad) | cold, on build / membership / reweight | the Maglev lookup table: **`M x 4` bytes** (`~256KB` at the `65537` default `M`), a `Uint32Array` allocation + an `O(M x N)` populate. Each `setWeight` / `rebuild` also allocates the populate SCRATCH (a few `Int32Array(N)` + a `Uint8Array(M)`), so a rebuild leaves cold garbage -- a **cold-path** cost, never on `pick()`. `M` is **configurable down** for small pools. A health flap does **not** rebuild -- the bounded probe absorbs it |
 | `setEligible(i, up)` | cold, on a health flip | **0** -- one byte write + an O(1) live-count adjust |
-| `setWeight(i, w)` (SmoothWRR) | cold, on reweight | **0** -- one array write + an O(1) eligible-total adjust |
-| `pick()` | **HOT**, per request | **0 B/op** -- proven by `torture` + `test:perf`, measured by `bench:gc` |
+| `setWeight(i, w)` (SmoothWRR) | cold, on reweight | **0** -- one array write + an O(1) eligible-total adjust (also resets the node's smoothing credit) |
+| `pick()` | **HOT**, per request | **allocates 0 B/op** (PerfGate scavenge counting), **retains 0 B/op** (torture). CAVEAT: `pick(now)` / `pick(keyHash)` box a non-small-integer number argument into a ~16 B transient `HeapNumber` when not inlined -- see the PeakEWMA / ConsistentHash sections; integer args in V8's small-integer range are 0 B/op |
 | `Pool.run(fn)` (`/pool`) | per request | a promise + one small `held` array -- an async wrapper, **not** the kernel path ([ADR 0007](./decisions/0007-pool-adapter.md)) |
 
 ### Complementary to AWS NLB / ALB (not a competitor)
@@ -364,8 +368,8 @@ The composition: inbound traffic still enters through your **ALB/NLB -> service*
 ```js
 import { BalancerBase, Prng, PICK_NONE, VERSION } from '@zakkster/lite-pick';
 
-// A pool of 4 endpoints. The eligibility view is SHARED and read-only to pick():
-// lite-di-health probes / circuit breakers write it; the balancer only reads it.
+// A pool of 4 endpoints. The eligibility view is read-only to pick(); at runtime it is
+// flipped only through setEligible (lite-di-health / a breaker drives that call).
 const eligible = Uint8Array.from([1, 1, 0, 1]); // endpoint 2 is down
 
 const base = new BalancerBase(4, eligible);
@@ -384,10 +388,10 @@ rng.nextBelow(4);     // -> a uint32 in [0, 4)
 rng.reset();          // replays the exact stream
 
 PICK_NONE;            // -> -1  (fail-closed sentinel: no endpoint, never a dead pick)
-VERSION;              // -> '0.9.0'
+VERSION;              // -> '1.0.1'
 ```
 
-`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`, `ConsistentHashBalancer`, `BoundedLoadBalancer`) extends it and reads the same shared eligibility view; you subclass it the same way to add your own.
+`BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`, `ConsistentHashBalancer`, `BoundedLoadBalancer`, `WeightedRandomBalancer`) extends it and reads the same eligibility view; you subclass it the same way to add your own. Flip eligibility only through `setEligible` (it keeps `live` exact) and give each balancer its own eligibility array (a shared `Eligibility` object is a 2.0 item).
 
 ## Wiring it up -- `@zakkster/lite-pick/pool` (v0.5.0)
 
@@ -416,7 +420,7 @@ const fetcher = liteQueryFetcher(pool,
 // query(qc, { key: ['users'], fetcher });
 ```
 
-**Two layers, no overlap** ([ADR 0007](./decisions/0007-pool-adapter.md)): the pool owns **spatial** failover (try a different endpoint *now*); your query cache owns **temporal** retry (backoff, staleness). `run()` is a normal async wrapper -- it adds O(1) counter ops per attempt, **it is not held to the kernel's 0 B/op bar** (that's `pick()`). See it end-to-end -- least-conn fan-out over a flaky pool with a node killed mid-run, proving 0 dead picks and 0 leaked in-flight:
+**Two layers, no overlap** ([ADR 0007](./decisions/0007-pool-adapter.md)): the pool owns **spatial** failover (try a genuinely different endpoint *now* -- it tracks the endpoints tried this run and stops when no untried eligible endpoint remains, so it never re-dispatches to a node that already failed); your query cache owns **temporal** retry (backoff, staleness). `run()` is a normal async wrapper -- it adds O(1) counter ops per attempt, **it is not held to the kernel's 0 B/op bar** (that's `pick()`). See it end-to-end -- least-conn fan-out over a flaky pool with a node killed mid-run, proving 0 dead picks and 0 leaked in-flight (from a clone of the repo; `demo/` is not in the published tarball):
 
 ```bash
 npm run demo
@@ -428,9 +432,10 @@ lite-pick owns **no mutable state it can avoid owning** ([ADR 0001](./decisions/
 
 | Concern | Owner | lite-pick's role |
 | --- | --- | --- |
-| Liveness / eligibility | `@zakkster/lite-di-health` writes a shared `Uint8Array` | **reads** it, zero-copy |
+| Liveness / eligibility | `@zakkster/lite-di-health` owns a `Uint8Array`, flips it via `setEligible` | **reads** it; `setEligible` is the only supported writer (a direct byte write desyncs the cached `live`) |
 | Circuit state | `@zakkster/lite-statechart` (consumed) | never built in; sees only the bit |
-| In-flight / rtt counters | caller-owned `Uint32Array` / `Float64Array` | **reads** them; pure `pick()` |
+| In-flight counters | caller-owned `Uint32Array` | **reads** them; pure `pick()` |
+| Latency / rtt (EWMA) state | **balancer-owned** `Float64Array` (`PeakEwmaBalancer`), written only by `recordRtt` | maintains it on the warm path; `pick()` decays on read |
 | Whole pool down | -- | fail-closed: returns `PICK_NONE` (-1) |
 | Routing flap | the layer that writes the shared view | hysteresis/dwell ([ADR 0002](./decisions/0002-anti-flapping.md)); `pick()` stays greedy |
 
@@ -438,7 +443,7 @@ lite-pick owns **no mutable state it can avoid owning** ([ADR 0001](./decisions/
 
 ## Composes with
 
-The moat is not the algorithms -- it is that lite-pick wires already-proven zero-GC parts of the suite: [`lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health) (liveness), [`lite-o1`](https://www.npmjs.com/package/@zakkster/lite-o1) (`RandomSet` / `AliasTable` / `RingLog` substrate), [`lite-logn`](https://www.npmjs.com/package/@zakkster/lite-logn) (exact least-conn heap / Fenwick weights), [`lite-lru`](https://www.npmjs.com/package/@zakkster/lite-lru) (sticky affinity), [`lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart) (breaker), [`lite-query`](https://www.npmjs.com/package/@zakkster/lite-query) (the fetcher adapter), and [`lite-await`](https://www.npmjs.com/package/@zakkster/lite-await) (hedging). **None is a hard dependency** -- each is an *optional peer* (`peerDependenciesMeta.optional`), every seam is duck-typed over a shared TypedArray, and the kernel runs with zero peers installed.
+The moat is not the algorithms -- it is that lite-pick wires already-proven zero-GC parts of the suite: [`lite-di-health`](https://www.npmjs.com/package/@zakkster/lite-di-health) (liveness), [`lite-o1`](https://www.npmjs.com/package/@zakkster/lite-o1) (`RandomSet` / `AliasTable` / `RingLog` substrate), [`lite-logn`](https://www.npmjs.com/package/@zakkster/lite-logn) (exact least-conn heap / Fenwick weights), [`lite-lru`](https://www.npmjs.com/package/@zakkster/lite-lru) (sticky affinity), [`lite-statechart`](https://www.npmjs.com/package/@zakkster/lite-statechart) (breaker), [`lite-query`](https://www.npmjs.com/package/@zakkster/lite-query) (the fetcher adapter), and [`lite-await`](https://www.npmjs.com/package/@zakkster/lite-await) (hedging). **None is a dependency of any kind** -- `dependencies`, `peerDependencies` and `peerDependenciesMeta` are all `{}`. Every seam is duck-typed over a shared TypedArray, so the kernel runs with nothing else installed; a peer would be declared only if a shipped code path imported one (none does today).
 
 ## Gates
 
@@ -447,15 +452,15 @@ Every strategy session must pass, no exceptions:
 ```bash
 npm test           # node:test boundary suite
 npm run test:types # tsc type-surface check (Pick.d.ts vs runtime)
-npm run torture    # lite-leak retention + lite-gc-profiler 0 B/op (needs --expose-gc)
-npm run test:perf  # lite-perf-gate HARD zero-alloc gate + a mustFail teeth-check
+npm run torture    # lite-leak retention + lite-gc-profiler: pick RETAINS 0 B/op (needs --expose-gc)
+npm run test:perf  # lite-perf-gate: pick ALLOCATES 0 B/op (scavenge counting) + a mustFail teeth-check
 npm run witness    # pick throughput flatness across a pool-size sweep
 npm run balance    # peak-to-average vs the strategy ceiling + random foil (the anchor)
 npm run fuzz       # seeded invariant fuzzer: state-sync invariants after every op
 npm run verify     # all of the above
 ```
 
-The zero-GC proof is two complementary tools kept separate (the suite's torture-harness discipline): a soak tester (`torture.mjs`, [`@zakkster/lite-leak`](https://www.npmjs.com/package/@zakkster/lite-leak) + [`@zakkster/lite-gc-profiler`](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)) and a node:test-native hard gate (`test/perf/PerfGate.test.mjs`, [`@zakkster/lite-perf-gate`](https://www.npmjs.com/package/@zakkster/lite-perf-gate)), which includes a `mustFail` scenario proving the instrument has teeth.
+The zero-GC proof is two complementary tools kept separate (the suite's torture-harness discipline): a **retention** soak (`torture.mjs`, [`@zakkster/lite-leak`](https://www.npmjs.com/package/@zakkster/lite-leak) + [`@zakkster/lite-gc-profiler`](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)) that proves `pick()` **retains** 0 B/op (it reports the retained B/op), and a node:test-native **allocation** gate (`test/perf/PerfGate.test.mjs`, [`@zakkster/lite-perf-gate`](https://www.npmjs.com/package/@zakkster/lite-perf-gate)) that proves `pick()` **allocates** 0 B/op by scavenge counting at a pinned 1 MB semi-space, and includes a `mustFail` scenario proving the instrument has teeth.
 
 ## License
 

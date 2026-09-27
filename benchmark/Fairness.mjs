@@ -16,6 +16,7 @@
  * Convergence + burstiness are ALGORITHMIC and seeded -- exact, reproducible, drift-checked.
  */
 
+import { pathToFileURL } from 'node:url';
 import { SmoothWRRBalancer, SedBalancer, PeakEwmaBalancer, P2cBalancer, WeightedRandomBalancer, Prng } from '../Pick.js';
 import { SEEDS } from './Matrix.mjs';
 
@@ -175,7 +176,7 @@ export function measureFairness() {
     };
 }
 
-if (import.meta.url === 'file://' + process.argv[1]) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     const r = measureFairness();
     const s = r.smoothwrr;
     process.stdout.write('lite-pick fairness (M6 dimension 8) -- weighted convergence + burstiness\n');

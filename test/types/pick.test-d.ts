@@ -225,3 +225,26 @@ new WeightedRandomBalancer(4, new Uint8Array(4), [1, 1, 1, 1]);
 
 // @ts-expect-error -- weights arg is required.
 new WeightedRandomBalancer(4, new Uint8Array(4));
+
+// --- Batch 2 (1.0.1): required pick() args + static channel markers ---
+
+// PeakEWMA is a LATENCY strategy: static LATENCY marker + pick(now) REQUIRES now.
+const peLat: true = PeakEwmaBalancer.LATENCY;
+void peLat;
+// @ts-expect-error -- pick(now) requires a numeric now.
+pe.pick();
+
+// ConsistentHash / BoundedLoad are KEYED: static KEYED marker (inherited) + pick(keyHash) REQUIRES keyHash.
+const chKeyed: true = ConsistentHashBalancer.KEYED;
+const blKeyed: true = BoundedLoadBalancer.KEYED;   // inherited from ConsistentHashBalancer
+void chKeyed; void blKeyed;
+// @ts-expect-error -- pick(keyHash) requires a numeric keyHash.
+ch.pick();
+// @ts-expect-error -- pick(keyHash) requires a numeric keyHash.
+bl.pick();
+
+// A keyed / latency subclass is still assignable to BalancerBase (base pick(arg?) accepts the arg).
+const peAsBase: BalancerBase = pe;
+const chAsBase: BalancerBase = ch;
+const blAsBase: BalancerBase = bl;
+void peAsBase; void chAsBase; void blAsBase;

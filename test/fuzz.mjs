@@ -61,7 +61,8 @@ const SPECS = {
         weighted: true, loadAware: false, usesSetWeight: true,
         make: (cap, el, _inf, w) => new SmoothWRRBalancer(cap, el, w),
         mass: (ctx) => recomputeEligibleWeight(ctx.el, ctx.weights, ctx.cap),
-        extra: (b, ctx) => {
+        extra: (b, ctx, p) => {
+            if (p !== PICK_NONE && ctx.weights[p] === 0) return 'SmoothWRR picked a weight-0 node ' + p;
             const want = recomputeEligibleWeight(ctx.el, ctx.weights, ctx.cap);
             if (b._totalEligibleWeight !== want) {
                 return '_totalEligibleWeight ' + b._totalEligibleWeight + ' != recomputed ' + want;
@@ -288,17 +289,33 @@ function pathological() {
         if (b._builds !== buildsAfterCtor + 1) fails.push('WeightedRandom setWeight did not rebuild exactly once');
     }
     // 3. Single node: every strategy returns it while up, PICK_NONE when down.
+    // Each balancer gets its OWN eligibility array -- a shared view desyncs each balancer's
+    // cached _live so setEligible no-ops and `live` goes stale (FINDINGS H2 / M-T4). The
+    // down-flip is driven ONLY through setEligible (the sole supported writer, never a direct
+    // byte write), and checkBase asserts base-invariant sync AFTER the flip.
     {
-        const el = new Uint8Array(1).fill(1), inf = new Uint32Array(1), w = new Uint32Array(1).fill(3);
-        const bs = [
-            new RoundRobinBalancer(1, el), new SmoothWRRBalancer(1, el, w), new P2cBalancer(1, el, inf),
-            new LeastConnBalancer(1, el, inf), new SedBalancer(1, el, inf, w), new NqBalancer(1, el, inf, w),
-            new PeakEwmaBalancer(1, el, inf, 1e6), new BoundedLoadBalancer(1, el, inf, 0.25, null, 2),
-            new WeightedRandomBalancer(1, el, w),
+        const inf = new Uint32Array(1), w = new Uint32Array(1).fill(3);
+        const makers = [
+            (el) => new RoundRobinBalancer(1, el),
+            (el) => new SmoothWRRBalancer(1, el, w),
+            (el) => new P2cBalancer(1, el, inf),
+            (el) => new LeastConnBalancer(1, el, inf),
+            (el) => new SedBalancer(1, el, inf, w),
+            (el) => new NqBalancer(1, el, inf, w),
+            (el) => new PeakEwmaBalancer(1, el, inf, 1e6),
+            (el) => new BoundedLoadBalancer(1, el, inf, 0.25, null, 2),
+            (el) => new WeightedRandomBalancer(1, el, w),
         ];
-        for (const b of bs) if (b.pick() !== 0) fails.push('single-node ' + b.constructor.name + ' did not return 0');
-        el[0] = 0;
-        for (const b of bs) { b.setEligible(0, false); if (b.pick() !== PICK_NONE) fails.push('single-node-down ' + b.constructor.name + ' did not fail closed'); }
+        for (const make of makers) {
+            const el = new Uint8Array(1).fill(1);           // this balancer's OWN eligibility view
+            const b = make(el);
+            if (b.pick() !== 0) fails.push('single-node ' + b.constructor.name + ' did not return 0');
+            b.setEligible(0, false);                        // flip through the sole writer, not el[0]=0
+            const p = b.pick();
+            if (p !== PICK_NONE) fails.push('single-node-down ' + b.constructor.name + ' did not fail closed (live=' + b.live + ')');
+            const base = checkBase(b, el, 1, p, 0);
+            if (base) fails.push('single-node-down ' + b.constructor.name + ' checkBase: ' + base);
+        }
     }
     // 4. ConsistentHash single-node (keyed pick): the sole backend for every key, PICK_NONE when down.
     {
@@ -324,6 +341,10 @@ const seeds = argSeed !== null
 
 let failed = false;
 process.stdout.write('lite-pick fuzz (M4: invariant state-machine attack)\n');
+// L21: print the discovery seed(s) on EVERY run (not only on failure) so a CI log records
+// exactly which random seed was exercised and a green run stays reproducible.
+process.stdout.write('  seeds: ' + seeds.map((s) => '0x' + (s >>> 0).toString(16)).join(' ') +
+    (argSeed !== null ? ' (replay)' : ' (fixed + random discovery + regression corpus)') + '\n');
 
 const pathFails = pathological();
 if (pathFails.length) { failed = true; for (const f of pathFails) process.stderr.write('  FAIL pathological: ' + f + '\n'); }

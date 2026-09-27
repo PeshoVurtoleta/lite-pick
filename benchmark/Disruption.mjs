@@ -19,6 +19,7 @@
  * fractions are EXACT and drift-checked by bench:verify.
  */
 
+import { pathToFileURL } from 'node:url';
 import { Prng, ConsistentHashBalancer } from '../Pick.js';
 import { SEEDS } from './Matrix.mjs';
 
@@ -88,7 +89,7 @@ export function measureDisruption() {
     return { keys: KEYS, seed: SEEDS.disruption, naiveModulo, consistentHash };
 }
 
-if (import.meta.url === 'file://' + process.argv[1]) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     const r = measureDisruption();
     process.stdout.write('lite-pick disruption (M6 dimension 7, Maglev measured at M8) -- ' + r.keys +
         ' keys, seed 0x' + r.seed.toString(16) + '\n');

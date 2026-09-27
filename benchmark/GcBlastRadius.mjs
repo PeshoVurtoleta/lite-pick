@@ -21,12 +21,25 @@
  * measureAllocs for the exact B/op line. Requires --expose-gc (measureAllocs + forced gc).
  */
 
+import { pathToFileURL } from 'node:url';
 import { buildWorkload, SEEDS } from './Matrix.mjs';
 import { P2cBalancer, PeakEwmaBalancer, Prng } from '../Pick.js';
 
 const CAP = 1024;          // a realistic downstream pool
 const REQUESTS = 2_000_000; // sustained request stream (enough churn to fill old gen)
 const PROBES = 2;          // power-of-two-choices d
+
+/**
+ * measureAllocs reports the bytes STILL ALIVE after a forced GC (min across batches): a
+ * RETENTION reading, NOT an allocation rate. `null` == "could not measure" is an unverified
+ * state -> fail closed (returned as null so the gate rejects it), NEVER coerced to 0 -- a
+ * silent 0 would land in results.json and be published verbatim in the README bench:gc fence
+ * (mirrors test/torture.mjs). A pick body that retains nothing per call reads 0.
+ */
+function retainedBytes(res) {
+    if (!res || res.bytesPerCall === null || res.bytesPerCall === undefined) return null;
+    return Math.max(0, Math.round(res.bytesPerCall));
+}
 
 /**
  * A "request" is one selection over the shared workload plus a tiny synchronous body,
@@ -150,14 +163,14 @@ export async function measureGcBlastRadius() {
     const lpTail = tailFromLat();
     const lpReport = checkNoGc(lpSum, { maxMajor: 0, maxPauseMs: 2 });
 
-    // Exact B/op on the lite-pick pick body (the 0 B/op claim, measured not asserted).
+    // Retained B/op on the lite-pick pick body (the 0-retained claim, measured not asserted).
     const bpWork = buildWorkload('skewed-cost', CAP, SEEDS.gc);
     const bpP2c = new P2cBalancer(CAP, bpWork.eligible, bpWork.inflight, SEEDS.p2c);
     let bpSink = 0;
     const bpStep = () => { bpSink = (bpSink + bpP2c.pick()) | 0; };
     const bpRes = measureAllocs(bpStep, { iterations: 100000, batches: 8 });
     void bpSink;
-    const lpBpop = Math.max(0, Math.round(bpRes.bytesPerCall === null ? 0 : bpRes.bytesPerCall));
+    const lpBpop = retainedBytes(bpRes);   // null on an unmeasured reading -> gate fails closed
 
     // --- PeakEWMA lane (latency-aware sibling; same 0 B/op contract) --------
     const peWork = buildWorkload('skewed-cost', CAP, SEEDS.gc);
@@ -168,14 +181,14 @@ export async function measureGcBlastRadius() {
     const peTail = tailFromLat();
     const peReport = checkNoGc(peSum, { maxMajor: 0, maxPauseMs: 2 });
 
-    // Exact B/op on the PeakEWMA pick + recordRtt bodies (the 0 B/op claim, measured).
+    // Retained B/op on the PeakEWMA pick + recordRtt bodies (the 0-retained claim, measured).
     const bpeWork = buildWorkload('skewed-cost', CAP, SEEDS.gc);
     const bpePe = new PeakEwmaBalancer(CAP, bpeWork.eligible, bpeWork.inflight, 1e9, SEEDS.p2c);
     let bpeSink = 0, bpeNow = 0;
     const bpeStep = () => { bpeNow += 1000; bpeSink = (bpeSink + bpePe.pick(bpeNow)) | 0; };
     const bpeRes = measureAllocs(bpeStep, { iterations: 100000, batches: 8 });
     void bpeSink;
-    const peBpop = Math.max(0, Math.round(bpeRes.bytesPerCall === null ? 0 : bpeRes.bytesPerCall));
+    const peBpop = retainedBytes(bpeRes);   // null on an unmeasured reading -> gate fails closed
 
     // --- allocating foil lane ----------------------------------------------
     const foilWork = buildWorkload('skewed-cost', CAP, SEEDS.gc);
@@ -217,21 +230,22 @@ export async function measureGcBlastRadius() {
     };
 }
 
-if (import.meta.url === 'file://' + process.argv[1]) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     const r = await measureGcBlastRadius();
     process.stdout.write('lite-pick GC blast-radius (M6 headline #2) -- n=' + r.cap +
         ', ' + r.requests + ' requests, seed 0x' + r.seed.toString(16) + '\n');
     const fmt = (x) => x.toFixed(3);
+    const showBpop = (b) => (b === null ? 'unmeasured(null)' : String(b));
     process.stdout.write('  lite-pick lane   major=' + r.litePick.major +
         ' minor=' + r.litePick.minor +
         ' maxPause=' + fmt(r.litePick.maxPauseMs) + 'ms' +
-        ' B/op=' + r.litePick.bpop +
+        ' retained B/op=' + showBpop(r.litePick.bpop) +
         ' | service p99.9=' + fmt(r.litePick.serviceP999Ms) + 'ms' +
         ' max=' + fmt(r.litePick.serviceMaxMs) + 'ms\n');
     process.stdout.write('  PeakEWMA lane    major=' + r.peakEwma.major +
         ' minor=' + r.peakEwma.minor +
         ' maxPause=' + fmt(r.peakEwma.maxPauseMs) + 'ms' +
-        ' B/op=' + r.peakEwma.bpop +
+        ' retained B/op=' + showBpop(r.peakEwma.bpop) +
         ' | service p99.9=' + fmt(r.peakEwma.serviceP999Ms) + 'ms' +
         ' max=' + fmt(r.peakEwma.serviceMaxMs) + 'ms\n');
     process.stdout.write('  allocating foil  major=' + r.foil.major +
@@ -240,14 +254,15 @@ if (import.meta.url === 'file://' + process.argv[1]) {
         ' | service p99.9=' + fmt(r.foil.serviceP999Ms) + 'ms' +
         ' max=' + fmt(r.foil.serviceMaxMs) + 'ms\n');
 
+    // bpop === 0 rejects a null (unmeasured) reading too: null === 0 is false -> fail closed.
     const lpOk = r.litePick.major === 0 && r.litePick.bpop === 0 &&
         r.litePick.maxPauseMs <= 2 && r.litePick.gateOk;
     const peOk = r.peakEwma.major === 0 && r.peakEwma.bpop === 0 &&
         r.peakEwma.maxPauseMs <= 2 && r.peakEwma.gateOk;
     const foilOk = r.foil.major >= 1;
-    process.stdout.write('  lite-pick lane (maxMajor 0 / 0 B/op / maxPause<=2ms) -> ' +
+    process.stdout.write('  lite-pick lane (maxMajor 0 / 0 retained B/op / maxPause<=2ms) -> ' +
         (lpOk ? 'PASS' : 'FAIL') + '\n');
-    process.stdout.write('  PeakEWMA lane  (maxMajor 0 / 0 B/op / maxPause<=2ms) -> ' +
+    process.stdout.write('  PeakEWMA lane  (maxMajor 0 / 0 retained B/op / maxPause<=2ms) -> ' +
         (peOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  allocating foil (maxMajor >= 1, the contrast) -> ' +
         (foilOk ? 'PASS' : 'FAIL') + '\n');

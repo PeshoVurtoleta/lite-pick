@@ -1,0 +1,8 @@
+{
+  "name": "lite-pick-consumer-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Repo-only type fixture. Compiles against the PACKED @zakkster/lite-pick tarball (installed into this folder in CI) to exercise the exports map and the typesVersions /pool mapping across moduleResolution node10/node16/bundler and a lib:ES2022-only/no-DOM variant. Never published; excluded from files[] (the tarball whitelist).",
+  "dependencies": {}
+}

@@ -16,6 +16,7 @@
  * PARITY check -- a strategy within noise of the foil while holding the contract has passed.
  */
 
+import { pathToFileURL } from 'node:url';
 import { RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, Prng } from '../Pick.js';
 
 export const SIZES = [8, 64, 512, 4096];
@@ -268,7 +269,7 @@ export function measureThroughput() {
 
 // Runnable standalone (`node benchmark/Matrix.mjs`); importing this file must NOT run the
 // sweep (Report.mjs imports SUBJECTS / buildWorkload), so the runner is behind a main guard.
-if (import.meta.url === 'file://' + process.argv[1]) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     process.stdout.write('lite-pick benchmark matrix -- raw pick() ops/ms (parity check)\n');
     process.stdout.write('  (full 10-dimension suite is M6; this is the throughput slice)\n\n');
     const header = 'subject'.padEnd(16) + SIZES.map((n) => ('n=' + n).padStart(12)).join('');

@@ -4,11 +4,11 @@
     "noEmit": true,
     "target": "ES2020",
     "lib": ["ES2020", "DOM"],
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    "module": "commonjs",
+    "moduleResolution": "node10",
     "types": [],
-    "skipLibCheck": true,
+    "skipLibCheck": false,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["pick.test-d.ts", "pool.test-d.ts", "pool-es2022.test-d.ts"]
+  "files": ["index.ts"]
 }

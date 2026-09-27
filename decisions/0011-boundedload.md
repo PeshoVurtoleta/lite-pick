@@ -104,3 +104,22 @@ AWS ALB anomaly-mitigation / NLB flow-hash-with-shedding belongs to, at the in-p
 - Mirrokni, Thorup, Zadimoghaddam, "Consistent Hashing with Bounded Loads" (Google Research, 2016).
 - Vimeo engineering: consistent hashing with bounded loads in production (`eps ~ 0.25`).
 - Eisenbud et al., "Maglev: A Fast and Reliable Software Network Load Balancer" (NSDI 2016) -- the table.
+
+## Amended in 1.0.1 (2026-09-27) -- per-bin capacity and the note() lockstep (audit H4, M-Doc1)
+
+- **Cap definition (Fork 4).** The cap is now `cap = ceil((1 + eps) x (_total + 1) / live)`, not the
+  0.9.0 `(1 + eps) x _total / live`. The load-bearing change is the `+1` that counts the INCOMING
+  request -- the Mirrokni-Thorup-Zadimoghaddam per-bin capacity -- so the cap is always `>= 1`. The
+  0.9.0 form dropped below 1 whenever `_total < live / (1+eps)`, so at low load a second concurrent
+  request for the SAME key overflowed to a different backend and key affinity was lost (audit H4).
+  `Math.ceil` matches the paper's integer capacity and is a no-op for the `inf < cap` test. HONEST
+  NOTE: this does NOT make small-`eps` low-load stickiness perfect -- a second concurrent same-key
+  request still overflows the home until `(1+eps)(_total+1)/live > 1`; a larger `eps` buys more
+  stickiness. This is NOT HAProxy's `hash-balance-factor`, which shares the `+1` but distributes one
+  GLOBAL `ceil((m+1)F/100)` slot budget across servers by weight (min 1) -- a stricter definition.
+- **`note()` lockstep (Fork 2 / M-Doc1).** The doc phrasing "mutate the mirrored counter ONLY through
+  `note()`" was misleading: `note()` maintains `_total` only, it does NOT write `inflight`. Corrected
+  contract: update `inflight[i]` AND call `note(i, +/-1)` in LOCKSTEP (or drive it through /pool,
+  which does both). A direct `inflight` write without the matching `note` desyncs `_total` (UB).
+- **Index validation (M1).** `note(i, delta)` throws `RangeError` for a non-integer / out-of-range
+  index (including a numeric string like `'2'`).

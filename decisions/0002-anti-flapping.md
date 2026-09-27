@@ -85,3 +85,15 @@ anti-flap assertion, the counterpart to the balance-quality gate.
   the CONTRACT (dwell/threshold/ramp) those writers must honor, and the gate that proves it.
 - Exact constants (dwell ms, HalfOpen probe count, `eps`, AZ drift %) are per-deployment tunables with
   documented defaults, settled at each strategy's session -- not hard-coded here.
+
+## Amended in 1.0.1 (2026-09-27) -- terminology and the bounded-load margin (audit L5, H4)
+
+- **"Half-life" -> "time constant".** This ADR and the PeakEWMA docs called `tau` the EWMA
+  half-life. With `exp(-dt/tau)`, `tau` is the TIME CONSTANT; the half-life is `tau x ln2`. The
+  smoothing statement is unchanged (the EWMA time constant IS the anti-flap smoothing, no extra
+  dwell) -- only the name is corrected everywhere.
+- **Mechanism 2 (bounded-load margin).** The cap is now `ceil((1 + eps) x (total + 1) / live)` --
+  the `+1` counts the incoming request (the Mirrokni-Thorup-Zadimoghaddam per-bin capacity), so the
+  cap is always `>= 1` (audit H4; see ADR 0011's 1.0.1 amendment). The `eps` band is still the
+  hysteresis; at small `eps` a second concurrent same-key request still overflows the home until
+  `(1+eps)(total+1)/live > 1`, so a larger `eps` buys more low-load stickiness.

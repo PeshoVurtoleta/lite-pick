@@ -5,8 +5,20 @@ job. This guide is how you CHOOSE one. It is deliberately distinct from [RECIPES
 which shows how to WIRE a chosen strategy (dispatch/settle counters, health, the `/pool` layer).
 
 Every strategy shares the same contract: a hot `pick()` returning an endpoint **index** over a fixed
-pool, **0 B/op** steady-state, **fail-closed** (`PICK_NONE` = -1 when nothing is pickable, never a
-dead pick), reading a **shared read-only eligibility bitmap** it never writes.
+pool, **fail-closed** (`PICK_NONE` = -1 when nothing is pickable, never a dead pick), reading a
+**read-only eligibility bitmap** it never writes -- flipped only through `setEligible` (the sole
+supported writer, which keeps the cached `live` exact; a direct byte write desyncs it), and each
+balancer has its own eligibility array.
+
+`pick()` **allocates 0 B/op** (PerfGate scavenge counting) and **retains 0 B/op** (torture) in the
+steady state. KNOWN LIMITATION (1.0.1): the strategies that take a **number argument** on the hot
+path -- `PeakEWMA.pick(now)` / `recordRtt(..., now)` with a realistic nanosecond clock, and
+`ConsistentHash`/`BoundedLoad.pick(keyHash)` with a key `>= 2^31` -- box that argument into a ~16 B
+transient `HeapNumber` when the call is not inlined (transient, does not retain, does not force a
+major GC). Arguments within V8's small-integer range are 0 B/op; that range is build-dependent (below
+2^31 on stock 64-bit Node, below 2^30 on pointer-compressed builds such as Chrome/Electron), and a
+value produced by `%` or division can box even when its value is a small integer. Buffer-based
+variants are planned for 1.1.0.
 
 ## The one question that splits everything: what fixes the primary choice?
 

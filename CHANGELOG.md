@@ -4,6 +4,144 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-09-27
+
+Bug-fix release: the fixes from the full audit at `audit/2026-09-26/` (audited code state commit
+`8c1ecc7`; H1-H4 and M1 independently reproduced on darwin/arm64 Node 26 before fixing). No new
+strategy, no new public class, no removed API -- caller-visible behaviour changes only where a
+documented contract was wrong or unsafe. See [ADR 0013](./decisions/0013-audit-1.0.1.md).
+
+### Fixed
+
+- **PeakEWMA + Pool no longer turns a fast-failing or hung endpoint into a black hole (H1).**
+  Kernel side: an unsampled node now costs 0 only WHILE IDLE (so it holds one request in flight at a
+  time until its first sample); an unsampled BUSY node is priced at the LIFETIME mean of all recorded
+  samples, not the old 1.0 ns baseline; a sampled node with work in flight is floored at
+  time-since-last-sample, so a hung node gets MORE expensive over time instead of decaying toward 0.
+  `Pool.run` side: a thrown attempt now feeds `recordRtt(i, max(elapsed, failurePenaltyNs), done)`
+  (new `opts.failurePenaltyNs`, default `1e9`), so a failing node stops being the cheapest pick.
+  Measured (4 PeakEWMA nodes, node 0 always throws): failure rate 49.4% (988/2000) in 1.0.0 -> ~0.05%
+  (1/2000); a hung node took 1 dispatch, was 4891/10000.
+- **SmoothWRR never returns a weight-0 node (H3).** `pick()` now requires a candidate to be eligible
+  AND have `weight > 0` (path-independent -- covers `setWeight(i, 0)` and eligibility toggles), and
+  `setWeight` resets that node's accumulated credit. A drained node is no longer selected.
+- **BoundedLoad keeps key affinity at the low-load boundary (H4).** The per-backend cap is now
+  `ceil((1 + eps) * (total + 1) / live)`; the `+ 1` counts the incoming request
+  (Mirrokni-Thorup-Zadimoghaddam per-bin capacity), so the cap is always >= 1. The `Math.ceil` is a
+  no-op for the integer `inflight < cap` test; behaviour is identical to 1.0.0 except at the boundary
+  where the old cap fell below 1.
+- **Non-integer, NaN, negative and string indices are rejected instead of silently desyncing state
+  (M1).** One shared index-validation helper (`(i >>> 0) === i && i < capacity`) guards `setEligible`,
+  `setWeight` (SmoothWRR / ConsistentHash / BoundedLoad / WeightedRandom), `note` and `recordRtt`:
+  they throw `RangeError` for `NaN`, fractions (`1.5`), negatives, out-of-range, and non-numbers
+  (including numeric strings like `'2'`, which previously "worked"); a rejected call changes no state.
+  `isEligible` returns `false` for a non-integer instead of `true`.
+- **`Pool` failover now reaches a genuinely DIFFERENT endpoint (M2).** A per-run tried set, up to 8
+  re-picks, then a scan for an eligible untried endpoint from a key-derived start (keyed) or a
+  rotating per-Pool cursor (unkeyed); when no untried eligible endpoint remains, failover STOPS and
+  the last error is thrown (a 1-node pool with `tries: 3` now makes 1 attempt). ConsistentHash keyed
+  `tries: 3` now hits 3 distinct backends (was `3, 3, 3`); a failing backend's keys spread over
+  neighbours (max share ~23%, was 100% onto one neighbour in an intermediate build).
+- **A `recordRtt` exception after a SUCCESSFUL call no longer re-runs `fn` (M4).** Settle-time
+  feedback runs OUTSIDE the attempt's try/catch, so `fn` runs exactly once; if it fails, `run` rejects
+  with a `LITE_PICK_FEEDBACK`-coded error carrying `.cause` and `.result` (fn's resolved value).
+- **`Pool.run(fn, null)` works (L1).** `opts` may be omitted or `null`; the option reads are null-safe.
+- **A throwing custom `note(+1)` no longer leaves an unpaired `note(-1)`** at settle: `note(-1)` fires
+  only for a dispatch whose `note(+1)` actually landed, and a cleanup-time throw is swallowed so it
+  never masks the error being thrown.
+- **PeakEWMA `dt` is clamped `>= 0` in `pick`, `recordRtt` and `ewmaAt` (L6),** so a non-monotonic
+  clock can no longer inflate the estimate via `exp(+x)`.
+- **`verify` is green (H5).** The PerfGate WeightedRandom heavy-outage scenario is shrunk (`FB_CAP`
+  2048; slowest phase 16.7 s -> ~3 s) so V8's memory reducer can no longer fire inside it.
+
+### Changed
+
+- **`Pool.run` keyed and latency channels are now separate and REQUIRED (M3).** A keyed balancer
+  (`ConsistentHashBalancer` / `BoundedLoadBalancer`, marked `static KEYED = true`) requires a numeric
+  `opts.key` (else `LITE_PICK_KEY_REQUIRED`); a latency balancer (`PeakEwmaBalancer`, marked
+  `static LATENCY = true`) requires an `opts.clock` (else `LITE_PICK_CLOCK_REQUIRED`). The key reaches
+  ONLY a keyed pick; a clock reading NEVER reaches a keyed pick. A non-keyed clocked run still passes
+  the clock reading to `pick(now)` (preserving 1.0.0 behaviour for a duck-typed latency balancer that
+  omits the marker). Previously a missing key routed everything to one backend, and `key` / `clock`
+  were conflated.
+- **`Pool.run` checks the abort signal before EVERY attempt.** An already-aborted signal now
+  dispatches nothing and rejects (`throwIfAborted`, then the signal's `reason`, else
+  `LITE_PICK_ABORTED`), including a structural `{ aborted: true }` signal with no `throwIfAborted`.
+- **A backwards but finite clock reading on a successful settle records NO rtt sample** (a fabricated
+  0 ns sample would make the node look instant); `done === now` is a real coarse-clock 0 and is
+  recorded. A non-finite clock reading throws before dispatch.
+- **On a failed attempt whose penalty feedback then fails, `Pool.run` throws `fn`'s original error
+  object (identity preserved)** with a non-enumerable `liteFeedbackError` attached, and stops
+  failover.
+- **`liteQueryFetcher` forwards `clock` and `failurePenaltyNs`** to `pool.run` (validated once at
+  creation). Its `ctx.key` remains the query-cache key, not a routing key.
+- **PeakEWMA `tau` is documented as the EWMA TIME CONSTANT (half-life = `tau x ln2`),** correcting the
+  earlier "half-life" wording (L5). No math change.
+- **Static class markers added:** `ConsistentHashBalancer.KEYED` (inherited by `BoundedLoadBalancer`)
+  and `PeakEwmaBalancer.LATENCY`, so `/pool` selects the right channel while staying duck-typed.
+- **BoundedLoad docs corrected (M-Doc1):** update `inflight[i]` AND call `note(i, +/-1)` in lockstep
+  (or drive it through `/pool`); `note` maintains `_total`, it does not write `inflight`.
+- **Types tightened:** `pick(now)` / `pick(keyHash)` are now REQUIRED on the concrete
+  `PeakEwmaBalancer` / `ConsistentHashBalancer` / `BoundedLoadBalancer` classes (`BalancerBase.pick`
+  stays deliberately loose, `pick(arg?)`); the `KEYED` / `LATENCY` markers are typed; `Pool.d.ts` now
+  uses a structural `AbortLike` type (compiles with `lib: ES2022` and no DOM, L15).
+
+### Added
+
+- **`opts.failurePenaltyNs`** on `Pool.run` (and `liteQueryFetcher`): the minimum rtt penalty a thrown
+  attempt feeds a latency-aware balancer (finite `> 0`, default `1e9`).
+- **`typesVersions`** maps `@zakkster/lite-pick/pool` -> `Pool.d.ts` for `moduleResolution: node10`
+  (L16); `test:types` gains an ES2022-no-DOM lane.
+- **`.github/workflows/ci.yml`:** `test` (Node 20/22/24 x ubuntu/macos/windows), `test-node18` (unit
+  suites only, backing `engines >=18`), `gates` (torture, `test:perf`, `bench:verify`, an exact
+  11-file tarball check), and `types-compat` (the packed tarball compiled with TypeScript 5 under
+  node10 / node16 / bundler / ES2022-only on case-sensitive Linux). `package-lock.json` is now
+  committed (maintainer decision; follows lite-di-container).
+- **`test` is now an explicit file list** (portable to Windows / Node 20 -- no shell glob), guarded by
+  `test/suite-list.test.js`, which fails if any test file under `test/` is not run.
+- **Gates hardened with teeth:** `test:perf` pins the semi-space `min = max = 1 MB` (sharper than
+  1.0.0's `max = 4 MB`) with a fail-closed test asserting the pin; must-fail allocations escape via a
+  64-slot ring and `grows` compares buffer identity (M-T3); new intermittent must-fail controls (an
+  allocation every 16 and every 32 picks). `torture` now reports RETAINED B/op, treats an unmeasured
+  reading as FAIL, and has a retaining must-fail control (trips at 40 B/op) (H6); `GcBlastRadius`
+  likewise, and its README column is renamed "pick retained B/op". Every `benchmark/*.mjs` entry check
+  uses `pathToFileURL` (M-T2); `bench:verify` states which blocks are re-measured vs compared to stored
+  `results.json` (M-T1); the fuzz single-node-down block uses one eligibility array per balancer (M-T4)
+  and prints the discovery seed every run (L21).
+- Demo (repo-only, not in the tarball): the Pool Scope web server binds `127.0.0.1`, serves GET/HEAD
+  only, enforces a path allowlist + Host-header check + `path.relative`/`realpath` traversal guard +
+  `nosniff` + port validation (M-D1, M-D2, L26); the driver keeps BoundedLoad's `totalInflight` in
+  lockstep (M-D3); the TUI reset uses `DEFAULT_CONC` and restores the terminal on SIGTERM/SIGHUP with
+  the alternate screen (M-D4, L23); fanout counts only distinct failovers and reports exhausted
+  requests (L24).
+
+### Known limitations
+
+Disclosed, shipped, and slated for 1.1.0:
+
+- **A realistic (non-small-integer) number argument boxes once per non-inlined call.** V8 boxes a
+  `HeapNumber` (~16 B) for a `PeakEWMA` `pick(now ~1.7e15)`, ~16-30 B for `recordRtt` with a realistic
+  clock and a fractional sample, and ~16 B for `ConsistentHash`/`BoundedLoad` `pick(keyHash >= 2^31)`.
+  Small-integer arguments are 0 B/op (range is build-dependent: `< 2^31` on stock 64-bit Node, `< 2^30`
+  on pointer-compressed builds); values produced by `%` or division may box even when small. 1.1.0 adds
+  buffer-based variants that read the clock/key from a caller-owned typed array (prototype measured
+  0 B/op at 1e15). `test:perf` prints these as report-only lines every run.
+- **OPEN:** run in isolation with some integer sample patterns (e.g. mod 500000, step 1000), the
+  PerfGate `recordRtt` lane shows a small allocation that scales with window length (8N: 2, 16N: 4,
+  32N: 9 scavenges at the 1 MB pin); it disappears with `--no-maglev`,
+  `--no-concurrent-recompilation`, or a preceding lane. Root cause not established; printed as a
+  report-only line; tracked for 1.1.0.
+- **M5 (LeastConn / NQ tie order) is now documented as unspecified.** A rotating tie-break lands in
+  1.1.0; it was moved OUT of 1.0.1 because "lowest index" was an explicit documented promise, so
+  changing it is not a patch-level fix.
+
+### Not in this release
+
+- The soak redesign (audit RECOMMENDATIONS section 1): the 1.0.0 soak's drift gates compared lanes
+  rather than time, and its heap sample included harness bookkeeping. Redesign pending.
+- Observability (section 2): zero-cost counters, `diagnostics_channel`/hooks, `describe()`, error codes.
+- The `Eligibility` object as the shared unit (section 3.1) -- a breaking change deferred to 2.0.
+
 ## [1.0.0] - 2026-09-23
 
 The **roster-complete** release: ten selection strategies + the `/pool` request layer + the benchmark

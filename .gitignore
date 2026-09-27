@@ -1,5 +1,4 @@
 /node_modules
-/package-lock.json
 
 # results.json is COMMITTED: it is the timing source-of-truth bench:verify reads (the
 # stored, machine-independent baseline -- verify does no fresh timing run). Regenerate with

@@ -59,25 +59,32 @@ send(endpoints[i]);
 
 ---
 
-## 3. Wire health -> eligibility (the shared bitmap)
+## 3. Wire health -> eligibility (the bitmap)
 
-Eligibility is a shared `Uint8Array` (1 = pickable, 0 = down). Something else writes it
--- a health checker, a circuit breaker, or `@zakkster/lite-di-health` -- and `pick()`
-only reads it. Two ways to flip a node:
+Eligibility is a `Uint8Array` (1 = pickable, 0 = down). A health checker, a circuit
+breaker, or `@zakkster/lite-di-health` decides who is up; the balancer reads that state
+through `pick()`. Flip a node **only** through `setEligible`:
 
 ```js
-// (a) write the bitmap directly if you own it elsewhere (zero-copy, pick sees it live):
-eligible[2] = 0;                 // endpoint c is down
-
-// (b) go through the balancer so its O(1) `live` count stays exact (recommended):
-lb.setEligible(2, false);        // COLD path; idempotent; keeps `live` correct
+lb.setEligible(2, false);        // COLD path; idempotent; keeps `live` exact
 lb.setEligible(2, true);         // back up
 
-lb.isEligible(2);                // -> boolean, HOT, out-of-range is false (never throws)
+lb.isEligible(2);                // -> boolean, HOT, out-of-range (or non-integer) is false, never throws
 ```
 
-Prefer `setEligible` when you rely on `live`. Health flapping is the writer's problem:
-apply hysteresis/dwell in the health layer -- `pick()` stays greedy and stateless.
+- **`setEligible()` is the only supported writer.** It flips the byte AND keeps the
+  balancer's cached `live` count (and SmoothWRR's eligible-weight total) exact in
+  lockstep. A DIRECT write to the array (`eligible[2] = 0`) desyncs that cache: `pick()`
+  then reads a stale `live`, which can fail closed on a pool that is actually up, or
+  destroy weight ratios and funnel 100% of traffic to one node. Have your health source
+  call `setEligible` rather than write the byte.
+- **Each balancer needs its OWN eligibility array.** Do not share one `Uint8Array`
+  across two balancers -- each caches its own `live`, so a `setEligible` on one leaves
+  the other's count stale. Give each balancer its own array (an `Eligibility` value
+  object that multiple balancers can share is deferred to 2.0; ADR 0001, amended 1.0.1).
+
+Health flapping is the writer's problem: apply hysteresis/dwell in the health layer --
+`pick()` stays greedy and stateless.
 
 ---
 
@@ -96,7 +103,7 @@ lb.setWeight(0, 5);                          // a is 5x
 lb.setWeight(1, 1);
 lb.setWeight(2, 1);
 lb.setWeight(3, 1);
-// pick() interleaves smoothly (nginx smooth WRR): a a b a c a a d ... not a a a a a b c d
+// pick() interleaves smoothly (nginx smooth WRR): a a b a c a d a ... not a a a a a b c d
 ```
 
 Use SmoothWRR when weights are known/config-driven and change rarely.
@@ -164,20 +171,25 @@ const body = await pool.run((i, signal) => fetchFrom(endpoints[i], { signal }));
 ## 7. Failover -- try a different endpoint on error
 
 Set `tries > 1`. On a thrown error, Pool keeps the failed node's in-flight count
-elevated and re-picks -- so a load-aware strategy naturally steers to a DIFFERENT
-endpoint -- up to `tries` attempts, then rejects with the last error.
+elevated and fails over to a genuinely DIFFERENT endpoint: it re-picks while the
+strategy repeats an already-tried endpoint (bounded), then scans for an eligible untried
+one (spread across keys for a keyed run, cursor-rotated otherwise). It stops -- surfacing
+the last error -- as soon as no untried eligible endpoint remains, so a 1-node pool with
+`tries: 3` makes exactly **one** attempt (Pool owns spatial failover, never temporal
+retry against the same node).
 
 ```js
 const body = await pool.run(
   (i, signal) => fetchFrom(endpoints[i], { signal }),
-  { tries: 3, signal: req.signal }           // up to 3 distinct endpoints
+  { tries: 3, signal: req.signal }           // up to 3 DISTINCT endpoints
 );
 ```
 
 Boundary: Pool owns **spatial** failover (move across the pool, once each, in-process).
 The caller or your query cache owns **temporal** retry (backoff, staleness, dedup).
-Don't double-own them. If `signal` aborts after a failure, failover stops and the abort
-propagates.
+Don't double-own them. `signal` is checked before EVERY attempt: an already-aborted
+signal dispatches nothing and rejects with the signal's `reason` (or a `LITE_PICK_ABORTED`
+-coded error); an abort after a failure stops failover and the abort propagates.
 
 ---
 
@@ -194,7 +206,7 @@ Manual loop:
 ```js
 import { PeakEwmaBalancer } from '@zakkster/lite-pick';
 
-const TAU_NS = 30_000_000;                    // 30ms half-life for the EWMA decay
+const TAU_NS = 30_000_000;                    // 30ms EWMA TIME CONSTANT (half-life = tau x ln2 ~= 21ms)
 const inflight = new Uint32Array(CAP);
 const lb = new PeakEwmaBalancer(CAP, eligible, inflight, TAU_NS);
 const nowNs = () => Number(process.hrtime.bigint());
@@ -214,23 +226,70 @@ async function handle(req) {
 }
 ```
 
-Or let Pool do the feedback for you -- pass a `clock`; Pool drives `pick(now)` and calls
-`recordRtt` on a successful settle when the balancer supports it:
+Or let Pool do the feedback for you. A latency balancer **requires** `opts.clock`
+(otherwise `run` rejects with a `LITE_PICK_CLOCK_REQUIRED`-coded error). Pool reads the
+clock before each dispatch, drives `pick(now)`, records the settled rtt on success, and
+-- new in 1.0.1 -- feeds a PENALTY on a thrown attempt so a fast-failing endpoint stops
+looking cheap:
 
 ```js
 import { Pool } from '@zakkster/lite-pick/pool';
 const pool = new Pool(lb, inflight);
+const clock = () => Number(process.hrtime.bigint());
+
 const body = await pool.run(
   (i, signal) => fetchFrom(endpoints[i], { signal }),
-  { clock: () => Number(process.hrtime.bigint()), tries: 2 }
+  {
+    clock,                                   // REQUIRED for PeakEWMA; validated finite each read
+    tries: 2,
+    failurePenaltyNs: 1_000_000_000,         // a throw records max(elapsed, this) as the rtt (default 1s)
+  }
 );
 ```
 
+Without the penalty a node that fails instantly would be sampled at ~0 rtt and become
+the most attractive pick (a black hole). With it, a failing node is priced expensive and
+only RE-PROBED roughly every `tauNs x ln(failurePenaltyNs / healthyRttNs)`, so it
+recovers when it heals but never dominates while broken.
+
+**Feedback never loses a result and never re-runs `fn`.** `fn` runs exactly once per
+attempt. If settle-time feedback after a SUCCESS fails (a clock that throws or returns
+non-finite, or a throwing `recordRtt`), `run` rejects with a `LITE_PICK_FEEDBACK`-coded
+error carrying `.cause` (the feedback error) and `.result` (fn's resolved value), so the
+caller can still use the result:
+
+```js
+try {
+  return await pool.run(work, { clock, tries: 2 });
+} catch (e) {
+  if (e.code === 'LITE_PICK_FEEDBACK') return e.result;   // fn succeeded; only the rtt bookkeeping failed
+  throw e;
+}
+```
+
+(A feedback failure after a FAILED attempt instead re-throws `fn`'s own error unchanged,
+with the feedback error attached as a non-enumerable `liteFeedbackError` -- identity is
+preserved. A backwards-stepping but finite clock records no sample and resolves normally.)
+
 Notes:
-- **Cold start** (no samples yet) degrades gracefully to least-connections -- never NaN.
-- `now` must be a FINITE number. A non-finite `now` degrades to P2C-random (no throw).
+- **Cold start.** An unsampled node costs 0 while idle (so it takes one probe request at
+  a time) and the pool's lifetime mean sampled rtt once it is busy -- graceful, never NaN,
+  never the old 1.0 ns black hole. A node that never records a sample (e.g. one that fails
+  fast so the caller records nothing) keeps winning while idle: record failures too (the
+  Pool `failurePenaltyNs` above does this for you).
+- `now` must be a FINITE number. A non-finite `now` degrades `pick` to P2C-random (no
+  throw); `recordRtt` throws on a non-finite argument.
 - Pick `tauNs` around your p50-p90 rtt: smaller = reacts faster to a slowdown, larger =
-  steadier. It IS the anti-flap smoothing; no extra dwell needed.
+  steadier. `tauNs` is the EWMA TIME CONSTANT (half-life = `tauNs x ln2`); it IS the
+  anti-flap smoothing, no extra dwell needed.
+- **KNOWN LIMITATION (1.0.1, buffer-based API planned for 1.1.0).** `pick(now)` /
+  `recordRtt(..., now)` take a nanosecond `now` as a plain number argument. When the call
+  is not inlined, V8 boxes a non-small-integer number into a ~16 B HeapNumber -- so with a
+  realistic nanosecond clock these calls allocate ~16 B/op (transient, dies young; it does
+  not RETAIN and does not force a major GC). Small-integer arguments are 0 B/op; the
+  small-integer range is build-dependent (below 2^31 on stock 64-bit Node, below 2^30 on
+  pointer-compressed builds such as Chrome/Electron). A buffer-based `recordRttFrom`/clock
+  API that keeps `now` in a `Float64Array` slot is planned for 1.1.0.
 - Measured effect: with one node at 10x latency, PeakEWMA sends it a tiny fraction of
   the traffic P2C-over-inflight would, and cuts service p99 sharply.
 
@@ -277,6 +336,24 @@ Notes:
   allocation. Turn `M` down for a small pool (any prime `>= N`).
 - `pick(keyHash)` coerces `keyHash >>> 0` and never throws; it returns `PICK_NONE` only when the
   pool is down or no eligible backend is reachable within the probe bound.
+- **Through `/pool`, a keyed balancer REQUIRES `opts.key`** (an integer), or `pool.run`
+  rejects with a `LITE_PICK_KEY_REQUIRED`-coded error -- the key never routes silently to
+  backend 0. The key drives the keyed `pick(key)` only; it is never passed to a latency
+  balancer as `now`:
+  ```js
+  import { Pool } from '@zakkster/lite-pick/pool';
+  const pool = new Pool(lb, new Uint32Array(CAP));   // CH does not read inflight; any view works
+  const body = await pool.run(
+    (endpoint, signal) => fetchFrom(endpoints[endpoint], { signal }),
+    { key: fnv1a(sessionId), tries: 2 }              // same key -> same backend; failover overflows to a neighbour
+  );
+  ```
+- **KNOWN LIMITATION (1.0.1).** `pick(keyHash)` takes the key as a plain number argument.
+  A key `>= 2^31` (about half of a 32-bit FNV-1a output) boxes into a ~16 B HeapNumber
+  when the call is not inlined (transient, does not retain; keys below the build's
+  small-integer range -- 2^31 on stock 64-bit Node, 2^30 on pointer-compressed builds --
+  are 0 B/op). A value produced by `%` or division can box even when it is a small
+  integer. A buffer-based key API is planned for 1.1.0.
 
 ---
 
@@ -311,10 +388,13 @@ const fetcher = liteQueryFetcher(
 | SED           | in-flight / weight  | O(cap)      | weighted least-conn |
 | NQ            | idle-first else SED  | O(cap)/O(1) | worker pools -- never queue while a worker is free |
 | PeakEWMA      | in-flight x ewma(rtt)| O(1)        | heterogeneous / flaky backends; steer around slow nodes |
+| WeightedRandom| static weight (O(1))| O(1)        | weighted at very large pools where SmoothWRR's O(cap) scan hurts; accepts sampling variance |
 | ConsistentHash| key hash (sticky)   | O(1)        | affinity/sticky: same key -> same backend, minimal disruption on scale |
+| BoundedLoad   | key hash + occupancy cap | O(1)   | sticky routing AND a few hot keys would otherwise overload one backend |
 
 The load-aware strategies read the SAME `inflight` array live, so you can swap among them
-without rewiring; ConsistentHash instead takes an integer key per pick (recipe 9).
+without rewiring; ConsistentHash and BoundedLoad instead take an integer key per pick
+(recipe 9). See [GUIDE.md](./GUIDE.md) for the full decision tree.
 
 ---
 
@@ -333,8 +413,9 @@ bounded-load / AZ / occupancy machinery. Feed rtt from your `fetch` timings via
 lite-pick declares ZERO hard dependencies and an EMPTY `peerDependencies`. Each seam is
 a shared TypedArray or a duck-typed shape, so you wire in a sibling only if you use it:
 
-- `@zakkster/lite-di-health` -- writes the eligibility bitmap from health checks.
-- `@zakkster/lite-statechart` -- a circuit breaker that flips eligibility.
+- `@zakkster/lite-di-health` -- drives `setEligible` from health checks (the supported
+  writer; a direct byte write desyncs the cached `live`, recipe 3).
+- `@zakkster/lite-statechart` -- a circuit breaker that flips eligibility via `setEligible`.
 - `@zakkster/lite-query` -- the cache behind `liteQueryFetcher` (recipe 10).
 - `@zakkster/lite-sketch` -- `DDSketch` for a p99-aware PeakEWMA variant (deferred).
 - `@zakkster/lite-filter` -- a hot-key / known-key oracle at the ConsistentHash key-routing
@@ -350,9 +431,15 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
 - Allocate `eligible` / `inflight` / `weights` ONCE at startup and reuse them. Never
   build arrays per pick.
 - The counters are YOURS -- mutate them in place (`inflight[i]++/--`), don't replace them.
-- `pick()` / `pick(now)` and `recordRtt` allocate nothing. The only async allocation is
-  the promise your own `fn` already creates (disclosed; `Pool.run` adds O(1) integer ops
-  plus one small per-run array).
+- `pick()` allocates 0 B/op (proven by PerfGate scavenge counting) and retains 0 B/op
+  (proven by torture). CAVEAT: `pick(now)` / `recordRtt(..., now)` and
+  `pick(keyHash)` take a number argument; V8 boxes a non-small-integer value into a
+  ~16 B transient HeapNumber when the call is not inlined -- so a realistic nanosecond
+  clock or a key `>= 2^31` allocates ~16 B/op (transient, does not retain, does not force
+  a major GC). Small-integer arguments are 0 B/op; buffer-based variants are planned for
+  1.1.0. See section 8/9.
+- The only async allocation is the promise your own `fn` already creates (disclosed;
+  `Pool.run` adds O(1) integer ops plus one small per-run array).
 - Fixed capacity: the pool size is set at construction and the backing arrays never
   reallocate.
 
@@ -362,14 +449,23 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
 
 - **PICK_NONE (-1)** is always possible -- handle it before indexing (recipe 2).
 - **SmoothWRR weights** must go through `setWeight`; direct array mutation is UB.
-- **ConsistentHash takes an INTEGER key** -- hash strings yourself, cold (recipe 9). Never
-  `pick(someString)` on the hot path; `M` must be a prime `>= capacity`.
+- **BoundedLoad occupancy** -- update `inflight[i]` AND call `note(i, +/-1)` in LOCKSTEP
+  (or drive it through `/pool`, which does both). `note` maintains the balancer's `_total`;
+  it does NOT write `inflight`. A direct `inflight` write without the matching `note`
+  desyncs `_total` and the cap goes wrong (UB).
+- **ConsistentHash / BoundedLoad take an INTEGER key** -- hash strings yourself, cold
+  (recipe 9). Never `pick(someString)` on the hot path; `M` must be a prime `>= capacity`.
+  Through `/pool` a keyed balancer requires `opts.key` (`LITE_PICK_KEY_REQUIRED` otherwise).
 - **Load-aware strategies need the dispatch/settle loop** -- forget the `inflight--` in
   a `finally` and load leaks upward forever. Use `/pool` (recipe 6) to avoid it.
 - **PeakEWMA needs a finite `now`** and rtt feedback -- without `recordRtt` it behaves
-  like LeastConn (cold-start baseline).
-- **Eligibility is read-only to `pick()`** -- the health layer writes it; the balancer
-  only reads (or maintains `live` via `setEligible`).
+  like LeastConn (cold-start baseline). Through `/pool` it requires `opts.clock`
+  (`LITE_PICK_CLOCK_REQUIRED` otherwise); pass `failurePenaltyNs` so failures are priced.
+- **Eligibility flips go through `setEligible`** -- it is the only supported writer and
+  keeps `live` exact; a direct byte write desyncs the cached count (recipe 3). Each
+  balancer needs its own eligibility array.
+- **Tie order is unspecified** -- LeastConn/SED/NQ break an exact tie deterministically
+  but on no promised index (1.0.1; a rotating tie-break is planned for 1.1.0).
 - **lite-pick is not a proxy** -- it returns an index; you own transport, retries/backoff
   (temporal), health checking, and the socket.
 

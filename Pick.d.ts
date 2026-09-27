@@ -32,27 +32,35 @@ export class Prng {
 }
 
 /**
- * The shared eligibility seam for every strategy. Owns the fixed capacity, a reference
- * to a shared read-only eligibility `Uint8Array` (written by @zakkster/lite-di-health /
- * circuit breakers, read by `pick()`), and an O(1) live count. Subclasses implement
- * `pick()`; the base `pick()` throws.
+ * The eligibility seam for every strategy. Owns the fixed capacity, a reference to a
+ * read-only eligibility `Uint8Array`, and an O(1) live count. The array is flipped ONLY
+ * through `setEligible` (the sole supported writer -- @zakkster/lite-di-health / circuit
+ * breakers drive that call); a direct byte write desyncs the cached live count (UB). Each
+ * balancer needs its own array. Subclasses implement `pick()`; the base `pick()` throws.
  */
 export class BalancerBase {
     /**
      * @param capacity endpoint count (fixed).
-     * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
+     * @param eligible 1 = pickable, 0 = down (length >= capacity); per-balancer, flipped only via `setEligible`.
      */
     constructor(capacity: number, eligible: Uint8Array);
     /** Endpoint count (fixed at construction). */
     readonly capacity: number;
     /** Number of currently eligible endpoints (O(1)). */
     readonly live: number;
-    /** True iff endpoint `i` is currently pickable. */
+    /** True iff endpoint `i` is currently pickable; a non-integer or out-of-range `i` is `false` (never throws). */
     isEligible(i: number): boolean;
-    /** Cold path: mark endpoint `i` up/down, keeping the live count exact. */
+    /** Cold path: the only supported eligibility writer -- flips `i` up/down and keeps the live count exact.
+     *  Throws `RangeError` on a non-integer or out-of-range index (incl. a numeric string like '2'). */
     setEligible(i: number, up: boolean): void;
-    /** Choose an endpoint index, or `PICK_NONE`. Abstract in the base (throws). */
-    pick(): number;
+    /**
+     * Choose an endpoint index, or `PICK_NONE`. Abstract in the base (throws). Declared with a
+     * DELIBERATELY LOOSE optional numeric argument so a keyed subclass (`pick(keyHash)`) or a latency
+     * subclass (`pick(now)`) that requires it stays assignable to `BalancerBase` (`const b:
+     * BalancerBase = ch; b.pick()` type-checks). To get the required-arg compile check, reference the
+     * CONCRETE class type (e.g. `ConsistentHashBalancer` / `PeakEwmaBalancer`), not `BalancerBase`.
+     */
+    pick(arg?: number): number;
 }
 
 /**
@@ -109,8 +117,9 @@ export class P2cBalancer extends BalancerBase {
 
 /**
  * LeastConnBalancer -- EXACT fewest-in-flight (M4, IPVS `lc`). A full O(cap) scan of the
- * caller-owned in-flight view returning the eligible node with the lowest count (lowest index
- * on a tie) -- the deterministic complement to P2C's O(1) approximation. In-flight counts are
+ * caller-owned in-flight view returning the eligible node with the lowest count (tie order is
+ * UNSPECIFIED in 1.0.1 -- deterministic, but do not depend on it; a rotating tie-break is planned
+ * for 1.1.0) -- the deterministic complement to P2C's O(1) approximation. In-flight counts are
  * caller-owned and read LIVE (no `setWeight`, no derived aggregate). 0 B/op. Fails closed
  * (`PICK_NONE`) when the whole pool is down.
  */
@@ -164,20 +173,27 @@ export class NqBalancer extends BalancerBase {
 
 /**
  * PeakEwmaBalancer -- latency-aware power-of-two-choices (M7, Twitter Finagle's peak-EWMA).
- * Draws two distinct eligible endpoints and returns the lower cost = `(inflight + 1) * ewmaAt(now)`;
- * a slow endpoint (high decayed EWMA rtt) is avoided even with a short queue. `inflight` is the
+ * Draws two distinct eligible endpoints and returns the LOWER COST (three cases: unsampled+idle -> 0;
+ * unsampled+busy -> `(inflight + 1) x lifetime mean`; sampled -> `(inflight + 1) x max(decayedEWMA,
+ * dt-while-busy)`); a slow endpoint (high decayed EWMA rtt) is avoided even with a short queue,
+ * and a hung node grows more expensive over time. `inflight` is the
  * caller-owned Uint32Array read LIVE; the EWMA state (`_ewma` / `_stamp`, Float64) is BALANCER-OWNED
  * and written ONLY by `recordRtt` (the warm feedback path). `pick(now)` decays on READ -- never
  * writes -- so it is 0 B/op, as is `recordRtt`. `now` / `sampleNs` are caller-supplied nanoseconds.
- * Cold start seeds the EWMA to 1.0 -> graceful least-connections, never NaN. O(d)=O(1). Fails
- * closed (`PICK_NONE`) when the whole pool is down.
+ * Cold start: an unsampled node costs 0 WHILE IDLE (graceful least-connections) and the pool's
+ * lifetime mean sampled rtt ONCE BUSY, so a fast-failing or hung node cannot masquerade as a 1.0 ns
+ * node and become a black hole; a hung node's busy floor grows with `dt` so it gets more expensive,
+ * not less. Never NaN. O(d)=O(1). Fails closed (`PICK_NONE`) when the whole pool is down.
+ * Latency-aware: @zakkster/lite-pick/pool REQUIRES an `opts.clock` for this strategy.
  */
 export class PeakEwmaBalancer extends BalancerBase {
+    /** Marker: latency-aware; /pool requires `opts.clock` and feeds recordRtt() from it. */
+    static readonly LATENCY: true;
     /**
      * @param capacity endpoint count (fixed).
      * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read live.
-     * @param tauNs the EWMA time-constant / half-life in nanoseconds (finite, > 0).
+     * @param tauNs the EWMA TIME CONSTANT in nanoseconds (finite, > 0); the half-life is tauNs x ln2.
      * @param seed deterministic PRNG seed (default 0x9e3779b9); reproducible benches.
      */
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, tauNs: number, seed?: number);
@@ -186,7 +202,7 @@ export class PeakEwmaBalancer extends BalancerBase {
     /** Warm feedback path: record an rtt sample (ns) for endpoint `i` at time `now` (ns). 0 B/op. */
     recordRtt(i: number, sampleNs: number, now: number): void;
     /** Pick by latency-aware power-of-two-choices at time `now` (ns), or `PICK_NONE`. O(d)=O(1). */
-    pick(now?: number): number;
+    pick(now: number): number;
 }
 
 /** The default Maglev lookup-table size (a prime, 2^16 + 1). Configurable via the ctor. */
@@ -207,6 +223,8 @@ export const CH_PROBE_LIMIT: number;
  * Fails closed (`PICK_NONE`) when the pool is down or no eligible backend is reachable within the bound.
  */
 export class ConsistentHashBalancer extends BalancerBase {
+    /** Marker: keyed; /pool requires a numeric `opts.key`. Inherited by BoundedLoadBalancer. */
+    static readonly KEYED: true;
     /**
      * @param capacity backend count (fixed).
      * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
@@ -223,22 +241,26 @@ export class ConsistentHashBalancer extends BalancerBase {
     /** Cold path: rebuild the lookup table from the current owned weights. */
     rebuild(): void;
     /** Map an integer `keyHash` to a backend index (bounded probe past down slots), or `PICK_NONE`. */
-    pick(keyHash?: number): number;
+    pick(keyHash: number): number;
 }
 
 /**
  * BoundedLoadBalancer -- Consistent Hashing with Bounded Loads (M9, CHBL: Mirrokni et al. / Google
  * Research; Vimeo eps ~ 0.25). `ConsistentHashBalancer` (the Maglev table) PLUS an occupancy cap: a
- * key sticks to its hashed home backend UNLESS that backend is over `cap = (1 + eps) * _total / live`,
- * in which case the request OVERFLOWS along the same bounded forward-probe to the next eligible,
+ * key sticks to its hashed home backend UNLESS that backend is over
+ * `cap = ceil((1 + eps) * (total + 1) / live)` -- the load-bearing part is the `+ 1` that counts the
+ * INCOMING request (Mirrokni-Thorup-Zadimoghaddam per-bin capacity), so the cap is always >= 1 and a
+ * second concurrent same-key request correctly overflows the home. In that case the request OVERFLOWS
+ * along the same bounded forward-probe to the next eligible,
  * under-cap backend -- keeping consistent hashing's stickiness + minimal disruption AND adding the
  * HOTSPOT protection plain consistent hashing lacks. `pick(keyHash)` returns the first eligible,
  * under-cap backend in the probe window, else falls back to the first eligible seen (sticky wins; the
  * cap is a soft preference, never a dead pick); `_total === 0` skips the cap -> pure ConsistentHash.
  * `inflight` is the caller-owned Uint32Array read LIVE as the per-backend OCCUPANCY; the running
- * occupancy sum `_total` is BALANCER-OWNED and written ONLY by `note` (dispatch +1 / settle -1), so
- * when using BoundedLoad the mirrored counter must be mutated exclusively through `note` / the /pool
- * adapter (direct mutation desyncs `_total` -- UB). It inherits the Maglev table + `setWeight` /
+ * occupancy sum `_total` is BALANCER-OWNED and written ONLY by `note` (dispatch +1 / settle -1). When
+ * using BoundedLoad you update `inflight[i]` AND call `note(i, +/-1)` in LOCKSTEP (or drive it through
+ * the /pool adapter, which does both): `note` maintains `_total`, it does not write `inflight`. A
+ * direct mutation of `inflight` without the matching `note` desyncs `_total` -- UB. It inherits the Maglev table + `setWeight` /
  * `rebuild` / `tableSize` from ConsistentHashBalancer (reused verbatim). `pick()` and `note()` are
  * both 0 B/op / O(1). Fails closed (`PICK_NONE`) ONLY when no eligible backend is reachable within
  * the probe window -- NEVER merely because backends are over cap. NOT the P2C-with-cap "overload"
@@ -266,10 +288,14 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
     );
     /** The balancer-owned running sum of in-flight the mean/cap is computed from. */
     readonly totalInflight: number;
-    /** Warm feedback path: adjust the owned occupancy sum (dispatch +1 / settle -1). Clamps at 0. 0 B/op. */
+    /**
+     * Warm feedback path: adjust the owned occupancy SUM by `delta` (dispatch +1 / settle -1), in
+     * LOCKSTEP with the caller's `inflight[i]` write. Maintains `_total`; does NOT write `inflight`.
+     * Clamps at 0. 0 B/op.
+     */
     note(i: number, delta: number): void;
     /** Map an integer `keyHash` to a backend, honouring the occupancy cap (overflow past a hot home), or `PICK_NONE`. O(1). */
-    pick(keyHash?: number): number;
+    pick(keyHash: number): number;
 }
 
 /**

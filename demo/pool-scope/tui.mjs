@@ -23,7 +23,7 @@
  * (I/O formatting) without creating arrays/objects/closures per frame.
  */
 
-import { Driver, STRATEGIES } from './driver.mjs';
+import { Driver, STRATEGIES, DEFAULT_CONC } from './driver.mjs';
 import { LitePickSnapshot } from './snapshot.mjs';
 import {
     Detectors, OVERLOAD_SAT, UNFAIR_GINI,
@@ -37,6 +37,8 @@ const RESET = ESC + '0m';
 const BOLD = ESC + '1m';
 const HIDE = ESC + '?25l';
 const SHOW = ESC + '?25h';
+const ALT_ON = ESC + '?1049h';   // enter the alternate screen buffer (the user's scrollback is untouched)
+const ALT_OFF = ESC + '?1049l';  // leave it -> restores the terminal exactly as it was before launch
 const HOME = ESC + 'H';
 const CLR_EOL = ESC + '0K';
 const CLR_DOWN = ESC + '0J';
@@ -498,16 +500,24 @@ function runInteractive(argv) {
         if (timer) clearInterval(timer);
         if (stdin.isTTY && stdin.setRawMode) stdin.setRawMode(false);
         stdin.pause();
-        out.write(SHOW + RESET + '\n');
+        // Show the cursor, reset attributes, and LEAVE the alternate screen so the user's terminal
+        // (scrollback + prior content) is restored exactly, not wiped (L23).
+        out.write(RESET + SHOW + ALT_OFF);
     }
 
     function quit() { restore(); process.exit(0); }
 
     function onKey(chunk) {
         const s = chunk.toString();
+        // Escape sequences: an arrow / function key arrives as ESC '[' ... (or ESC 'O' ...). Ignore the
+        // whole sequence rather than quitting on the bare ESC prefix (L23). A lone ESC still quits.
+        if (s.charCodeAt(0) === 0x1b) {
+            if (s.length === 1) { quit(); }
+            return;
+        }
         for (let c = 0; c < s.length; c++) {
             const ch = s[c];
-            if (ch === 'q' || ch === '\x03' || ch === '\x1b') { quit(); return; }
+            if (ch === 'q' || ch === '\x03') { quit(); return; }
             if (ch >= '1' && ch <= '9') { switchTo((ch.charCodeAt(0) - 49)); }
             else if (ch === '0') { switchTo(9); }
             else if (ch === 'n') { switchTo((STRATEGIES.indexOf(drv.strategyName) + 1) % STRATEGIES.length); }
@@ -540,15 +550,17 @@ function runInteractive(argv) {
         drv.pin.fill(0); drv.ceil.fill(-1); drv.slow.fill(0);
         drv.flapEnabled = false; drv.ppEnabled = false;
         drv.keyDist = 'uniform';
-        drv.conc = 108;
+        drv.conc = DEFAULT_CONC;   // M-D4: match the driver default (and the web reset), not a stale 108
         drv.setStrategy(cur);
         det.reset();
     }
 
     process.on('SIGINT', quit);
+    process.on('SIGTERM', quit);   // L23: restore the terminal on a kill / hangup too, not only Ctrl-C
+    process.on('SIGHUP', quit);
     process.on('exit', restore);
 
-    out.write(CLR_SCREEN + HIDE);
+    out.write(ALT_ON + CLR_SCREEN + HIDE);
     if (stdin.isTTY && stdin.setRawMode) stdin.setRawMode(true);
     stdin.resume();
     stdin.on('data', onKey);

@@ -646,3 +646,7 @@ await initCharts();
 for (let f = 0; f < 40; f++) { drv.beginFrame(FRAME_SECONDS); for (let t = 0; t < TICKS_PER_FRAME; t++) drv.tick(); snap.build(drv); det.evaluate(snap); }
 frame();
 setInterval(frame, FRAME_MS);
+
+// Signal a clean start so index.html's CDN-failure watchdog stands down (L25): if this line is never
+// reached (a critical module such as lite-signal failed to load), the page shows a visible banner.
+globalThis.__poolScopeReady = true;

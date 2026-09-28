@@ -97,8 +97,10 @@ byte-identical to 0.5.0 apart from the VERSION stamp. It lives entirely under be
 the published tarball): the balance anchor + GC blast-radius headlines, weighted-fairness and
 consistent-hash-disruption trust gates, a seeded + Node/CPU/OS-stamped results.json, a
 bench:verify drift check (algorithmic EXACT, timing +/-15%), the naive-modulo disruption foil
-with an explicit ConsistentHash SKIP row (Maglev lands at M8), the endurance Soak.mjs scaffold
-(reuses test/invariants.mjs:checkBase), and REAL pinned npm competitors (load-balancers,
+with an explicit ConsistentHash SKIP row (Maglev lands at M8), the redesigned endurance soak
+(benchmark/soak/*: time-axis drift gates, per-strategy quality invariants, /pool lanes, a DDSketch
+p99 gate, a soak:teeth must-fail battery + a soak:report analyser -- audit 1, ADR 0014; reuses
+test/invariants.mjs:checkBase), and REAL pinned npm competitors (load-balancers,
 loadbalance, wrr) as devDeps beside our in-repo foils. Framing: parity on speed, superiority on
 the contract + balance + tail -- never an "N times faster" headline (decisions/0008).
 

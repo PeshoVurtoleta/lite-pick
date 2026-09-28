@@ -1,0 +1,51 @@
+name: soak-nightly
+
+# The endurance soak (audit 1.15): a scheduled 45-minute Linux burn-in plus the must-fail teeth. It is
+# benchmark-only -- it never touches the published kernel -- so it runs on its own schedule, off the PR
+# path. A gate breach FAILs the job; the JSONL stream and the HTML report are always uploaded so a
+# failure leaves evidence. Trigger it by hand from the Actions tab (workflow_dispatch) for an on-demand run.
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 04:00 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: soak (45m, ubuntu / node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the teeth runner's 1.0.0-revert check does `git show <old>:Pick.js`
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # 1. Teeth first: prove every gate/oracle still trips (through main.mjs) before trusting a green run.
+      - name: soak:teeth (must-fail battery + config + 1.0.0 revert)
+        run: npm run soak:teeth
+      # 2. The burn-in. SOAK_REQUIRE_PROVENANCE fails closed if the checkout has no git SHA.
+      - name: soak (45m burn-in)
+        env:
+          SOAK_DURATION: 45m
+          SOAK_REQUIRE_PROVENANCE: '1'
+        run: node --expose-gc --min-semi-space-size=4 --max-semi-space-size=4 benchmark/soak/main.mjs
+      # 3. Re-derive the verdict from the stream (integrity) and render the HTML report.
+      - name: soak:report
+        if: always()
+        run: node benchmark/soak/SoakReport.mjs --out benchmark/out/soak-report.html
+      - name: upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ github.run_id }}
+          path: |
+            benchmark/out/*.jsonl
+            benchmark/out/*.html
+          if-no-files-found: warn

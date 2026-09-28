@@ -1,0 +1,112 @@
+/**
+ * @zakkster/lite-pick soak -- run provenance header (audit RECOMMENDATIONS 1.12).
+ *
+ * buildHeader() gathers everything needed to COMPARE two runs: schema + package version, the git SHA
+ * and dirty flag (read-only), the sha256 of the kernel files under test (so a patched kernel is
+ * visible), the V8 + node versions, the execArgv flags, the machine's memory + CPU, the seed formula,
+ * every gate constant, and the timer floor. A missing git SHA is null + a gitError field (fail
+ * closed, never a fabricated value). COLD: runs once at startup.
+ */
+
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import os from 'node:os';
+import { VERSION, KERNEL_URL, KERNEL_OVERRIDE } from './kernel.mjs';
+import { SEED_FORMULA } from './seeds.mjs';
+import * as G from './gates.mjs';
+
+export const SCHEMA_VERSION = 2;
+
+const PICK_PATH = fileURLToPath(KERNEL_URL);   // the RESOLVED kernel (SOAK_KERNEL override or in-tree)
+const POOL_PATH = fileURLToPath(new URL('../../Pool.js', import.meta.url));
+
+function sha256(path) {
+    try {
+        return createHash('sha256').update(readFileSync(path)).digest('hex');
+    } catch (e) {
+        return null;
+    }
+}
+
+function gitInfo() {
+    try {
+        const sha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+        let dirty = null;   // null (unknown), never false, if the status probe fails
+        try {
+            const st = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
+            dirty = st.trim().length > 0;
+        } catch (e) { /* dirty stays null: we could not determine it */ }
+        return { sha, dirty, error: null };
+    } catch (e) {
+        return { sha: null, dirty: null, error: String(e && e.message ? e.message : e) };
+    }
+}
+
+/** Measure the performance.now() floor (smallest nonzero delta) in nanoseconds. */
+function timerFloorNs() {
+    let floor = Infinity;
+    for (let i = 0; i < 1000; i++) {
+        const a = performance.now();
+        let b = performance.now();
+        while (b === a) b = performance.now();
+        const d = (b - a) * 1e6;   // ms -> ns
+        if (d > 0 && d < floor) floor = d;
+    }
+    return floor === Infinity ? 0 : +floor.toFixed(1);
+}
+
+/** Build the header record body (the caller stamps type/seq/tMs). */
+export function buildHeader(cfg) {
+    const git = gitInfo();
+    // Fail closed when the caller demands provenance and none is establishable (CI: audit 1.12).
+    if (cfg && cfg.requireProvenance && git.sha === null) {
+        process.stderr.write('soak: FAIL -- SOAK_REQUIRE_PROVENANCE set but no git SHA (' + (git.error || 'unknown') + ')\n');
+        process.exit(2);
+    }
+    const pickSha = sha256(PICK_PATH);
+    const poolSha = sha256(POOL_PATH);
+    const cpus = os.cpus();
+    return {
+        schemaVersion: SCHEMA_VERSION,
+        pkgVersion: VERSION,
+        startedAt: new Date().toISOString(),
+        gitSha: git.sha,
+        gitDirty: git.dirty,
+        gitError: git.error,
+        kernel: {
+            pickSha256: pickSha,
+            poolSha256: poolSha,
+            kernelUrl: KERNEL_URL,
+            kernelOverride: KERNEL_OVERRIDE,   // true when SOAK_KERNEL swapped in a scratch/mutant kernel
+        },
+        node: process.version,
+        v8: process.versions.v8,
+        execArgv: process.execArgv.slice(),
+        os: {
+            platform: os.platform(),
+            arch: os.arch(),
+            totalmem: os.totalmem(),
+            freemem: os.freemem(),
+            cpuModel: cpus.length ? cpus[0].model : null,
+            cpuCount: cpus.length,
+        },
+        config: {
+            cycles: cfg.cycles, durationMs: cfg.durationMs, picks: cfg.picks, seed: cfg.seed,
+            lanes: cfg.lanes, smoke: cfg.smoke, mustFail: cfg.mustFail,
+            warmupCycles: cfg.warmupCycles, gateN: cfg.gateN, minActiveCycles: cfg.minActiveCycles,
+        },
+        seedFormula: SEED_FORMULA,
+        gates: {
+            heapMult: G.HEAP_MULT, heapSlackMB: G.HEAP_SLACK_MB,
+            rssMult: G.RSS_MULT, rssSlackMB: G.RSS_SLACK_MB,
+            hotOpsRatio: G.HOTOPS_RATIO,
+            gcPauseMult: G.GCPAUSE_MULT, gcPauseAddMs: G.GCPAUSE_ADD_MS,
+            gcMajorMax: G.GC_MAJOR_MAX, hotAllocMax: G.HOTALLOC_MAX,
+        },
+        timerFloorNs: timerFloorNs(),
+    };
+}
+
+export { PICK_PATH, POOL_PATH };

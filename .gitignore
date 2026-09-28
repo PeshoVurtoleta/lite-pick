@@ -4,4 +4,4 @@
 # stored, machine-independent baseline -- verify does no fresh timing run). Regenerate with
 # `npm run bench:report`. Only the per-run generated logs below are ignored.
 /benchmark/report.html
-/benchmark/soak.jsonl
+/benchmark/out

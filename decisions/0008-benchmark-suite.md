@@ -88,13 +88,14 @@ the docs, `package.json`, and the three version sites. Four forks were settled.
 - `benchmark/` gains `GcBlastRadius.mjs`, `Fairness.mjs`, `Disruption.mjs`, `Report.mjs`, `Soak.mjs`,
   and `results.json`; `Matrix.mjs` is extended (a `dims` flag per subject + the shared seeded
   `buildWorkload` matrix + `SEEDS`), not rewritten. No `benchmark/` file is imported by anything under
-  `test/`; the reverse is allowed -- `Soak.mjs` imports `test/invariants.mjs:checkBase` (the M4
-  checker, reused) so the endurance soak proves state-synchronisation at every checkpoint.
+  `test/`; the reverse is allowed -- the endurance soak imported `test/invariants.mjs:checkBase` (the M4
+  checker, reused) to prove state-synchronisation at every checkpoint. (The soak is now `benchmark/soak/*`
+  per ADR 0014; the checker reuse is unchanged.)
 - `package.json` gains `bench:gc` / `bench:fairness` / `bench:disruption` / `bench:verify` / `soak`
   scripts and the three pinned competitor devDeps; `bench:report` (previously broken -- it pointed at
   an absent `Report.mjs`) now works. `files[]`, `exports`, `peerDependencies`, and the tsc-visible
   API surface are UNCHANGED.
-- `Soak.mjs` is the post-1.0 #8 scaffold: ONE P2C lane now (per-strategy lanes are future work),
-  emitting a JSONL time-series, the harness the overnight `caffeinate -i` burn-in plugs into.
+- `Soak.mjs` was the post-1.0 #8 scaffold (one P2C lane, a JSONL time-series). It has been REPLACED by
+  the `benchmark/soak/*` redesign per the 2026-09-26 audit -- see [ADR 0014](./0014-soak-redesign.md).
 - M6 is an EVIDENCE session, not a strategy append: it adds NO s0 strategy-accounting row, NO new
   `Pick.js` class. The kernel stays a single 0 B/op file; the suite proves it.

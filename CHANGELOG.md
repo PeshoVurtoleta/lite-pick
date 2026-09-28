@@ -4,6 +4,23 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Benchmark-only: the endurance soak is redesigned (no runtime change).** Per the 2026-09-26 audit
+  (RECOMMENDATIONS section 1), the old `benchmark/Soak.mjs` is replaced by `benchmark/soak/*` -- a
+  harness whose drift gates measure TIME (per-lane early-vs-late medians across cycles), not lanes; a
+  discrete-event load model with real service times; per-strategy quality invariants (RoundRobin
+  evenness, SmoothWRR/WeightedRandom weight-fairness, P2C balance, LeastConn/SED/NQ argmin,
+  ConsistentHash stickiness, BoundedLoad cap, PeakEWMA latency-steering); `/pool` lanes (async
+  dispatch/settle/failover/abort); a DDSketch p99 tail gate; a hot-path 0-B/op probe that reads all V8
+  data spaces; provenance + fail-closed config; a `soak:teeth` must-fail battery (every gate proven to
+  trip through the production path, including a 1.0.0-kernel revert that the new quality gates catch);
+  and a `soak:report` tool that re-derives the verdict from the JSONL and diffs runs against a
+  baseline. `Pick.js`/`Pool.js`/`*.d.ts` are byte-identical; no version bump. See
+  [ADR 0014](./decisions/0014-soak-redesign.md).
+
 ## [1.0.1] - 2026-09-27
 
 Bug-fix release: the fixes from the full audit at `audit/2026-09-26/` (audited code state commit

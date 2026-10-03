@@ -124,3 +124,15 @@ it false-FAILs a correct kernel. Two decisions change:
   (SIGINT after cycle 1 -> exit 3) and I2 (`SOAK_DURATION=10s` -> exit 3).
 - **The nightly is manual-only** until the remaining Node 22 false-FAILs (S2 timing noise, S3 teeth, S4
   harness heap growth) are fixed and 20/20 runs are green on Node 22 under load.
+
+## Amendment 2026-10-03 -- audit 2026-09-29 (S4)
+
+- **O(lanes) harness memory.** The gate accumulators were O(1) but `main.mjs` fed them from an array of
+  every cycle record, kept for the whole run (~1 KB of heap per record), so a long clean run FAILed its own
+  heap gate. Records now stream into `GateAccumulator` (per-lane `EarlyLate` windows, scalar counters, a
+  bounded RSS series) and are dropped after the JSONL write. `computeGates(rows)` wraps the same
+  accumulator for `soak:report`. The RSS runaway guard keeps a deterministic decimating sample of 1024
+  values (every value, then every 2nd, 4th, ...) for the band center and the last 256 values for the
+  late-quarter p95 -- identical to the unbounded list up to 1024 samples per lane.
+- Teeth: PL (clean `SOAK_CYCLES=1500 SOAK_PICKS=70000 SOAK_LANES=RoundRobin` must PASS) and ML (the same
+  with `SOAK_MUSTFAIL=slowleak`, ~1 KB retained per lane-cycle, must FAIL `heap`).

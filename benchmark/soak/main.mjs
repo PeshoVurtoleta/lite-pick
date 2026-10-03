@@ -25,7 +25,7 @@ import { openStream, writeRecord, installFatalHandlers, defaultOutPath, writeFat
 import { makeHotCtx, stepFor, warmBiasBytes, measureHotBytesPerOp, assertPinnedFlags, SMI_LIMIT } from './hot.mjs';
 import { QualityWindow } from './quality.mjs';
 import { evaluateOracle } from './oracles.mjs';
-import { computeGates, exitCodeFor, VERDICT } from './gates.mjs';
+import { GateAccumulator, exitCodeFor, VERDICT } from './gates.mjs';
 import { closeLaneCycle } from './boundary.mjs';
 
 const CHECKPOINTS = 5;
@@ -39,6 +39,7 @@ const HOTOPS_SPARSE_BATCH = 20000;   // fixed SPARSE (~95% down) batch -- each p
 const LAT_PICKS = 96000;             // dense latency pass, every pick timed: 96000 samples/cycle (p999 stable)
 const LAT_SPARSE_PICKS = 20000;      // sparse latency pass (each pick O(cap)): report-only p50/p99/p999
 const LEAK_ARRAY_LEN = 700000;   // MUSTFAIL=leak/heap: plain-array retained per lane-cycle
+const SLOWLEAK_LEN = 128;        // MUSTFAIL=slowleak: ~1 KB retained per lane-cycle (S4 teeth ML)
 
 const noop = () => {};           // leak-contract safe: closes over nothing
 let fatalCtx = null;             // set once stream/summarize exist, so main().catch can write a fatal
@@ -134,7 +135,11 @@ async function main() {
     const bias = biasInfo.bias;
     header.bopBias = { biasBytes: bias, floorBytes: biasInfo.floor, spreadBytes: biasInfo.spread, gcFreeWindows: biasInfo.gcFree };
 
-    const rollups = [];
+    // S4 (audit 2026-09-29): records stream into O(lanes) gate state and are NOT kept (the JSONL on disk is
+    // the durable record for soak:report). A kept array grew the post-GC heap ~1 KB per record and tripped
+    // the heap gate on long runs. Pool records are counted only (computeGates never read them).
+    const gateAcc = new GateAccumulator({ warmupCycles: cfg.warmupCycles, gateN: cfg.gateN, lanes: laneIds });
+    let rollupCount = 0;
     const leakSink = [];
     let invariantFailures = 0;
     let sizeFailures = 0;
@@ -167,8 +172,8 @@ async function main() {
     gc.reset();   // header build allocates; start each lane-cycle's workload window clean
 
     function summarize(reason) {
-        const gate = computeGates(rollups, {
-            warmupCycles: cfg.warmupCycles, gateN: cfg.gateN, smoke: cfg.smoke, lanes: laneIds,
+        const gate = gateAcc.compute({
+            smoke: cfg.smoke, lanes: laneIds,
             timerFloorNs: header.timerFloorNs,   // latency floor = 2 * this (BLOCKER 3)
             poolLaunched: poolLaunchedTotal,     // count pool runs as work for the "did nothing" gate
             // S5: a bounded run that did not reach its end is never a PASS. A forever run (SOAK_CYCLES=0)
@@ -200,7 +205,7 @@ async function main() {
         writeRecord(stream, 'summary', {
             reason,
             wallSec: +((performance.now() - t0) / 1000).toFixed(1),
-            totalPicks, lanes: laneIds.length, cyclesRun, rollups: rollups.length,
+            totalPicks, lanes: laneIds.length, cyclesRun, rollups: rollupCount,
             invariantFailures, retentionFailures: sizeFailures, qualityViolations, poolFailures, unhandledCount,
             inconclusiveLanes, phasesNotFired,
             phaseTotals: reason === 'end' ? Object.fromEntries(phaseTotals) : undefined,
@@ -253,6 +258,9 @@ async function main() {
         tracker.track(built.b, noop, lane.name, { audit: true });
         if (MF === 'leak') { leakSink.push(built.b); leakSink.push(new Array(LEAK_ARRAY_LEN).fill(cycle & 255)); }
         if (MF === 'heap') { leakSink.push(new Array(LEAK_ARRAY_LEN * (cycle + 1)).fill(cycle & 255)); }
+        // S4 teeth (ML): ~1 KB retained per lane-cycle -- the rate the harness's own record array leaked.
+        // Over a long run the heap drift gate must catch it (the same run without it must PASS: PL).
+        if (MF === 'slowleak') leakSink.push(new Array(SLOWLEAK_LEN).fill(cycle & 255));
         const eligible = built.eligible, inflight = built.inflight, weights = built.weights;
         qw.arm(lane.name, lane.weighted, eligible, weights, CAP);
         const ctx = makeHotCtx(lane, built, seed, CAP, QUEUE_CAP, MEAN_SVC_US, seed & 1);
@@ -554,7 +562,7 @@ async function main() {
                     assert4: pcore.assert4_codesOk, assert5_outcome: pcore.assert5_outcomeOk,
                     assert6_retention: retentionOk, trackerSize: pb.trackerSize, badCode: pcore.badCode, outcomeMiss: pcore.outcomeMiss,
                 };
-                rollups.push(prollup);
+                rollupCount++;
                 writeRecord(stream, 'cycle', prollup);
                 continue;
             }
@@ -635,7 +643,8 @@ async function main() {
                 heapSampledAfterGc: b.heapSampledAfterGc,
                 seed: core.seed,
             };
-            rollups.push(rollup);
+            gateAcc.push(rollup);
+            rollupCount++;
             writeRecord(stream, 'cycle', rollup);
         }
         const mem = process.memoryUsage();

@@ -323,6 +323,14 @@ if (want('I2 SOAK_DURATION=10s')) {
     record('I2 SOAK_DURATION=10s', runSoak(writeMutant(PICK, 'I2'), { SOAK_DURATION: '10s', SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'drift gates need');
 }
 
+// --- S4 (audit 2026-09-29): the harness's own memory is O(lanes). PL: a clean 1500-cycle run (3000
+// records) must PASS the heap gate -- the kept record array used to grow the heap ~1 KB/record and FAIL
+// it. ML: the same run retaining ~1 KB per lane-cycle (SOAK_MUSTFAIL=slowleak) must FAIL it. ------------
+// 70000 picks: the fewest at which the RoundRobin quality windows fill (below it the run is INCONCLUSIVE).
+const LONG = { SOAK_CYCLES: '1500', SOAK_PICKS: '70000', SOAK_LANES: 'RoundRobin' };
+control('PL clean 1500 cycles (heap flat)', PICK, LONG, 0, null);
+modeControl('ML slowleak 1KB/lane-cycle (heap)', { ...LONG, SOAK_MUSTFAIL: 'slowleak' }, 1, 'gate heap[');
+
 // --- pass-control: the CLEAN kernel through the same path must exit 0 ----------------------------
 control('P clean kernel (pass-control)', PICK,
     { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0, null);

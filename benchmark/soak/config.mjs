@@ -38,7 +38,7 @@ const KNOWN_KEYS = [
 // forces a workload major GC -> the gcMajor gate, which fires before the deliberately generous RSS
 // runaway threshold), decay->dense hotOps, decaysparse->sparse hotOps (proves the split series has
 // teeth on its own), weight0->quality(H3 guard), imbalance->quality(distribution).
-const MUSTFAIL_MODES = ['leak', 'heap', 'rss', 'decay', 'decaysparse', 'weight0', 'imbalance',
+const MUSTFAIL_MODES = ['leak', 'heap', 'slowleak', 'rss', 'decay', 'decaysparse', 'weight0', 'imbalance',
     // pool-lane teeth (T14-15): poolleak->quiescence(A2), poolnote->totalInflight(A1), pooldrop->
     // accounting(A3), poolbadcode->rejection-codes(A4), poolretain->retention(A6), poolunhandled->A7.
     'poolleak', 'poolnote', 'pooldrop', 'poolbadcode', 'poolretain', 'poolunhandled'];

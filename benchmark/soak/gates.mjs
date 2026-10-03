@@ -94,22 +94,131 @@ function percentileOf(list, p) {
     return a[idx];
 }
 
-function medianList(list) {
-    if (!list.length) return 0;
-    const a = list.slice().sort((x, y) => x - y);
-    const m = a.length >> 1;
-    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+/** Bounded RSS series for the runaway guard (S4: O(1) memory). `bandCenter()` is the median of a
+ * decimating buffer -- every sample while <= RSS_KEEP, then every 2nd, 4th, ... (deterministic, evenly
+ * spread over the whole run); `lateP95()` is the p95 of the last quarter of the run, capped at the last
+ * RSS_LATE samples. Both equal the old unbounded list's values for runs of <= RSS_KEEP samples. */
+export const RSS_KEEP = 1024;
+export const RSS_LATE = 256;
+class RssSeries {
+    constructor() {
+        this.buf = new Float64Array(RSS_KEEP);
+        this.len = 0;
+        this.stride = 1;
+        this.ring = new Float64Array(RSS_LATE);
+        this.total = 0;
+    }
+    push(v) {
+        const i = this.total++;
+        this.ring[i % RSS_LATE] = v;
+        if (i % this.stride !== 0) return;
+        if (this.len === RSS_KEEP) {
+            // keep every 2nd retained sample (those with index % (2*stride) === 0), then double the stride
+            for (let k = 0; k < RSS_KEEP / 2; k++) this.buf[k] = this.buf[2 * k];
+            this.len = RSS_KEEP / 2;
+            this.stride *= 2;
+            if (i % this.stride !== 0) return;
+        }
+        this.buf[this.len++] = v;
+    }
+    bandCenter() { return medianOf(this.buf, this.len); }
+    lateP95() {
+        let q = Math.max(1, Math.floor(this.total / 4));
+        if (q > RSS_LATE) q = RSS_LATE;
+        if (q > this.total) q = this.total;
+        const out = [];
+        for (let k = this.total - q; k < this.total; k++) out.push(this.ring[k % RSS_LATE]);
+        return percentileOf(out, 0.95);
+    }
 }
 
+function newLaneState(N) {
+    return {
+        post: 0, firstTier: null,
+        elHeap: new EarlyLate(N), elRss: new EarlyLate(N),
+        elOps: new EarlyLate(N), elOpsSparse: new EarlyLate(N), elPause: new EarlyLate(N),
+        elLatP999: new EarlyLate(N), elLatSamples: new EarlyLate(N),
+        elRebuildP99: new EarlyLate(N), elRebuildSamples: new EarlyLate(N),
+        rss: new RssSeries(),
+        gcMajorMax: 0, hotAllocWorst: 0, hotAllocMeasured: 0, hotAllocScavengedFail: false,
+        hotAllocNonFinite: false,
+        hotAllocPassMaxOver: 0,   // NIT1: post-warmup cycles where max(pass1,pass2) B/op > bound
+        lanePicks: 0,
+    };
+}
+
+/** Fold one post-warmup cycle record into its lane's state (O(1) memory per lane). */
+function pushRow(st, r) {
+    st.post++;
+    if (st.firstTier === null) st.firstTier = r.tier;
+    st.elHeap.push(r.heapUsedMB);
+    st.elRss.push(r.rssMB);
+    st.elOps.push(r.hotOpsDense);
+    st.elOpsSparse.push(r.hotOpsSparse);
+    st.elPause.push(r.gcPauseMs);
+    // Gate on p99 (top 1% ~ 960 of 96000 samples): p999 individual sub-microsecond-pick timing is
+    // dominated by rare OS-scheduling jitter in the tail, not kernel drift, so a 1.5x p999 ratio
+    // false-fails a clean kernel. p99 is the robust kernel tail; a growing stall still inflates it.
+    // p999/max remain in the cycle record (informational).
+    const lat = r.latency || { p99: 0, samples: 0 };
+    st.elLatP999.push(lat.p99); st.elLatSamples.push(lat.samples);
+    st.elRebuildP99.push(r.rebuildP99 || 0); st.elRebuildSamples.push(r.rebuildSamples || 0);
+    st.rss.push(r.rssMB);
+    if (r.gcMajor > st.gcMajorMax) st.gcMajorMax = r.gcMajor;
+    st.lanePicks += r.totalPicks;
+    // hotAlloc: EVERY post-warmup cycle is measured. The B/op probe runs at ctx.now=0, so a cycle
+    // whose WORKLOAD clock went into the boxing range still measures the true 0-alloc steady state
+    // -- no boxingRegime exclusion (NIT C: it needlessly halved PeakEWMA coverage).
+    if (r.hotBopNonFinite) {
+        // A non-finite measured B/op is recorded as null (JSON drops Infinity) + this flag. It is a
+        // measurement FAIL (Infinity), re-derivable from the JSONL by the report tool.
+        st.hotAllocMeasured++;
+        st.hotAllocWorst = Infinity;
+        st.hotAllocNonFinite = true;
+    } else if (r.hotBytesPerOp !== null && r.hotBytesPerOp !== undefined) {
+        st.hotAllocMeasured++;
+        // NaN-closed: a non-finite measured value is a FAIL (Infinity), never a silent pass via a
+        // `NaN > worst` that evaluates false.
+        if (!Number.isFinite(r.hotBytesPerOp)) { st.hotAllocWorst = Infinity; st.hotAllocNonFinite = true; }
+        else if (r.hotBytesPerOp > st.hotAllocWorst) st.hotAllocWorst = r.hotBytesPerOp;
+    } else if (r.hotBopGcFree === 0) {
+        // EVERY window scavenged -> sustained allocation (>= a semi-space per window) -> a heavy
+        // leak, NOT "unmeasurable". This is a FAIL, never a silent skip.
+        st.hotAllocScavengedFail = true;
+    }
+    // NIT1 recurrence: a periodic allocation RARER than one pass lands in only one pass per cycle
+    // (so the MIN `bop` misses it, like a one-off) but RECURS every cycle. Count cycles where the
+    // per-pass max exceeds the bound; >=2 is periodic (a true one-off happens ~once per process).
+    if (r.hotBopPassMax !== null && r.hotBopPassMax !== undefined &&
+        (!Number.isFinite(r.hotBopPassMax) || r.hotBopPassMax > HOTALLOC_MAX)) st.hotAllocPassMaxOver++;
+    }
+
 /**
- * @param {Array} rollups per-lane-cycle records: { lane, cycle, tier, heapUsedMB, rssMB,
- *        hotOpsPerSec, gcMajor, gcPauseMs, hotBytesPerOp (number|null), totalPicks, boxingRegime }
- * @param {object} opts { warmupCycles, gateN, smoke, lanes: [names], interrupted (bool: a bounded run
- *        that did not reach its end -- S5), timerFloorNs, poolLaunched }
+ * Streaming gate state (S4, audit 2026-09-29): main.mjs pushes each cycle record as it is produced and
+ * keeps NO record array, so the harness's own memory is O(lanes), not O(cycles) -- an unbounded record
+ * list grew the post-GC heap ~1 KB per record and tripped the heap gate on long runs. Records must arrive
+ * in cycle order per lane (main produces them so; computeGates sorts). Records of an unknown lane or a
+ * warm-up cycle are ignored.
  */
-export function computeGates(rollups, opts) {
-    const warmup = opts.warmupCycles | 0;
-    const N = opts.gateN | 0;
+export class GateAccumulator {
+    /** @param {object} opts { warmupCycles, gateN, lanes: [names] } */
+    constructor(opts) {
+    this.warmup = opts.warmupCycles | 0;
+    this.N = opts.gateN | 0;
+    this.lanes = new Map();
+    for (const nm of opts.lanes) this.lanes.set(nm, newLaneState(this.N));
+    }
+    push(r) {
+    const st = this.lanes.get(r.lane);
+    if (st === undefined || r.cycle < this.warmup) return;
+    pushRow(st, r);
+    }
+    /**
+     * @param {object} opts { smoke, lanes: [names], interrupted (bool: a bounded run that did not reach its
+     *        end -- S5), timerFloorNs, poolLaunched }
+     */
+    compute(opts) {
+    const N = this.N;
     const activeFloor = 2 * N;
     const lanes = opts.lanes;
     // Latency granularity floor = LAT_ADD_TICKS * timerFloorNs (from provenance); clean lanes wobble <= 1
@@ -124,63 +233,10 @@ export function computeGates(rollups, opts) {
     let totalPicksAll = 0;
 
     for (const laneName of lanes) {
-        const rows = rollups
-            .filter((r) => r.lane === laneName && r.cycle >= warmup)
-            .sort((a, b) => a.cycle - b.cycle);
-        const post = rows.length;
-
-        const elHeap = new EarlyLate(N), elRss = new EarlyLate(N);
-        const elOps = new EarlyLate(N), elOpsSparse = new EarlyLate(N), elPause = new EarlyLate(N);
-        const elLatP999 = new EarlyLate(N), elLatSamples = new EarlyLate(N);
-        const elRebuildP99 = new EarlyLate(N), elRebuildSamples = new EarlyLate(N);
-        const rssList = [];
-        let gcMajorMax = 0, hotAllocWorst = 0, hotAllocMeasured = 0, hotAllocScavengedFail = false;
-        let hotAllocNonFinite = false;
-        let hotAllocPassMaxOver = 0;   // NIT1: post-warmup cycles where max(pass1,pass2) B/op > bound
-        let lanePicks = 0;
-
-        for (const r of rows) {
-            elHeap.push(r.heapUsedMB);
-            elRss.push(r.rssMB);
-            elOps.push(r.hotOpsDense);
-            elOpsSparse.push(r.hotOpsSparse);
-            elPause.push(r.gcPauseMs);
-            // Gate on p99 (top 1% ~ 960 of 96000 samples): p999 individual sub-microsecond-pick timing is
-            // dominated by rare OS-scheduling jitter in the tail, not kernel drift, so a 1.5x p999 ratio
-            // false-fails a clean kernel. p99 is the robust kernel tail; a growing stall still inflates it.
-            // p999/max remain in the cycle record (informational).
-            const lat = r.latency || { p99: 0, samples: 0 };
-            elLatP999.push(lat.p99); elLatSamples.push(lat.samples);
-            elRebuildP99.push(r.rebuildP99 || 0); elRebuildSamples.push(r.rebuildSamples || 0);
-            rssList.push(r.rssMB);
-            if (r.gcMajor > gcMajorMax) gcMajorMax = r.gcMajor;
-            lanePicks += r.totalPicks;
-            // hotAlloc: EVERY post-warmup cycle is measured. The B/op probe runs at ctx.now=0, so a cycle
-            // whose WORKLOAD clock went into the boxing range still measures the true 0-alloc steady state
-            // -- no boxingRegime exclusion (NIT C: it needlessly halved PeakEWMA coverage).
-            if (r.hotBopNonFinite) {
-                // A non-finite measured B/op is recorded as null (JSON drops Infinity) + this flag. It is a
-                // measurement FAIL (Infinity), re-derivable from the JSONL by the report tool.
-                hotAllocMeasured++;
-                hotAllocWorst = Infinity;
-                hotAllocNonFinite = true;
-            } else if (r.hotBytesPerOp !== null && r.hotBytesPerOp !== undefined) {
-                hotAllocMeasured++;
-                // NaN-closed: a non-finite measured value is a FAIL (Infinity), never a silent pass via a
-                // `NaN > worst` that evaluates false.
-                if (!Number.isFinite(r.hotBytesPerOp)) { hotAllocWorst = Infinity; hotAllocNonFinite = true; }
-                else if (r.hotBytesPerOp > hotAllocWorst) hotAllocWorst = r.hotBytesPerOp;
-            } else if (r.hotBopGcFree === 0) {
-                // EVERY window scavenged -> sustained allocation (>= a semi-space per window) -> a heavy
-                // leak, NOT "unmeasurable". This is a FAIL, never a silent skip.
-                hotAllocScavengedFail = true;
-            }
-            // NIT1 recurrence: a periodic allocation RARER than one pass lands in only one pass per cycle
-            // (so the MIN `bop` misses it, like a one-off) but RECURS every cycle. Count cycles where the
-            // per-pass max exceeds the bound; >=2 is periodic (a true one-off happens ~once per process).
-            if (r.hotBopPassMax !== null && r.hotBopPassMax !== undefined &&
-                (!Number.isFinite(r.hotBopPassMax) || r.hotBopPassMax > HOTALLOC_MAX)) hotAllocPassMaxOver++;
-        }
+        const st = this.lanes.get(laneName) || newLaneState(N);
+        const { post, elHeap, elOps, elOpsSparse, elPause, elLatP999, elLatSamples, elRebuildP99,
+            elRebuildSamples, gcMajorMax, hotAllocWorst, hotAllocMeasured, hotAllocScavengedFail,
+            hotAllocNonFinite, hotAllocPassMaxOver, lanePicks } = st;
         totalPicksAll += lanePicks;
 
         // --- always-active per-cycle gates -----------------------------------------------------
@@ -205,7 +261,7 @@ export function computeGates(rollups, opts) {
         else if (hotAllocVerdict === VERDICT.STUB) notes.push('hotAlloc[' + laneName + '] ' + (hotAllocWorst > HOTALLOC_MAX ? 'max=' + hotAllocWorst.toFixed(3) : 'per-pass max over bound in ' + hotAllocPassMaxOver + ' cycles') + ' > ' + HOTALLOC_MAX + ' B/op (report-only; PerfGate owns per-op 0 B/op)');
 
         // tiny lanes report throughput/latency, never fail on it (cap in {1,2,3} is a degenerate regime).
-        const reportOnlyThroughput = rows.length > 0 && rows[0].tier === 'tiny';
+        const reportOnlyThroughput = st.firstTier === 'tiny';
         // --- drift gates: active only at >= 2N post-warmup cycles -------------------------------
         let heapGate, rssGate, opsGate, opsSparseGate, pauseGate;
         if (opts.smoke || post < activeFloor) {
@@ -220,9 +276,8 @@ export function computeGates(rollups, opts) {
             heapGate = { verdict: heapLate <= heapLimit ? VERDICT.PASS : VERDICT.FAIL, earlyMedianMB: r1(heapEarly), lateMedianMB: r1(heapLate), limitMB: r1(heapLimit) };
             if (heapGate.verdict === VERDICT.FAIL) breaches.push('heap[' + laneName + '] late=' + r1(heapLate) + 'MB > limit=' + r1(heapLimit) + 'MB');
 
-            const bandCenter = medianList(rssList);
-            const q = Math.max(1, Math.floor(rssList.length / 4));
-            const lateP95 = percentileOf(rssList.slice(rssList.length - q), 0.95);
+            const bandCenter = st.rss.bandCenter();
+            const lateP95 = st.rss.lateP95();
             const rssLimit = bandCenter * RSS_MULT + RSS_SLACK_MB;
             rssGate = { verdict: lateP95 <= rssLimit ? VERDICT.PASS : VERDICT.FAIL, bandCenterMB: r1(bandCenter), lateP95MB: r1(lateP95), limitMB: r1(rssLimit) };
             if (rssGate.verdict === VERDICT.FAIL) breaches.push('rss[' + laneName + '] lateP95=' + r1(lateP95) + 'MB > limit=' + r1(rssLimit) + 'MB');
@@ -272,6 +327,21 @@ export function computeGates(rollups, opts) {
 
     const verdict = sawFail ? VERDICT.FAIL : ((sawInconclusive || inconclusive.length !== 0) ? VERDICT.INCONCLUSIVE : VERDICT.PASS);
     return { verdict, breaches, notes, inconclusive, perLane, totalPicks: totalPicksGate, active: !opts.smoke };
+    }
+}
+
+/**
+ * Re-derive the gates from a full record array (the report tool: it can afford the memory). The SAME
+ * accumulator main.mjs streams into, so the two always agree.
+ * @param {Array} rollups per-lane-cycle records: { lane, cycle, tier, heapUsedMB, rssMB, hotOpsDense,
+ *        hotOpsSparse, gcMajor, gcPauseMs, hotBytesPerOp (number|null), totalPicks, latency, ... }
+ * @param {object} opts { warmupCycles, gateN, smoke, lanes: [names], interrupted, timerFloorNs, poolLaunched }
+ */
+export function computeGates(rollups, opts) {
+    const acc = new GateAccumulator(opts);
+    const rows = rollups.slice().sort((x, y) => x.cycle - y.cycle);   // stable: per-lane order preserved
+    for (const r of rows) acc.push(r);
+    return acc.compute(opts);
 }
 
 /** Map a verdict to a process exit code. */

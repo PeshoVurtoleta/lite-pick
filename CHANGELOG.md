@@ -19,6 +19,16 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   every run. An over-bound lane now prints `soak: NOTE -- hotAlloc[lane] ...`; the soak still FAILs when
   every probe window scavenges (~512+ B/op) or the measurement is non-finite. Per-op 0 B/op stays gated by
   `test:perf` (PerfGate), which fails on the same allocation mutants. See the ADR 0014 amendment.
+- **Benchmark-only: the soak harness's own memory no longer grows with run length (S4, audit
+  2026-09-29).** `main.mjs` kept every cycle record in an array for the whole run; the post-GC heap grew
+  ~1 KB per record and a clean 1500-cycle RoundRobin run FAILed its own heap gate (7.5 -> 10.5 MB,
+  `heap[RoundRobin] late=10.5MB > limit=10.3MB`). Records now stream into a per-lane
+  `GateAccumulator` (`gates.mjs`) and are not kept; the JSONL on disk stays the full record.
+  `computeGates(rows)` is now a wrapper over the same accumulator, so `soak:report` re-derives with the
+  identical code path. Results are byte-identical to before for runs up to 1025 post-warmup cycles per
+  lane; beyond that the RSS runaway guard's band center and late-quarter p95 come from a bounded
+  decimating sample (1024) and the last 256 samples. New teeth: PL (clean 1500 cycles must PASS) and ML
+  (`SOAK_MUSTFAIL=slowleak`, ~1 KB retained per lane-cycle, must FAIL the heap gate).
 - **Benchmark-only: `soak:teeth` accepts `MUSTFAIL_ONLY=<regex>`** to run a subset of controls (dev aid;
   the full battery is the gate), and keeps a child's stderr on an exit-0 run too (it was discarded, so a
   control could not assert a line printed by a passing run).

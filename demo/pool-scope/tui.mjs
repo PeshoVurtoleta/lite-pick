@@ -23,12 +23,12 @@
  * (I/O formatting) without creating arrays/objects/closures per frame.
  */
 
-import { Driver, STRATEGIES, DEFAULT_CONC } from './driver.mjs';
-import { LitePickSnapshot } from './snapshot.mjs';
+import {Driver, STRATEGIES, DEFAULT_CONC} from './driver.mjs';
+import {LitePickSnapshot} from './snapshot.mjs';
 import {
     Detectors, OVERLOAD_SAT, UNFAIR_GINI,
 } from './detectors.mjs';
-import { LATENCY_BACKING, DETECTOR_BACKING, HOTKEY_BACKING } from './siblings.mjs';
+import {LATENCY_BACKING, DETECTOR_BACKING, HOTKEY_BACKING} from './siblings.mjs';
 
 /* ------------------------------------------------------------------- ANSI + glyph constants ---- */
 
@@ -44,7 +44,9 @@ const CLR_EOL = ESC + '0K';
 const CLR_DOWN = ESC + '0J';
 const CLR_SCREEN = ESC + '2J';
 
-function fg(r, g, b) { return ESC + '38;2;' + r + ';' + g + ';' + b + 'm'; }
+function fg(r, g, b) {
+    return ESC + '38;2;' + r + ';' + g + ';' + b + 'm';
+}
 
 const C_GREEN = fg(0x5f, 0xe3, 0x9f);
 const C_CYAN = fg(0x7d, 0xd3, 0xfc);
@@ -72,7 +74,15 @@ const GRAD = new Array(GRAD_N);
     for (let i = 0; i < GRAD_N; i++) {
         const t = i / (GRAD_N - 1);
         let a, b, u;
-        if (t < 0.5) { a = g0; b = g1; u = t * 2; } else { a = g1; b = g2; u = (t - 0.5) * 2; }
+        if (t < 0.5) {
+            a = g0;
+            b = g1;
+            u = t * 2;
+        } else {
+            a = g1;
+            b = g2;
+            u = (t - 0.5) * 2;
+        }
         GRAD[i] = fg(
             (a[0] + (b[0] - a[0]) * u) | 0,
             (a[1] + (b[1] - a[1]) * u) | 0,
@@ -116,8 +126,13 @@ const WARMUP_FRAMES = 60;        // scripted: settle the rings before the first 
 const MEAS_WARM = 400;           // data-path measurement: JIT/warm iterations before sampling
 const MEAS_N = 20000;            // data-path measurement: sampled iterations (batch, gc-settled)
 
-function clampi(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
-function gradIdx(v) { return clampi((v * (GRAD_N - 1)) | 0, 0, GRAD_N - 1); }
+function clampi(v, lo, hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+function gradIdx(v) {
+    return clampi((v * (GRAD_N - 1)) | 0, 0, GRAD_N - 1);
+}
 
 /* --------------------------------------------------------------------------------- renderer ---- */
 
@@ -163,10 +178,16 @@ class Renderer {
         let sumW = 0;
         for (let i = 0; i < cap; i++) if (snap.wEligible[i]) sumW += drv.weights[i];
         let meanLoad = 0, liveN = 0;
-        for (let i = 0; i < cap; i++) if (snap.wEligible[i]) { meanLoad += snap.wInflight[i]; liveN++; }
+        for (let i = 0; i < cap; i++) if (snap.wEligible[i]) {
+            meanLoad += snap.wInflight[i];
+            liveN++;
+        }
         meanLoad = liveN > 0 ? meanLoad / liveN : 0;
         let sig = 0;
-        for (let i = 0; i < cap; i++) if (snap.wEligible[i]) { const d = snap.wInflight[i] - meanLoad; sig += d * d; }
+        for (let i = 0; i < cap; i++) if (snap.wEligible[i]) {
+            const d = snap.wInflight[i] - meanLoad;
+            sig += d * d;
+        }
         sig = liveN > 0 ? Math.sqrt(sig / liveN) : 0;
         let fpScale = meanLoad * FP_MEAN_MULT;
         if (fpScale < FP_SCALE_FLOOR) fpScale = FP_SCALE_FLOOR;
@@ -261,10 +282,19 @@ class Renderer {
             let line = C_FAINT + 'w' + (w < 10 ? ' ' : '') + w + ' ' + RESET;
             for (let c = 0; c < HEAT_COLS; c++) {
                 const k = HEAT_COLS - 1 - c;              // newest at the right
-                if (k >= snap.frames) { line += ' '; continue; }
-                if (!snap.eligAt(w, k)) { line += C_FAINT + '·' + RESET; continue; }
+                if (k >= snap.frames) {
+                    line += ' ';
+                    continue;
+                }
+                if (!snap.eligAt(w, k)) {
+                    line += C_FAINT + '·' + RESET;
+                    continue;
+                }
                 const load = snap.loadAt(w, k);
-                if (load <= 0) { line += C_FAINT + '·' + RESET; continue; }
+                if (load <= 0) {
+                    line += C_FAINT + '·' + RESET;
+                    continue;
+                }
                 // Value-driven: COLOUR lerps green->amber->red along magnitude AND the density glyph
                 // steps light->full, so frame-to-frame load jitter reads as shimmer/texture.
                 const v = load / scale;
@@ -366,10 +396,22 @@ function applyScenario(drv, name) {
         for (let k = 1; k < drv.cap; k += 2) drv.killWorker(k);   // mass outage -> survivor hotspot
         return;
     }
-    if (name === 'overload') { drv.overloadSpike((drv.cap / 2) | 0); return; }
-    if (name === 'flapstorm') { drv.flapStorm((drv.cap / 3) | 0); return; }
-    if (name === 'pingpong') { drv.forcePingPong(2, drv.cap - 4); return; }
-    if (name === 'unfair') { drv.makeUnfair(); return; }
+    if (name === 'overload') {
+        drv.overloadSpike((drv.cap / 2) | 0);
+        return;
+    }
+    if (name === 'flapstorm') {
+        drv.flapStorm((drv.cap / 3) | 0);
+        return;
+    }
+    if (name === 'pingpong') {
+        drv.forcePingPong(2, drv.cap - 4);
+        return;
+    }
+    if (name === 'unfair') {
+        drv.makeUnfair();
+        return;
+    }
     if (name === 'starve') {
         // Genuine POLICY starvation: a weight-aware strategy correctly never routes to a weight-0 but UP
         // node. Ensure a weight-aware strategy is active (under a weight-blind one a weight-0 node is still
@@ -378,7 +420,10 @@ function applyScenario(drv, name) {
         drv.makeStarve();
         return;
     }
-    if (name === 'hotkeys') { drv.makeHotKeys(); return; }   // zipfian keys -> a keyed-strategy hotspot
+    if (name === 'hotkeys') {
+        drv.makeHotKeys();
+        return;
+    }   // zipfian keys -> a keyed-strategy hotspot
     throw new Error('[pool-scope] unknown scenario: ' + name + ' (one of ' + SCENARIOS.join(', ') + ')');
 }
 
@@ -404,7 +449,10 @@ function measureDataPath(strategy, seed) {
         sn.build(d);
         dt.evaluate(sn);
     }
-    if (typeof globalThis.gc === 'function') { globalThis.gc(); globalThis.gc(); }
+    if (typeof globalThis.gc === 'function') {
+        globalThis.gc();
+        globalThis.gc();
+    }
     const before = process.memoryUsage().heapUsed;
     for (let i = 0; i < MEAS_N; i++) {
         d.beginFrame(FRAME_SECONDS);
@@ -505,29 +553,50 @@ function runInteractive(argv) {
         out.write(RESET + SHOW + ALT_OFF);
     }
 
-    function quit() { restore(); process.exit(0); }
+    function quit() {
+        restore();
+        process.exit(0);
+    }
 
     function onKey(chunk) {
         const s = chunk.toString();
         // Escape sequences: an arrow / function key arrives as ESC '[' ... (or ESC 'O' ...). Ignore the
         // whole sequence rather than quitting on the bare ESC prefix (L23). A lone ESC still quits.
         if (s.charCodeAt(0) === 0x1b) {
-            if (s.length === 1) { quit(); }
+            if (s.length === 1) {
+                quit();
+            }
             return;
         }
         for (let c = 0; c < s.length; c++) {
             const ch = s[c];
-            if (ch === 'q' || ch === '\x03') { quit(); return; }
-            if (ch >= '1' && ch <= '9') { switchTo((ch.charCodeAt(0) - 49)); }
-            else if (ch === '0') { switchTo(9); }
-            else if (ch === 'n') { switchTo((STRATEGIES.indexOf(drv.strategyName) + 1) % STRATEGIES.length); }
-            else if (ch === 'k') { drv.conc = 150; drv.killWorker(killIdx); killIdx = (killIdx + 2) % drv.cap; }
-            else if (ch === 'o') { drv.overloadSpike((drv.cap / 2) | 0); }
-            else if (ch === 'f') { drv.flapStorm((drv.cap / 3) | 0); }
-            else if (ch === 'p') { drv.forcePingPong(2, drv.cap - 4); }
-            else if (ch === 'u') { drv.makeUnfair(); }
-            else if (ch === 's') { drv.makeStarve(); }
-            else if (ch === 'r') { resetAll(); }
+            if (ch === 'q' || ch === '\x03') {
+                quit();
+                return;
+            }
+            if (ch >= '1' && ch <= '9') {
+                switchTo((ch.charCodeAt(0) - 49));
+            } else if (ch === '0') {
+                switchTo(9);
+            } else if (ch === 'n') {
+                switchTo((STRATEGIES.indexOf(drv.strategyName) + 1) % STRATEGIES.length);
+            } else if (ch === 'k') {
+                drv.conc = 150;
+                drv.killWorker(killIdx);
+                killIdx = (killIdx + 2) % drv.cap;
+            } else if (ch === 'o') {
+                drv.overloadSpike((drv.cap / 2) | 0);
+            } else if (ch === 'f') {
+                drv.flapStorm((drv.cap / 3) | 0);
+            } else if (ch === 'p') {
+                drv.forcePingPong(2, drv.cap - 4);
+            } else if (ch === 'u') {
+                drv.makeUnfair();
+            } else if (ch === 's') {
+                drv.makeStarve();
+            } else if (ch === 'r') {
+                resetAll();
+            }
         }
     }
 
@@ -547,8 +616,11 @@ function runInteractive(argv) {
         drv.eligible.set(fresh.eligible);
         drv.inflight.set(fresh.inflight);
         drv.weights.set(fresh.weights);
-        drv.pin.fill(0); drv.ceil.fill(-1); drv.slow.fill(0);
-        drv.flapEnabled = false; drv.ppEnabled = false;
+        drv.pin.fill(0);
+        drv.ceil.fill(-1);
+        drv.slow.fill(0);
+        drv.flapEnabled = false;
+        drv.ppEnabled = false;
         drv.keyDist = 'uniform';
         drv.conc = DEFAULT_CONC;   // M-D4: match the driver default (and the web reset), not a stale 108
         drv.setStrategy(cur);

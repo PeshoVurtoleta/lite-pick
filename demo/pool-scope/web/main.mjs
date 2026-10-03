@@ -20,11 +20,11 @@
  * degrades to a small canvas fallback so the page ALWAYS loads live with no uncaught console error.
  */
 
-import { Driver, STRATEGIES } from '../driver.mjs';
-import { LitePickSnapshot } from '../snapshot.mjs';
-import { Detectors, UNFAIR_GINI } from '../detectors.mjs';
-import { LATENCY_BACKING, DETECTOR_BACKING, HOTKEY_BACKING } from '../siblings.mjs';
-import { signal, effect } from '@zakkster/lite-signal';
+import {Driver, STRATEGIES} from '../driver.mjs';
+import {LitePickSnapshot} from '../snapshot.mjs';
+import {Detectors, UNFAIR_GINI} from '../detectors.mjs';
+import {LATENCY_BACKING, DETECTOR_BACKING, HOTKEY_BACKING} from '../siblings.mjs';
+import {signal, effect} from '@zakkster/lite-signal';
 
 /* --------------------------------------------------------------------- constants + palette ---- */
 
@@ -45,11 +45,20 @@ const COL = {
 };
 
 const G0 = [0x5f, 0xe3, 0x9f], G1 = [0xf5, 0xb9, 0x42], G2 = [0xf8, 0x71, 0x71];
+
 /** green -> amber -> red ramp along t in [0,1]; the reading IS the hue (btop idiom). */
 function ramp(t) {
     t = t < 0 ? 0 : (t > 1 ? 1 : t);
     let a, b, u;
-    if (t < 0.5) { a = G0; b = G1; u = t * 2; } else { a = G1; b = G2; u = (t - 0.5) * 2; }
+    if (t < 0.5) {
+        a = G0;
+        b = G1;
+        u = t * 2;
+    } else {
+        a = G1;
+        b = G2;
+        u = (t - 0.5) * 2;
+    }
     const r = (a[0] + (b[0] - a[0]) * u) | 0;
     const g = (a[1] + (b[1] - a[1]) * u) | 0;
     const bl = (a[2] + (b[2] - a[2]) * u) | 0;
@@ -112,6 +121,7 @@ function paintBacking(el, label, live) {
     el.textContent = label;
     el.className = 'b ' + (live ? 'live' : 'fallback');
 }
+
 paintBacking($backDet, DETECTOR_BACKING, DETECTOR_BACKING === 'lite-adaptive');
 paintBacking($backLat, LATENCY_BACKING, LATENCY_BACKING === 'lite-sketch');
 paintBacking($backHk, HOTKEY_BACKING, HOTKEY_BACKING === 'lite-adaptive');
@@ -143,15 +153,19 @@ function makeCanvas(host) {
     host.appendChild(c);
     return c;
 }
+
 function fitCanvas(c) {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
     const w = c.clientWidth || c.parentElement.clientWidth || 600;
     const h = c.clientHeight || c.parentElement.clientHeight || 220;
     const pw = (w * dpr) | 0, ph = (h * dpr) | 0;
-    if (c.width !== pw || c.height !== ph) { c.width = pw; c.height = ph; }
+    if (c.width !== pw || c.height !== ph) {
+        c.width = pw;
+        c.height = ph;
+    }
     const ctx = c.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    return { ctx, w, h };
+    return {ctx, w, h};
 }
 
 /* -------- FINGERPRINT: hand-rolled canvas hero (bar + mean/sigma band + weight-ghost) -------- */
@@ -159,16 +173,23 @@ function fitCanvas(c) {
 const fpCanvas = makeCanvas($('host-fingerprint'));
 
 function drawFingerprint() {
-    const { ctx, w, h } = fitCanvas(fpCanvas);
+    const {ctx, w, h} = fitCanvas(fpCanvas);
     ctx.clearRect(0, 0, w, h);
     const pad = 8, base = h - 16;
     const plotH = base - pad;
     // live weight sum + mean/std of live inflight (mean-relative scale, TUI-parity).
     let sumW = 0, meanLoad = 0, liveN = 0;
-    for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) { sumW += drv.weights[i]; meanLoad += snap.wInflight[i]; liveN++; }
+    for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) {
+        sumW += drv.weights[i];
+        meanLoad += snap.wInflight[i];
+        liveN++;
+    }
     meanLoad = liveN > 0 ? meanLoad / liveN : 0;
     let sig = 0;
-    for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) { const d = snap.wInflight[i] - meanLoad; sig += d * d; }
+    for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) {
+        const d = snap.wInflight[i] - meanLoad;
+        sig += d * d;
+    }
     sig = liveN > 0 ? Math.sqrt(sig / liveN) : 0;
     let fpScale = meanLoad * FP_MEAN_MULT;
     if (fpScale < FP_SCALE_FLOOR) fpScale = FP_SCALE_FLOOR;
@@ -202,11 +223,18 @@ function drawFingerprint() {
         ctx.setLineDash([]);
     }
     // mean line
-    ctx.strokeStyle = COL.dim; ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(pad, yOf(meanLoad)); ctx.lineTo(w - pad, yOf(meanLoad)); ctx.stroke();
+    ctx.strokeStyle = COL.dim;
+    ctx.setLineDash([5, 4]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad, yOf(meanLoad));
+    ctx.lineTo(w - pad, yOf(meanLoad));
+    ctx.stroke();
     ctx.setLineDash([]);
     // worker index axis
-    ctx.fillStyle = COL.faint; ctx.font = '10px "JetBrains Mono", monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = COL.faint;
+    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
     for (let i = 0; i < CAP; i++) ctx.fillText(String(i % 10), pad + i * colW + colW / 2, h - 3);
 }
 
@@ -223,26 +251,33 @@ function buildHeatData() {
             const k = HEAT_COLS - 1 - c;               // newest at the right
             let v = 0;
             if (k < snap.frames && snap.eligAt(wI, k)) v = snap.loadAt(wI, k);
-            heatData.push({ x: 't' + c, y: 'w' + wI, v: v / scale });
+            heatData.push({x: 't' + c, y: 'w' + wI, v: v / scale});
         }
     }
 }
 
 function drawHeatFallback() {
-    const { ctx, w, h } = fitCanvas(heatFallback);
+    const {ctx, w, h} = fitCanvas(heatFallback);
     ctx.clearRect(0, 0, w, h);
     const labW = 26, pad = 4;
     const cellW = (w - labW - pad) / HEAT_COLS;
     const cellH = (h - pad) / CAP;
     const scale = snap.maxLoad > SCALE_FLOOR ? snap.maxLoad : SCALE_FLOOR;
-    ctx.font = '9px "JetBrains Mono", monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.font = '9px "JetBrains Mono", monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
     for (let wI = 0; wI < CAP; wI++) {
         const y = pad + wI * cellH;
-        ctx.fillStyle = COL.faint; ctx.fillText('w' + wI, 0, y + cellH / 2);
+        ctx.fillStyle = COL.faint;
+        ctx.fillText('w' + wI, 0, y + cellH / 2);
         for (let c = 0; c < HEAT_COLS; c++) {
             const k = HEAT_COLS - 1 - c;
             const x = labW + c * cellW;
-            if (k >= snap.frames || !snap.eligAt(wI, k)) { ctx.fillStyle = COL.bg3; ctx.fillRect(x, y, cellW - 0.5, cellH - 0.5); continue; }
+            if (k >= snap.frames || !snap.eligAt(wI, k)) {
+                ctx.fillStyle = COL.bg3;
+                ctx.fillRect(x, y, cellW - 0.5, cellH - 0.5);
+                continue;
+            }
             const v = snap.loadAt(wI, k) / scale;
             ctx.fillStyle = v <= 0 ? COL.bg3 : ramp(v);
             ctx.fillRect(x, y, cellW - 0.5, cellH - 0.5);
@@ -262,34 +297,53 @@ function buildLorenz() {
     for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) shares.push(snap.wShare[i]);
     shares.sort((a, b) => a - b);
     const n = shares.length;
-    lorenzData.push({ x: 0, y: 0 });
+    lorenzData.push({x: 0, y: 0});
     if (n > 0) {
-        let acc = 0; const total = shares.reduce((s, v) => s + v, 0) || 1;
-        for (let i = 0; i < n; i++) { acc += shares[i]; lorenzData.push({ x: (i + 1) / n, y: acc / total }); }
+        let acc = 0;
+        const total = shares.reduce((s, v) => s + v, 0) || 1;
+        for (let i = 0; i < n; i++) {
+            acc += shares[i];
+            lorenzData.push({x: (i + 1) / n, y: acc / total});
+        }
     } else {
-        lorenzData.push({ x: 1, y: 1 });
+        lorenzData.push({x: 1, y: 1});
     }
 }
 
 function drawFairFallback() {
-    const { ctx, w, h } = fitCanvas(fairFallback);
+    const {ctx, w, h} = fitCanvas(fairFallback);
     ctx.clearRect(0, 0, w, h);
-    const pad = 22; const px = pad, py = pad, pw = w - pad * 2, ph = h - pad * 2;
+    const pad = 22;
+    const px = pad, py = pad, pw = w - pad * 2, ph = h - pad * 2;
     // equality diagonal
-    ctx.strokeStyle = COL.faint; ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(px, py + ph); ctx.lineTo(px + pw, py); ctx.stroke(); ctx.setLineDash([]);
+    ctx.strokeStyle = COL.faint;
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(px, py + ph);
+    ctx.lineTo(px + pw, py);
+    ctx.stroke();
+    ctx.setLineDash([]);
     // Lorenz curve
     const g = snap.curGini;
-    ctx.strokeStyle = g >= UNFAIR_GINI ? COL.red : COL.green; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.strokeStyle = g >= UNFAIR_GINI ? COL.red : COL.green;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
     for (let i = 0; i < lorenzData.length; i++) {
         const p = lorenzData[i];
         const xx = px + p.x * pw, yy = py + ph - p.y * ph;
         if (i === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
     }
     ctx.stroke();
-    ctx.fillStyle = COL.faint; ctx.font = '10px "JetBrains Mono", monospace'; ctx.textAlign = 'left';
+    ctx.fillStyle = COL.faint;
+    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'left';
     ctx.fillText('population', px, h - 6);
-    ctx.save(); ctx.translate(10, py + ph); ctx.rotate(-Math.PI / 2); ctx.fillText('cumulative share', 0, 0); ctx.restore();
+    ctx.save();
+    ctx.translate(10, py + ph);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText('cumulative share', 0, 0);
+    ctx.restore();
 }
 
 function drawGiniGauge() {
@@ -314,19 +368,25 @@ let killerChart = null, killerFallback = null;
 function pushKiller() {
     const x = snap.p50, y = snap.curThroughput;
     if (x === x && y === y) {                 // both finite
-        killerData.push({ x, y });
+        killerData.push({x, y});
         if (killerData.length > KILLER_MAX) killerData.shift();
     }
 }
 
 function drawKillerFallback() {
-    const { ctx, w, h } = fitCanvas(killerFallback);
+    const {ctx, w, h} = fitCanvas(killerFallback);
     ctx.clearRect(0, 0, w, h);
-    const pad = 30; const px = pad, py = 12, pw = w - pad - 12, ph = h - py - pad;
+    const pad = 30;
+    const px = pad, py = 12, pw = w - pad - 12, ph = h - py - pad;
     let maxX = 1, maxY = 1;
-    for (let i = 0; i < killerData.length; i++) { if (killerData[i].x > maxX) maxX = killerData[i].x; if (killerData[i].y > maxY) maxY = killerData[i].y; }
-    maxX *= 1.1; maxY *= 1.1;
-    ctx.strokeStyle = COL.line; ctx.lineWidth = 1;
+    for (let i = 0; i < killerData.length; i++) {
+        if (killerData[i].x > maxX) maxX = killerData[i].x;
+        if (killerData[i].y > maxY) maxY = killerData[i].y;
+    }
+    maxX *= 1.1;
+    maxY *= 1.1;
+    ctx.strokeStyle = COL.line;
+    ctx.lineWidth = 1;
     ctx.strokeRect(px, py, pw, ph);
     for (let i = 0; i < killerData.length; i++) {
         const p = killerData[i];
@@ -334,11 +394,19 @@ function drawKillerFallback() {
         const yy = py + ph - (p.y / maxY) * ph;
         const age = i / Math.max(1, killerData.length - 1);   // fade the trail (recency = brighter)
         ctx.fillStyle = i === killerData.length - 1 ? COL.cyan : 'rgba(125,211,252,' + (0.15 + age * 0.5).toFixed(2) + ')';
-        ctx.beginPath(); ctx.arc(xx, yy, i === killerData.length - 1 ? 4 : 2.5, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath();
+        ctx.arc(xx, yy, i === killerData.length - 1 ? 4 : 2.5, 0, Math.PI * 2);
+        ctx.fill();
     }
-    ctx.fillStyle = COL.faint; ctx.font = '10px "JetBrains Mono", monospace'; ctx.textAlign = 'left';
+    ctx.fillStyle = COL.faint;
+    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'left';
     ctx.fillText('service latency (p50) ->', px, h - 8);
-    ctx.save(); ctx.translate(12, py + ph); ctx.rotate(-Math.PI / 2); ctx.fillText('picks/sec ->', 0, 0); ctx.restore();
+    ctx.save();
+    ctx.translate(12, py + ph);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText('picks/sec ->', 0, 0);
+    ctx.restore();
 }
 
 /* ------------------------------------------------------------ lite-charts creation (guarded) --- */
@@ -349,51 +417,74 @@ async function initCharts() {
     } catch (e) {
         charts = null;
     }
-    const axis = { axisColor: COL.line, labelColor: COL.faint, font: '11px "JetBrains Mono", monospace', background: null };
+    const axis = {
+        axisColor: COL.line,
+        labelColor: COL.faint,
+        font: '11px "JetBrains Mono", monospace',
+        background: null
+    };
 
     // HEAT -- heatmap kernel
     try {
         if (!charts || typeof charts.createHeatmap !== 'function') throw 0;
         heatChart = charts.createHeatmap({
-            data: () => { sTick(); return heatData; },
+            data: () => {
+                sTick();
+                return heatData;
+            },
             x: 'x', y: 'y', value: 'v',
             colorFn: (v) => (v <= 0 ? COL.bg3 : ramp(v)),
             cellGap: 0.08, rowHighlight: true, columnHighlight: true,
             labelColor: COL.faint, labelFont: '9px "JetBrains Mono", monospace', background: COL.bg1,
-            margin: { top: 6, right: 6, bottom: 6, left: 30 },
+            margin: {top: 6, right: 6, bottom: 6, left: 30},
         }).mount(heatHost);
-    } catch (e) { heatChart = null; heatFallback = makeCanvas(heatHost); }
+    } catch (e) {
+        heatChart = null;
+        heatFallback = makeCanvas(heatHost);
+    }
 
     // FAIRNESS -- Lorenz via area chart + an equality-diagonal annotation
     try {
         if (!charts || typeof charts.createAreaChart !== 'function') throw 0;
         fairChart = charts.createAreaChart({
-            data: () => { sTick(); return lorenzData; },
+            data: () => {
+                sTick();
+                return lorenzData;
+            },
             x: 'x', y: 'y', color: COL.green, lineWidth: 2,
-            xScale: { domain: [0, 1] }, yScale: { domain: [0, 1] },
-            grid: { x: false, y: false }, crosshair: false, tooltip: false, legend: false,
+            xScale: {domain: [0, 1]}, yScale: {domain: [0, 1]},
+            grid: {x: false, y: false}, crosshair: false, tooltip: false, legend: false,
             xTitle: 'population', yTitle: 'cumulative share',
             annotations: () => [
-                { type: 'line', axis: 'y', value: 0, color: COL.line },
-                { type: 'point', x: 0, y: 0, color: COL.faint, radius: 1 },
-                { type: 'point', x: 1, y: 1, color: COL.faint, radius: 1 },
+                {type: 'line', axis: 'y', value: 0, color: COL.line},
+                {type: 'point', x: 0, y: 0, color: COL.faint, radius: 1},
+                {type: 'point', x: 1, y: 1, color: COL.faint, radius: 1},
             ],
-            margin: { top: 10, right: 14, bottom: 34, left: 44 }, ...axis,
+            margin: {top: 10, right: 14, bottom: 34, left: 44}, ...axis,
         }).mount(fairHost);
-    } catch (e) { fairChart = null; fairFallback = makeCanvas(fairHost); }
+    } catch (e) {
+        fairChart = null;
+        fairFallback = makeCanvas(fairHost);
+    }
 
     // KILLER GRAPH -- scatter kernel
     try {
         if (!charts || typeof charts.createScatterChart !== 'function') throw 0;
         killerChart = charts.createScatterChart({
-            data: () => { sTick(); return killerData; },
+            data: () => {
+                sTick();
+                return killerData;
+            },
             x: 'x', y: 'y', color: COL.cyan, markerSize: 3, fillOpacity: 0.7,
-            grid: { x: true, y: true, color: COL.line }, crosshair: false, tooltip: false,
+            grid: {x: true, y: true, color: COL.line}, crosshair: false, tooltip: false,
             xTitle: 'service latency (p50)', yTitle: 'picks/sec',
-            yScale: { zero: true },
-            margin: { top: 10, right: 14, bottom: 34, left: 48 }, ...axis,
+            yScale: {zero: true},
+            margin: {top: 10, right: 14, bottom: 34, left: 48}, ...axis,
         }).mount(killerHost);
-    } catch (e) { killerChart = null; killerFallback = makeCanvas(killerHost); }
+    } catch (e) {
+        killerChart = null;
+        killerFallback = makeCanvas(killerHost);
+    }
 
     const anyChart = !!(heatChart || fairChart || killerChart);
     paintBacking($backRender, anyChart ? 'lite-charts' : 'canvas (fallback)', anyChart);
@@ -453,14 +544,20 @@ function paintHeader() {
 
 // worker row order buffer (reused, avoids per-frame alloc growth beyond the CAP-length array)
 const order = new Int32Array(CAP);
+
 function paintTable() {
     const key = sSort.peek();
     for (let i = 0; i < CAP; i++) order[i] = i;
     // small insertion sort over CAP (12) by the chosen key, descending (w ascending).
     const val = (i) => key === 'share' ? snap.wShare[i] : key === 'lat' ? p95Of(i) : key === 'w' ? -i : snap.wInflight[i];
     for (let a = 1; a < CAP; a++) {
-        const cur = order[a]; const cv = val(cur); let b = a - 1;
-        while (b >= 0 && val(order[b]) < cv) { order[b + 1] = order[b]; b--; }
+        const cur = order[a];
+        const cv = val(cur);
+        let b = a - 1;
+        while (b >= 0 && val(order[b]) < cv) {
+            order[b + 1] = order[b];
+            b--;
+        }
         order[b + 1] = cur;
     }
     const sel = sSelected.peek();
@@ -491,7 +588,10 @@ function p95Of(i) {
 
 function paintInspector() {
     const i = sSelected.peek();
-    if (i < 0) { $inspector.innerHTML = '<h2>Inspector</h2><div class="empty">select a worker to inspect</div>'; return; }
+    if (i < 0) {
+        $inspector.innerHTML = '<h2>Inspector</h2><div class="empty">select a worker to inspect</div>';
+        return;
+    }
     const rows = [
         ['worker', 'w' + i],
         ['state', snap.wEligible[i] ? 'up' : 'DOWN'],
@@ -508,14 +608,23 @@ function paintInspector() {
     for (let r = 0; r < rows.length; r++) html += '<div class="kv"><span class="k">' + rows[r][0] + '</span><span>' + rows[r][1] + '</span></div>';
     $inspector.innerHTML = html;
 }
-function fmt(v) { return v === v ? (v).toFixed(1) : '-'; }
+
+function fmt(v) {
+    return v === v ? (v).toFixed(1) : '-';
+}
 
 function paintHotKeys() {
-    if (!drv.keyed) { $hotkeysPanel.hidden = true; return; }
+    if (!drv.keyed) {
+        $hotkeysPanel.hidden = true;
+        return;
+    }
     $hotkeysPanel.hidden = false;
     const n = drv.hotKeys(hotKeyBuf);
     const mass = drv.keyMass();
-    if (n === 0 || mass <= 0) { $hotkeysList.innerHTML = '<div class="empty">warming up&hellip;</div>'; return; }
+    if (n === 0 || mass <= 0) {
+        $hotkeysList.innerHTML = '<div class="empty">warming up&hellip;</div>';
+        return;
+    }
     let html = '';
     for (let e = 0; e < n; e++) {
         const key = hotKeyBuf[e];
@@ -533,7 +642,10 @@ function paintHotKeys() {
 // One effect keyed on the render-version + the control-state signals: redraws every DOM panel.
 // The lite-charts panels re-extract independently off sTick() in their own data thunks.
 effect(() => {
-    sTick(); sStrategy(); sSelected(); sSort();
+    sTick();
+    sStrategy();
+    sSelected();
+    sSort();
     paintHeader();
     paintAlarm();
     paintTable();
@@ -565,8 +677,11 @@ function setStrategy(name) {
 }
 
 function inject(kind) {
-    if (kind === 'kill') { drv.conc = 150; drv.killWorker(killIdx); killIdx = (killIdx + 2) % CAP; }
-    else if (kind === 'overload') drv.overloadSpike((CAP / 2) | 0);
+    if (kind === 'kill') {
+        drv.conc = 150;
+        drv.killWorker(killIdx);
+        killIdx = (killIdx + 2) % CAP;
+    } else if (kind === 'overload') drv.overloadSpike((CAP / 2) | 0);
     else if (kind === 'flap') drv.flapStorm((CAP / 3) | 0);
     else if (kind === 'pingpong') drv.forcePingPong(2, CAP - 4);
     else if (kind === 'unfair') drv.makeUnfair();
@@ -592,7 +707,8 @@ function inject(kind) {
 // strategy select
 for (let i = 0; i < STRATEGIES.length; i++) {
     const o = document.createElement('option');
-    o.value = STRATEGIES[i]; o.textContent = (i === 9 ? 0 : i + 1) + '  ' + STRATEGIES[i];
+    o.value = STRATEGIES[i];
+    o.textContent = (i === 9 ? 0 : i + 1) + '  ' + STRATEGIES[i];
     $strategySelect.appendChild(o);
 }
 $strategySelect.value = 'p2c';
@@ -643,7 +759,12 @@ globalThis.addEventListener('keydown', (ev) => {
 // Auto-run the healthy scenario on load (design brief: show the app at rest, calm baseline).
 await initCharts();
 // Warm the rings so the first painted frame is settled (no short-window transient blips).
-for (let f = 0; f < 40; f++) { drv.beginFrame(FRAME_SECONDS); for (let t = 0; t < TICKS_PER_FRAME; t++) drv.tick(); snap.build(drv); det.evaluate(snap); }
+for (let f = 0; f < 40; f++) {
+    drv.beginFrame(FRAME_SECONDS);
+    for (let t = 0; t < TICKS_PER_FRAME; t++) drv.tick();
+    snap.build(drv);
+    det.evaluate(snap);
+}
 frame();
 setInterval(frame, FRAME_MS);
 

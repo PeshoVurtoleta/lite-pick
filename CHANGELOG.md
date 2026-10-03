@@ -6,7 +6,26 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Pool.run` no longer penalizes an endpoint for a caller abort (N1, audit 2026-09-29).** In 1.0.1
+  the H1 failure penalty (`recordRtt(i, max(elapsed, failurePenaltyNs))`) ran before the abort check,
+  so a cancelled request (unmount, client-side timeout) pushed that endpoint's PeakEWMA estimate to
+  1 s and inflated the lifetime mean that prices unsampled nodes (repro: 100 settles at 1 ms, one
+  abort -> EWMA 1e6 -> 1e9, mean 1e6 -> 1.09e7). The abort check now runs first; a plain failure
+  still feeds the penalty.
+- **`Pool.run` forwards `opts.key` to an unmarked balancer again (N2, audit 2026-09-29).** 1.0.1 passed
+  the key only to a class marked `static KEYED = true`, so a wrapper, decorator or custom keyed
+  strategy without the marker silently got `pick()` and routed every key to one backend (repro: 200
+  keys -> 1 of 8 backends). An unmarked balancer now receives the supplied key verbatim as
+  `pick(key)`, as in 1.0.0 (the key wins over a clock reading, as in 1.0.0). A `LATENCY`-marked
+  balancer still never receives the key. Mark a keyed class `static KEYED = true` to get key validation.
+
 ### Changed
+
+- **Benchmark-only: the soak nightly is manual-only (`workflow_dispatch`).** On Node 22 the redesigned
+  harness false-FAILs a correct kernel (audit 2026-09-29 S1-S4); the schedule returns once the harness
+  is green there.
 
 - **Benchmark-only: the endurance soak is redesigned (no runtime change).** Per the 2026-09-26 audit
   (RECOMMENDATIONS section 1), the old `benchmark/Soak.mjs` is replaced by `benchmark/soak/*` -- a

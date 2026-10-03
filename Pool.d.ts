@@ -55,15 +55,18 @@ export interface RunOptions {
     /**
      * An integer routing key. REQUIRED for a keyed balancer (ConsistentHash / BoundedLoad): `run`
      * drives `pick(key)` (sticky / bounded-load routing). Omitting it for a keyed balancer is a
-     * runtime error. It is NOT passed to a latency balancer as `now`, and is ignored by non-keyed,
-     * non-latency strategies. The `note` occupancy hook is driven whenever the balancer duck-types
+     * runtime error. It is NOT passed to a latency balancer as `now`. An UNMARKED balancer (no
+     * `KEYED` / `LATENCY` static -- e.g. a wrapper or custom keyed strategy) receives it verbatim as
+     * `pick(key)`, as in 1.0.0; mark the class `static KEYED = true` to get key validation. The
+     * non-keyed built-ins ignore the argument. The `note` occupancy hook is driven whenever the balancer duck-types
      * `note`, independently of `key`.
      */
     key?: number;
     /**
      * The minimum rtt penalty (nanoseconds) a thrown attempt feeds a latency-aware balancer via
      * `recordRtt(i, max(elapsed, failurePenaltyNs), done)`, so a fast-failing endpoint stops being the
-     * cheapest pick. Finite, > 0. Default 1e9 (1 s). RECOVERY: the penalized estimate decays back to
+     * cheapest pick. Not fed when the `signal` is aborted (a caller cancel is not the endpoint's
+     * fault). Finite, > 0. Default 1e9 (1 s). RECOVERY: the penalized estimate decays back to
      * competitive after roughly `tauNs * ln(failurePenaltyNs / healthyRttNs)`, so the node is
      * periodically RE-PROBED at that cadence (recovery works) while its steady-state share stays low.
      */

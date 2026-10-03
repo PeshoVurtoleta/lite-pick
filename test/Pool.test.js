@@ -719,3 +719,77 @@ test('B20 (nit 8): a throwing note(+1) is not followed by an UNPAIRED note(-1)',
     assert.deepEqual(bal.calls, [1], 'only the throwing note(+1); the finally sent NO unpaired note(-1)');
     for (let i = 0; i < 2; i++) assert.equal(inflight[i], 0, 'inflight still released net-zero');
 });
+
+// =====================================================================================
+// 1.0.2 regression suite: N1 (abort is not a penalty) / N2 (unmarked balancers keep opts.key).
+// =====================================================================================
+
+test('C1 (N1): a caller abort mid-flight feeds NO penalty -- the endpoint keeps its estimate and its share', async () => {
+    const n = 4;
+    const inflight = new Uint32Array(n);
+    const pe = new PeakEwmaBalancer(n, up(n), inflight, 1e9, 0xABCDEF);
+    const pool = new Pool(pe, inflight);
+    const clock = msClock();
+    for (let r = 0; r < 100; r++) await pool.run(() => 'ok', { clock });   // every node settles at ~1 ms
+    let victim = -1;
+    const ac = new AbortController();
+    await assert.rejects(pool.run((i) => {
+        victim = i;
+        ac.abort();                       // the caller cancels mid-request (unmount, client timeout)
+        throw new Error('aborted-mid-flight');
+    }, { clock, signal: ac.signal }), /aborted-mid-flight/);
+    assert.ok(victim >= 0, 'the aborted run dispatched');
+    const now = clock();
+    assert.ok(pe.ewmaAt(victim, now) <= 2e6,
+        'no 1 s penalty: ewma stays at the ~1 ms scale (got ' + pe.ewmaAt(victim, now).toExponential(2) + ')');
+    const hits = new Uint32Array(n);
+    const N = 1000;
+    for (let r = 0; r < N; r++) await pool.run((i) => { hits[i]++; return 'ok'; }, { clock });
+    assert.ok(hits[victim] >= N * 0.2,
+        'the aborted endpoint is not shunned: ' + hits[victim] + '/' + N + ' (hits ' + Array.from(hits).join(',') + ')');
+    for (let i = 0; i < n; i++) assert.equal(inflight[i], 0, 'net-zero on node ' + i);
+});
+
+test('C1b (N1): a plain failure (no abort) still feeds the H1 penalty', async () => {
+    const n = 4;
+    const inflight = new Uint32Array(n);
+    const pe = new PeakEwmaBalancer(n, up(n), inflight, 1e9, 0xABCDEF);
+    const pool = new Pool(pe, inflight);
+    const clock = msClock();
+    for (let r = 0; r < 100; r++) await pool.run(() => 'ok', { clock });
+    let victim = -1;
+    await assert.rejects(pool.run((i) => { victim = i; throw new Error('plain-fail'); }, { clock }), /plain-fail/);
+    assert.ok(pe.ewmaAt(victim, clock()) > 1e8, 'the penalty landed on a real failure');
+});
+
+test('C2 (N2): an UNMARKED wrapper around ConsistentHash still routes by opts.key (1.0.0 semantics)', async () => {
+    const n = 8;
+    const inflight = new Uint32Array(n);
+    const ch = new ConsistentHashBalancer(n, up(n), null, 257, 0xC0FFEE);
+    // A plain-object decorator with no static KEYED marker (the shape a user's wrapper takes).
+    const wrapper = {
+        capacity: ch.capacity,
+        get live() { return ch.live; },
+        pick: (k) => ch.pick(k),
+        isEligible: (i) => ch.isEligible(i),
+    };
+    const pool = new Pool(wrapper, inflight);
+    const reached = new Set();
+    for (let k = 1; k <= 200; k++) {
+        const got = await pool.run((i) => i, { key: Math.imul(k, 0x9e3779b1) >>> 0 });
+        assert.equal(got, ch.pick(Math.imul(k, 0x9e3779b1) >>> 0), 'Pool routed key ' + k + ' exactly as pick(key)');
+        reached.add(got);
+    }
+    assert.ok(reached.size >= 6, '200 keys reach >= 6 of 8 backends (got ' + reached.size + ')');
+    for (let i = 0; i < n; i++) assert.equal(inflight[i], 0);
+});
+
+test('C3 (N2): an unmarked balancer given BOTH key and clock gets pick(key), and recordRtt is still fed', async () => {
+    const inflight = new Uint32Array(2);
+    const duck = new DuckClockPick(2);
+    const pool = new Pool(duck, inflight);
+    await pool.run(() => 'ok', { clock: () => 4242, key: 7 });
+    assert.equal(duck.picks[0], 7, 'the key wins for an unmarked balancer, as in 1.0.0');
+    assert.equal(duck.rtts, 1, 'latency feedback still fed on settle');
+    for (let i = 0; i < 2; i++) assert.equal(inflight[i], 0);
+});

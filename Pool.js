@@ -133,9 +133,12 @@ export class Pool {
      *     clock reading is NEVER passed to a keyed pick.
      *   - A LATENCY balancer (`constructor.LATENCY === true`: PeakEWMA) REQUIRES an `opts.clock`;
      *     Pool reads `clock()` (validated finite BEFORE dispatch) and drives `pick(now)`.
-     *   - Otherwise, when a `clock` is supplied Pool passes its reading to `pick(now)` too (a
-     *     non-latency built-in ignores the argument; a duck-typed latency balancer that omitted the
-     *     marker still gets `now`, preserving 1.0.0 behaviour). The KEY still reaches ONLY a keyed pick.
+     *   - Otherwise (an UNMARKED balancer) Pool keeps the 1.0.0 semantics: a supplied `opts.key`
+     *     drives `pick(key)` verbatim (N2 -- a wrapper or custom keyed strategy without the marker
+     *     still routes by key; mark it `static KEYED = true` to get key validation); else, when a
+     *     `clock` is supplied, its reading drives `pick(now)` (a non-latency built-in ignores the
+     *     argument; a duck-typed latency balancer that omitted the marker still gets `now`). A LATENCY
+     *     balancer never receives the key.
      *
      * FEEDBACK IS LOUD, never silent, and never re-runs fn (M4): the occupancy hook `note(i, +1/-1)`
      * mirrors dispatch/settle, and the latency hook `recordRtt` is fed on settle when a clock is in use.
@@ -146,6 +149,7 @@ export class Pool {
      *     -coded error whose `.cause` is the feedback error and whose `.result` is fn's resolved value
      *     (the caller loses nothing). fn ran exactly once.
      *   - On FAILURE the penalty feedback `recordRtt(i, max(elapsed, failurePenaltyNs), done)` (H1)
+     *     -- skipped when the signal is aborted (N1: a caller cancel is not the endpoint's fault) --
      *     runs in its OWN try/catch so fn's error object is preserved by identity as the thrown value.
      *     If the penalty feedback fails (throwing/non-finite clock, throwing `recordRtt`) Pool stops
      *     failing over (a broken clock would throw on the next attempt anyway), attaches the feedback
@@ -161,7 +165,8 @@ export class Pool {
      *   `tries` (default 1 = no failover) is the max distinct-endpoint attempts; `signal` is passed to
      *   `fn` and, when already aborted, dispatches NOTHING (the abort always propagates); `clock`
      *   (REQUIRED for a latency balancer) is a caller-owned nanosecond source driving `pick(now)` +
-     *   `recordRtt`; `key` (REQUIRED for a keyed balancer) is a caller-supplied INTEGER routing key;
+     *   `recordRtt`; `key` (REQUIRED for a keyed balancer, forwarded verbatim to an unmarked one) is a
+     *   caller-supplied INTEGER routing key;
      *   `failurePenaltyNs` (default 1e9) is the minimum rtt penalty a thrown attempt feeds a
      *   latency-aware balancer.
      * @returns {Promise<T>}
@@ -189,7 +194,13 @@ export class Pool {
                 throw e;
             }
             key = k;
+        } else if (!latency && o && o.key !== undefined) {
+            // N2: an UNMARKED balancer (a wrapper, decorator or custom keyed strategy without
+            // `static KEYED = true`) gets the supplied key verbatim, as 1.0.0 did. Dropping it would
+            // silently route every key to one backend. Mark the class KEYED to get key validation.
+            key = o.key;
         }
+        const useKey = key !== undefined;
 
         let clock;
         if (latency) {
@@ -217,10 +228,10 @@ export class Pool {
 
         // Opt-in feedback (duck-typed, independent): latency (recordRtt, only with a clock) and
         // occupancy (note). Inert when the balancer does not duck-type the method. `useNow` is true
-        // when the clock reading is passed to pick() (any clocked run that is not keyed).
+        // when the clock reading is passed to pick() (any clocked run that does not route by key).
         const rtt = clock !== undefined && typeof b.recordRtt === 'function';
         const notes = typeof b.note === 'function';
-        const useNow = clock !== undefined && !keyed;
+        const useNow = clock !== undefined && !useKey;
 
         const held = [];         // endpoints incremented this run == the endpoints TRIED (kept elevated)
         const noteApplied = [];   // per-held: whether note(+1) actually landed (so finally never unpairs)
@@ -247,19 +258,20 @@ export class Pool {
                     }
                 }
 
-                // Choose an endpoint: the key goes ONLY to a keyed pick; a clock reading (now) never
-                // reaches a keyed pick but does drive pick(now) for any other clocked run (M3 + nit 7).
-                let i = keyed ? b.pick(key) : (useNow ? b.pick(now) : b.pick());
+                // Choose an endpoint: the key goes to a keyed pick (marked, or an unmarked balancer
+                // given opts.key -- N2); a clock reading (now) never reaches a key-routed pick but
+                // does drive pick(now) for any other clocked run (M3 + nit 7).
+                let i = useKey ? b.pick(key) : (useNow ? b.pick(now) : b.pick());
                 if (attempt > 0) {
                     // M2: genuinely DISTINCT failover. Re-pick while the result repeats a tried
                     // endpoint (bounded), then a scan for an eligible UNTRIED endpoint from a start that
                     // is key-derived (keyed: stable per key, spread across keys) or cursor-rotated.
                     for (let g = 0; i !== PICK_NONE && held.indexOf(i) >= 0 && g < REPICK_LIMIT; g++) {
-                        i = keyed ? b.pick(key) : (useNow ? b.pick(now) : b.pick());
+                        i = useKey ? b.pick(key) : (useNow ? b.pick(now) : b.pick());
                     }
                     if (i === PICK_NONE || held.indexOf(i) >= 0) {
                         const cap = b.capacity;
-                        const from = keyed
+                        const from = typeof key === 'number'
                             ? (Math.imul(key >>> 0, 0x9e3779b1) >>> 0) % cap
                             : (this._scanCursor = (this._scanCursor + 1) & 0x3fffffff) % cap;   // stays an SMI
                         i = _scanUntried(b, held, from);
@@ -291,6 +303,9 @@ export class Pool {
                     ok = true;
                 } catch (err) {
                     lastErr = err;
+                    // N1: a caller abort is not the endpoint's fault. Check it BEFORE the penalty, so a
+                    // cancel never feeds the 1 s penalty into the EWMA (peak rule) or the lifetime mean.
+                    if (signal && signal.aborted) throw err;   // abort: stop failover, propagate
                     if (rtt) {
                         // H1 penalty feedback in its OWN try/catch: fn's error identity is preserved.
                         // Boolean flag, not a null sentinel: a hook that throws `null` is still a failure.
@@ -316,7 +331,6 @@ export class Pool {
                             throw err;
                         }
                     }
-                    if (signal && signal.aborted) throw err;   // abort: stop failover, propagate
                     continue;                                   // keep inflight[i] elevated, re-pick distinct
                 }
                 if (ok) {

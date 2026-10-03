@@ -4,10 +4,12 @@ name: soak-nightly
 # benchmark-only -- it never touches the published kernel -- so it runs on its own schedule, off the PR
 # path. A gate breach FAILs the job; the JSONL stream and the HTML report are always uploaded so a
 # failure leaves evidence. Trigger it by hand from the Actions tab (workflow_dispatch) for an on-demand run.
+#
+# MANUAL-ONLY until audit 2026-09-29 Phase 0 lands: on Node 22 the harness false-FAILs a correct kernel
+# (S1 hotAlloc JIT state, S2 timing noise, S3 teeth red, S4 heap growth), so a schedule would be red every
+# night for reasons unrelated to the kernel. Restore the cron once 20/20 runs are green on Node 22 under load.
 
 on:
-  schedule:
-    - cron: '0 4 * * *'   # 04:00 UTC nightly
   workflow_dispatch:
 
 permissions:

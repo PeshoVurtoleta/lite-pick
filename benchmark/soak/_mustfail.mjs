@@ -9,8 +9,9 @@
  * computeGates via the SOAK_KERNEL seam, asserting the run exits 1 AND the breach names the right
  * gate. A clean copy is the pass-control (exit 0). Nothing here calls the gate modules directly.
  *
- * MUSTFAIL_ONLY=<regex> runs only the controls whose name matches (a dev aid for short bursts; NOT a
- * SOAK_ key, so the soak's own fail-closed config never sees it). The full battery is the gate.
+ * MUSTFAIL_ONLY=<regex> runs only the controls whose name matches (NOT a SOAK_ key, so the soak's own
+ * fail-closed config never sees it). The full battery is the gate: the nightly splits it into two jobs,
+ * '^(?!PL |ML )' and '^(PL|ML) ', whose union is every control. An empty selection is an error.
  */
 
 import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
@@ -96,14 +97,19 @@ function runSoakPool(poolPath, env) {
 
 const out = [];
 let allOk = true;
+let lastT = Date.now();   // per-control wall time (the battery's cost is budgeted in the nightly)
+/** `wantStatus` is an exit code, or an array of acceptable codes (the alloc NOTE controls: a gross
+ *  allocator may ALSO trip the hard gcMajor gate -- correct, but run-length dependent). */
 function record(name, r, wantStatus, wantBreach) {
-    const statusOk = r.status === wantStatus;
+    const now = Date.now(), secs = ((now - lastT) / 1000).toFixed(0);
+    lastT = now;
+    const statusOk = Array.isArray(wantStatus) ? wantStatus.indexOf(r.status) !== -1 : r.status === wantStatus;
     const breachOk = !wantBreach || r.stderr.indexOf(wantBreach) !== -1;
     const ok = statusOk && breachOk;
     if (!ok) allOk = false;
     const firstBreach = (r.stderr.match(/soak: FAIL -- .*/g) || [''])[0].slice(0, 90);
     out.push('  ' + (ok ? 'OK  ' : 'MISS') + ' ' + name.padEnd(34) +
-        ' exit=' + r.status + ' want=' + wantStatus + (wantBreach ? ' [' + wantBreach + ']' : '') +
+        ' exit=' + r.status + ' want=' + (Array.isArray(wantStatus) ? wantStatus.join('|') : wantStatus) + (wantBreach ? ' [' + wantBreach + ']' : '') + ' ' + secs + 's' +
         (ok ? '' : '  <<< ' + (firstBreach || 'no breach')));
 }
 function control(name, src, env, wantStatus, wantBreach) {
@@ -128,18 +134,20 @@ const A = 20000, Q = 100000;   // alloc mutants can use a short main loop; quali
 // --- alloc mutants (RoundRobin.pick), driven through the hotAlloc PROBE -------------------------
 // hotAlloc is REPORT-ONLY (S1, audit 2026-09-29: V8 JIT state false-FAILs a correct kernel on Node 22;
 // PerfGate owns per-op 0 B/op and is proven against these same mutants). The control now asserts the
-// probe still SEES the allocation: exit 0 with a `soak: NOTE -- hotAlloc[RoundRobin]` line.
+// probe still SEES the allocation: a `soak: NOTE -- hotAlloc[RoundRobin]` line. Exit 0, or 1 when a gross
+// allocator (M1 320 KB arrays, M2 a growing retained log) ALSO forces a workload major GC -- the hard
+// gcMajor gate catching it is correct, but whether it happens depends on the run length.
 // They need Q picks: with A the RoundRobin quality windows never fill and the run is (correctly)
 // INCONCLUSIVE (S5) -- a FAIL used to mask that.
 const NOTE_RR = 'soak: NOTE -- hotAlloc[RoundRobin]';
 control('M1 160KB-array/8192', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c & 8191) === 0) { this.__o = new Array(40000); }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
 control('M2 retained-log/8th', patch(PICK, RR_ANCHOR, RR_INJECT('if (!this.__log) this.__log = []; if ((this.__c & 7) === 0) this.__log.push({ a: this.__c });')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
 control('M3 64KB-burst/24576', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c % 24576) === 0) { this.__o = new Array(8192); }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
 control('M4 2-field-object/64', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c & 63) === 0) { this.__o = { a: this.__c, b: 0 }; }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
 
 // --- quality mutants, driven through the SmoothWRR / WeightedRandom oracles ----------------------
 // M5: SmoothWRR ignores weight in the accumulator -> a PERSISTENT ratio corruption (near-uniform
@@ -226,7 +234,7 @@ control('M15 BoundedLoad _total desync',
 // A genuine one-off (once per process) does NOT recur and correctly does not fire.
 control('M16 64KB/2^20 periodic (recurrence)',
     patch(PICK, RR_ANCHOR, RR_INJECT('globalThis.__P20 = (globalThis.__P20 | 0) + 1; if ((globalThis.__P20 & 0xFFFFF) === 0) { this.__o = new Array(8192); }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
 
 // --- POOL LANE teeth (T14-15): each assertion proven by a REAL Pool.js mutant via the SOAK_POOL seam
 // (Pool.js stays byte-frozen -- the mutant is a scratch copy). These catch REAL Pool bugs, not harness
@@ -363,6 +371,7 @@ reportControl('RPT clean non-smoke -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PI
 reportControl('RPT clean smoke -> integrity OK', { SOAK_SMOKE: '1', SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0);
 reportControl('RPT genuine FAIL stream -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 0);
 
+if (out.length === 0) { allOk = false; out.push('  MISS MUSTFAIL_ONLY=' + process.env.MUSTFAIL_ONLY + ' selected no control'); }
 for (const l of out) process.stdout.write(l + '\n');
 process.stdout.write('MUSTFAIL(through main.mjs): ' + (allOk ? 'all controls behaved AS REQUIRED (gates have teeth)' : 'A CONTROL MISBEHAVED -- gate is hollow or over-eager') + '\n');
 process.exit(allOk ? 0 : 1);

@@ -152,3 +152,22 @@ it false-FAILs a correct kernel. Two decisions change:
 - Teeth: MT1 (`decay`) trips `hotOps`, MT2 (`decaysparse`) trips `hotOpsSparse` and NOT `hotOps`. Under the
   decay modes the batch re-calibrates per cycle with the spin, which dominates the pick cost. `gcPause`
   still has no mutant control (audit S8; Phase 2 teeth coverage).
+
+## Amendment 2026-10-03 -- audit 2026-09-29 (S3) and the nightly
+
+- **Acceptance (Node 22.23, Apple M4, 12 cores).** The full teeth battery: 51/51 controls as required.
+  20 clean full-roster runs (11 cycles, default picks) under 16 busy threads: 20/20 PASS. Worst margins
+  under that load: dense throughput late/early 0.60, sparse 0.51 (bound 0.60, not significant); 35
+  lane-gates crossed their ratio bound and were held by the Mann-Whitney requirement (closest p = 0.016).
+- **Open risk -- gcPause.** 31 of those 35 were `gcPause`. A lane-cycle has only 1-2 GC events, so the
+  "mean" pause is effectively the max again; quiet, a scavenge reads ~0.1 ms, under oversubscription
+  0.5-22 ms (the OS preempting the process mid-GC), and late cycles read higher than early ones even under
+  constant load (unverified: likely thermal throttling). The gate still has no mutant control (S8). If it
+  false-FAILs a nightly, the decision is to make it report-only (as hotAlloc) or to give it a real signal
+  (pauses aggregated over many lane-cycles) plus a mutant -- not to widen its bound.
+- **Nightly shape.** Three parallel jobs on separate runners: `burn-in` (`SOAK_DURATION=45m`,
+  `SOAK_REQUIRE_PROVENANCE=1`, report + artifacts always), `teeth` (`MUSTFAIL_ONLY='^(?!PL |ML )'`) and
+  `teeth-long` (`'^(PL|ML) '`) -- the union is the full battery. Teeth no longer share a machine with the
+  burn-in (the battery is ~42 minutes, 32 of them PL/ML, and its load would distort the burn-in's timing
+  gates). The audit's parity step and `--baseline` comparison against the last green nightly are not in
+  yet (Phase 2: S6 parity script, baseline artifact).

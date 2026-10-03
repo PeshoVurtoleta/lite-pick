@@ -1,53 +1,113 @@
 name: soak-nightly
 
-# The endurance soak (audit 1.15): a scheduled 45-minute Linux burn-in plus the must-fail teeth. It is
-# benchmark-only -- it never touches the published kernel -- so it runs on its own schedule, off the PR
-# path. A gate breach FAILs the job; the JSONL stream and the HTML report are always uploaded so a
-# failure leaves evidence. Trigger it by hand from the Actions tab (workflow_dispatch) for an on-demand run.
+# The endurance soak (audit 1.15, reshaped by audit 2026-09-29 S3): a 45-minute Linux burn-in and the
+# must-fail teeth battery, as THREE PARALLEL JOBS on separate runners. The full battery takes ~42 minutes on
+# an Apple M4 (32 of them in the two 1500-cycle heap controls PL/ML), so it is split: `teeth` runs every
+# control except PL/ML, `teeth-long` runs PL/ML -- together the full battery. Running any of it on the
+# burn-in's machine would blow the time budget AND load the CPU under the burn-in's timing gates.
+# Benchmark-only (it never touches the published kernel), so it runs on its own schedule, off the PR path.
+# Each job fails on its own verdict and ALWAYS uploads its evidence (the JSONL stream + HTML report, or the
+# teeth log). Trigger by hand from the Actions tab (workflow_dispatch).
 #
-# MANUAL-ONLY until audit 2026-09-29 Phase 0 lands: on Node 22 the harness false-FAILs a correct kernel
-# (S1 hotAlloc JIT state, S2 timing noise, S3 teeth red, S4 heap growth), so a schedule would be red every
-# night for reasons unrelated to the kernel. Restore the cron once 20/20 runs are green on Node 22 under load.
+# Exit codes of the burn-in: 0 PASS, 1 FAIL, 2 bad config, 3 INCONCLUSIVE (not enough evidence -- e.g. a
+# runner too slow to reach the 11-cycle active floor in 45 minutes). All but 0 fail the job.
 
 on:
+  schedule:
+    - cron: '0 4 * * *'   # 04:00 UTC nightly
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  soak:
-    name: soak (45m, ubuntu / node 22)
+  burn-in:
+    name: burn-in (45m, ubuntu / node 22)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # the teeth runner's 1.0.0-revert check does `git show <old>:Pick.js`
+          fetch-depth: 0   # provenance records the git SHA (SOAK_REQUIRE_PROVENANCE fails closed without it)
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
-      # 1. Teeth first: prove every gate/oracle still trips (through main.mjs) before trusting a green run.
-      - name: soak:teeth (must-fail battery + config + 1.0.0 revert)
-        run: npm run soak:teeth
-      # 2. The burn-in. SOAK_REQUIRE_PROVENANCE fails closed if the checkout has no git SHA.
       - name: soak (45m burn-in)
         env:
           SOAK_DURATION: 45m
           SOAK_REQUIRE_PROVENANCE: '1'
-        run: node --expose-gc --min-semi-space-size=4 --max-semi-space-size=4 benchmark/soak/main.mjs
-      # 3. Re-derive the verdict from the stream (integrity) and render the HTML report.
+        run: npm run soak
+      # Re-derive the verdict from the stream (integrity) and render the HTML report -- also on a FAIL.
       - name: soak:report
         if: always()
         run: node benchmark/soak/SoakReport.mjs --out benchmark/out/soak-report.html
-      - name: upload soak artifacts
+      - name: upload burn-in artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: soak-${{ github.run_id }}
+          name: soak-burn-in-${{ github.run_id }}
           path: |
             benchmark/out/*.jsonl
             benchmark/out/*.html
+          if-no-files-found: warn
+
+  teeth:
+    name: teeth (must-fail battery minus PL/ML, ubuntu / node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the 1.0.0-revert control does `git show <old>:Pick.js`
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Every gate/oracle proven to trip through main.mjs, the clean pass-controls, the config fail-closed
+      # cases, the S5 INCONCLUSIVE cases and the 1.0.0-kernel revert. pipefail keeps the exit code through tee.
+      - name: soak:teeth (all but PL/ML)
+        shell: bash
+        env:
+          MUSTFAIL_ONLY: '^(?!PL |ML )'
+        run: |
+          set -o pipefail
+          mkdir -p benchmark/out
+          npm run soak:teeth 2>&1 | tee benchmark/out/teeth.log
+      - name: upload teeth log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-teeth-${{ github.run_id }}
+          path: benchmark/out/teeth.log
+          if-no-files-found: warn
+
+  teeth-long:
+    name: teeth-long (PL/ML 1500-cycle heap controls, ubuntu / node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # ~32 min on an Apple M4; headroom for a slower shared runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # S4: a clean 1500-cycle run keeps the heap flat (PL) and a ~1 KB/lane-cycle leak FAILs it (ML).
+      - name: soak:teeth (PL/ML)
+        shell: bash
+        env:
+          MUSTFAIL_ONLY: '^(PL|ML) '
+        run: |
+          set -o pipefail
+          mkdir -p benchmark/out
+          npm run soak:teeth 2>&1 | tee benchmark/out/teeth-long.log
+      - name: upload teeth-long log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-teeth-long-${{ github.run_id }}
+          path: benchmark/out/teeth-long.log
           if-no-files-found: warn

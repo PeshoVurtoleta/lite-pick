@@ -19,6 +19,15 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   every run. An over-bound lane now prints `soak: NOTE -- hotAlloc[lane] ...`; the soak still FAILs when
   every probe window scavenges (~512+ B/op) or the measurement is non-finite. Per-op 0 B/op stays gated by
   `test:perf` (PerfGate), which fails on the same allocation mutants. See the ADR 0014 amendment.
+- **Benchmark-only: `soak:teeth` is green on a clean tree, and the soak nightly is scheduled again (S3,
+  audit 2026-09-29).** With S1/S2/S4/S5 fixed, the full battery passes on Node 22 (51/51 controls; it
+  was red on the clean pass-control), and 20/20 clean full-roster runs PASS on Node 22 under 16 busy
+  threads on a 12-core Apple M4. The nightly (04:00 UTC) now runs three parallel jobs on separate
+  runners: the 45-minute burn-in, the teeth battery without PL/ML, and PL/ML (~32 of the battery's ~42
+  minutes) -- teeth no longer run before the burn-in on the same machine. Each job always uploads its
+  evidence. The alloc NOTE controls accept exit 0 or 1 (a gross allocator may also trip the hard gcMajor
+  gate, depending on run length), `soak:teeth` prints each control's wall time, and an empty
+  `MUSTFAIL_ONLY` selection FAILs.
 - **Benchmark-only: the soak's timing gates absorb normal noise (S2, audit 2026-09-29).** Clean
   kernels FAILed `gcPause`, `hotOps` and `hotOpsSparse` on ordinary noise. Three changes:
   hotOps batches are sized by time (each lane calibrates once to >= 25 ms per repeat, then 5 repeats,

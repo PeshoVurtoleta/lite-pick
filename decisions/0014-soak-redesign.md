@@ -217,3 +217,10 @@ it false-FAILs a correct kernel. Two decisions change:
   zeroed node), so its control targets WeightedRandom. `pooldrop` was never wired and is removed. Gaps 28 ->
   11; the rest are new kernel mutants (9c2: hotAlloc gross tier, SED, NQ) and checks main.mjs cannot reach
   from a kernel or mode (9c3: gcPause, rebuild, totalPicks, freeze, phases, tracker, two INCONCLUSIVE causes).
+- **Burst 9c2 (2026-10-04).** Kernel mutants M17 (SED weight-blind), M18 (NQ never-queue removed) and M19
+  (~2 KB per pick). M19 found that the hotAlloc gross tier -- the soak's only HARD allocation gate since S1
+  -- was hollow for heavy allocation: snapshot-based GC detection aliases once a window runs several
+  scavenges (~90% of windows read "GC-free" at ~54 B/op), so a 2 KB/op allocator produced only a NOTE.
+  `sampleWindows` now brackets each window with `v8.GCProfiler` (synchronous stop(), every GC listed) and
+  keeps the snapshot checks as a second condition. Clean lanes read 0 B/op as before; ~4% runtime. Gaps 8,
+  all for 9c3.

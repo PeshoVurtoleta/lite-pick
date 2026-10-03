@@ -171,19 +171,28 @@ function minArr(a) {
 }
 
 /**
- * Run `windows` windows of `ops` steps; collect the total-heap byte-delta of each GC-FREE window
- * (dropping a window whose new space shrank -> scavenge, or whose total shrank -> mark-compact).
+ * Run `windows` windows of `ops` steps; collect the total-heap byte-delta of each GC-FREE window.
  * Window 0 is always dropped (Maglev warm-up). Returns { deltas, gcFree, scavenged }.
+ *
+ * A window is GC-free only if v8.GCProfiler (synchronous: stop() returns every GC in its span) saw NO
+ * collection in it AND the snapshots agree (new space did not shrink, total did not shrink). Snapshots
+ * ALONE alias under heavy allocation (audit 2026-09-29, teeth M19): at ~2 KB/op a window runs ~4 scavenges
+ * and its end-of-window new-space usage lands below the previous reading only by chance, so ~90% of the
+ * windows read "GC-free" with a garbage delta (~54 B/op) and the gross tier never fired. The profiler's own
+ * small per-window allocation is the same in every window, so the warm bias (same geometry) absorbs it.
  */
 export function sampleWindows(ctx, stepFn, ops, windows) {
     const deltas = [];
     let scavenged = 0;
+    const gcp = new v8.GCProfiler();
     let prev = heapProbe();
     for (let w = 0; w < windows; w++) {
+        gcp.start();
         for (let i = 0; i < ops; i++) stepFn(ctx);
+        const gcs = gcp.stop().statistics.length;
         const cur = heapProbe();
         const dTotal = cur.total - prev.total;
-        const gcRan = cur.newu < prev.newu || dTotal < 0;   // scavenge OR mark-compact
+        const gcRan = gcs !== 0 || cur.newu < prev.newu || dTotal < 0;   // any GC, scavenge OR mark-compact
         prev = cur;
         if (w === 0) continue;
         if (gcRan) { scavenged++; continue; }

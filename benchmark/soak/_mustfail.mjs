@@ -291,6 +291,25 @@ control('M15 BoundedLoad _total desync',
     patch(PICK, '        const t = this._total + delta;', '        const t = this._total + delta * 2;'),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad kind=oracle');
 
+// --- burst 9c2 (audit 2026-09-29): the last oracle lanes and the hotAlloc gross tier, as KERNEL mutants. ---
+// M17: SED goes weight-blind (score = in-flight + 1, the LeastConn rule) -> the SED argmin oracle, which
+// recomputes (inflight + 1) / weight independently, disagrees whenever weights differ. The score line is
+// shared verbatim with NQ; the mutant runs on the SED lane only.
+control('M17 SED weight-blind score',
+    patchAll(PICK, '                    const score = (inf[i] + 1) / w;', '                    const score = inf[i] + 1;', 2),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'SED' }, 1, 'quality lane=SED kind=oracle');
+// M18: NQ loses its never-queue shortcut (an idle node no longer wins outright) -> it degenerates to SED and
+// queues on a busy node while an idle one exists -> the NQ oracle (first idle, else SED min) trips.
+control('M18 NQ never-queue removed',
+    patch(PICK, '                    if (inf[i] === 0) return i;   // idle: never queue -- take it immediately', '                    /* mutant: idle shortcut removed */'),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'NQ' }, 1, 'quality lane=NQ kind=oracle');
+// M19: ~2 KB allocated on EVERY RoundRobin pick (dies young, nothing retained) -> every 8192-pick B/op window
+// scavenges (>= one 4 MB semi-space) -> the hotAlloc GROSS tier FAILs (the hard part of the report-only
+// gate, S1). M1-M4/M16 prove the NOTE tier; this proves the FAIL tier.
+control('M19 2KB/pick sustained (hotAlloc gross)',
+    patch(PICK, RR_ANCHOR, RR_INJECT('this.__o = new Array(256);')),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'gate=hotAlloc lane=RoundRobin');
+
 // M16 (NIT1): a periodic allocation RARER than one B/op pass (64KB every 2^20 picks, ~0.0625 B/op = 3x
 // the bound). The MIN estimator misses it (it lands in only one pass per cycle, like a one-off), but it
 // RECURS every cycle -> the cross-cycle recurrence rule (max(pass1,pass2) > bound in >=2 cycles) trips.

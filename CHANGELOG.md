@@ -47,6 +47,15 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   several lines (`rss` trips both the rss and gcMajor gates), and the 1.0.0-revert control must now catch
   H3, H4 and H1 each by name instead of "some quality breach". The never-wired `pooldrop` mode is removed
   (A3 is proven by the real Pool.js mutant MP3). Declared gaps: 28 -> 11 of 54 checks.
+- **Benchmark-only: the soak's hard allocation gate could not see heavy allocation (audit 2026-09-29,
+  teeth M19).** The B/op probe decided "a GC ran in this window" by comparing heap snapshots. At ~2 KB
+  per pick a window runs several scavenges, and the snapshot comparison catches one only by chance: ~90%
+  of windows read GC-free with a meaningless ~54 B/op, so the gross tier ("every window scavenged",
+  FAIL) never fired and the run printed only the report-only NOTE. Each window is now bracketed by
+  `v8.GCProfiler`, whose synchronous `stop()` lists every collection in it; a window counts as GC-free only
+  if it saw none (and the snapshots agree). Clean kernels still read 0 B/op; cost ~4% of soak runtime.
+  New kernel mutants: M17 (SED weight-blind score), M18 (NQ never-queue shortcut removed), M19 (2 KB per
+  pick -> hotAlloc gross tier). Declared gaps: 11 -> 8.
 - **Benchmark-only: a real parity gate for the shipped code (S6, audit 2026-09-29).** ADR 0014 said a
   sha256 parity gate kept the kernel byte-identical across the soak redesign; none existed. Now
   `npm run parity` checks `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and `test/invariants.mjs`

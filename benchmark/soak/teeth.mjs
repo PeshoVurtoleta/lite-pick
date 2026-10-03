@@ -60,17 +60,14 @@ export function checks() {
 }
 
 /**
- * Declared gaps: check id -> why it has no control yet. Bursts 9c2/9c3 (audit 2026-09-29) add the controls
- * and delete these lines; the meta-test fails on any line whose check became covered. NEVER add a line here to
- * make the meta-test pass for a NEW gate -- a new gate ships with its control.
+ * Declared gaps: check id -> why it has no control yet. Burst 9c3 (audit 2026-09-29) adds the controls (or
+ * a decision) and deletes these lines; the meta-test fails on any line whose check became covered. NEVER
+ * add a line here to make the meta-test pass for a NEW gate -- a new gate ships with its control.
  */
 export const GAPS = Object.freeze({
-    'gate=hotAlloc': '9c2: the gross tier (every window scavenged) has no control asserting it',
     'gate=gcPause': '9c3: needs a mutant that lengthens late GC pauses',
     'gate=rebuild': '9c3: the rebuild series can never activate (too few samples); make it report-only or add a micro-bench',
     'gate=totalPicks': '9c3: needs a run that does no work',
-    'quality lane=SED': '9c2: shares the LeastConn argmin oracle path but is not proven on its own lane',
-    'quality lane=NQ': '9c2: shares the LeastConn argmin oracle path but is not proven on its own lane',
     'invariants kind=freeze': '9c3: needs a run that drains positive-weight eligibility below 8',
     'phases': '9c3: needs a run where a chaos phase never fires',
     'tracker': '9c3: needs a run with a lite-leak tracker finding',

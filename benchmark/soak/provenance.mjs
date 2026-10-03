@@ -8,27 +8,21 @@
  * closed, never a fabricated value). COLD: runs once at startup.
  */
 
-import { readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
-import { VERSION, KERNEL_URL, KERNEL_OVERRIDE } from './kernel.mjs';
+import { VERSION, KERNEL_URL, KERNEL_OVERRIDE, POOL_URL, POOL_OVERRIDE } from './kernel.mjs';
+import { sha256File, checkParity } from './parity.mjs';
 import { SEED_FORMULA } from './seeds.mjs';
 import * as G from './gates.mjs';
 
-export const SCHEMA_VERSION = 2;
+// 3: header.kernel gains poolUrl/poolOverride (the LOADED pool is hashed) + header.parity (S6); cycle
+// records gained gcPauseAvgMs/hotOps*N (S2). soak:report imports this constant (one source of truth).
+export const SCHEMA_VERSION = 3;
 
 const PICK_PATH = fileURLToPath(KERNEL_URL);   // the RESOLVED kernel (SOAK_KERNEL override or in-tree)
-const POOL_PATH = fileURLToPath(new URL('../../Pool.js', import.meta.url));
-
-function sha256(path) {
-    try {
-        return createHash('sha256').update(readFileSync(path)).digest('hex');
-    } catch (e) {
-        return null;
-    }
-}
+const POOL_PATH = fileURLToPath(POOL_URL);     // the RESOLVED pool (SOAK_POOL override or in-tree) -- S6: it
+                                               // hashed the in-tree Pool.js even when a mutant was loaded
 
 function gitInfo() {
     try {
@@ -65,8 +59,9 @@ export function buildHeader(cfg) {
         process.stderr.write('soak: FAIL -- SOAK_REQUIRE_PROVENANCE set but no git SHA (' + (git.error || 'unknown') + ')\n');
         process.exit(2);
     }
-    const pickSha = sha256(PICK_PATH);
-    const poolSha = sha256(POOL_PATH);
+    const pickSha = sha256File(PICK_PATH);
+    const poolSha = sha256File(POOL_PATH);
+    const parity = checkParity();   // the IN-TREE shipped files vs benchmark/soak/parity.json (S6)
     const cpus = os.cpus();
     return {
         schemaVersion: SCHEMA_VERSION,
@@ -80,7 +75,11 @@ export function buildHeader(cfg) {
             poolSha256: poolSha,
             kernelUrl: KERNEL_URL,
             kernelOverride: KERNEL_OVERRIDE,   // true when SOAK_KERNEL swapped in a scratch/mutant kernel
+            poolUrl: POOL_URL,
+            poolOverride: POOL_OVERRIDE,       // true when SOAK_POOL swapped in a scratch/mutant pool
         },
+        // ok: true (pins match) | false (a shipped file differs) | null (pin file unreadable: unknown).
+        parity: { ok: parity.ok, mismatched: parity.mismatched.map((m) => m.file), error: parity.error },
         node: process.version,
         v8: process.versions.v8,
         execArgv: process.execArgv.slice(),

@@ -369,6 +369,13 @@ function reportControl(name, soakEnv, wantExit) {
 }
 reportControl('RPT clean non-smoke -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0);
 reportControl('RPT clean smoke -> integrity OK', { SOAK_SMOKE: '1', SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0);
+// S6: a stream that ran an OVERRIDDEN pool (SOAK_POOL) is not evidence about the shipped code -- the report
+// must refuse it (exit 1) unless --allow-override. An identity copy is enough: the override flag is the point.
+if (want('RPT overridden pool -> not a release soak')) {
+    const pp = join(TMP, 'pool-rpt-identity.js');
+    writeFileSync(pp, patchPool("from '" + REAL_PICK_URL + "'", "from '" + REAL_PICK_URL + "'"));
+    reportControl('RPT overridden pool -> not a release soak', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_POOL: pp }, 1);
+}
 reportControl('RPT genuine FAIL stream -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 0);
 
 if (out.length === 0) { allOk = false; out.push('  MISS MUSTFAIL_ONLY=' + process.env.MUSTFAIL_ONLY + ' selected no control'); }

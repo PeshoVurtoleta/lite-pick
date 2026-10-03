@@ -2,6 +2,7 @@
  * @zakkster/lite-pick soak -- the JSONL analysis tool (audit 1.13).
  *
  *   node benchmark/soak/SoakReport.mjs [file.jsonl] [--baseline other.jsonl] [--out report.html]
+ *                                       [--allow-override]
  *
  * Reads a soak stream back and does three jobs:
  *   1. INTEGRITY: re-derive the verdict from the raw CYCLE records (via the SAME pure gates.mjs the run
@@ -18,14 +19,20 @@
  * hot B/op per lane over cycles). It uses NO charting peer: lite-charts is a browser-canvas module with
  * no offline artifact (decisions/0014), so the SVG is hand-emitted here.
  *
- * Exit codes: 0 report ok (and, with --baseline, no regression); 1 integrity mismatch OR a regression;
- * 2 a bad/unsupported stream (missing file, schemaVersion != 2, no summary).
+ * A stream whose kernel or pool was OVERRIDDEN (SOAK_KERNEL / SOAK_POOL -- a teeth mutant) is not
+ * evidence about the shipped code: the report exits 1 on it unless --allow-override is passed (to
+ * analyse a mutant run on purpose). The header's parity status (S6) is printed.
+ *
+ * Exit codes: 0 report ok (and, with --baseline, no regression); 1 integrity mismatch, a regression, or
+ * an overridden kernel/pool without --allow-override; 2 a bad/unsupported stream (missing file, a
+ * schemaVersion other than provenance.mjs's SCHEMA_VERSION, no summary).
  */
 
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { computeGates, VERDICT } from './gates.mjs';
+import { SCHEMA_VERSION } from './provenance.mjs';
 import { GATE_N, WARMUP_CYCLES } from './config.mjs';
 import { KERNEL_LANES } from './lanes.mjs';
 
@@ -36,7 +43,7 @@ const REBUILD_LANES = new Set(['ConsistentHash', 'BoundedLoad', 'WeightedRandom'
 const LANE_FLAGS = new Map();
 for (const l of KERNEL_LANES) LANE_FLAGS.set(l.name, { weighted: !!l.weighted, loadAware: !!l.loadAware, latencyLane: !!l.latency, hasRebuild: REBUILD_LANES.has(l.name) });
 
-const SCHEMA = 2;
+const SCHEMA = SCHEMA_VERSION;
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const OUT_DIR = join(ROOT, 'benchmark', 'out');
 
@@ -46,11 +53,12 @@ const REG = { hotOpsDownPct: 15, p99UpPct: 25, heapUpMB: 2 };
 function die(code, msg) { process.stderr.write('soak:report: ' + msg + '\n'); process.exit(code); }
 
 function parseArgs(argv) {
-    const a = { file: null, baseline: null, out: null };
+    const a = { file: null, baseline: null, out: null, allowOverride: false };
     for (let i = 0; i < argv.length; i++) {
         const v = argv[i];
         if (v === '--baseline') a.baseline = argv[++i];
         else if (v === '--out') a.out = argv[++i];
+        else if (v === '--allow-override') a.allowOverride = true;
         else if (v.startsWith('--')) die(2, 'unknown flag ' + v);
         else if (a.file === null) a.file = v;
         else die(2, 'unexpected argument ' + v);
@@ -255,6 +263,13 @@ process.stdout.write('  pkg ' + header.pkgVersion + '  git ' + (header.gitSha ? 
     (header.gitDirty ? '-dirty' : '') + '  schema ' + header.schemaVersion +
     '  cycles ' + summary.cyclesRun + '  lanes ' + lanes.length + '  wall ' + summary.wallSec + 's\n');
 if (header.bopBias) process.stdout.write('  hotAlloc bias floor ' + header.bopBias.biasBytes + ' B/window (spread ' + header.bopBias.spreadBytes + ')\n');
+// S6: is this evidence about the SHIPPED code? An overridden kernel/pool (a teeth mutant) is not.
+const kh = header.kernel || {};
+const overridden = kh.kernelOverride === true || kh.poolOverride === true;
+const par = header.parity || null;
+process.stdout.write('  kernel ' + (kh.pickSha256 ? kh.pickSha256.slice(0, 12) : '?') + (kh.kernelOverride ? ' (OVERRIDDEN)' : '') +
+    '  pool ' + (kh.poolSha256 ? kh.poolSha256.slice(0, 12) : '?') + (kh.poolOverride ? ' (OVERRIDDEN)' : '') +
+    '  parity ' + (par === null ? '?' : par.ok === true ? 'OK' : par.ok === false ? 'MISMATCH (' + par.mismatched.join(', ') + ')' : 'UNKNOWN (' + par.error + ')') + '\n');
 
 // 1. INTEGRITY -----------------------------------------------------------------------------------
 const integrityOk = verdict === summary.verdict && issues.length === 0;
@@ -326,7 +341,8 @@ if (args.baseline) {
 // SVG report (--out) -----------------------------------------------------------------------------
 if (args.out) { writeFileSync(args.out, renderHtml(doc, gate, verdict)); process.stdout.write('  wrote ' + args.out + '\n'); }
 
-// exit: integrity mismatch or a regression is a hard failure.
+// exit: integrity mismatch, a regression, or an overridden kernel/pool is a hard failure.
+if (overridden && !args.allowOverride) die(1, 'NOT A RELEASE SOAK -- the stream ran an overridden ' + (kh.kernelOverride ? 'kernel' : 'pool') + ' (SOAK_KERNEL/SOAK_POOL); pass --allow-override to analyse it anyway');
 if (!integrityOk) die(1, 'INTEGRITY MISMATCH -- ' + (verdict !== summary.verdict ? 're-derived verdict ' + verdict + ' != recorded ' + summary.verdict : issues.length + ' consistency issue(s)'));
 if (regressionFail) die(1, 'REGRESSION vs baseline');
 process.exit(0);

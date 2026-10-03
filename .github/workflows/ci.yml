@@ -60,6 +60,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # S6: shipped code (Pick/Pool .js/.d.ts) + the soak's invariant oracle must match their committed
+      # sha256 pins -- a change to them must re-pin (npm run parity:update) in the same commit.
+      - run: npm run parity
       - run: npm run torture
       - run: npm run test:perf
       - run: npm run bench:verify

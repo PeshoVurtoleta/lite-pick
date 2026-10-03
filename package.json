@@ -57,6 +57,8 @@
     "soak": "node --expose-gc --min-semi-space-size=4 --max-semi-space-size=4 benchmark/soak/main.mjs",
     "soak:teeth": "node benchmark/soak/_mustfail.mjs",
     "soak:report": "node benchmark/soak/SoakReport.mjs",
+    "parity": "node benchmark/soak/parity.mjs",
+    "parity:update": "node benchmark/soak/parity.mjs --update",
     "demo": "node demo/fanout.mjs",
     "scope": "node --expose-gc demo/pool-scope/tui.mjs",
     "scope:frames": "node --expose-gc demo/pool-scope/tui.mjs --frames 40 --scenario flapstorm",

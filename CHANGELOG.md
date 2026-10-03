@@ -19,6 +19,15 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   every run. An over-bound lane now prints `soak: NOTE -- hotAlloc[lane] ...`; the soak still FAILs when
   every probe window scavenges (~512+ B/op) or the measurement is non-finite. Per-op 0 B/op stays gated by
   `test:perf` (PerfGate), which fails on the same allocation mutants. See the ADR 0014 amendment.
+- **Benchmark-only: a real parity gate for the shipped code (S6, audit 2026-09-29).** ADR 0014 said a
+  sha256 parity gate kept the kernel byte-identical across the soak redesign; none existed. Now
+  `npm run parity` checks `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and `test/invariants.mjs`
+  against the committed `benchmark/soak/parity.json` (mismatch exit 1, unreadable pins exit 2), in CI's
+  `gates` job and the nightly burn-in. **A commit that changes any of those files must run
+  `npm run parity:update` and commit `parity.json` with it.** The soak header now hashes the pool that was
+  actually loaded (it hashed the in-tree `Pool.js` even under `SOAK_POOL`), records
+  `poolOverride`/`poolUrl` and the parity status (schema 3), and `soak:report` exits 1 on a stream whose
+  kernel or pool was overridden unless `--allow-override` is passed.
 - **Benchmark-only: `soak:teeth` is green on a clean tree, and the soak nightly is scheduled again (S3,
   audit 2026-09-29).** With S1/S2/S4/S5 fixed, the full battery passes on Node 22 (51/51 controls; it
   was red on the clean pass-control), and 20/20 clean full-roster runs PASS on Node 22 under 16 busy

@@ -18,7 +18,7 @@ layer. A soak whose gates cannot fail is not a soak.
 This is a **benchmark-only** change. `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and
 `test/invariants.mjs` are byte-identical to their pre-redesign state (checked by hand with `diff` at the
 time -- correction, audit 2026-09-29 S6: an earlier wording said "a sha256 parity gate enforces it"; no
-such gate exists yet, only the provenance header records the kernel sha256),
+such gate existed then. It does since the S6 amendment below: `npm run parity`),
 `files[]` and the tarball are untouched, and there is no version bump.
 
 ## Decision
@@ -171,3 +171,19 @@ it false-FAILs a correct kernel. Two decisions change:
   burn-in (the battery is ~42 minutes, 32 of them PL/ML, and its load would distort the burn-in's timing
   gates). The audit's parity step and `--baseline` comparison against the last green nightly are not in
   yet (Phase 2: S6 parity script, baseline artifact).
+
+## Amendment 2026-10-04 -- audit 2026-09-29 (S6)
+
+- **A real parity gate.** `benchmark/soak/parity.mjs` (`npm run parity`) checks the sha256 of
+  `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and `test/invariants.mjs` against the committed
+  `benchmark/soak/parity.json`; a difference exits 1, a missing/malformed pin file exits 2. A change to
+  shipped code must re-pin (`npm run parity:update`) in the same commit -- a deliberate acknowledgment, so
+  a "benchmark-only" commit that touches the kernel by accident fails CI (`gates` job) and the nightly
+  burn-in. (The repo is pushed to directly, so a PR-label rule would not run; pins do.)
+- **Provenance hashes what was loaded.** The header hashed the in-tree `Pool.js` even when `SOAK_POOL`
+  loaded a mutant; it now hashes the resolved pool and records `poolUrl`/`poolOverride` beside
+  `kernelOverride`, plus `parity: { ok, mismatched, error }` for the in-tree files. Schema 3 (the report
+  imports `SCHEMA_VERSION` from `provenance.mjs`; S2 had already added record fields without a bump).
+- **`soak:report` refuses an overridden stream** (exit 1, "NOT A RELEASE SOAK") unless
+  `--allow-override`; it prints kernel/pool hashes, override flags and parity. Teeth: `RPT overridden pool`.
+

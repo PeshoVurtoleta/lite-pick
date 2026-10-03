@@ -34,6 +34,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # S6: the soak is evidence about the PINNED shipped code (benchmark/soak/parity.json).
+      - name: parity
+        run: npm run parity
       - name: soak (45m burn-in)
         env:
           SOAK_DURATION: 45m

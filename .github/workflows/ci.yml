@@ -36,16 +36,16 @@ jobs:
   # @zakkster/lite-leak / lite-gc-profiler -- needs >=20, so torture/test:perf cannot run on 18).
   # This job actually TESTS the >=18 floor: it runs ONLY `npm test`, whose unit suites depend
   # solely on node:test + the zero-dep Pick.js/Pool.js and need none of the Node-20 tooling.
+  # No `npm ci`: installing the devDependencies on 18 only produces EBADENGINE noise (lite-leak,
+  # lite-cleanup need >=20), and running with NO node_modules proves the suites are dependency-free.
   test-node18:
-    name: test-node18 (engines floor -- unit suites only)
+    name: test-node18 (engines floor -- unit suites only, no install)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 18
-          cache: npm
-      - run: npm ci
       - run: npm test
 
   # The heavy, timing-sensitive gates on one pinned runner. test:perf pins its own semi-space

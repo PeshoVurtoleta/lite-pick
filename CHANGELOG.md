@@ -19,6 +19,17 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   every run. An over-bound lane now prints `soak: NOTE -- hotAlloc[lane] ...`; the soak still FAILs when
   every probe window scavenges (~512+ B/op) or the measurement is non-finite. Per-op 0 B/op stays gated by
   `test:perf` (PerfGate), which fails on the same allocation mutants. See the ADR 0014 amendment.
+- **Benchmark-only: soak failures are structured lines, and `soak:teeth` matches them exactly (S11,
+  audit 2026-09-29).** Every failure is now one `soak: BREACH <family> k=v ... detail=...` line on
+  stderr, written when detected: `gate=<name> lane=`, `quality lane= kind=oracle|weightZero|chiSquare`,
+  `invariants lane=`, `retention lane=`, `pool=A1..A7 lane=` (each failed pool assertion named;
+  before, one line listed a JSON blob), `phases lane=`, `tracker` (findings/warnings, which printed
+  nothing before). An unhandled rejection is `pool=A7`; any other crash prints `soak: CRASH -- ...`.
+  The teeth runner used `stderr.indexOf(want)`, so a crash whose stack trace or mutant file name
+  contained the word passed (an uncaught exception from a `setTimeout` "passed" the A7 control); it now
+  requires one BREACH line carrying every token of the control's spec (e.g. `gate=hotOps
+  lane=RoundRobin`), and any `soak: CRASH` is a MISS. Children run on `process.execPath` with a 30-minute
+  timeout, and the scratch directory is removed on exit.
 - **Benchmark-only: a real parity gate for the shipped code (S6, audit 2026-09-29).** ADR 0014 said a
   sha256 parity gate kept the kernel byte-identical across the soak redesign; none existed. Now
   `npm run parity` checks `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and `test/invariants.mjs`

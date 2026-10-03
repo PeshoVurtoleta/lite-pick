@@ -49,6 +49,16 @@ const LEAK_ARRAY_LEN = 700000;   // MUSTFAIL=leak/heap: plain-array retained per
 const SLOWLEAK_LEN = 128;        // MUSTFAIL=slowleak: ~1 KB retained per lane-cycle (S4 teeth ML)
 
 const noop = () => {};           // leak-contract safe: closes over nothing
+
+/**
+ * S11 (audit 2026-09-29): every failure is ONE structured stderr line, written when it is detected:
+ *     soak: BREACH <family> k=v ... detail=<free text, always last>
+ * family: gate=<name> | quality | invariants | retention | pool=A1..A7 | phases | tracker. The teeth
+ * runner parses ONLY these lines (never a substring of stack traces); a crash prints `soak: CRASH --`.
+ */
+function breach(head, detail) {
+    process.stderr.write('soak: BREACH ' + head + (detail === undefined ? '' : ' detail=' + String(detail).replace(/\n/g, ' ')) + '\n');
+}
 let fatalCtx = null;             // set once stream/summarize exist, so main().catch can write a fatal
 
 /** The chaos phases that SHOULD fire for a lane (T8 self-check applicability, from lane flags). */
@@ -179,7 +189,7 @@ async function main() {
     process.on('beforeExit', () => {
         if (!summaryWritten) {
             try { writeFatal(stream, 'lostRun', current, new Error('run ended with no summary -- a pool run never settled')); } catch (e) { /* ignore */ }
-            process.stderr.write('soak: FAIL -- lost run: the event loop drained before a summary was written (A3)\n');
+            breach('pool=A3 lane=' + (current.lane || '?') + ' cycle=' + current.cycle, 'lost run: the event loop drained before a summary was written');
             process.exitCode = 1;
         }
     });
@@ -269,7 +279,7 @@ async function main() {
     // One lane-cycle in its own frame; built + hotCtx are local so they are collectable on return.
     // cap/m are per-lane: kernel lanes use CAP=256/M_CH; tiny lanes use cap in {1,2,3}. Shadow the
     // module CAP/M_CH so the body below is cap-parameterized without touching every reference.
-    function runCycle(lane, seed, cycle, cap, m) {
+    function runCycle(lane, seed, cycle, cap, m, laneId) {
         const CAP = cap, M_CH = m;
         const built = lane.make(seed, CAP, M_CH);
         tracker.track(built.b, noop, lane.name, { audit: true });
@@ -419,8 +429,7 @@ async function main() {
                 if (reason !== null) {
                     invariantFailures++;
                     if (firstFail === null) firstFail = reason;
-                    process.stderr.write('  soak invariant FAIL lane ' + lane.name + ' cycle ' + cycle +
-                        ' step ' + s1 + ' seed=0x' + seed.toString(16) + ': ' + reason + '\n');
+                    breach('invariants lane=' + laneId + ' cycle=' + cycle + ' step=' + s1 + ' seed=0x' + seed.toString(16), reason);
                 }
             }
         }
@@ -434,8 +443,7 @@ async function main() {
         if (lane.weighted && CAP >= 8 && posWtEligible < 8) {
             invariantFailures++;
             if (firstFail === null) firstFail = 'posWtEligible ' + posWtEligible + ' < 8 at freeze';
-            process.stderr.write('  soak freeze FAIL lane ' + lane.name + ' cycle ' + cycle +
-                ': only ' + posWtEligible + ' positive-weight eligible nodes (need >= 8)\n');
+            breach('invariants lane=' + laneId + ' cycle=' + cycle + ' kind=freeze', 'only ' + posWtEligible + ' positive-weight eligible nodes (need >= 8)');
         }
         // Quality on the FROZEN post-chaos state. PLAIN lanes use the QualityWindow (histogram-based
         // RR/SmoothWRR/WR + the H3 guard); LOAD/KEYED lanes use the argmin / P2C-bound / stickiness /
@@ -578,8 +586,13 @@ async function main() {
                     pcore.assert3_accounted && pcore.assert4_codesOk && pcore.assert5_outcomeOk && retentionOk;
                 if (!passed) {
                     poolFailures++;
-                    process.stderr.write('  soak pool FAIL lane ' + laneId + ' cycle ' + cycle + ': ' +
-                        JSON.stringify({ a1: pcore.assert1_inflightConsistent, a2: pcore.assert2_quiescenceZero, a3: pcore.assert3_accounted, a4: pcore.assert4_codesOk, a5outcome: pcore.assert5_outcomeOk, a6: retentionOk, lostRun: pcore.lostRun, pending: pcore.pendingCount, badCode: pcore.badCode, outcomeMiss: pcore.outcomeMiss }) + '\n');
+                    const at = ' lane=' + laneId + ' cycle=' + cycle;
+                    if (!pcore.assert1_inflightConsistent) breach('pool=A1' + at, 'totalInflight != sum(inflight) in flight');
+                    if (!pcore.assert2_quiescenceZero) breach('pool=A2' + at, 'inflight not all-zero at quiescence');
+                    if (!pcore.assert3_accounted) breach('pool=A3' + at, 'accounting' + (pcore.lostRun ? ': lost run, ' + pcore.pendingCount + ' pending' : ''));
+                    if (!pcore.assert4_codesOk) breach('pool=A4' + at, 'unexpected rejection code ' + pcore.badCode);
+                    if (!pcore.assert5_outcomeOk) breach('pool=A5' + at, 'outcome oracle: ' + pcore.outcomeMiss);
+                    if (!retentionOk) breach('pool=A6' + at, 'tracker.size()=' + pb.trackerSize);
                 }
                 cyclesRun++;
                 const prollup = {
@@ -604,7 +617,7 @@ async function main() {
             const seed = seedFor(base, laneIndex, cycle);
             current.lane = laneId; current.cycle = cycle; current.seeds = { seed };
 
-            const core = runCycle(lane, seed, cycle, cap, m);
+            const core = runCycle(lane, seed, cycle, cap, m, laneId);
 
             // MUSTFAIL=rss teeth: retain a super-linear resident buffer so RSS runs away.
             if (MF === 'rss') { const bytes = Math.min(256 * 1048576, Math.floor(2 * 1048576 * (cyclesRun + 1) * (cyclesRun + 1))); leakSink.push(new Uint8Array(bytes).fill(cyclesRun & 255)); }
@@ -613,7 +626,7 @@ async function main() {
             workloadMajorTotal += b.workloadMajor;
             if (b.trackerSize !== 0) {
                 sizeFailures++;
-                process.stderr.write('  soak retention FAIL lane ' + laneId + ' cycle ' + cycle + ': tracker.size()=' + b.trackerSize + '\n');
+                breach('retention lane=' + laneId + ' cycle=' + cycle, 'tracker.size()=' + b.trackerSize);
             }
             // A real quality VIOLATION fails any lane (kernel or tiny). But insufficientData -> only a
             // KERNEL lane can be INCONCLUSIVE; a tiny lane (cap in {1,2,3}) is a degenerate regime where
@@ -627,7 +640,12 @@ async function main() {
             if (tier === 'kernel') lanesSeen.add(laneId);
             if (!core.quality.green) {
                 qualityViolations += core.quality.totalViolations;
-                process.stderr.write('  soak quality FAIL lane ' + laneId + ' cycle ' + cycle + ': ' + JSON.stringify(core.quality) + '\n');
+                const q = core.quality;
+                const kinds = [];
+                if (q.violations > 0) kinds.push('oracle');
+                if (q.weightZero > 0) kinds.push('weightZero');
+                if (q.rejections > q.rejMax) kinds.push('chiSquare');
+                breach('quality lane=' + laneId + ' cycle=' + cycle + ' kind=' + (kinds.join(',') || 'unknown'), JSON.stringify(q));
             } else if (tier === 'kernel' && !core.quality.insufficientData) {
                 lanesConclusive.add(laneId);   // this kernel lane got a clean, sufficiently-windowed cycle
             }
@@ -686,27 +704,37 @@ async function main() {
     }
     gc.stop();
 
-    const { verdict, gate, inconclusiveLanes, phasesNotFired } = summarize('end');
+    const { verdict, gate, inconclusiveLanes, phasesNotFired, findings } = summarize('end');
     const wallS = ((performance.now() - t0) / 1000).toFixed(1);
     process.stdout.write('soak: ran ' + wallS + 's, ' + totalPicks + ' picks across ' + laneIds.length +
         ' lanes, workloadMajor ' + workloadMajorTotal + ', invariants ' +
         (invariantFailures === 0 ? 'green' : invariantFailures + ' FAIL') + ' -> ' + verdict + '\n');
 
-    printVerdict({ verdict, gate, inconclusiveLanes, phasesNotFired });
+    printVerdict({ verdict, gate, inconclusiveLanes, phasesNotFired, findings });
     process.exit(exitCodeFor(verdict));
 
     /** The final verdict lines (also used by the signal path). FAIL / INCONCLUSIVE go to stderr with one
      * line per reason; report-only NOTEs (S1 hotAlloc) go to stderr on every verdict so they stay visible. */
-    function printVerdict({ verdict, gate, inconclusiveLanes, phasesNotFired }) {
+    function printVerdict({ verdict, gate, inconclusiveLanes, phasesNotFired, findings }) {
         for (const nt of gate.notes) process.stderr.write('soak: NOTE -- ' + nt + '\n');
         if (verdict === VERDICT.FAIL) {
-            if (invariantFailures) process.stderr.write('soak: FAIL -- invariants ' + invariantFailures + ' checkpoint(s)\n');
-            if (sizeFailures) process.stderr.write('soak: FAIL -- retention: tracker.size() != 0 after ' + sizeFailures + ' cycle(s)\n');
-            if (qualityViolations) process.stderr.write('soak: FAIL -- quality ' + qualityViolations + ' violation(s)\n');
-            if (poolFailures) process.stderr.write('soak: FAIL -- pool assertion(s) failed in ' + poolFailures + ' lane-cycle(s)\n');
-            if (unhandledCount) process.stderr.write('soak: FAIL -- pool assertion 7: ' + unhandledCount + ' unhandled rejection(s)\n');
-            if (phasesNotFired && phasesNotFired.length) process.stderr.write('soak: FAIL -- chaos phases never fired: ' + phasesNotFired.join(', ') + '\n');
-            for (const g of gate.breaches) process.stderr.write('soak: FAIL -- gate ' + g + '\n');
+            // Run-level breaches (the per-lane-cycle ones were already written when detected).
+            if (unhandledCount) breach('pool=A7 lane=*', unhandledCount + ' unhandled rejection(s)');
+            for (const pnf of (phasesNotFired || [])) {
+                const dot = pnf.lastIndexOf('.');
+                breach('phases lane=' + pnf.slice(0, dot), 'chaos phase never fired: ' + pnf.slice(dot + 1));
+            }
+            if ((findings && findings.length) || warns.length) breach('tracker lane=*', 'findings=' + (findings ? findings.length : 0) + ' warnings=' + warns.length);
+            // gates.mjs breach strings are '<gate>[<lane>] <detail>' (totalPicks: no lane).
+            for (const g of gate.breaches) {
+                const m = /^(\w+)\[([^\]]+)\] ?(.*)$/.exec(g);
+                if (m) breach('gate=' + m[1] + ' lane=' + m[2], m[3]);
+                else breach('gate=' + (/^(\w+)/.exec(g) || ['', 'unknown'])[1] + ' lane=*', g);
+            }
+            process.stderr.write('soak: FAIL -- invariants=' + invariantFailures + ' retention=' + sizeFailures +
+                ' quality=' + qualityViolations + ' pool=' + poolFailures + ' unhandled=' + unhandledCount +
+                ' phasesNotFired=' + (phasesNotFired ? phasesNotFired.length : 0) + ' gates=' + gate.breaches.length +
+                ' (one `soak: BREACH` line each, above)\n');
         } else if (verdict === VERDICT.INCONCLUSIVE) {
             for (const why of gate.inconclusive) process.stderr.write('soak: INCONCLUSIVE -- ' + why + '\n');
             if (inconclusiveLanes.length) process.stderr.write('soak: INCONCLUSIVE -- quality windows never sufficient for lane(s): ' + inconclusiveLanes.join(', ') + '\n');
@@ -721,6 +749,6 @@ main().catch((e) => {
     try {
         if (fatalCtx) { writeFatal(fatalCtx.stream, 'mainRejection', fatalCtx.current(), e); fatalCtx.summarize('fatal'); }
     } catch (e2) { /* fall through to the plain line */ }
-    process.stderr.write('soak: FAIL -- ' + (e && e.stack ? e.stack : e) + '\n');
+    process.stderr.write('soak: CRASH -- mainRejection: ' + (e && e.stack ? e.stack : e) + '\n');
     process.exit(1);
 });

@@ -67,7 +67,12 @@ export function installFatalHandlers(stream, getContext, writeSummary) {
         } catch (e) {
             try { process.stderr.write('soak: fatal-handler write failed -- ' + e + '\n'); } catch (e2) { /* ignore */ }
         }
-        process.stderr.write('soak: FAIL -- ' + kind + ': ' + (err && err.stack ? err.stack : err) + '\n');
+        // S11: an unhandled rejection IS pool assertion A7 (zero unhandled rejections over the run) -- a
+        // structured breach; anything else (uncaughtException) is a CRASH, never mistaken for a breach.
+        const ctx = (getContext && getContext()) || {};
+        const msg = (err && err.stack ? err.stack : String(err)).replace(/\n/g, ' ');
+        if (kind === 'unhandledRejection') process.stderr.write('soak: BREACH pool=A7 lane=' + (ctx.lane || '*') + ' cycle=' + ctx.cycle + ' detail=unhandled rejection: ' + msg + '\n');
+        else process.stderr.write('soak: CRASH -- ' + kind + ': ' + (err && err.stack ? err.stack : err) + '\n');
         process.exit(1);
     };
     process.on('uncaughtException', (err) => handle('uncaughtException', err));

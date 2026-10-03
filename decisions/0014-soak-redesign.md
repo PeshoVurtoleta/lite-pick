@@ -187,3 +187,13 @@ it false-FAILs a correct kernel. Two decisions change:
 - **`soak:report` refuses an overridden stream** (exit 1, "NOT A RELEASE SOAK") unless
   `--allow-override`; it prints kernel/pool hashes, override flags and parity. Teeth: `RPT overridden pool`.
 
+## Amendment 2026-10-04 -- audit 2026-09-29 (S11)
+
+- **Structured failure lines.** One `soak: BREACH <family> k=v ... detail=<text>` line per failure, written
+  when it is detected (families: `gate=<name>`, `quality` with `kind=`, `invariants`, `retention`,
+  `pool=A1..A7`, `phases`, `tracker`), then one `soak: FAIL -- <counts>` summary. An unhandled rejection is
+  `pool=A7` by definition; any other uncaught error is `soak: CRASH -- <kind>: <stack>`.
+- **Strict teeth matching.** A control's spec is either a line prefix (`soak: NOTE -- ...`,
+  `soak: INCONCLUSIVE -- ...`) or a token set that ONE BREACH line must carry exactly; a crash is a MISS
+  for every control. The old `stderr.indexOf(want)` accepted a stack trace or a mutant's file name.
+

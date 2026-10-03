@@ -14,7 +14,7 @@
  * '^(?!PL |ML )' and '^(PL|ML) ', whose union is every control. An empty selection is an error.
  */
 
-import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -29,6 +29,11 @@ const PICK = readFileSync(join(ROOT, 'Pick.js'), 'utf8');
 const POOL = readFileSync(join(ROOT, 'Pool.js'), 'utf8');
 const REAL_PICK_URL = pathToFileURL(join(ROOT, 'Pick.js')).href;   // scratch Pool imports the REAL kernel
 const TMP = mkdtempSync(join(tmpdir(), 'litepick-mutant-'));
+process.on('exit', () => { try { rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ } });
+// Children run on THIS node binary (so `PATH=<node22>/bin node _mustfail.mjs` tests node 22 end to end),
+// each bounded by a timeout (a hung child is a MISS, never a hung battery). PL/ML take ~16 min each.
+const NODE = process.execPath;
+const RUN_TIMEOUT_MS = 30 * 60 * 1000;
 const NODE_FLAGS = ['--expose-gc', '--min-semi-space-size=4', '--max-semi-space-size=4'];
 
 const RR_ANCHOR = '        const cap = this._cap, el = this._eligible;\n        let i = this._cursor;';
@@ -74,7 +79,7 @@ function runSoak(kernelPath, env) {
  * must keep its stderr too (the report-only NOTE lines a control asserts are on stderr). A child killed
  * by a signal reports status -1. */
 function runMain(env) {
-    const r = spawnSync('node', NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const r = spawnSync(NODE, NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: RUN_TIMEOUT_MS });
     return { status: r.status === null ? -1 : r.status, stderr: String(r.stderr || '') };
 }
 
@@ -100,17 +105,44 @@ let allOk = true;
 let lastT = Date.now();   // per-control wall time (the battery's cost is budgeted in the nightly)
 /** `wantStatus` is an exit code, or an array of acceptable codes (the alloc NOTE controls: a gross
  *  allocator may ALSO trip the hard gcMajor gate -- correct, but run-length dependent). */
+/**
+ * S11 (audit 2026-09-29): strict matching. A spec starting with 'soak: ' must be the PREFIX of a stderr
+ * line (the NOTE / INCONCLUSIVE lines). Any other spec is a BREACH token spec -- e.g. 'gate=hotOps
+ * lane=RoundRobin', 'quality lane=SmoothWRR', 'pool=A4' -- and ONE `soak: BREACH` line must carry every
+ * token exactly (before its `detail=`). It never matches a substring of a stack trace or a file name.
+ */
+function matchWant(stderr, spec) {
+    const lines = stderr.split('\n');
+    if (spec.startsWith('soak: ')) return lines.some((l) => l.startsWith(spec));
+    const toks = spec.split(' ').filter(Boolean);
+    for (const l of lines) {
+        if (!l.startsWith('soak: BREACH ')) continue;
+        let head = l.slice('soak: BREACH '.length);
+        const d = head.indexOf('detail=');
+        if (d !== -1) head = head.slice(0, d);
+        const have = head.split(' ').filter(Boolean);
+        if (toks.every((t) => have.indexOf(t) !== -1)) return true;
+    }
+    return false;
+}
+/** A child that crashed (uncaught exception, main rejection) is a MISS for EVERY control: a crash is
+ *  never evidence that a gate tripped (S11: a thrown setTimeout used to "pass" the A7 case). */
+const crashedOf = (stderr) => /^soak: CRASH --/m.test(stderr);
+
+/** `wantStatus` is an exit code, or an array of acceptable codes (the alloc NOTE controls: a gross
+ *  allocator may ALSO trip the hard gcMajor gate -- correct, but run-length dependent). */
 function record(name, r, wantStatus, wantBreach) {
     const now = Date.now(), secs = ((now - lastT) / 1000).toFixed(0);
     lastT = now;
     const statusOk = Array.isArray(wantStatus) ? wantStatus.indexOf(r.status) !== -1 : r.status === wantStatus;
-    const breachOk = !wantBreach || r.stderr.indexOf(wantBreach) !== -1;
-    const ok = statusOk && breachOk;
+    const breachOk = !wantBreach || matchWant(r.stderr, wantBreach);
+    const crashed = crashedOf(r.stderr);
+    const ok = statusOk && breachOk && !crashed;
     if (!ok) allOk = false;
-    const firstBreach = (r.stderr.match(/soak: FAIL -- .*/g) || [''])[0].slice(0, 90);
+    const firstLine = (r.stderr.match(/^soak: (CRASH|BREACH|FAIL|INCONCLUSIVE) .*/m) || [''])[0].slice(0, 110);
     out.push('  ' + (ok ? 'OK  ' : 'MISS') + ' ' + name.padEnd(34) +
         ' exit=' + r.status + ' want=' + (Array.isArray(wantStatus) ? wantStatus.join('|') : wantStatus) + (wantBreach ? ' [' + wantBreach + ']' : '') + ' ' + secs + 's' +
-        (ok ? '' : '  <<< ' + (firstBreach || 'no breach')));
+        (ok ? '' : '  <<< ' + (crashed ? 'CRASHED: ' : '') + (firstLine || 'no breach line')));
 }
 function control(name, src, env, wantStatus, wantBreach) {
     if (!want(name)) return;
@@ -156,7 +188,7 @@ control('M4 2-field-object/64', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c 
 // corrects a transient accumulator offset over a long quiet window, so it is not a lasting defect.)
 control('M5 SmoothWRR ignores-weight',
     patch(PICK, '                const c = cur[i] + wt[i];', '                const c = cur[i] + 1;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality lane=SmoothWRR');
 // M6: the H3 weight-0 regression -- BOTH the pick-loop guard AND the setWeight credit-reset removed,
 // so a node drained to weight 0 keeps its stale credit and gets returned. The lane-agnostic H3 guard
 // (weights[picked]===0) fires; the same guard protects CH/BL (see report note).
@@ -164,27 +196,27 @@ control('M6 SmoothWRR weight-0 (H3)',
     patch(
         patch(PICK, '            if (el[i] && wt[i] > 0) {       // eligible AND positive weight: a weight-0 node is never a candidate', '            if (el[i]) {'),
         '        this._current[i] = 0;               // reset credit: a reweighted node holds no stale accumulator', '        /* mutant: setWeight credit-reset removed (H3) */'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality lane=SmoothWRR');
 // M6b: the SAME H3 defect in ConsistentHash's Maglev build -- a weight-0 backend is given a table
 // slot (+1 quota) instead of zero, so it becomes reachable and gets picked. Proves the weight-0 guard
 // has teeth on the KEYED lanes too, not only SmoothWRR.
 control('M6b CH weight-0 (H3, keyed)',
     patch(PICK, 'const q = Math.floor(wt[b] / total * M);', 'const q = Math.floor(wt[b] / total * M) + 1;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'ConsistentHash' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash');
 control('M7 biased WR sampler',
     patch(PICK, '            const cand = u < prob[col] ? col : alias[col];', '            const cand = col;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' }, 1, 'quality lane=WeightedRandom');
 
 // --- increment 2a: load / keyed oracles (oracles.mjs), each proven through main ------------------
 // M8: P2C returns the WORSE of the two choices -> load balance collapses -> the max-mean bound trips.
 control('M8 P2C worst-of-two',
     patch(PICK, 'return this._inflight[b] < this._inflight[a] ? b : a;', 'return this._inflight[b] > this._inflight[a] ? b : a;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality lane=P2C');
 // M9: LeastConn picks the MOST-loaded eligible node -> the argmin oracle trips. (SED/NQ share the
 // identical oracleArgmin path, differing only in the recomputed score; see report note.)
 control('M9 LeastConn non-argmin',
     patch(PICK, '                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }', '                if (best < 0 || c > bestLoad) { best = i; bestLoad = c; }'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 1, 'quality lane=LeastConn');
 // M10: ConsistentHash rotates the start slot per call (in ITS OWN fast path) -> a key no longer
 // sticks -> the consecutive-equality stickiness check trips.
 // M10: the reviewer's exact mutant -- a slot rotation that advances PER setEligible (this.__ROT++ in
@@ -194,18 +226,18 @@ control('M10 CH stickiness break (per-setEligible rotation)',
     patchAll(
         patch(PICK, '    setEligible(i, up) {\n        _vIdx(i, this._cap);', '    setEligible(i, up) {\n        this.__ROT = (this.__ROT | 0) + 1;\n        _vIdx(i, this._cap);'),
         '        let slot = (keyHash >>> 0) % M;', '        let slot = ((keyHash >>> 0) + (this.__ROT | 0)) % M;', 2),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash');
 // M11: BoundedLoad drops the +1 that counts the incoming request (the H4 bug) -> under-caps -> the
 // reference walk disagrees with the pick.
 control('M11 BoundedLoad H4 under-cap',
     patch(PICK, 'const cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;   // > 0: total>0, live>0', 'const cap = capActive ? Math.ceil((1 + this._eps) * total / this._live) : 0;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad');
 
 // M12: PeakEWMA ignores the cost comparison (no latency steering, the H1 black-hole shape) -> the
 // busy slow node is no longer avoided and gets ~uniform share -> the slowNode-share oracle trips.
 control('M12 PeakEWMA H1 no-steer',
     patch(PICK, '        return costB < costA ? b : a;         // lower cost wins; tie -> the first draw', '        return a;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'PeakEWMA' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'PeakEWMA' }, 1, 'quality lane=PeakEWMA');
 
 // M13 (T6 tiny lanes): P2C returns PICK_NONE on a live===1 pool (breaking the cap-1 shortcut). On the
 // tiny P2C lane (cap 1 when cycle%3===0) this makes pick() fail closed with a healthy node up -> the
@@ -219,14 +251,14 @@ control('M13 P2C cap-1 mispick',
 // that the median (p50 / dense throughput) is barely moved -- it is a TAIL regression.
 control('M14 latency tail inflate (growing stall)',
     patch(PICK, RR_ANCHOR, RR_INJECT('globalThis.__L = (globalThis.__L | 0) + 1; if ((globalThis.__L % 97) === 0) { let x = 0; const n = 120 * (1 + (globalThis.__L >> 16)); for (let z = 0; z < n; z++) x += z; this.__s = x; }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'latencyP99');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'gate=latencyP99 lane=RoundRobin');
 
 // M15 (NIT B): BoundedLoad note() double-counts -> _total desyncs from the true sum(inflight). The BL
 // oracle recomputes total INDEPENDENTLY, so the kernel's wrong cap makes its pick disagree with the
 // reference -> trips. (A shared-state oracle reading b._total would be blind to this.)
 control('M15 BoundedLoad _total desync',
     patch(PICK, '        const t = this._total + delta;', '        const t = this._total + delta * 2;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad');
 
 // M16 (NIT1): a periodic allocation RARER than one B/op pass (64KB every 2^20 picks, ~0.0625 B/op = 3x
 // the bound). The MIN estimator misses it (it lands in only one pass per cycle, like a one-off), but it
@@ -243,46 +275,46 @@ const PA = { SOAK_CYCLES: CYC, SOAK_PICKS: String(A) };
 // A1: note(+1) on dispatch removed -> b._total stays 0 while inflight grows -> A1 fails IN FLIGHT.
 poolControl('MP1 note-removed (A1 totalInflight)',
     patchPool('                    b.note(i, 1);', '                    ;'),
-    { ...PA, SOAK_LANES: 'PoolBoundedLoad' }, 1, 'pool assertion');
+    { ...PA, SOAK_LANES: 'PoolBoundedLoad' }, 1, 'pool=A1 lane=PoolBoundedLoad');
 // A2: a settle inflight-- skipped 1/500 -> inflight cells stuck > 0 at quiescence.
 poolControl('MP2 settle-skip (A2 quiescence)',
     patchPool('                inflight[j] = inflight[j] > 0 ? inflight[j] - 1 : 0;', '                if (((this.__sk = (this.__sk | 0) + 1) % 500) !== 0) inflight[j] = inflight[j] > 0 ? inflight[j] - 1 : 0;'),
-    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool assertion');
+    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A2 lane=PoolP2C');
 // A3: a run never settles 1/997 -> the batch deadline trips -> lostRun -> assert3_accounted FAIL.
 poolControl('MP3 never-resolving (A3 lost run)',
     patchPool('                out = await fn(i, signal);', '                out = await ((this.__hg = (this.__hg | 0) + 1) % 997 === 0 ? new Promise(() => {}) : fn(i, signal));'),
-    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool assertion');
+    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A3 lane=PoolP2C');
 // A4/outcome: no failover (break on attempt>0) -> a failover run rejects instead of resolving.
 poolControl('MP4 no-failover (outcome)',
     patchPool('                let i = useKey ? b.pick(key) : (useNow ? b.pick(now) : b.pick());', '                if (attempt > 0) break;\n                let i = useKey ? b.pick(key) : (useNow ? b.pick(now) : b.pick());'),
-    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool assertion');
+    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A5 lane=PoolP2C');
 // A4/outcome: abort checks disabled -> an aborted run resolves instead of rejecting with the reason.
 poolControl('MP4b abort-ignored (outcome)',
     patchPool('if (signal && signal.aborted)', 'if (false && signal.aborted)', 2),
-    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool assertion');
+    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A5 lane=PoolP2C');
 // A5: failover reuses a tried endpoint (distinctness broken).
 poolControl('MP5 failover-repeat (A5 distinct)',
     patchPool('                if (attempt > 0) {', '                if (attempt > 0) { i = held[0]; } else if (false) {'),
-    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool assertion');
+    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A5 lane=PoolP2C');
 // A6: Pool retains every instance in a global -> tracker.size() never drains.
 poolControl('MP6 pool-retains-self (A6 retention)',
     patchPool('        const b = this._b, inflight = this._inflight;', '        const b = this._b, inflight = this._inflight; (globalThis.__PLEAK = globalThis.__PLEAK || []).push(this);'),
-    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool assertion');
+    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A6 lane=PoolP2C');
 // A7: Pool creates an unhandled rejection.
 poolControl('MP7 pool-unhandled (A7)',
     patchPool('        const o = opts != null ? opts : undefined;', '        const o = opts != null ? opts : undefined; if (((this.__ur = (this.__ur | 0) + 1) % 1000) === 0) Promise.reject(new Error("pool unhandled"));'),
-    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'unhandled');
+    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A7');
 // The three REQUIRED harness modes (also exit 1 through main).
-modeControl('MPm1 poolnote mode (A1)', { ...PA, SOAK_LANES: 'PoolBoundedLoad', SOAK_MUSTFAIL: 'poolnote' }, 1, 'pool assertion');
-modeControl('MPm2 poolleak mode (A2)', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolleak' }, 1, 'pool assertion');
-modeControl('MPm3 poolunhandled mode (A7)', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolunhandled' }, 1, 'unhandled');
+modeControl('MPm1 poolnote mode (A1)', { ...PA, SOAK_LANES: 'PoolBoundedLoad', SOAK_MUSTFAIL: 'poolnote' }, 1, 'pool=A1 lane=PoolBoundedLoad');
+modeControl('MPm2 poolleak mode (A2)', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolleak' }, 1, 'pool=A2 lane=PoolP2C');
+modeControl('MPm3 poolunhandled mode (A7)', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolunhandled' }, 1, 'pool=A7');
 
 // --- config fail-closed cases (audit 1.1): a bad env aborts with exit 2, never a silent 0-picks PASS.
 // These run the CLEAN in-tree kernel (config is parsed before the kernel does anything). --------------
 function runCfg(env, flags) {
     const full = Object.assign({}, process.env, { SOAK_OUT: join(TMP, 'cfg-' + (idx++) + '.jsonl') }, env);
     try {
-        execFileSync('node', (flags || NODE_FLAGS).concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: full, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
+        execFileSync(NODE, (flags || NODE_FLAGS).concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: full, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: RUN_TIMEOUT_MS });
         return { status: 0, stderr: '' };
     } catch (e) { return { status: e.status === undefined ? -1 : e.status, stderr: String(e.stderr || '') }; }
 }
@@ -321,7 +353,9 @@ if (want('REVERT 1.0.0 kernel (H1/H3/H4)')) {
 function runSoakSigint(env) {
     return new Promise((resolve) => {
         const full = Object.assign({}, process.env, { SOAK_OUT: join(TMP, 'sig-' + (idx++) + '.jsonl') }, env);
-        const ch = spawn('node', NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: full, stdio: ['ignore', 'pipe', 'pipe'] });
+        const ch = spawn(NODE, NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: full, stdio: ['ignore', 'pipe', 'pipe'] });
+        const killer = setTimeout(() => ch.kill('SIGKILL'), RUN_TIMEOUT_MS);
+        ch.on('exit', () => clearTimeout(killer));
         let stderr = '', sent = false;
         ch.stdout.on('data', (d) => { if (!sent && /soak cycle 1:/.test(String(d))) { sent = true; ch.kill('SIGINT'); } });
         ch.stderr.on('data', (d) => { stderr += d; });
@@ -332,14 +366,14 @@ if (want('I1 SIGINT after cycle 1')) {
     record('I1 SIGINT after cycle 1', await runSoakSigint({ SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'soak: INCONCLUSIVE -- run interrupted before its end');
 }
 if (want('I2 SOAK_DURATION=10s')) {
-    record('I2 SOAK_DURATION=10s', runSoak(writeMutant(PICK, 'I2'), { SOAK_DURATION: '10s', SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'drift gates need');
+    record('I2 SOAK_DURATION=10s', runSoak(writeMutant(PICK, 'I2'), { SOAK_DURATION: '10s', SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'soak: INCONCLUSIVE -- lane SED ran');
 }
 
 // --- S2 (audit 2026-09-29): the timing gates are noise-aware (time-sized batches, N=5, MAD + exact
 // one-sided Mann-Whitney). A real, sustained slowdown must still trip THEIR OWN gate: `decay` spins a
 // cycle-scaled busy loop inside BOTH timed batches, `decaysparse` inside the sparse batch only. ------------
-modeControl('MT1 decay -> hotOps', { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'decay' }, 1, 'gate hotOps[RoundRobin]');
-modeControl('MT2 decaysparse -> hotOpsSparse', { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'decaysparse' }, 1, 'gate hotOpsSparse[RoundRobin]');
+modeControl('MT1 decay -> hotOps', { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'decay' }, 1, 'gate=hotOps lane=RoundRobin');
+modeControl('MT2 decaysparse -> hotOpsSparse', { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'decaysparse' }, 1, 'gate=hotOpsSparse lane=RoundRobin');
 
 // --- S4 (audit 2026-09-29): the harness's own memory is O(lanes). PL: a clean 1500-cycle run (3000
 // records) must PASS the heap gate -- the kept record array used to grow the heap ~1 KB/record and FAIL
@@ -347,7 +381,7 @@ modeControl('MT2 decaysparse -> hotOpsSparse', { SOAK_CYCLES: CYC, SOAK_PICKS: S
 // 70000 picks: the fewest at which the RoundRobin quality windows fill (below it the run is INCONCLUSIVE).
 const LONG = { SOAK_CYCLES: '1500', SOAK_PICKS: '70000', SOAK_LANES: 'RoundRobin' };
 control('PL clean 1500 cycles (heap flat)', PICK, LONG, 0, null);
-modeControl('ML slowleak 1KB/lane-cycle (heap)', { ...LONG, SOAK_MUSTFAIL: 'slowleak' }, 1, 'gate heap[');
+modeControl('ML slowleak 1KB/lane-cycle (heap)', { ...LONG, SOAK_MUSTFAIL: 'slowleak' }, 1, 'gate=heap');
 
 // --- pass-control: the CLEAN kernel through the same path must exit 0 ----------------------------
 control('P clean kernel (pass-control)', PICK,
@@ -361,9 +395,9 @@ poolControl('P2 clean pool (pass-control)', patchPool("from '" + REAL_PICK_URL +
 function reportControl(name, soakEnv, wantExit) {
     if (!want(name)) return;
     const stream = join(TMP, 'rep-' + (idx++) + '.jsonl');
-    try { execFileSync('node', NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: Object.assign({}, process.env, soakEnv, { SOAK_OUT: stream }), stdio: 'ignore' }); } catch { /* the soak itself may exit 1 (a FAIL stream); we only report on its output */ }
+    try { execFileSync(NODE, NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: Object.assign({}, process.env, soakEnv, { SOAK_OUT: stream }), stdio: 'ignore', timeout: RUN_TIMEOUT_MS }); } catch { /* the soak itself may exit 1 (a FAIL stream); we only report on its output */ }
     let status = 0, stderr = '';
-    try { execFileSync('node', ['benchmark/soak/SoakReport.mjs', stream], { cwd: ROOT, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' }); }
+    try { execFileSync(NODE, ['benchmark/soak/SoakReport.mjs', stream], { cwd: ROOT, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: RUN_TIMEOUT_MS }); }
     catch (e) { status = e.status === undefined ? -1 : e.status; stderr = String(e.stderr || ''); }
     record(name, { status, stderr }, wantExit, null);
 }

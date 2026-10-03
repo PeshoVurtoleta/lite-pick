@@ -197,3 +197,17 @@ it false-FAILs a correct kernel. Two decisions change:
   `soak: INCONCLUSIVE -- ...`) or a token set that ONE BREACH line must carry exactly; a crash is a MISS
   for every control. The old `stderr.indexOf(want)` accepted a stack trace or a mutant's file name.
 
+
+## Amendment 2026-10-04 -- audit 2026-09-29 (teeth coverage)
+
+- **A manifest of what the teeth must cover.** `benchmark/soak/teeth.mjs` lists every check that can
+  decide a verdict: each gate in `GATE_NAMES` (now exported from `gates.mjs`), each roster lane's quality
+  oracle, each quality `kind`, invariants (and `kind=freeze`), retention, pool A1..A7, phases, tracker, the
+  INCONCLUSIVE causes, the hotAlloc NOTE, and every `SOAK_MUSTFAIL` mode (now exported from `config.mjs`).
+- **A meta-test in `npm test`** (`test/SoakTeeth.test.js`) lists the battery with `MUSTFAIL_LIST=1`
+  (builds every mutant, runs nothing, < 1 s) and fails when a check has no control and is not a declared
+  gap, when a declared gap has become covered, when a control's spec names an unknown family / gate / lane /
+  kind, when the manifest drifts from what the soak code emits, or when the nightly's two `MUSTFAIL_ONLY`
+  jobs stop partitioning the battery. A stale patch anchor now fails `npm test`, not the nightly.
+- **Declared gaps (28 of 55 checks)** are in `teeth.mjs` `GAPS`, each with its reason; they are the next
+  burst's work and the list may only shrink. A new gate ships with its control, never with a gap line.

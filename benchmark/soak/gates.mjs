@@ -22,6 +22,12 @@
 
 export const VERDICT = Object.freeze({ PASS: 'PASS', FAIL: 'FAIL', INCONCLUSIVE: 'INCONCLUSIVE', SMOKE: 'SMOKE', STUB: 'STUB' });
 
+// Every gate computeGates() judges: the per-lane gate keys (perLane[i].gates) plus the global totalPicks.
+// The teeth coverage meta-test (test/SoakTeeth.test.js) proves this list equals what compute() returns
+// and that each one is tripped by a must-fail control (or is a declared gap in teeth.mjs).
+export const GATE_NAMES = Object.freeze(['gcMajor', 'hotAlloc', 'heap', 'rss', 'hotOps', 'hotOpsSparse', 'gcPause',
+    'latencyP99', 'rebuild', 'totalPicks']);
+
 // Named gate constants (one-line tunable; NEVER widen to make a gate pass).
 export const HEAP_MULT = 1.10;         // late heap median <= early median * this ...
 export const HEAP_SLACK_MB = 2;        //   ... + this many MB

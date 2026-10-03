@@ -1,0 +1,97 @@
+/**
+ * @zakkster/lite-pick -- soak teeth COVERAGE meta-test (audit 2026-09-29, burst 9b).
+ *
+ *     node --test test/SoakTeeth.test.js
+ *
+ * The must-fail battery (benchmark/soak/_mustfail.mjs) proves gates trip -- but only the gates it has a
+ * control for, and nothing proved the battery covered them all. This suite lists the battery without
+ * running it (MUSTFAIL_LIST=1: every mutant is BUILT, so a stale patch anchor fails here, in `npm test`,
+ * instead of at nightly time) and checks it against the manifest benchmark/soak/teeth.mjs:
+ *   - every check is covered by a control or is a declared gap, and no declared gap is covered (stale);
+ *   - every control's spec is well-formed (a typo'd spec could only MISS);
+ *   - the manifest matches the code (gate names, breach families, pool assertions, quality kinds,
+ *     INCONCLUSIVE / NOTE causes), so a new gate cannot slip in without a check;
+ *   - the nightly's two MUSTFAIL_ONLY jobs partition the battery (every control runs exactly once).
+ * Zero-dep and fast (< 1 s): it runs in the no-install Node 18 job too.
+ */
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import {
+    checks, covers, validSpec, GAPS, BREACH_FAMILIES, POOL_ASSERTIONS, QUALITY_KINDS, INCONCLUSIVE_CAUSES, NOTE_GATES,
+} from '../benchmark/soak/teeth.mjs';
+import { GATE_NAMES, GateAccumulator } from '../benchmark/soak/gates.mjs';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const src = (rel) => readFileSync(join(ROOT, rel), 'utf8');
+const scan = (text, re) => { const out = new Set(); for (const m of text.matchAll(re)) out.add(m[1]); return [...out].sort(); };
+const sorted = (a) => [...a].sort();
+
+function listBattery() {
+    const env = Object.assign({}, process.env, { MUSTFAIL_LIST: '1' });
+    delete env.MUSTFAIL_ONLY;
+    const r = spawnSync(process.execPath, ['benchmark/soak/_mustfail.mjs'], { cwd: ROOT, env, encoding: 'utf8', timeout: 60000 });
+    assert.equal(r.status, 0, 'MUSTFAIL_LIST=1 failed (a stale patch anchor?):\n' + r.stderr);
+    return r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+}
+const CONTROLS = listBattery();
+const CHECKS = checks();
+
+test('the battery lists controls with unique names', () => {
+    assert.ok(CONTROLS.length > 0);
+    const names = CONTROLS.map((c) => c.name);
+    assert.deepEqual(names.filter((n, i) => names.indexOf(n) !== i), []);
+});
+
+test('every control spec is well-formed against the manifest', () => {
+    const bad = CONTROLS.map((c) => [c.name, validSpec(c.spec)]).filter((x) => x[1] !== null);
+    assert.deepEqual(bad, []);
+});
+
+test('every check is covered by a control or is a declared gap', () => {
+    const uncovered = CHECKS.filter((k) => !CONTROLS.some((c) => covers(c, k)) && !(k.id in GAPS)).map((k) => k.id);
+    assert.deepEqual(uncovered, [], 'checks with no control (add one; never a GAPS line for a new gate)');
+});
+
+test('no declared gap is stale (covered, or not a check)', () => {
+    const ids = CHECKS.map((k) => k.id);
+    const notACheck = Object.keys(GAPS).filter((g) => ids.indexOf(g) === -1);
+    assert.deepEqual(notACheck, [], 'GAPS keys that are no check id');
+    const nowCovered = CHECKS.filter((k) => (k.id in GAPS) && CONTROLS.some((c) => covers(c, k))).map((k) => k.id);
+    assert.deepEqual(nowCovered, [], 'covered now: delete these GAPS lines');
+});
+
+test('GATE_NAMES is exactly what computeGates() judges', () => {
+    const acc = new GateAccumulator({ warmupCycles: 1, gateN: 5, lanes: ['RoundRobin'] });
+    const g = acc.compute({ smoke: true, lanes: ['RoundRobin'], interrupted: false, timerFloorNs: 0, poolLaunched: 0 });
+    assert.deepEqual(sorted(GATE_NAMES), sorted(Object.keys(g.perLane[0].gates).concat(['totalPicks'])));
+});
+
+test('breach families / pool assertions / quality kinds match what the soak emits', () => {
+    const main = src('benchmark/soak/main.mjs'), jsonl = src('benchmark/soak/jsonl.mjs');
+    const fams = sorted(new Set(scan(main, /breach\('([a-z]+)[= ]/g).concat(scan(jsonl, /soak: BREACH ([a-z]+)[= ]/g))));
+    assert.deepEqual(fams, sorted(BREACH_FAMILIES));
+    assert.deepEqual(sorted(new Set(scan(main, /pool=(A\d)/g).concat(scan(jsonl, /pool=(A\d)/g)))), sorted(POOL_ASSERTIONS));
+    assert.deepEqual(scan(main, /kinds\.push\('(\w+)'\)/g), sorted(QUALITY_KINDS));
+});
+
+test('INCONCLUSIVE causes and NOTE gates match what the soak emits', () => {
+    const gates = src('benchmark/soak/gates.mjs'), main = src('benchmark/soak/main.mjs');
+    const emitted = scan(gates, /inconclusive\.push\('([^'[]*\[?)/g).concat(scan(main, /'soak: INCONCLUSIVE -- ([^']+)'/g));
+    assert.ok(emitted.length > 0);
+    assert.deepEqual(emitted.filter((e) => !INCONCLUSIVE_CAUSES.some((c) => e.startsWith(c))), [], 'emitted cause not in INCONCLUSIVE_CAUSES');
+    assert.deepEqual(INCONCLUSIVE_CAUSES.filter((c) => !emitted.some((e) => e.startsWith(c))), [], 'INCONCLUSIVE_CAUSES entry the soak never emits');
+    assert.deepEqual(scan(gates, /notes\.push\('(\w+)\[/g), sorted(NOTE_GATES));
+});
+
+test('the nightly teeth jobs partition the battery (every control exactly once)', () => {
+    const yml = src('.github/workflows/soak-nightly.yml');
+    const res = scan(yml, /MUSTFAIL_ONLY: '([^']+)'/g).map((r) => new RegExp(r));
+    assert.equal(res.length, 2);
+    const wrong = CONTROLS.filter((c) => res.filter((re) => re.test(c.name)).length !== 1).map((c) => c.name);
+    assert.deepEqual(wrong, []);
+});

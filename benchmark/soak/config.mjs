@@ -40,10 +40,10 @@ const KNOWN_KEYS = [
 // forces a workload major GC -> the gcMajor gate, which fires before the deliberately generous RSS
 // runaway threshold), decay->dense hotOps, decaysparse->sparse hotOps (proves the split series has
 // teeth on its own), weight0->quality(H3 guard), imbalance->quality(distribution).
-const MUSTFAIL_MODES = ['leak', 'heap', 'slowleak', 'rss', 'decay', 'decaysparse', 'weight0', 'imbalance',
+export const MUSTFAIL_MODES = Object.freeze(['leak', 'heap', 'slowleak', 'rss', 'decay', 'decaysparse', 'weight0', 'imbalance',
     // pool-lane teeth (T14-15): poolleak->quiescence(A2), poolnote->totalInflight(A1), pooldrop->
     // accounting(A3), poolbadcode->rejection-codes(A4), poolretain->retention(A6), poolunhandled->A7.
-    'poolleak', 'poolnote', 'pooldrop', 'poolbadcode', 'poolretain', 'poolunhandled'];
+    'poolleak', 'poolnote', 'pooldrop', 'poolbadcode', 'poolretain', 'poolunhandled']);
 
 const DURATION_RE = /^[1-9]\d*(s|m|h)$/;
 const INT_RE = /^-?\d+$/;

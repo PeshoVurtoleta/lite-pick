@@ -12,6 +12,11 @@
  * MUSTFAIL_ONLY=<regex> runs only the controls whose name matches (NOT a SOAK_ key, so the soak's own
  * fail-closed config never sees it). The full battery is the gate: the nightly splits it into two jobs,
  * '^(?!PL |ML )' and '^(PL|ML) ', whose union is every control. An empty selection is an error.
+ *
+ * MUSTFAIL_LIST=1 builds every control (so every patch anchor is resolved -- a stale anchor throws, exit 1)
+ * but RUNS nothing: it prints one JSON line per control, { name, run, status, spec, mode, lanes }, in
+ * well under a second. test/SoakTeeth.test.js reads it to prove every gate / oracle / pool assertion /
+ * SOAK_MUSTFAIL mode in teeth.mjs has a control (audit 2026-09-29, burst 9b).
  */
 
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -58,6 +63,11 @@ function patchAll(src, from, to, expect) {
 
 const ONLY = process.env.MUSTFAIL_ONLY ? new RegExp(process.env.MUSTFAIL_ONLY) : null;
 const want = (name) => !ONLY || ONLY.test(name);
+if (process.env.MUSTFAIL_LIST !== undefined && process.env.MUSTFAIL_LIST !== '1') {
+    process.stderr.write("MUSTFAIL_LIST='" + process.env.MUSTFAIL_LIST + "' -- did you mean 1?\n");
+    process.exit(2);
+}
+const LIST = process.env.MUSTFAIL_LIST === '1';
 
 let idx = 0;
 function writeMutant(src, name) {
@@ -102,6 +112,14 @@ function runSoakPool(poolPath, env) {
 
 const out = [];
 let allOk = true;
+/** LIST mode: describe the control instead of running it. `run` is what the exit status belongs to: main
+ *  (main.mjs through a mutant/mode), cfg (main.mjs config parse), report (SoakReport.mjs on a stream). */
+function listed(name, run, env, wantStatus, wantBreach) {
+    out.push(JSON.stringify({
+        name, run, status: Array.isArray(wantStatus) ? wantStatus : [wantStatus], spec: wantBreach || null,
+        mode: (env && env.SOAK_MUSTFAIL) || null, lanes: (env && env.SOAK_LANES) || null,
+    }));
+}
 let lastT = Date.now();   // per-control wall time (the battery's cost is budgeted in the nightly)
 /** `wantStatus` is an exit code, or an array of acceptable codes (the alloc NOTE controls: a gross
  *  allocator may ALSO trip the hard gcMajor gate -- correct, but run-length dependent). */
@@ -146,16 +164,19 @@ function record(name, r, wantStatus, wantBreach) {
 }
 function control(name, src, env, wantStatus, wantBreach) {
     if (!want(name)) return;
+    if (LIST) return listed(name, 'main', env, wantStatus, wantBreach);
     record(name, runSoak(writeMutant(src, name.replace(/[^a-z0-9]/gi, '')), env), wantStatus, wantBreach);
 }
 // A pool MODE control: clean kernel (PICK), SOAK_MUSTFAIL=<mode>, driven through a pool lane.
 function modeControl(name, env, wantStatus, wantBreach) {
     if (!want(name)) return;
+    if (LIST) return listed(name, 'main', env, wantStatus, wantBreach);
     record(name, runSoak(writeMutant(PICK, name.replace(/[^a-z0-9]/gi, '')), env), wantStatus, wantBreach);
 }
 // A pool.js mutant control (SOAK_POOL seam, clean kernel).
 function poolControl(name, poolSrc, env, wantStatus, wantBreach) {
     if (!want(name)) return;
+    if (LIST) return listed(name, 'main', env, wantStatus, wantBreach);
     const pp = join(TMP, 'pool-' + (idx++) + '-' + name.replace(/[^a-z0-9]/gi, '') + '.js');
     writeFileSync(pp, poolSrc);
     record(name, runSoakPool(pp, env), wantStatus, wantBreach);
@@ -318,7 +339,11 @@ function runCfg(env, flags) {
         return { status: 0, stderr: '' };
     } catch (e) { return { status: e.status === undefined ? -1 : e.status, stderr: String(e.stderr || '') }; }
 }
-function cfgCase(name, env, flags) { if (!want('CFG ' + name)) return; record('CFG ' + name, runCfg(env, flags), 2, null); }
+function cfgCase(name, env, flags) {
+    if (!want('CFG ' + name)) return;
+    if (LIST) return listed('CFG ' + name, 'cfg', env, 2, null);
+    record('CFG ' + name, runCfg(env, flags), 2, null);
+}
 cfgCase('SOAK_CYCLES=abc', { SOAK_CYCLES: 'abc' });
 cfgCase('SOAK_CYCLES=-5', { SOAK_CYCLES: '-5' });
 cfgCase('SOAK_CYCLES=2.5', { SOAK_CYCLES: '2.5' });
@@ -337,10 +362,12 @@ cfgCase('unpinned semi-space', { SOAK_CYCLES: CYC }, ['--expose-gc']);
 // the old kernel fine.) ---------------------------------------------------------------------------------
 if (want('REVERT 1.0.0 kernel (H1/H3/H4)')) {
     const name = 'REVERT 1.0.0 kernel (H1/H3/H4)';
-    try {
+    const env = { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR,BoundedLoad,PeakEWMA' };
+    if (LIST) listed(name, 'main', env, 1, 'quality');
+    else try {
         const old = execFileSync('git', ['show', '8c1ecc7:Pick.js'], { cwd: ROOT, encoding: 'utf8' });
         const p = writeMutant(old, 'revert100');
-        record(name, runSoak(p, { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR,BoundedLoad,PeakEWMA' }), 1, 'quality');
+        record(name, runSoak(p, env), 1, 'quality');
     } catch (e) {
         allOk = false;
         out.push('  MISS ' + name.padEnd(34) + ' <<< could not run: ' + String(e.message || e).slice(0, 80));
@@ -362,11 +389,14 @@ function runSoakSigint(env) {
         ch.on('exit', (code) => resolve({ status: sent ? (code === null ? -1 : code) : -2, stderr }));
     });
 }
+const I1_ENV = { SOAK_LANES: 'SED,NQ,SmoothWRR' }, I2_ENV = { SOAK_DURATION: '10s', SOAK_LANES: 'SED,NQ,SmoothWRR' };
 if (want('I1 SIGINT after cycle 1')) {
-    record('I1 SIGINT after cycle 1', await runSoakSigint({ SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'soak: INCONCLUSIVE -- run interrupted before its end');
+    if (LIST) listed('I1 SIGINT after cycle 1', 'main', I1_ENV, 3, 'soak: INCONCLUSIVE -- run interrupted before its end');
+    else record('I1 SIGINT after cycle 1', await runSoakSigint(I1_ENV), 3, 'soak: INCONCLUSIVE -- run interrupted before its end');
 }
 if (want('I2 SOAK_DURATION=10s')) {
-    record('I2 SOAK_DURATION=10s', runSoak(writeMutant(PICK, 'I2'), { SOAK_DURATION: '10s', SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'soak: INCONCLUSIVE -- lane SED ran');
+    if (LIST) listed('I2 SOAK_DURATION=10s', 'main', I2_ENV, 3, 'soak: INCONCLUSIVE -- lane SED ran');
+    else record('I2 SOAK_DURATION=10s', runSoak(writeMutant(PICK, 'I2'), I2_ENV), 3, 'soak: INCONCLUSIVE -- lane SED ran');
 }
 
 // --- S2 (audit 2026-09-29): the timing gates are noise-aware (time-sized batches, N=5, MAD + exact
@@ -394,6 +424,7 @@ poolControl('P2 clean pool (pass-control)', patchPool("from '" + REAL_PICK_URL +
 // the teeth battery, not only by the reviewer. ---------------------------------------------------------
 function reportControl(name, soakEnv, wantExit) {
     if (!want(name)) return;
+    if (LIST) return listed(name, 'report', soakEnv, wantExit, null);
     const stream = join(TMP, 'rep-' + (idx++) + '.jsonl');
     try { execFileSync(NODE, NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: Object.assign({}, process.env, soakEnv, { SOAK_OUT: stream }), stdio: 'ignore', timeout: RUN_TIMEOUT_MS }); } catch { /* the soak itself may exit 1 (a FAIL stream); we only report on its output */ }
     let status = 0, stderr = '';
@@ -413,6 +444,10 @@ if (want('RPT overridden pool -> not a release soak')) {
 reportControl('RPT genuine FAIL stream -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 0);
 
 if (out.length === 0) { allOk = false; out.push('  MISS MUSTFAIL_ONLY=' + process.env.MUSTFAIL_ONLY + ' selected no control'); }
+if (LIST) {
+    for (const l of out) process.stdout.write(l + '\n');
+    process.exit(allOk ? 0 : 1);
+}
 for (const l of out) process.stdout.write(l + '\n');
 process.stdout.write('MUSTFAIL(through main.mjs): ' + (allOk ? 'all controls behaved AS REQUIRED (gates have teeth)' : 'A CONTROL MISBEHAVED -- gate is hollow or over-eager') + '\n');
 process.exit(allOk ? 0 : 1);

@@ -30,6 +30,13 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   requires one BREACH line carrying every token of the control's spec (e.g. `gate=hotOps
   lane=RoundRobin`), and any `soak: CRASH` is a MISS. Children run on `process.execPath` with a 30-minute
   timeout, and the scratch directory is removed on exit.
+- **Benchmark-only: the teeth battery's coverage is itself tested (audit 2026-09-29).** A new manifest,
+  `benchmark/soak/teeth.mjs`, lists every gate, quality oracle and kind, invariant, pool assertion,
+  INCONCLUSIVE cause and `SOAK_MUSTFAIL` mode; a new `npm test` suite, `test/SoakTeeth.test.js`, lists the
+  battery without running it (`MUSTFAIL_LIST=1 npm run soak:teeth`, which still builds every mutant) and
+  fails when one of them has no control and is not a declared gap, when a gap is covered, when a control's
+  spec is malformed, when the manifest drifts from the code, or when the nightly's two teeth jobs no longer
+  split the battery exactly. 28 of the 55 checks are declared gaps today, each with its reason.
 - **Benchmark-only: a real parity gate for the shipped code (S6, audit 2026-09-29).** ADR 0014 said a
   sha256 parity gate kept the kernel byte-identical across the soak redesign; none existed. Now
   `npm run parity` checks `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and `test/invariants.mjs`

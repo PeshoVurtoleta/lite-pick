@@ -173,7 +173,7 @@ control('M10 CH stickiness break (per-setEligible rotation)',
 // M11: BoundedLoad drops the +1 that counts the incoming request (the H4 bug) -> under-caps -> the
 // reference walk disagrees with the pick.
 control('M11 BoundedLoad H4 under-cap',
-    patch(PICK, 'const cap = capActive ? Math.ceil((1 + this._eps) * (total + 1) / this._live) : 0;   // >= 1: total>0, live>0', 'const cap = capActive ? Math.ceil((1 + this._eps) * total / this._live) : 0;'),
+    patch(PICK, 'const cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;   // > 0: total>0, live>0', 'const cap = capActive ? Math.ceil((1 + this._eps) * total / this._live) : 0;'),
     { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality');
 
 // M12: PeakEWMA ignores the cost comparison (no latency steering, the H1 black-hole shape) -> the
@@ -229,7 +229,7 @@ poolControl('MP3 never-resolving (A3 lost run)',
     { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool assertion');
 // A4/outcome: no failover (break on attempt>0) -> a failover run rejects instead of resolving.
 poolControl('MP4 no-failover (outcome)',
-    patchPool('                let i = keyed ? b.pick(key) : (useNow ? b.pick(now) : b.pick());', '                if (attempt > 0) break;\n                let i = keyed ? b.pick(key) : (useNow ? b.pick(now) : b.pick());'),
+    patchPool('                let i = useKey ? b.pick(key) : (useNow ? b.pick(now) : b.pick());', '                if (attempt > 0) break;\n                let i = useKey ? b.pick(key) : (useNow ? b.pick(now) : b.pick());'),
     { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool assertion');
 // A4/outcome: abort checks disabled -> an aborted run resolves instead of rejecting with the reason.
 poolControl('MP4b abort-ignored (outcome)',

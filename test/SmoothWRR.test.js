@@ -137,6 +137,32 @@ test('A5: eligibility toggle resets the accumulator (no stale credit)', () => {
     assert.equal(counts[2], 1000);
 });
 
+test('A5b (T2): the toggle reset is OBSERVABLE -- stale credit is cleared and the next picks follow', () => {
+    // A5 above is vacuous for the reset: after 20 picks (a multiple of the cycle length 5) every
+    // accumulator is already 0. 21 picks leaves node 0 holding credit, so deleting the reset in
+    // setEligible changes the state and the following sequence (audit 2026-09-29 T2).
+    const weights = Uint32Array.from([3, 1, 1]);
+    const b = new SmoothWRRBalancer(3, up(3), weights);
+    for (let i = 0; i < 21; i++) b.pick();
+    assert.notEqual(b._current[0], 0, 'precondition: node 0 holds non-zero credit before the toggle');
+    b.setEligible(0, false);
+    assert.equal(b._current[0], 0, 'going DOWN resets the accumulator');
+    b._current[0] = 7;                        // plant stale credit while down (re-admit must clear it too)
+    b.setEligible(0, true);
+    assert.equal(b._current[0], 0, 'coming back UP resets the accumulator');
+    // Reference nginx smooth WRR from the post-toggle state: the kernel must follow it exactly.
+    const cur = Array.from(b._current);
+    const ref = [], got = [];
+    for (let k = 0; k < 10; k++) {
+        let best = -1;
+        for (let i = 0; i < 3; i++) { cur[i] += weights[i]; if (best < 0 || cur[i] > cur[best]) best = i; }
+        cur[best] -= 5;
+        ref.push(best);
+        got.push(b.pick());
+    }
+    assert.deepEqual(got, ref, 'post-toggle sequence follows a fresh epoch for node 0');
+});
+
 test('A4 (churn): never returns a down index under adversarial flapping', () => {
     const n = 16;
     const el = up(n);

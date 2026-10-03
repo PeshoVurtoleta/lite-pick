@@ -20,8 +20,19 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   keys -> 1 of 8 backends). An unmarked balancer now receives the supplied key verbatim as
   `pick(key)`, as in 1.0.0 (the key wins over a clock reading, as in 1.0.0). A `LATENCY`-marked
   balancer still never receives the key. Mark a keyed class `static KEYED = true` to get key validation.
+- **Test-only: SmoothWRR's eligibility reset is now actually tested (T2, audit 2026-09-29).** A5 picked
+  20 times (a multiple of the `[3,1,1]` cycle length), so every accumulator was already 0 and deleting
+  the reset in `setEligible` passed the suite. A5b picks 21 times, asserts the reset on both
+  transitions, and checks the following sequence against a reference smooth WRR; the mutant now fails.
+- **Benchmark-only: the `soak:teeth` MP4 Pool anchor follows the N2 rename** (`keyed` -> `useKey` in
+  the pick line); every teeth anchor resolves again.
 
 ### Changed
+
+- **BoundedLoad `pick` no longer calls `Math.ceil` on the cap (N3, audit 2026-09-29).** For an integer
+  in-flight count `inf < ceil(x)` equals `inf < x`, so behaviour is unchanged; the call was pure cost.
+  Measured on a skewed 64-node table with Smi keys: +1% to +16% ops/ms (noisy; Node 26 and Node 22,
+  Apple M4). The documented cap is still `ceil((1 + eps) x (_total + 1) / live)`.
 
 - **Benchmark-only: the soak nightly is manual-only (`workflow_dispatch`).** On Node 22 the redesigned
   harness false-FAILs a correct kernel (audit 2026-09-29 S1-S4); the schedule returns once the harness

@@ -1124,9 +1124,9 @@ export class ConsistentHashBalancer extends BalancerBase {
  * (sticky wins; the cap is a soft preference, never a dead pick). When `_total === 0` the cap test is
  * skipped entirely -> behaves as pure ConsistentHash. `cap = ceil((1 + eps) x (_total + 1) / live)`
  * -- the load-bearing change from the old `(1 + eps) x _total / live` is the +1 that counts the
- * INCOMING request (Mirrokni-Thorup-Zadimoghaddam per-bin capacity); the Math.ceil matches the
- * paper's integer capacity but is a no-op for the `inf < cap` test (for integer inf,
- * `inf < ceil(x)` == `inf < x`). A second concurrent same-key request correctly overflows the home
+ * INCOMING request (Mirrokni-Thorup-Zadimoghaddam per-bin capacity). The ceil is the paper's integer
+ * capacity; the code compares against the unrounded x, which is equivalent for the `inf < cap` test
+ * (for integer inf, `inf < ceil(x)` == `inf < x`) and avoids the call on the hot path. A second concurrent same-key request correctly overflows the home
  * until `(1+eps)(_total+1)/live > 1`. HAProxy's `hash-balance-factor` shares the +1 but distributes
  * ONE global `ceil((m+1)F/100)` slot budget across servers by weight (min 1), which is stricter.
  *
@@ -1222,9 +1222,9 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
         // cap is only meaningful once occupancy is known; _total === 0 -> pure ConsistentHash.
         const capActive = total > 0;
         // CHBL cap (Mirrokni-Thorup-Zadimoghaddam per-bin capacity). The load-bearing part is the +1
-        // that counts the INCOMING request; the Math.ceil matches the paper's integer capacity but is a
-        // no-op for the `inf < cap` test (integer inf: `inf < ceil(x)` == `inf < x`).
-        const cap = capActive ? Math.ceil((1 + this._eps) * (total + 1) / this._live) : 0;   // >= 1: total>0, live>0
+        // that counts the INCOMING request. The paper's integer capacity is ceil(x); it is NOT taken here
+        // because for an integer inf `inf < ceil(x)` == `inf < x`, and the call cost 15-20% (N3).
+        const cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;   // > 0: total>0, live>0
         let slot = (keyHash >>> 0) % M;           // integer key; NaN >>> 0 = 0 (never throws)
         let firstEligible = -1;                   // the pure-ConsistentHash sticky fallback answer
         let i = lookup[slot];

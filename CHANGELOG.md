@@ -37,6 +37,16 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   fails when one of them has no control and is not a declared gap, when a gap is covered, when a control's
   spec is malformed, when the manifest drifts from the code, or when the nightly's two teeth jobs no longer
   split the battery exactly. 28 of the 55 checks are declared gaps today, each with its reason.
+- **Benchmark-only: every `SOAK_MUSTFAIL` mode now has a control, and the controls name what they trip
+  (audit 2026-09-29).** Seven new mode controls (MM1-MM7: leak, heap, weight0, imbalance, rss, poolbadcode,
+  poolretain) and I3 (a lane whose quality windows never fill is INCONCLUSIVE). Writing them found that
+  `weight0` never tripped SmoothWRR: it zeroes the weight array the kernel reads live, which a correct
+  SmoothWRR treats as a drain; it only bites where weights are cached (WeightedRandom's alias table,
+  CH/BL's Maglev table), so its control now runs on WeightedRandom. Quality specs assert the `kind=`
+  (`oracle` / `weightZero` / `chiSquare`; the matcher accepts `kind=a,b` lines), a control may assert
+  several lines (`rss` trips both the rss and gcMajor gates), and the 1.0.0-revert control must now catch
+  H3, H4 and H1 each by name instead of "some quality breach". The never-wired `pooldrop` mode is removed
+  (A3 is proven by the real Pool.js mutant MP3). Declared gaps: 28 -> 11 of 54 checks.
 - **Benchmark-only: a real parity gate for the shipped code (S6, audit 2026-09-29).** ADR 0014 said a
   sha256 parity gate kept the kernel byte-identical across the soak redesign; none existed. Now
   `npm run parity` checks `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and `test/invariants.mjs`

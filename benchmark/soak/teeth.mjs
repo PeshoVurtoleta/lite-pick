@@ -60,39 +60,22 @@ export function checks() {
 }
 
 /**
- * Declared gaps: check id -> why it has no control yet. Burst 9c (audit 2026-09-29) adds the controls and
- * deletes these lines; the meta-test fails on any line whose check became covered. NEVER add a line here to
+ * Declared gaps: check id -> why it has no control yet. Bursts 9c2/9c3 (audit 2026-09-29) add the controls
+ * and delete these lines; the meta-test fails on any line whose check became covered. NEVER add a line here to
  * make the meta-test pass for a NEW gate -- a new gate ships with its control.
  */
 export const GAPS = Object.freeze({
-    'gate=gcMajor': '9c: only tripped incidentally by M1/M2 (exit [0,1]); needs a control that asserts it',
-    'gate=hotAlloc': '9c: the gross tier (every window scavenged) has no control asserting it',
-    'gate=rss': '9c: SOAK_MUSTFAIL=rss trips gcMajor first (config.mjs note); needs an rss-specific control or report-only',
-    'gate=gcPause': '9c: needs a mutant that lengthens late GC pauses',
-    'gate=rebuild': '9c: the rebuild series can never activate (too few samples); make it report-only or add a micro-bench',
-    'gate=totalPicks': '9c: needs a run that does no work',
-    'quality lane=RoundRobin': '9c: no RoundRobin quality mutant',
-    'quality lane=SED': '9c: shares the LeastConn argmin oracle path but is not proven on its own lane',
-    'quality lane=NQ': '9c: shares the LeastConn argmin oracle path but is not proven on its own lane',
-    'quality kind=oracle': '9c: quality specs do not yet assert the kind',
-    'quality kind=weightZero': '9c: quality specs do not yet assert the kind',
-    'quality kind=chiSquare': '9c: quality specs do not yet assert the kind',
-    'invariants kind=freeze': '9c: needs a run that drains positive-weight eligibility below 8',
-    'retention': '9c: SOAK_MUSTFAIL=leak has no control',
-    'pool=A4': '9c: SOAK_MUSTFAIL=poolbadcode has no control',
-    'phases': '9c: needs a run where a chaos phase never fires',
-    'tracker': '9c: needs a run with a lite-leak tracker finding',
-    'soak: INCONCLUSIVE -- hotAlloc[': '9c: needs a lane whose every hot window saw a GC',
-    'soak: INCONCLUSIVE -- gcPause[': '9c: only reachable from a malformed record; prove via the report path or drop',
-    'soak: INCONCLUSIVE -- quality windows never sufficient': '9c: a short-picks run (the M1 lesson: 20000 picks on RoundRobin)',
-    'mode=leak': '9c: no control (-> retention)',
-    'mode=heap': '9c: no control (-> heap)',
-    'mode=rss': '9c: no control (-> gcMajor; see gate=rss)',
-    'mode=weight0': '9c: no control (-> quality kind=weightZero)',
-    'mode=imbalance': '9c: only used by the RPT stream control, which asserts the report exit, not the trip',
-    'mode=pooldrop': '9c: NOT WIRED in main.mjs / pool-lane.mjs -- implement (A3) or remove the mode',
-    'mode=poolbadcode': '9c: no control (-> pool=A4)',
-    'mode=poolretain': '9c: no control (-> pool=A6)',
+    'gate=hotAlloc': '9c2: the gross tier (every window scavenged) has no control asserting it',
+    'gate=gcPause': '9c3: needs a mutant that lengthens late GC pauses',
+    'gate=rebuild': '9c3: the rebuild series can never activate (too few samples); make it report-only or add a micro-bench',
+    'gate=totalPicks': '9c3: needs a run that does no work',
+    'quality lane=SED': '9c2: shares the LeastConn argmin oracle path but is not proven on its own lane',
+    'quality lane=NQ': '9c2: shares the LeastConn argmin oracle path but is not proven on its own lane',
+    'invariants kind=freeze': '9c3: needs a run that drains positive-weight eligibility below 8',
+    'phases': '9c3: needs a run where a chaos phase never fires',
+    'tracker': '9c3: needs a run with a lite-leak tracker finding',
+    'soak: INCONCLUSIVE -- hotAlloc[': '9c3: needs a lane whose every hot window saw a GC',
+    'soak: INCONCLUSIVE -- gcPause[': '9c3: only reachable from a malformed record; prove via the report path or drop',
 });
 
 /** Values a `k=v` token of a BREACH spec may carry (lane ids: kernel, `#tiny`, pool). */
@@ -101,7 +84,7 @@ const TOKEN_VALUES = {
     lane: ROSTER.concat(ROSTER.map((l) => l + '#tiny'), POOL_LANES),
 };
 
-/** null when `spec` (a control's wantBreach) is well-formed against this manifest, else why not. */
+/** null when `spec` (one of a control's specs) is well-formed against this manifest, else why not. */
 export function validSpec(spec) {
     if (spec === null) return null;
     if (spec.startsWith('soak: ')) {
@@ -122,13 +105,16 @@ export function validSpec(spec) {
     return null;
 }
 
-/** True when control `c` (a MUSTFAIL_LIST row) covers check `k`. */
+/** True when control `c` (a MUSTFAIL_LIST row; `specs` must ALL match, so any one of them proves its
+ *  check) covers check `k`. */
 export function covers(c, k) {
     const mayFail = c.status.indexOf(1) !== -1;
-    if (k.kind === 'mode') return c.run === 'main' && c.mode === k.mode && mayFail && c.spec !== null;
-    if (c.run !== 'main' || c.spec === null) return false;
-    if (k.kind === 'line') return c.spec.startsWith(k.prefix) && (k.exit === null || c.status.indexOf(k.exit) !== -1);
-    if (c.spec.startsWith('soak: ') || !mayFail) return false;
-    const have = c.spec.split(' ').filter(Boolean);
-    return k.tokens.every((t) => have.indexOf(t) !== -1);
+    if (k.kind === 'mode') return c.run === 'main' && c.mode === k.mode && mayFail && c.specs.length !== 0;
+    if (c.run !== 'main') return false;
+    return c.specs.some((sp) => {
+        if (k.kind === 'line') return sp.startsWith(k.prefix) && (k.exit === null || c.status.indexOf(k.exit) !== -1);
+        if (sp.startsWith('soak: ') || !mayFail) return false;
+        const have = sp.split(' ').filter(Boolean);
+        return k.tokens.every((t) => have.indexOf(t) !== -1);
+    });
 }

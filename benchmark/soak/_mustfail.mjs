@@ -114,9 +114,11 @@ const out = [];
 let allOk = true;
 /** LIST mode: describe the control instead of running it. `run` is what the exit status belongs to: main
  *  (main.mjs through a mutant/mode), cfg (main.mjs config parse), report (SoakReport.mjs on a stream). */
+/** A control's spec is null, one spec, or an array of specs that must ALL match (one mode, several gates). */
+const specsOf = (w) => (w === null || w === undefined ? [] : [].concat(w));
 function listed(name, run, env, wantStatus, wantBreach) {
     out.push(JSON.stringify({
-        name, run, status: Array.isArray(wantStatus) ? wantStatus : [wantStatus], spec: wantBreach || null,
+        name, run, status: Array.isArray(wantStatus) ? wantStatus : [wantStatus], specs: specsOf(wantBreach),
         mode: (env && env.SOAK_MUSTFAIL) || null, lanes: (env && env.SOAK_LANES) || null,
     }));
 }
@@ -139,9 +141,17 @@ function matchWant(stderr, spec) {
         const d = head.indexOf('detail=');
         if (d !== -1) head = head.slice(0, d);
         const have = head.split(' ').filter(Boolean);
-        if (toks.every((t) => have.indexOf(t) !== -1)) return true;
+        if (toks.every((t) => hasToken(have, t))) return true;
     }
     return false;
+}
+/** `k=v` matches a line token `k=v` or `k=a,v,b` (main joins several quality kinds with commas). */
+function hasToken(have, t) {
+    if (have.indexOf(t) !== -1) return true;
+    const eq = t.indexOf('=');
+    if (eq === -1) return false;
+    const key = t.slice(0, eq + 1), val = t.slice(eq + 1);
+    return have.some((h) => h.startsWith(key) && h.slice(key.length).split(',').indexOf(val) !== -1);
 }
 /** A child that crashed (uncaught exception, main rejection) is a MISS for EVERY control: a crash is
  *  never evidence that a gate tripped (S11: a thrown setTimeout used to "pass" the A7 case). */
@@ -153,13 +163,13 @@ function record(name, r, wantStatus, wantBreach) {
     const now = Date.now(), secs = ((now - lastT) / 1000).toFixed(0);
     lastT = now;
     const statusOk = Array.isArray(wantStatus) ? wantStatus.indexOf(r.status) !== -1 : r.status === wantStatus;
-    const breachOk = !wantBreach || matchWant(r.stderr, wantBreach);
+    const breachOk = specsOf(wantBreach).every((sp) => matchWant(r.stderr, sp));
     const crashed = crashedOf(r.stderr);
     const ok = statusOk && breachOk && !crashed;
     if (!ok) allOk = false;
     const firstLine = (r.stderr.match(/^soak: (CRASH|BREACH|FAIL|INCONCLUSIVE) .*/m) || [''])[0].slice(0, 110);
     out.push('  ' + (ok ? 'OK  ' : 'MISS') + ' ' + name.padEnd(34) +
-        ' exit=' + r.status + ' want=' + (Array.isArray(wantStatus) ? wantStatus.join('|') : wantStatus) + (wantBreach ? ' [' + wantBreach + ']' : '') + ' ' + secs + 's' +
+        ' exit=' + r.status + ' want=' + (Array.isArray(wantStatus) ? wantStatus.join('|') : wantStatus) + (wantBreach ? ' [' + specsOf(wantBreach).join(' & ') + ']' : '') + ' ' + secs + 's' +
         (ok ? '' : '  <<< ' + (crashed ? 'CRASHED: ' : '') + (firstLine || 'no breach line')));
 }
 function control(name, src, env, wantStatus, wantBreach) {
@@ -209,7 +219,7 @@ control('M4 2-field-object/64', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c 
 // corrects a transient accumulator offset over a long quiet window, so it is not a lasting defect.)
 control('M5 SmoothWRR ignores-weight',
     patch(PICK, '                const c = cur[i] + wt[i];', '                const c = cur[i] + 1;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality lane=SmoothWRR');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality lane=SmoothWRR kind=oracle');
 // M6: the H3 weight-0 regression -- BOTH the pick-loop guard AND the setWeight credit-reset removed,
 // so a node drained to weight 0 keeps its stale credit and gets returned. The lane-agnostic H3 guard
 // (weights[picked]===0) fires; the same guard protects CH/BL (see report note).
@@ -217,27 +227,27 @@ control('M6 SmoothWRR weight-0 (H3)',
     patch(
         patch(PICK, '            if (el[i] && wt[i] > 0) {       // eligible AND positive weight: a weight-0 node is never a candidate', '            if (el[i]) {'),
         '        this._current[i] = 0;               // reset credit: a reweighted node holds no stale accumulator', '        /* mutant: setWeight credit-reset removed (H3) */'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality lane=SmoothWRR');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality lane=SmoothWRR kind=weightZero');
 // M6b: the SAME H3 defect in ConsistentHash's Maglev build -- a weight-0 backend is given a table
 // slot (+1 quota) instead of zero, so it becomes reachable and gets picked. Proves the weight-0 guard
 // has teeth on the KEYED lanes too, not only SmoothWRR.
 control('M6b CH weight-0 (H3, keyed)',
     patch(PICK, 'const q = Math.floor(wt[b] / total * M);', 'const q = Math.floor(wt[b] / total * M) + 1;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash kind=weightZero');
 control('M7 biased WR sampler',
     patch(PICK, '            const cand = u < prob[col] ? col : alias[col];', '            const cand = col;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' }, 1, 'quality lane=WeightedRandom');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' }, 1, 'quality lane=WeightedRandom kind=chiSquare');
 
 // --- increment 2a: load / keyed oracles (oracles.mjs), each proven through main ------------------
 // M8: P2C returns the WORSE of the two choices -> load balance collapses -> the max-mean bound trips.
 control('M8 P2C worst-of-two',
     patch(PICK, 'return this._inflight[b] < this._inflight[a] ? b : a;', 'return this._inflight[b] > this._inflight[a] ? b : a;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality lane=P2C');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality lane=P2C kind=oracle');
 // M9: LeastConn picks the MOST-loaded eligible node -> the argmin oracle trips. (SED/NQ share the
 // identical oracleArgmin path, differing only in the recomputed score; see report note.)
 control('M9 LeastConn non-argmin',
     patch(PICK, '                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }', '                if (best < 0 || c > bestLoad) { best = i; bestLoad = c; }'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 1, 'quality lane=LeastConn');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 1, 'quality lane=LeastConn kind=oracle');
 // M10: ConsistentHash rotates the start slot per call (in ITS OWN fast path) -> a key no longer
 // sticks -> the consecutive-equality stickiness check trips.
 // M10: the reviewer's exact mutant -- a slot rotation that advances PER setEligible (this.__ROT++ in
@@ -247,18 +257,18 @@ control('M10 CH stickiness break (per-setEligible rotation)',
     patchAll(
         patch(PICK, '    setEligible(i, up) {\n        _vIdx(i, this._cap);', '    setEligible(i, up) {\n        this.__ROT = (this.__ROT | 0) + 1;\n        _vIdx(i, this._cap);'),
         '        let slot = (keyHash >>> 0) % M;', '        let slot = ((keyHash >>> 0) + (this.__ROT | 0)) % M;', 2),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash kind=oracle');
 // M11: BoundedLoad drops the +1 that counts the incoming request (the H4 bug) -> under-caps -> the
 // reference walk disagrees with the pick.
 control('M11 BoundedLoad H4 under-cap',
     patch(PICK, 'const cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;   // > 0: total>0, live>0', 'const cap = capActive ? Math.ceil((1 + this._eps) * total / this._live) : 0;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad kind=oracle');
 
 // M12: PeakEWMA ignores the cost comparison (no latency steering, the H1 black-hole shape) -> the
 // busy slow node is no longer avoided and gets ~uniform share -> the slowNode-share oracle trips.
 control('M12 PeakEWMA H1 no-steer',
     patch(PICK, '        return costB < costA ? b : a;         // lower cost wins; tie -> the first draw', '        return a;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'PeakEWMA' }, 1, 'quality lane=PeakEWMA');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'PeakEWMA' }, 1, 'quality lane=PeakEWMA kind=oracle');
 
 // M13 (T6 tiny lanes): P2C returns PICK_NONE on a live===1 pool (breaking the cap-1 shortcut). On the
 // tiny P2C lane (cap 1 when cycle%3===0) this makes pick() fail closed with a healthy node up -> the
@@ -279,7 +289,7 @@ control('M14 latency tail inflate (growing stall)',
 // reference -> trips. (A shared-state oracle reading b._total would be blind to this.)
 control('M15 BoundedLoad _total desync',
     patch(PICK, '        const t = this._total + delta;', '        const t = this._total + delta * 2;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad kind=oracle');
 
 // M16 (NIT1): a periodic allocation RARER than one B/op pass (64KB every 2^20 picks, ~0.0625 B/op = 3x
 // the bound). The MIN estimator misses it (it lands in only one pass per cycle, like a one-off), but it
@@ -330,6 +340,22 @@ modeControl('MPm1 poolnote mode (A1)', { ...PA, SOAK_LANES: 'PoolBoundedLoad', S
 modeControl('MPm2 poolleak mode (A2)', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolleak' }, 1, 'pool=A2 lane=PoolP2C');
 modeControl('MPm3 poolunhandled mode (A7)', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolunhandled' }, 1, 'pool=A7');
 
+// --- burst 9c (audit 2026-09-29): every SOAK_MUSTFAIL mode proven through main, asserting WHAT it trips.
+// These are harness self-injections (weaker than a kernel/Pool mutant, which the controls above are);
+// they prove the gate/oracle path the mode targets, and teeth.mjs requires each mode to have one. -------
+modeControl('MM1 leak -> retention', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'leak' }, 1, 'retention lane=RoundRobin');
+modeControl('MM2 heap -> heap', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'heap' }, 1, 'gate=heap lane=RoundRobin');
+// weight0 zeroes the harness weight array, which IS the kernel's: SmoothWRR/SED/NQ read it live, so for them
+// it is a legitimate drain (a correct kernel skips the node -- no trip). It bites where the kernel CACHES
+// weights: the WeightedRandom alias table (and the CH/BL Maglev table) still routes to the drained node.
+modeControl('MM3 weight0 -> weightZero', { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom', SOAK_MUSTFAIL: 'weight0' }, 1, 'quality lane=WeightedRandom kind=weightZero');
+modeControl('MM4 imbalance -> RR quality', { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 1, 'quality lane=RoundRobin kind=oracle');
+modeControl('MM5 rss -> rss + gcMajor', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'rss' }, 1, ['gate=rss lane=RoundRobin', 'gate=gcMajor lane=RoundRobin']);
+modeControl('MM6 poolbadcode -> A4', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolbadcode' }, 1, 'pool=A4 lane=PoolP2C');
+modeControl('MM7 poolretain -> A6', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolretain' }, 1, 'pool=A6 lane=PoolP2C');
+// I3 (S5): a lane whose quality windows never fill (RoundRobin at the 20000-pick floor) is INCONCLUSIVE.
+modeControl('I3 quality windows never sufficient', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 3, 'soak: INCONCLUSIVE -- quality windows never sufficient for lane(s): RoundRobin');
+
 // --- config fail-closed cases (audit 1.1): a bad env aborts with exit 2, never a silent 0-picks PASS.
 // These run the CLEAN in-tree kernel (config is parsed before the kernel does anything). --------------
 function runCfg(env, flags) {
@@ -363,11 +389,13 @@ cfgCase('unpinned semi-space', { SOAK_CYCLES: CYC }, ['--expose-gc']);
 if (want('REVERT 1.0.0 kernel (H1/H3/H4)')) {
     const name = 'REVERT 1.0.0 kernel (H1/H3/H4)';
     const env = { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR,BoundedLoad,PeakEWMA' };
-    if (LIST) listed(name, 'main', env, 1, 'quality');
+    // H3 (SmoothWRR weight-0), H4 (BoundedLoad cap), H1 (PeakEWMA steering): each must be caught by name.
+    const REVERT_SPECS = ['quality lane=SmoothWRR kind=weightZero', 'quality lane=BoundedLoad kind=oracle', 'quality lane=PeakEWMA kind=oracle'];
+    if (LIST) listed(name, 'main', env, 1, REVERT_SPECS);
     else try {
         const old = execFileSync('git', ['show', '8c1ecc7:Pick.js'], { cwd: ROOT, encoding: 'utf8' });
         const p = writeMutant(old, 'revert100');
-        record(name, runSoak(p, env), 1, 'quality');
+        record(name, runSoak(p, env), 1, REVERT_SPECS);
     } catch (e) {
         allOk = false;
         out.push('  MISS ' + name.padEnd(34) + ' <<< could not run: ' + String(e.message || e).slice(0, 80));

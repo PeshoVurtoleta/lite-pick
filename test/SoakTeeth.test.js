@@ -48,7 +48,7 @@ test('the battery lists controls with unique names', () => {
 });
 
 test('every control spec is well-formed against the manifest', () => {
-    const bad = CONTROLS.map((c) => [c.name, validSpec(c.spec)]).filter((x) => x[1] !== null);
+    const bad = CONTROLS.flatMap((c) => c.specs.map((sp) => [c.name, sp, validSpec(sp)])).filter((x) => x[2] !== null);
     assert.deepEqual(bad, []);
 });
 

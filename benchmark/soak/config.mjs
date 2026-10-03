@@ -36,14 +36,17 @@ const KNOWN_KEYS = [
 ];
 
 // Every SOAK_MUSTFAIL mode is WIRED to actually trip a gate (exit 1); an unknown value is an error,
-// never a silent no-op. leak->retention, heap->heap-drift, rss->memory-runaway (the resident buffer
-// forces a workload major GC -> the gcMajor gate, which fires before the deliberately generous RSS
-// runaway threshold), decay->dense hotOps, decaysparse->sparse hotOps (proves the split series has
-// teeth on its own), weight0->quality(H3 guard), imbalance->quality(distribution).
+// never a silent no-op. leak->retention, heap->heap-drift, rss->memory-runaway (trips BOTH the rss gate
+// and gcMajor: the resident buffer also forces a workload major GC), decay->dense hotOps, decaysparse->
+// sparse hotOps (proves the split series has teeth on its own), weight0->quality kind=weightZero (H3 guard;
+// only on a lane that CACHES weights -- WeightedRandom alias, CH/BL table: SmoothWRR/SED/NQ read the zeroed
+// weight live and correctly skip the node), imbalance->RoundRobin quality (distribution). Each is proven
+// by an MM control in _mustfail.mjs (teeth.mjs requires it).
 export const MUSTFAIL_MODES = Object.freeze(['leak', 'heap', 'slowleak', 'rss', 'decay', 'decaysparse', 'weight0', 'imbalance',
-    // pool-lane teeth (T14-15): poolleak->quiescence(A2), poolnote->totalInflight(A1), pooldrop->
-    // accounting(A3), poolbadcode->rejection-codes(A4), poolretain->retention(A6), poolunhandled->A7.
-    'poolleak', 'poolnote', 'pooldrop', 'poolbadcode', 'poolretain', 'poolunhandled']);
+    // pool-lane teeth (T14-15): poolleak->quiescence(A2), poolnote->totalInflight(A1), poolbadcode->
+    // rejection-codes(A4), poolretain->retention(A6), poolunhandled->A7. (A3 accounting is proven by the
+    // real Pool.js mutant MP3; the never-wired `pooldrop` mode was removed, audit 2026-09-29.)
+    'poolleak', 'poolnote', 'poolbadcode', 'poolretain', 'poolunhandled']);
 
 const DURATION_RE = /^[1-9]\d*(s|m|h)$/;
 const INT_RE = /^-?\d+$/;

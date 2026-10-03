@@ -211,3 +211,9 @@ it false-FAILs a correct kernel. Two decisions change:
   jobs stop partitioning the battery. A stale patch anchor now fails `npm test`, not the nightly.
 - **Declared gaps (28 of 55 checks)** are in `teeth.mjs` `GAPS`, each with its reason; they are the next
   burst's work and the list may only shrink. A new gate ships with its control, never with a gap line.
+- **Burst 9c1 (2026-10-04).** Every `SOAK_MUSTFAIL` mode has a control (MM1-MM7), quality specs name their
+  `kind`, a control may assert several lines, and REVERT must catch H3/H4/H1 by name. Finding: `weight0`
+  was hollow on SmoothWRR (the harness weight array IS the kernel's; a live-reading kernel correctly skips a
+  zeroed node), so its control targets WeightedRandom. `pooldrop` was never wired and is removed. Gaps 28 ->
+  11; the rest are new kernel mutants (9c2: hotAlloc gross tier, SED, NQ) and checks main.mjs cannot reach
+  from a kernel or mode (9c3: gcPause, rebuild, totalPicks, freeze, phases, tracker, two INCONCLUSIVE causes).

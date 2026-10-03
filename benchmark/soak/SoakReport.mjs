@@ -125,7 +125,11 @@ function rederive(doc) {
     const lanes = laneIdsOf(cycles);
 
     // --- completeness: the stream must be whole (catches dropped / truncated records, an aborted run) --
-    if (summary.reason && summary.reason !== 'end') issues.push('run did not complete (reason=' + summary.reason + ')');
+    // An interrupted run (reason 'signal') is legitimate evidence: it re-derives INCONCLUSIVE (S5) unless
+    // it was a forever run, for which a signal is the normal end. Any OTHER non-end reason is an issue.
+    if (summary.reason && summary.reason !== 'end' && summary.reason !== 'signal') issues.push('run did not complete (reason=' + summary.reason + ')');
+    const forever = !!header.config && header.config.cycles === 0 && header.config.durationMs === 0;
+    const interrupted = !!summary.reason && summary.reason !== 'end' && !(summary.reason === 'signal' && forever);
     if (typeof summary.rollups === 'number' && cycles.length !== summary.rollups) issues.push('cycle records ' + cycles.length + ' != summary.rollups ' + summary.rollups);
     if (typeof summary.cyclesRun === 'number' && cycles.length !== summary.cyclesRun) issues.push('cycle records ' + cycles.length + ' != summary.cyclesRun ' + summary.cyclesRun);
     // laneRoster is REQUIRED (fail closed): without it the grid check would silently pass a dropped lane.
@@ -157,7 +161,7 @@ function rederive(doc) {
         warmupCycles: header.config ? header.config.warmupCycles : 0,
         gateN: header.config ? header.config.gateN : 0,
         smoke: header.config ? header.config.smoke : false,
-        lanes, timerFloorNs: header.timerFloorNs, poolLaunched,
+        lanes, timerFloorNs: header.timerFloorNs, poolLaunched, interrupted,
     });
 
     // --- failure signals derived from the cycle records themselves ------------------------------------
@@ -211,7 +215,7 @@ function rederive(doc) {
     const cycleFail = qViol > 0 || invFail > 0 || trackFail > 0 || poolFail > 0 || phasesNotFiredDerived.length > 0;
     const runLevelFail = (summary.findings | 0) !== 0 || (summary.warnings | 0) !== 0 || (summary.unhandledCount | 0) !== 0;
     let verdict = gate.verdict;
-    if (summary.fatal) verdict = VERDICT.FAIL;
+    if (summary.fatal || summary.reason === 'fatal') verdict = VERDICT.FAIL;   // main: a crash is never PASS
     else if (cycleFail || runLevelFail) verdict = VERDICT.FAIL;
     else if (verdict === VERDICT.PASS && !smoke && inconclusiveDerived.length !== 0) verdict = VERDICT.INCONCLUSIVE;
     return { gate, verdict, lanes, issues };
@@ -260,6 +264,8 @@ for (const iss of issues) process.stdout.write('    ! ' + iss + '\n');
 if (summary.breaches && summary.breaches.length) {
     for (const b of summary.breaches) process.stdout.write('    breach: ' + b + '\n');
 }
+for (const why of gate.inconclusive) process.stdout.write('    inconclusive: ' + why + '\n');
+for (const nt of gate.notes) process.stdout.write('    note: ' + nt + '\n');
 
 // 2. MARGINS -------------------------------------------------------------------------------------
 process.stdout.write('  per-lane gate verdicts:\n');

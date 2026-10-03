@@ -8,11 +8,14 @@
  * LINE of a scratch copy of Pick.js (a kernel mutant) and drives it through the REAL main.mjs ->
  * computeGates via the SOAK_KERNEL seam, asserting the run exits 1 AND the breach names the right
  * gate. A clean copy is the pass-control (exit 0). Nothing here calls the gate modules directly.
+ *
+ * MUSTFAIL_ONLY=<regex> runs only the controls whose name matches (a dev aid for short bursts; NOT a
+ * SOAK_ key, so the soak's own fail-closed config never sees it). The full battery is the gate.
  */
 
 import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -43,6 +46,9 @@ function patchAll(src, from, to, expect) {
     return src.split(from).join(to);
 }
 
+const ONLY = process.env.MUSTFAIL_ONLY ? new RegExp(process.env.MUSTFAIL_ONLY) : null;
+const want = (name) => !ONLY || ONLY.test(name);
+
 let idx = 0;
 function writeMutant(src, name) {
     const p = join(TMP, 'kernel-' + (idx++) + '-' + name + '.js');
@@ -56,12 +62,15 @@ function runSoak(kernelPath, env) {
         SOAK_KERNEL: kernelPath,
         SOAK_OUT: join(TMP, 'run-' + (idx++) + '.jsonl'),
     }, env);
-    try {
-        execFileSync('node', NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: full, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
-        return { status: 0, stderr: '' };
-    } catch (e) {
-        return { status: e.status === undefined ? -1 : e.status, stderr: String(e.stderr || '') };
-    }
+    return runMain(full);
+}
+
+/** Run main.mjs with `env`; { status, stderr } on EVERY exit. spawnSync, not execFileSync: an exit-0 run
+ * must keep its stderr too (the report-only NOTE lines a control asserts are on stderr). A child killed
+ * by a signal reports status -1. */
+function runMain(env) {
+    const r = spawnSync('node', NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    return { status: r.status === null ? -1 : r.status, stderr: String(r.stderr || '') };
 }
 
 /** A Pool.js mutant (Pool.js is byte-frozen; patch a SCRATCH copy driven via SOAK_POOL). The scratch's
@@ -78,12 +87,7 @@ function patchPool(from, to, expect) {
 /** Run main.mjs through a mutant POOL (clean kernel), returns { status, stderr }. */
 function runSoakPool(poolPath, env) {
     const full = Object.assign({}, process.env, { SOAK_POOL: poolPath, SOAK_OUT: join(TMP, 'run-' + (idx++) + '.jsonl') }, env);
-    try {
-        execFileSync('node', NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: full, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
-        return { status: 0, stderr: '' };
-    } catch (e) {
-        return { status: e.status === undefined ? -1 : e.status, stderr: String(e.stderr || '') };
-    }
+    return runMain(full);
 }
 
 const out = [];
@@ -99,14 +103,17 @@ function record(name, r, wantStatus, wantBreach) {
         (ok ? '' : '  <<< ' + (firstBreach || 'no breach')));
 }
 function control(name, src, env, wantStatus, wantBreach) {
+    if (!want(name)) return;
     record(name, runSoak(writeMutant(src, name.replace(/[^a-z0-9]/gi, '')), env), wantStatus, wantBreach);
 }
 // A pool MODE control: clean kernel (PICK), SOAK_MUSTFAIL=<mode>, driven through a pool lane.
 function modeControl(name, env, wantStatus, wantBreach) {
+    if (!want(name)) return;
     record(name, runSoak(writeMutant(PICK, name.replace(/[^a-z0-9]/gi, '')), env), wantStatus, wantBreach);
 }
 // A pool.js mutant control (SOAK_POOL seam, clean kernel).
 function poolControl(name, poolSrc, env, wantStatus, wantBreach) {
+    if (!want(name)) return;
     const pp = join(TMP, 'pool-' + (idx++) + '-' + name.replace(/[^a-z0-9]/gi, '') + '.js');
     writeFileSync(pp, poolSrc);
     record(name, runSoakPool(pp, env), wantStatus, wantBreach);
@@ -114,15 +121,21 @@ function poolControl(name, poolSrc, env, wantStatus, wantBreach) {
 
 const A = 20000, Q = 100000;   // alloc mutants can use a short main loop; quality mutants need windows
 
-// --- alloc mutants (RoundRobin.pick), driven through the hotAlloc gate --------------------------
+// --- alloc mutants (RoundRobin.pick), driven through the hotAlloc PROBE -------------------------
+// hotAlloc is REPORT-ONLY (S1, audit 2026-09-29: V8 JIT state false-FAILs a correct kernel on Node 22;
+// PerfGate owns per-op 0 B/op and is proven against these same mutants). The control now asserts the
+// probe still SEES the allocation: exit 0 with a `soak: NOTE -- hotAlloc[RoundRobin]` line.
+// They need Q picks: with A the RoundRobin quality windows never fill and the run is (correctly)
+// INCONCLUSIVE (S5) -- a FAIL used to mask that.
+const NOTE_RR = 'soak: NOTE -- hotAlloc[RoundRobin]';
 control('M1 160KB-array/8192', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c & 8191) === 0) { this.__o = new Array(40000); }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'hotAlloc[RoundRobin]');
+    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 control('M2 retained-log/8th', patch(PICK, RR_ANCHOR, RR_INJECT('if (!this.__log) this.__log = []; if ((this.__c & 7) === 0) this.__log.push({ a: this.__c });')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'hotAlloc[RoundRobin]');
+    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 control('M3 64KB-burst/24576', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c % 24576) === 0) { this.__o = new Array(8192); }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'hotAlloc[RoundRobin]');
+    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 control('M4 2-field-object/64', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c & 63) === 0) { this.__o = { a: this.__c, b: 0 }; }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'hotAlloc[RoundRobin]');
+    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 
 // --- quality mutants, driven through the SmoothWRR / WeightedRandom oracles ----------------------
 // M5: SmoothWRR ignores weight in the accumulator -> a PERSISTENT ratio corruption (near-uniform
@@ -209,7 +222,7 @@ control('M15 BoundedLoad _total desync',
 // A genuine one-off (once per process) does NOT recur and correctly does not fire.
 control('M16 64KB/2^20 periodic (recurrence)',
     patch(PICK, RR_ANCHOR, RR_INJECT('globalThis.__P20 = (globalThis.__P20 | 0) + 1; if ((globalThis.__P20 & 0xFFFFF) === 0) { this.__o = new Array(8192); }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'hotAlloc[RoundRobin]');
+    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 
 // --- POOL LANE teeth (T14-15): each assertion proven by a REAL Pool.js mutant via the SOAK_POOL seam
 // (Pool.js stays byte-frozen -- the mutant is a scratch copy). These catch REAL Pool bugs, not harness
@@ -261,7 +274,7 @@ function runCfg(env, flags) {
         return { status: 0, stderr: '' };
     } catch (e) { return { status: e.status === undefined ? -1 : e.status, stderr: String(e.stderr || '') }; }
 }
-function cfgCase(name, env, flags) { record('CFG ' + name, runCfg(env, flags), 2, null); }
+function cfgCase(name, env, flags) { if (!want('CFG ' + name)) return; record('CFG ' + name, runCfg(env, flags), 2, null); }
 cfgCase('SOAK_CYCLES=abc', { SOAK_CYCLES: 'abc' });
 cfgCase('SOAK_CYCLES=-5', { SOAK_CYCLES: '-5' });
 cfgCase('SOAK_CYCLES=2.5', { SOAK_CYCLES: '2.5' });
@@ -278,7 +291,7 @@ cfgCase('unpinned semi-space', { SOAK_CYCLES: '7' }, ['--expose-gc']);
 // a scratch file and drive the H3 (SmoothWRR/CH weight-0), H4 (BoundedLoad cap) and H1 (PeakEWMA) lanes;
 // it must exit 1 on a quality breach. (Pool.js/markers unchanged in the fix, so the kernel-lane soak loads
 // the old kernel fine.) ---------------------------------------------------------------------------------
-{
+if (want('REVERT 1.0.0 kernel (H1/H3/H4)')) {
     const name = 'REVERT 1.0.0 kernel (H1/H3/H4)';
     try {
         const old = execFileSync('git', ['show', '8c1ecc7:Pick.js'], { cwd: ROOT, encoding: 'utf8' });
@@ -288,6 +301,26 @@ cfgCase('unpinned semi-space', { SOAK_CYCLES: '7' }, ['--expose-gc']);
         allOk = false;
         out.push('  MISS ' + name.padEnd(34) + ' <<< could not run: ' + String(e.message || e).slice(0, 80));
     }
+}
+
+// --- S5 (audit 2026-09-29): a run without the evidence to judge is INCONCLUSIVE (exit 3), never PASS. --
+// I1: a bounded run interrupted by SIGINT after cycle 1. I2: a duration-bound run too short to reach the
+// 2N active floor. Both run the CLEAN in-tree kernel.
+function runSoakSigint(env) {
+    return new Promise((resolve) => {
+        const full = Object.assign({}, process.env, { SOAK_OUT: join(TMP, 'sig-' + (idx++) + '.jsonl') }, env);
+        const ch = spawn('node', NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: full, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '', sent = false;
+        ch.stdout.on('data', (d) => { if (!sent && /soak cycle 1:/.test(String(d))) { sent = true; ch.kill('SIGINT'); } });
+        ch.stderr.on('data', (d) => { stderr += d; });
+        ch.on('exit', (code) => resolve({ status: sent ? (code === null ? -1 : code) : -2, stderr }));
+    });
+}
+if (want('I1 SIGINT after cycle 1')) {
+    record('I1 SIGINT after cycle 1', await runSoakSigint({ SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'soak: INCONCLUSIVE -- run interrupted before its end');
+}
+if (want('I2 SOAK_DURATION=10s')) {
+    record('I2 SOAK_DURATION=10s', runSoak(writeMutant(PICK, 'I2'), { SOAK_DURATION: '10s', SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'drift gates need');
 }
 
 // --- pass-control: the CLEAN kernel through the same path must exit 0 ----------------------------
@@ -300,6 +333,7 @@ poolControl('P2 clean pool (pass-control)', patchPool("from '" + REAL_PICK_URL +
 // run SoakReport.mjs on real streams so a report regression (e.g. a smoke/FAIL false-alarm) is caught by
 // the teeth battery, not only by the reviewer. ---------------------------------------------------------
 function reportControl(name, soakEnv, wantExit) {
+    if (!want(name)) return;
     const stream = join(TMP, 'rep-' + (idx++) + '.jsonl');
     try { execFileSync('node', NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: Object.assign({}, process.env, soakEnv, { SOAK_OUT: stream }), stdio: 'ignore' }); } catch { /* the soak itself may exit 1 (a FAIL stream); we only report on its output */ }
     let status = 0, stderr = '';

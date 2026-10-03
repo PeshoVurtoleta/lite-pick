@@ -6,6 +6,23 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
+### Changed
+
+- **Benchmark-only: a soak run without the evidence to judge is INCONCLUSIVE, not PASS (S5, audit
+  2026-09-29).** A non-smoke run where any lane has fewer than 2N post-warmup cycles (e.g.
+  `SOAK_DURATION=10s`), or a bounded run interrupted by a signal, now exits 3 with one
+  `soak: INCONCLUSIVE -- <why>` line per reason; before, both printed `soak: PASS` and exited 0. A
+  forever run (`SOAK_CYCLES=0`) still ends normally on a signal; a crash is FAIL. `soak:report`
+  re-derives the same verdict (`computeGates` takes `interrupted`). New teeth: I1, I2.
+- **Benchmark-only: the soak's hotAlloc gate is report-only below the gross tier (S1, audit 2026-09-29).**
+  On Node 22 V8 JIT state in the long-lived soak process reads 8-20 B/op on a correct kernel and failed
+  every run. An over-bound lane now prints `soak: NOTE -- hotAlloc[lane] ...`; the soak still FAILs when
+  every probe window scavenges (~512+ B/op) or the measurement is non-finite. Per-op 0 B/op stays gated by
+  `test:perf` (PerfGate), which fails on the same allocation mutants. See the ADR 0014 amendment.
+- **Benchmark-only: `soak:teeth` accepts `MUSTFAIL_ONLY=<regex>`** to run a subset of controls (dev aid;
+  the full battery is the gate), and keeps a child's stderr on an exit-0 run too (it was discarded, so a
+  control could not assert a line printed by a passing run).
+
 ## [1.0.2] - 2026-10-03
 
 Bug-fix release from the re-audit at `audit/2026-09-29/` (audited commit `1848f7b`; N1, N2, D1 and T2

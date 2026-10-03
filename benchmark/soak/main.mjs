@@ -171,6 +171,9 @@ async function main() {
             warmupCycles: cfg.warmupCycles, gateN: cfg.gateN, smoke: cfg.smoke, lanes: laneIds,
             timerFloorNs: header.timerFloorNs,   // latency floor = 2 * this (BLOCKER 3)
             poolLaunched: poolLaunchedTotal,     // count pool runs as work for the "did nothing" gate
+            // S5: a bounded run that did not reach its end is never a PASS. A forever run (SOAK_CYCLES=0)
+            // ends ONLY by a signal, so for it a signal is the normal end (the 2N floor still applies).
+            interrupted: reason !== 'end' && !(reason === 'signal' && cfg.forever),
         });
         const findings = tracker.audit();
         const inconclusiveLanes = [];
@@ -189,7 +192,7 @@ async function main() {
             qualityViolations !== 0 || findings.length !== 0 || warns.length !== 0 || phasesNotFired.length !== 0 ||
             poolFailures !== 0 || unhandledCount !== 0;
         let verdict = gate.verdict;
-        if (counterFail) verdict = VERDICT.FAIL;
+        if (counterFail || reason === 'fatal') verdict = VERDICT.FAIL;   // a crash is never PASS/INCONCLUSIVE
         // A lane whose quality oracle NEVER gathered enough windows in ANY cycle is INCONCLUSIVE, never
         // a silent PASS -- but only when NOT a deliberately short smoke run.
         else if (verdict === VERDICT.PASS && !cfg.smoke && inconclusiveLanes.length !== 0) verdict = VERDICT.INCONCLUSIVE;
@@ -202,7 +205,8 @@ async function main() {
             inconclusiveLanes, phasesNotFired,
             phaseTotals: reason === 'end' ? Object.fromEntries(phaseTotals) : undefined,
             findings: findings.length, warnings: warns.length, workloadMajorTotal,
-            verdict, breaches: gate.breaches, gate: gate.perLane, totalPicksGate: gate.totalPicks,
+            verdict, breaches: gate.breaches, notes: gate.notes, inconclusive: gate.inconclusive,
+            gate: gate.perLane, totalPicksGate: gate.totalPicks,
         });
         return { verdict, gate, findings, inconclusiveLanes, phasesNotFired };
     }
@@ -217,8 +221,9 @@ async function main() {
         shuttingDown = true;
         stopRequested = true;
         process.stdout.write('\nsoak: ' + sig + ' -- writing final summary and exiting\n');
-        const { verdict } = summarize('signal');
-        process.exit(exitCodeFor(verdict));
+        const res = summarize('signal');
+        printVerdict(res);
+        process.exit(exitCodeFor(res.verdict));
     }
     process.on('SIGINT', () => onSignal('SIGINT'));
     process.on('SIGTERM', () => onSignal('SIGTERM'));
@@ -646,20 +651,28 @@ async function main() {
         ' lanes, workloadMajor ' + workloadMajorTotal + ', invariants ' +
         (invariantFailures === 0 ? 'green' : invariantFailures + ' FAIL') + ' -> ' + verdict + '\n');
 
-    if (verdict === VERDICT.FAIL) {
-        if (invariantFailures) process.stderr.write('soak: FAIL -- invariants ' + invariantFailures + ' checkpoint(s)\n');
-        if (sizeFailures) process.stderr.write('soak: FAIL -- retention: tracker.size() != 0 after ' + sizeFailures + ' cycle(s)\n');
-        if (qualityViolations) process.stderr.write('soak: FAIL -- quality ' + qualityViolations + ' violation(s)\n');
-        if (poolFailures) process.stderr.write('soak: FAIL -- pool assertion(s) failed in ' + poolFailures + ' lane-cycle(s)\n');
-        if (unhandledCount) process.stderr.write('soak: FAIL -- pool assertion 7: ' + unhandledCount + ' unhandled rejection(s)\n');
-        if (phasesNotFired && phasesNotFired.length) process.stderr.write('soak: FAIL -- chaos phases never fired: ' + phasesNotFired.join(', ') + '\n');
-        for (const g of gate.breaches) process.stderr.write('soak: FAIL -- gate ' + g + '\n');
-    } else if (verdict === VERDICT.INCONCLUSIVE) {
-        process.stderr.write('soak: INCONCLUSIVE -- quality windows never sufficient for lane(s): ' + inconclusiveLanes.join(', ') + '\n');
-    } else {
-        process.stdout.write('soak: PASS' + (gate.active ? '' : ' (smoke: drift gates report SMOKE)') + '\n');
-    }
+    printVerdict({ verdict, gate, inconclusiveLanes, phasesNotFired });
     process.exit(exitCodeFor(verdict));
+
+    /** The final verdict lines (also used by the signal path). FAIL / INCONCLUSIVE go to stderr with one
+     * line per reason; report-only NOTEs (S1 hotAlloc) go to stderr on every verdict so they stay visible. */
+    function printVerdict({ verdict, gate, inconclusiveLanes, phasesNotFired }) {
+        for (const nt of gate.notes) process.stderr.write('soak: NOTE -- ' + nt + '\n');
+        if (verdict === VERDICT.FAIL) {
+            if (invariantFailures) process.stderr.write('soak: FAIL -- invariants ' + invariantFailures + ' checkpoint(s)\n');
+            if (sizeFailures) process.stderr.write('soak: FAIL -- retention: tracker.size() != 0 after ' + sizeFailures + ' cycle(s)\n');
+            if (qualityViolations) process.stderr.write('soak: FAIL -- quality ' + qualityViolations + ' violation(s)\n');
+            if (poolFailures) process.stderr.write('soak: FAIL -- pool assertion(s) failed in ' + poolFailures + ' lane-cycle(s)\n');
+            if (unhandledCount) process.stderr.write('soak: FAIL -- pool assertion 7: ' + unhandledCount + ' unhandled rejection(s)\n');
+            if (phasesNotFired && phasesNotFired.length) process.stderr.write('soak: FAIL -- chaos phases never fired: ' + phasesNotFired.join(', ') + '\n');
+            for (const g of gate.breaches) process.stderr.write('soak: FAIL -- gate ' + g + '\n');
+        } else if (verdict === VERDICT.INCONCLUSIVE) {
+            for (const why of gate.inconclusive) process.stderr.write('soak: INCONCLUSIVE -- ' + why + '\n');
+            if (inconclusiveLanes.length) process.stderr.write('soak: INCONCLUSIVE -- quality windows never sufficient for lane(s): ' + inconclusiveLanes.join(', ') + '\n');
+        } else {
+            process.stdout.write('soak: PASS' + (gate.active ? '' : ' (smoke: drift gates report SMOKE)') + '\n');
+        }
+    }
 }
 
 // A crash in main() itself must still leave a fatal record + summary (route through the same path).

@@ -16,7 +16,9 @@ included the harness's own `JSON.stringify` / `memoryUsage` garbage; and nothing
 layer. A soak whose gates cannot fail is not a soak.
 
 This is a **benchmark-only** change. `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and
-`test/invariants.mjs` are byte-identical to their pre-redesign state (a sha256 parity gate enforces it),
+`test/invariants.mjs` are byte-identical to their pre-redesign state (checked by hand with `diff` at the
+time -- correction, audit 2026-09-29 S6: an earlier wording said "a sha256 parity gate enforces it"; no
+such gate exists yet, only the provenance header records the kernel sha256),
 `files[]` and the tarball are untouched, and there is no version bump.
 
 ## Decision
@@ -95,3 +97,30 @@ Replace `benchmark/Soak.mjs` with `benchmark/soak/*`:
 - `soak:report` exits 0 on an internally consistent recorded FAIL (it fails only on an integrity mismatch
   or a `--baseline` regression). The `npm run soak` step's own exit code is the authoritative CI gate; the
   report is an analyser, not the gate.
+
+## Amendment 2026-10-03 -- audit 2026-09-29 (S1, S5)
+
+The redesign was validated only on Node 26 / Apple M4 / an idle machine. On Node 22 (the nightly's pin)
+it false-FAILs a correct kernel. Two decisions change:
+
+- **hotAlloc is report-only below the gross tier (S1).** In one long-lived process running 20 lanes,
+  shared step functions plus a fresh balancer per lane-cycle drive V8 into deopt windows that box doubles:
+  a correct kernel reads 8-20 B/op in some cycles (quantized ~16 B HeapNumbers), and the cross-cycle
+  recurrence rule turns that into a FAIL. `--no-concurrent-recompilation` cleans the kernel lanes but not
+  the tiny lanes. A forked per-lane probe (the audit's option C) would measure a fresh balancer in a fresh
+  process -- which is what PerfGate (`test:perf`) already does, with isolated scavenge counting -- so it
+  would add a second copy of PerfGate rather than soak evidence. Decision: the soak keeps measuring and
+  prints `soak: NOTE -- hotAlloc[lane] ...` (verdict STUB) when a lane is over 0.02 B/op; it still FAILs
+  on the gross tier (every window scavenged, i.e. >= one 4 MB semi-space per 8192-pick window, ~512 B/op)
+  and on a non-finite measurement. Per-op 0 B/op is owned by PerfGate (verified to FAIL on the same
+  allocation mutants the soak used: M1-M4, M16); retention by `torture` and the soak's heap drift gate.
+  The teeth controls M1-M4/M16 now assert the NOTE (the probe still sees the allocation), exit 0.
+- **No evidence, no PASS (S5).** A non-smoke run where any kernel/tiny lane has fewer than 2N post-warmup
+  cycles (all its drift gates SMOKE), or a bounded run interrupted before its end, is INCONCLUSIVE
+  (exit 3) with one `soak: INCONCLUSIVE -- <why>` line per reason. A forever run (`SOAK_CYCLES=0`) ends
+  only by a signal, so a signal is its normal end (the 2N floor still applies). A crash (`reason:'fatal'`)
+  is FAIL. `computeGates` takes `interrupted` so `soak:report` re-derives the same verdict; the report
+  accepts a `reason:'signal'` stream as legitimate evidence (it re-derives INCONCLUSIVE). Teeth: I1
+  (SIGINT after cycle 1 -> exit 3) and I2 (`SOAK_DURATION=10s` -> exit 3).
+- **The nightly is manual-only** until the remaining Node 22 false-FAILs (S2 timing noise, S3 teeth, S4
+  harness heap growth) are fixed and 20/20 runs are green on Node 22 under load.

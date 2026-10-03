@@ -8,7 +8,16 @@
  * gate is ACTIVE only at >= 2*N post-warmup cycles; below that it reports SMOKE.
  *
  * Verdicts: PASS | FAIL | INCONCLUSIVE (exit 3) | SMOKE. The overall verdict is FAIL if any gate
- * FAILs, else INCONCLUSIVE if any is inconclusive, else PASS (SMOKE gates never fail a run).
+ * FAILs, else INCONCLUSIVE if any is inconclusive OR the run lacks the evidence to judge (S5: a
+ * non-smoke lane below the 2N active floor, or an interrupted run), else PASS. SMOKE gates never fail
+ * a run, and a non-smoke run never PASSes on SMOKE gates.
+ *
+ * hotAlloc is REPORT-ONLY below the gross tier (S1, audit 2026-09-29): in a long-lived multi-lane
+ * process, V8 JIT state (shared step functions + fresh instances per lane-cycle -> deopt windows that
+ * box doubles) shows 8-20 B/op on a correct kernel on Node 22. Per-op 0 B/op is owned by PerfGate
+ * (test:perf, isolated scavenge counting); retention by torture and the heap drift gate. The soak keeps
+ * measuring and reports an over-bound lane as a NOTE; it still FAILs on the gross tier (every window
+ * scavenged = >= a 4 MB semi-space per 8192-pick window, ~512 B/op) and on a non-finite measurement.
  */
 
 export const VERDICT = Object.freeze({ PASS: 'PASS', FAIL: 'FAIL', INCONCLUSIVE: 'INCONCLUSIVE', SMOKE: 'SMOKE', STUB: 'STUB' });
@@ -29,10 +38,9 @@ export const LAT_ADD_TICKS = 2;        // wall-clock granularity floor = this * 
                                        // Two ticks is the minimal floor; a real regression exceeds it easily.
 export const LAT_ADD_NS_FALLBACK = 100; // used only if timerFloorNs is unavailable
 export const LAT_MIN_SAMPLES = 2000;   // per early/late window; below this the gate is INACTIVE (never PASS)
-export const HOTALLOC_MAX = 0.02;      // per post-warmup cycle: hot B/op MEAN <= this. Every clean
-                                       // lane-cycle measures 0.000 (house rule is 0 B/op); 0.02 is a
-                                       // hair above the warm noise floor so even a 2-field object every
-                                       // 64th pick (~0.5 B/op) FAILs.
+export const HOTALLOC_MAX = 0.02;      // per post-warmup cycle: hot B/op MEAN above this is REPORTED
+                                       // (a NOTE, not a breach -- S1). 0.02 is a hair above the warm noise
+                                       // floor so even a 2-field object every 64th pick (~0.5 B/op) shows.
 
 /** O(1)-memory early/late accumulator: first N samples + a ring of the last N. */
 export class EarlyLate {
@@ -96,7 +104,8 @@ function medianList(list) {
 /**
  * @param {Array} rollups per-lane-cycle records: { lane, cycle, tier, heapUsedMB, rssMB,
  *        hotOpsPerSec, gcMajor, gcPauseMs, hotBytesPerOp (number|null), totalPicks, boxingRegime }
- * @param {object} opts { warmupCycles, gateN, smoke, lanes: [names] }
+ * @param {object} opts { warmupCycles, gateN, smoke, lanes: [names], interrupted (bool: a bounded run
+ *        that did not reach its end -- S5), timerFloorNs, poolLaunched }
  */
 export function computeGates(rollups, opts) {
     const warmup = opts.warmupCycles | 0;
@@ -107,6 +116,8 @@ export function computeGates(rollups, opts) {
     // tick, a real regression exceeds 2 ticks easily. Falls back if the timer floor is unavailable.
     const latAddNs = opts.timerFloorNs > 0 ? LAT_ADD_TICKS * opts.timerFloorNs : LAT_ADD_NS_FALLBACK;
     const breaches = [];
+    const notes = [];          // report-only observations (hotAlloc over bound): printed, never a verdict
+    const inconclusive = [];   // S5: why the run cannot be judged (evidence missing), never a silent PASS
     const perLane = [];
     let sawFail = false, sawInconclusive = false;
 
@@ -124,6 +135,7 @@ export function computeGates(rollups, opts) {
         const elRebuildP99 = new EarlyLate(N), elRebuildSamples = new EarlyLate(N);
         const rssList = [];
         let gcMajorMax = 0, hotAllocWorst = 0, hotAllocMeasured = 0, hotAllocScavengedFail = false;
+        let hotAllocNonFinite = false;
         let hotAllocPassMaxOver = 0;   // NIT1: post-warmup cycles where max(pass1,pass2) B/op > bound
         let lanePicks = 0;
 
@@ -151,11 +163,12 @@ export function computeGates(rollups, opts) {
                 // measurement FAIL (Infinity), re-derivable from the JSONL by the report tool.
                 hotAllocMeasured++;
                 hotAllocWorst = Infinity;
+                hotAllocNonFinite = true;
             } else if (r.hotBytesPerOp !== null && r.hotBytesPerOp !== undefined) {
                 hotAllocMeasured++;
                 // NaN-closed: a non-finite measured value is a FAIL (Infinity), never a silent pass via a
                 // `NaN > worst` that evaluates false.
-                if (!Number.isFinite(r.hotBytesPerOp)) hotAllocWorst = Infinity;
+                if (!Number.isFinite(r.hotBytesPerOp)) { hotAllocWorst = Infinity; hotAllocNonFinite = true; }
                 else if (r.hotBytesPerOp > hotAllocWorst) hotAllocWorst = r.hotBytesPerOp;
             } else if (r.hotBopGcFree === 0) {
                 // EVERY window scavenged -> sustained allocation (>= a semi-space per window) -> a heavy
@@ -174,17 +187,22 @@ export function computeGates(rollups, opts) {
         const gcMajorGate = { verdict: post >= 1 ? (gcMajorMax <= GC_MAJOR_MAX ? VERDICT.PASS : VERDICT.FAIL) : VERDICT.SMOKE, observed: gcMajorMax, bound: GC_MAJOR_MAX };
         if (gcMajorGate.verdict === VERDICT.FAIL) breaches.push('gcMajor[' + laneName + '] observed=' + gcMajorMax + ' > ' + GC_MAJOR_MAX);
 
-        // hotAlloc: check the FAIL condition FIRST (BLOCKER 7). A single over-budget measured cycle
-        // FAILs even if another cycle was null; INCONCLUSIVE is reserved for "nothing was measured"
-        // (all boxingRegime or all null), which must never PASS with worst=0.
-        const hotAllocRecurFail = hotAllocPassMaxOver >= 2;
+        // hotAlloc (S1): the GROSS tier FAILs first -- every window scavenged (sustained allocation,
+        // ~512+ B/op) or a non-finite measurement (a broken probe never passes). Over-bound below that
+        // is REPORT-ONLY (verdict STUB + a NOTE). INCONCLUSIVE stays reserved for "nothing was measured",
+        // which must never PASS with worst=0.
+        const hotAllocRecur = hotAllocPassMaxOver >= 2;
+        const hotAllocOver = hotAllocWorst > HOTALLOC_MAX || hotAllocRecur;
         let hotAllocVerdict;
         if (post < 1) hotAllocVerdict = VERDICT.SMOKE;
-        else if (hotAllocScavengedFail || hotAllocWorst > HOTALLOC_MAX || hotAllocRecurFail) hotAllocVerdict = VERDICT.FAIL;
+        else if (hotAllocScavengedFail || hotAllocNonFinite) hotAllocVerdict = VERDICT.FAIL;
         else if (hotAllocMeasured === 0) hotAllocVerdict = VERDICT.INCONCLUSIVE;
+        else if (hotAllocOver) hotAllocVerdict = VERDICT.STUB;
         else hotAllocVerdict = VERDICT.PASS;
-        const hotAllocGate = { verdict: hotAllocVerdict, observedMax: hotAllocWorst, measured: hotAllocMeasured, scavengedFail: hotAllocScavengedFail, passMaxOver: hotAllocPassMaxOver, bound: HOTALLOC_MAX };
-        if (hotAllocGate.verdict === VERDICT.FAIL) breaches.push('hotAlloc[' + laneName + '] ' + (hotAllocScavengedFail ? 'every window scavenged (sustained allocation)' : hotAllocRecurFail ? 'per-pass max > ' + HOTALLOC_MAX + ' in ' + hotAllocPassMaxOver + ' cycles (periodic allocation rarer than one pass)' : 'max=' + hotAllocWorst.toFixed(3) + ' > ' + HOTALLOC_MAX));
+        const hotAllocGate = { verdict: hotAllocVerdict, reportOnly: hotAllocVerdict === VERDICT.STUB, observedMax: hotAllocWorst, measured: hotAllocMeasured, scavengedFail: hotAllocScavengedFail, nonFinite: hotAllocNonFinite, passMaxOver: hotAllocPassMaxOver, bound: HOTALLOC_MAX };
+        if (hotAllocVerdict === VERDICT.FAIL) breaches.push('hotAlloc[' + laneName + '] ' + (hotAllocScavengedFail ? 'every window scavenged (sustained allocation)' : 'non-finite B/op measurement'));
+        else if (hotAllocVerdict === VERDICT.INCONCLUSIVE) inconclusive.push('hotAlloc[' + laneName + '] measured no GC-free window');
+        else if (hotAllocVerdict === VERDICT.STUB) notes.push('hotAlloc[' + laneName + '] ' + (hotAllocWorst > HOTALLOC_MAX ? 'max=' + hotAllocWorst.toFixed(3) : 'per-pass max over bound in ' + hotAllocPassMaxOver + ' cycles') + ' > ' + HOTALLOC_MAX + ' B/op (report-only; PerfGate owns per-op 0 B/op)');
 
         // tiny lanes report throughput/latency, never fail on it (cap in {1,2,3} is a degenerate regime).
         const reportOnlyThroughput = rows.length > 0 && rows[0].tier === 'tiny';
@@ -240,16 +258,20 @@ export function computeGates(rollups, opts) {
             if (v === VERDICT.FAIL) sawFail = true;
             else if (v === VERDICT.INCONCLUSIVE) sawInconclusive = true;
         }
+        // S5: a non-smoke lane below the active floor has SMOKE drift gates -- not enough evidence.
+        if (!opts.smoke && post < activeFloor) inconclusive.push('lane ' + laneName + ' ran ' + post + ' post-warmup cycle(s); drift gates need ' + activeFloor);
         perLane.push({ lane: laneName, postWarmupCycles: post, gates });
     }
+    // S5: a bounded run stopped before its end (signal, crash) is never a PASS.
+    if (opts.interrupted) inconclusive.push('run interrupted before its end');
 
     // totalPicks gate (global): a soak that did nothing must never pass.
     const allWork = totalPicksAll + (opts.poolLaunched || 0);   // kernel/tiny picks + pool runs
     const totalPicksGate = { verdict: allWork > 0 ? VERDICT.PASS : VERDICT.FAIL, totalPicks: totalPicksAll, poolLaunched: opts.poolLaunched || 0 };
     if (totalPicksGate.verdict === VERDICT.FAIL) { breaches.push('totalPicks=0 -- the soak did nothing'); sawFail = true; }
 
-    const verdict = sawFail ? VERDICT.FAIL : (sawInconclusive ? VERDICT.INCONCLUSIVE : VERDICT.PASS);
-    return { verdict, breaches, perLane, totalPicks: totalPicksGate, active: !opts.smoke };
+    const verdict = sawFail ? VERDICT.FAIL : ((sawInconclusive || inconclusive.length !== 0) ? VERDICT.INCONCLUSIVE : VERDICT.PASS);
+    return { verdict, breaches, notes, inconclusive, perLane, totalPicks: totalPicksGate, active: !opts.smoke };
 }
 
 /** Map a verdict to a process exit code. */

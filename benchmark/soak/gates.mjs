@@ -28,7 +28,7 @@ export const HEAP_SLACK_MB = 2;        //   ... + this many MB
 export const RSS_MULT = 1.75;          // rss runaway: late-quarter p95 <= band-center median * this ...
 export const RSS_SLACK_MB = 16;        //   ... + this many MB
 export const HOTOPS_RATIO = 0.60;      // late hotOps median >= this * early median
-export const GCPAUSE_MULT = 2;         // late gcPause median <= early median * this ...
+export const GCPAUSE_MULT = 2;         // late MEAN-pause median <= early median * this ...
 export const GCPAUSE_ADD_MS = 1;       //   ... + this many ms
 export const GC_MAJOR_MAX = 0;         // hard: zero workload major GC per lane-cycle
 export const LAT_P999_MULT = 1.5;      // latency p99 / rebuild p99: late <= early * this + addNs
@@ -38,6 +38,14 @@ export const LAT_ADD_TICKS = 2;        // wall-clock granularity floor = this * 
                                        // Two ticks is the minimal floor; a real regression exceeds it easily.
 export const LAT_ADD_NS_FALLBACK = 100; // used only if timerFloorNs is unavailable
 export const LAT_MIN_SAMPLES = 2000;   // per early/late window; below this the gate is INACTIVE (never PASS)
+// S2 (audit 2026-09-29): a TIMING drift (hotOps, hotOpsSparse, gcPause, latencyP99) FAILs only when it
+// breaches its ratio bound (the minimum effect size, above) AND is statistically real: an exact one-sided
+// Mann-Whitney test of the early vs late window gives p < MW_ALPHA. With N=5 per side the smallest
+// attainable p is 1/252 = 0.004, so p < 0.01 needs (near-)complete separation of the two windows -- one or
+// two noisy cycles can no longer FAIL a run. The early-window MAD is RECORDED, not gated: a "drop > 3 MAD"
+// rule (the audit's suggestion) rejects exactly a gradual decay, whose own trend widens the early window
+// (the decay teeth: drop 15.7M vs 3 x MAD 28M, while p = 0.004 and the ratio bound is clearly breached).
+export const MW_ALPHA = 0.01;
 export const HOTALLOC_MAX = 0.02;      // per post-warmup cycle: hot B/op MEAN above this is REPORTED
                                        // (a NOTE, not a breach -- S1). 0.02 is a hair above the warm noise
                                        // floor so even a 2-field object every 64th pick (~0.5 B/op) shows.
@@ -73,11 +81,68 @@ function latencyGate(name, laneName, elVal, elSamples, smoke, active, reportOnly
     if (earlyS < LAT_MIN_SAMPLES || lateS < LAT_MIN_SAMPLES) {
         return { verdict: VERDICT.STUB, reason: 'insufficientSamples', earlySamples: earlyS, lateSamples: lateS, minSamples: LAT_MIN_SAMPLES };
     }
-    const early = elVal.earlyMedian(), late = elVal.lateMedian();
+    const { early, late, p } = shiftStats(elVal, +1);
     const limit = early * LAT_P999_MULT + addNs;
-    const verdict = late <= limit ? VERDICT.PASS : VERDICT.FAIL;
-    if (verdict === VERDICT.FAIL) breaches.push(name + '[' + laneName + '] late=' + r0(late) + 'ns > limit=' + r0(limit) + 'ns (early=' + r0(early) + ', floor=' + r0(addNs) + 'ns)');
-    return { verdict, earlyMedianNs: r0(early), lateMedianNs: r0(late), limitNs: r0(limit), floorNs: r0(addNs), earlySamples: earlyS, lateSamples: lateS };
+    // S2: over the limit AND a significant upward shift (one noisy late cycle no longer FAILs).
+    const verdict = (late > limit && p < MW_ALPHA) ? VERDICT.FAIL : VERDICT.PASS;
+    if (verdict === VERDICT.FAIL) breaches.push(name + '[' + laneName + '] late=' + r0(late) + 'ns > limit=' + r0(limit) + 'ns (early=' + r0(early) + ', floor=' + r0(addNs) + 'ns, p=' + p.toFixed(4) + ')');
+    return { verdict, earlyMedianNs: r0(early), lateMedianNs: r0(late), limitNs: r0(limit), floorNs: r0(addNs), p: +p.toFixed(4), earlySamples: earlyS, lateSamples: lateS };
+}
+
+/** Median absolute deviation of the first `count` values. */
+function madOf(arr, count) {
+    if (count === 0) return 0;
+    const med = medianOf(arr, count);
+    const dev = new Float64Array(count);
+    for (let i = 0; i < count; i++) dev[i] = Math.abs(arr[i] - med);
+    return medianOf(dev, count);
+}
+
+const uDistMemo = new Map();
+/** Exact null distribution of the Mann-Whitney U for sample sizes (m, n): counts[u] = number of the
+ * C(m+n, m) equally likely orderings with U = u. f(m,n)[u] = f(m-1,n)[u-n] + f(m,n-1)[u]. */
+function uDist(m, n) {
+    const key = m + ',' + n;
+    const hit = uDistMemo.get(key);
+    if (hit) return hit;
+    let out;
+    if (m === 0 || n === 0) out = [1];
+    else {
+        const a = uDist(m - 1, n), b = uDist(m, n - 1);
+        out = new Array(m * n + 1).fill(0);
+        for (let u = 0; u < a.length; u++) out[u + n] += a[u];
+        for (let u = 0; u < b.length; u++) out[u] += b[u];
+    }
+    uDistMemo.set(key, out);
+    return out;
+}
+
+/**
+ * Exact one-sided Mann-Whitney p-value that the LATE window is shifted in direction `dir` (+1 = higher,
+ * -1 = lower) relative to the EARLY window. S = #pairs where late is beyond early in `dir` (+0.5 per tie);
+ * p = P(U >= floor(S)) under H0. Rounding S down is conservative (a larger p, fewer false FAILs).
+ */
+export function mwOneSidedP(early, m, late, n, dir) {
+    if (m === 0 || n === 0) return 1;
+    let s = 0;
+    for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) {
+        const d = (late[j] - early[i]) * dir;
+        s += d > 0 ? 1 : (d === 0 ? 0.5 : 0);
+    }
+    const counts = uDist(m, n);
+    let total = 0, tail = 0;
+    const k = Math.floor(s);
+    for (let u = 0; u < counts.length; u++) { total += counts[u]; if (u >= k) tail += counts[u]; }
+    return tail / total;
+}
+
+/** Early/late shift statistics for a drift gate: medians, early MAD, one-sided MW p in `dir`. */
+function shiftStats(el, dir) {
+    return {
+        early: el.earlyMedian(), late: el.lateMedian(),
+        mad: madOf(el.early, el.earlyCount),
+        p: mwOneSidedP(el.early, el.earlyCount, el.lateRing, el.lateCount, dir),
+    };
 }
 
 function medianOf(arr, count) {
@@ -141,7 +206,7 @@ function newLaneState(N) {
         elRebuildP99: new EarlyLate(N), elRebuildSamples: new EarlyLate(N),
         rss: new RssSeries(),
         gcMajorMax: 0, hotAllocWorst: 0, hotAllocMeasured: 0, hotAllocScavengedFail: false,
-        hotAllocNonFinite: false,
+        hotAllocNonFinite: false, pauseMissing: false,
         hotAllocPassMaxOver: 0,   // NIT1: post-warmup cycles where max(pass1,pass2) B/op > bound
         lanePicks: 0,
     };
@@ -155,7 +220,10 @@ function pushRow(st, r) {
     st.elRss.push(r.rssMB);
     st.elOps.push(r.hotOpsDense);
     st.elOpsSparse.push(r.hotOpsSparse);
-    st.elPause.push(r.gcPauseMs);
+    // S2: gate the MEAN workload pause (gcPauseAvgMs); the per-cycle max (gcPauseMs) is telemetry. A record
+    // without it (a pre-S2 stream) makes the gate INCONCLUSIVE, never a NaN that compares false = PASS.
+    if (typeof r.gcPauseAvgMs === 'number' && Number.isFinite(r.gcPauseAvgMs)) st.elPause.push(r.gcPauseAvgMs);
+    else st.pauseMissing = true;
     // Gate on p99 (top 1% ~ 960 of 96000 samples): p999 individual sub-microsecond-pick timing is
     // dominated by rare OS-scheduling jitter in the tail, not kernel drift, so a 1.5x p999 ratio
     // false-fails a clean kernel. p99 is the robust kernel tail; a growing stall still inflates it.
@@ -282,22 +350,31 @@ export class GateAccumulator {
             rssGate = { verdict: lateP95 <= rssLimit ? VERDICT.PASS : VERDICT.FAIL, bandCenterMB: r1(bandCenter), lateP95MB: r1(lateP95), limitMB: r1(rssLimit) };
             if (rssGate.verdict === VERDICT.FAIL) breaches.push('rss[' + laneName + '] lateP95=' + r1(lateP95) + 'MB > limit=' + r1(rssLimit) + 'MB');
 
-            const opsEarly = elOps.earlyMedian(), opsLate = elOps.lateMedian();
-            const opsLimit = HOTOPS_RATIO * opsEarly;
-            const opsFail = opsLate < opsLimit;
-            opsGate = { verdict: reportOnlyThroughput ? VERDICT.STUB : (opsFail ? VERDICT.FAIL : VERDICT.PASS), earlyMedian: r0(opsEarly), lateMedian: r0(opsLate), limit: r0(opsLimit), reportOnly: reportOnlyThroughput };
-            if (opsGate.verdict === VERDICT.FAIL) breaches.push('hotOps[' + laneName + '] dense late=' + r0(opsLate) + ' < limit=' + r0(opsLimit));
+            // S2: throughput FAILs only if the late median is below the ratio bound AND the one-sided
+            // Mann-Whitney p < MW_ALPHA (late really is slower, not one noisy cycle).
+            const ops = shiftStats(elOps, -1);
+            const opsLimit = HOTOPS_RATIO * ops.early;
+            const opsFail = ops.late < opsLimit && ops.p < MW_ALPHA;
+            opsGate = { verdict: reportOnlyThroughput ? VERDICT.STUB : (opsFail ? VERDICT.FAIL : VERDICT.PASS), earlyMedian: r0(ops.early), lateMedian: r0(ops.late), limit: r0(opsLimit), earlyMad: r0(ops.mad), p: +ops.p.toFixed(4), reportOnly: reportOnlyThroughput };
+            if (opsGate.verdict === VERDICT.FAIL) breaches.push('hotOps[' + laneName + '] dense late=' + r0(ops.late) + ' < limit=' + r0(opsLimit) + ' (p=' + ops.p.toFixed(4) + ')');
 
-            const spEarly = elOpsSparse.earlyMedian(), spLate = elOpsSparse.lateMedian();
-            const spLimit = HOTOPS_RATIO * spEarly;
-            const spFail = spLate < spLimit;
-            opsSparseGate = { verdict: reportOnlyThroughput ? VERDICT.STUB : (spFail ? VERDICT.FAIL : VERDICT.PASS), earlyMedian: r0(spEarly), lateMedian: r0(spLate), limit: r0(spLimit), reportOnly: reportOnlyThroughput };
-            if (opsSparseGate.verdict === VERDICT.FAIL) breaches.push('hotOpsSparse[' + laneName + '] late=' + r0(spLate) + ' < limit=' + r0(spLimit));
+            const sp = shiftStats(elOpsSparse, -1);
+            const spLimit = HOTOPS_RATIO * sp.early;
+            const spFail = sp.late < spLimit && sp.p < MW_ALPHA;
+            opsSparseGate = { verdict: reportOnlyThroughput ? VERDICT.STUB : (spFail ? VERDICT.FAIL : VERDICT.PASS), earlyMedian: r0(sp.early), lateMedian: r0(sp.late), limit: r0(spLimit), earlyMad: r0(sp.mad), p: +sp.p.toFixed(4), reportOnly: reportOnlyThroughput };
+            if (opsSparseGate.verdict === VERDICT.FAIL) breaches.push('hotOpsSparse[' + laneName + '] late=' + r0(sp.late) + ' < limit=' + r0(spLimit) + ' (p=' + sp.p.toFixed(4) + ')');
 
-            const pEarly = elPause.earlyMedian(), pLate = elPause.lateMedian();
-            const pLimit = pEarly * GCPAUSE_MULT + GCPAUSE_ADD_MS;
-            pauseGate = { verdict: pLate <= pLimit ? VERDICT.PASS : VERDICT.FAIL, earlyMedianMs: r2(pEarly), lateMedianMs: r2(pLate), limitMs: r2(pLimit) };
-            if (pauseGate.verdict === VERDICT.FAIL) breaches.push('gcPause[' + laneName + '] late=' + r2(pLate) + 'ms > limit=' + r2(pLimit) + 'ms');
+            // S2: the MEAN pause (not the per-cycle max), same significance rule in the upward direction.
+            if (st.pauseMissing) {
+                pauseGate = { verdict: VERDICT.INCONCLUSIVE, reason: 'gcPauseAvgMs missing from a record' };
+                inconclusive.push('gcPause[' + laneName + '] has records without gcPauseAvgMs');
+            } else {
+                const pz = shiftStats(elPause, +1);
+                const pLimit = pz.early * GCPAUSE_MULT + GCPAUSE_ADD_MS;
+                const pFail = pz.late > pLimit && pz.p < MW_ALPHA;
+                pauseGate = { verdict: pFail ? VERDICT.FAIL : VERDICT.PASS, earlyMedianMs: r2(pz.early), lateMedianMs: r2(pz.late), limitMs: r2(pLimit), earlyMadMs: r2(pz.mad), p: +pz.p.toFixed(4) };
+                if (pFail) breaches.push('gcPause[' + laneName + '] mean late=' + r2(pz.late) + 'ms > limit=' + r2(pLimit) + 'ms (p=' + pz.p.toFixed(4) + ')');
+            }
         }
 
         const gates = {

@@ -19,6 +19,17 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   every run. An over-bound lane now prints `soak: NOTE -- hotAlloc[lane] ...`; the soak still FAILs when
   every probe window scavenges (~512+ B/op) or the measurement is non-finite. Per-op 0 B/op stays gated by
   `test:perf` (PerfGate), which fails on the same allocation mutants. See the ADR 0014 amendment.
+- **Benchmark-only: the soak's timing gates absorb normal noise (S2, audit 2026-09-29).** Clean
+  kernels FAILed `gcPause`, `hotOps` and `hotOpsSparse` on ordinary noise. Three changes:
+  hotOps batches are sized by time (each lane calibrates once to >= 25 ms per repeat, then 5 repeats,
+  median; dense was a fixed 500k picks = 4-8 ms on the fast lanes, sparse a single repeat); the drift
+  windows are N=5 (active floor 11 cycles, was 3/7); and a timing drift (hotOps, hotOpsSparse, gcPause,
+  latencyP99) FAILs only if it breaches its ratio bound AND an exact one-sided Mann-Whitney test of the
+  early vs late window gives p < 0.01 (with N=5, near-complete separation). `gcPause` now gates the MEAN
+  workload pause (`gcPauseAvgMs`); the per-cycle max stays in the record as telemetry. A record without
+  `gcPauseAvgMs` makes the gate INCONCLUSIVE. New teeth MT1 (`decay` -> hotOps) and MT2
+  (`decaysparse` -> hotOpsSparse only); the decay spin now dominates the pick cost (late/early 0.35-0.44
+  vs the 0.60 bound) and re-calibrates per cycle, so both run in ~23 s.
 - **Benchmark-only: the soak harness's own memory no longer grows with run length (S4, audit
   2026-09-29).** `main.mjs` kept every cycle record in an array for the whole run; the post-GC heap grew
   ~1 KB per record and a clean 1500-cycle RoundRobin run FAILed its own heap gate (7.5 -> 10.5 MB,

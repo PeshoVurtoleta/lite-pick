@@ -104,6 +104,8 @@ export function buildHeader(cfg) {
             hotOpsRatio: G.HOTOPS_RATIO,
             gcPauseMult: G.GCPAUSE_MULT, gcPauseAddMs: G.GCPAUSE_ADD_MS,
             gcMajorMax: G.GC_MAJOR_MAX, hotAllocMax: G.HOTALLOC_MAX,
+            mwAlpha: G.MW_ALPHA,   // S2: timing drifts also need a one-sided Mann-Whitney p < this
+            latP99Mult: G.LAT_P999_MULT, rssKeep: G.RSS_KEEP, rssLate: G.RSS_LATE,
         },
         timerFloorNs: timerFloorNs(),
     };

@@ -34,8 +34,15 @@ const MEAN_SVC_US = 1000;
 const BOP_OPS = 8192;            // B/op window length
 const BOP_WINDOWS = 65;          // windows sampled per lane-cycle (window 0 dropped as Maglev warm-up)
 const HOTOPS_WARM = 50000;       // warm the fixed hotOps batch before timing
-const HOTOPS_BATCH = 500000;     // fixed DENSE pick batch timed per lane-cycle (median of 3)
-const HOTOPS_SPARSE_BATCH = 20000;   // fixed SPARSE (~95% down) batch -- each pick is O(cap), so short
+// S2 (audit 2026-09-29): hotOps batches are sized by TIME, not count. A fixed 500k dense batch ran 4-8 ms
+// on the fast lanes -- too short to time on a shared CPU -- and the sparse batch was a single repeat. Each
+// lane calibrates its batch length ONCE (its first cycle = the warm-up cycle, excluded from the gates) to
+// the smallest power of two that takes >= HOTOPS_MIN_MS, then every cycle times HOTOPS_REPS repeats of that
+// SAME length and records the median -- comparable across cycles, long enough to be stable.
+const HOTOPS_MIN_MS = 25;
+const HOTOPS_REPS = 5;
+const HOTOPS_N_MIN = 1024;
+const HOTOPS_N_MAX = 1 << 26;
 const LAT_PICKS = 96000;             // dense latency pass, every pick timed: 96000 samples/cycle (p999 stable)
 const LAT_SPARSE_PICKS = 20000;      // sparse latency pass (each pick O(cap)): report-only p50/p99/p999
 const LEAK_ARRAY_LEN = 700000;   // MUSTFAIL=leak/heap: plain-array retained per lane-cycle
@@ -68,6 +75,15 @@ function timeBatch(step, ctx, n, spin, reps) {
     }
     ms.sort((a, b) => a - b);
     return ms[ms.length >> 1];
+}
+
+/** Smallest power-of-two batch length (>= HOTOPS_N_MIN, <= HOTOPS_N_MAX) whose single timed repeat takes
+ *  >= minMs (with `spin` in the step, for the decay teeth). Cold path: once per lane, in its warm-up cycle;
+ *  per cycle only under the decay teeth. */
+function calibrateBatch(step, ctx, minMs, spin) {
+    let n = HOTOPS_N_MIN;
+    while (n < HOTOPS_N_MAX && timeBatch(step, ctx, n, spin, 1) < minMs) n *= 2;
+    return n;
 }
 
 /** Fixed-seed sparse eligibility (~95% down) so the sparse hotOps batch exercises the fallback scans
@@ -239,6 +255,7 @@ async function main() {
     let prevElu = performance.eventLoopUtilization();
 
     const qw = new QualityWindow(CAP);
+    const opsN = new Map();   // S2: per-lane (name#cap) calibrated hotOps batch lengths { dense, sparse }
     // Sketches are created ONCE and clear()ed per lane-cycle -- a `new DDSketch` per cycle allocated
     // enough (over 20 lanes) to trigger a workload major GC inside the window. Strict-range bins are
     // pre-allocated at construction; clear() zeroes counts without allocating.
@@ -454,12 +471,22 @@ async function main() {
         // NIT 1: dense and sparse are SEPARATE gated series (a blended number needs an ~8-34x sparse
         // slowdown to move it; separated, each has its own 0.60 early/late verdict). The decay teeth
         // spins inside the timed step: `decay` slows both, `decaysparse` slows ONLY the sparse batch.
-        const spinDense = MF === 'decay' ? cycle * 40 : 0;
-        const spinSparse = (MF === 'decay' || MF === 'decaysparse') ? cycle * 40 : 0;
-        const denseMs = timeBatch(step, ctx, HOTOPS_BATCH, spinDense, 3);
+        // The decay spin grows linearly with the cycle and must DOMINATE the pick cost so the slowdown is
+        // unambiguous (late/early ~ 3/8 at N=5); under it the batch is re-calibrated per cycle WITH the spin,
+        // so a teeth run stays ~HOTOPS_MIN_MS per repeat instead of growing with cycle * calibrated length.
+        // ops/s is length-independent once a repeat is >= HOTOPS_MIN_MS. A clean run calibrates ONCE.
+        const spinDense = MF === 'decay' ? cycle * 400 : 0;
+        const spinSparse = (MF === 'decay' || MF === 'decaysparse') ? cycle * 400 : 0;
+        const nKey = lane.name + '#' + CAP;
+        let nn = opsN.get(nKey);
+        if (nn === undefined) { nn = { dense: calibrateBatch(step, ctx, HOTOPS_MIN_MS, 0), sparse: 0 }; opsN.set(nKey, nn); }
+        if (spinDense) nn.dense = calibrateBatch(step, ctx, HOTOPS_MIN_MS, spinDense);
+        const denseMs = timeBatch(step, ctx, nn.dense, spinDense, HOTOPS_REPS);
         setSparse(built.b, CAP, sparseRng);                            // ~95% down: fallback-scan / probe tail
         for (let i = 0; i < HOTOPS_WARM; i++) step(ctx);
-        const sparseMs = timeBatch(step, ctx, HOTOPS_SPARSE_BATCH, spinSparse, 1);
+        if (nn.sparse === 0) nn.sparse = calibrateBatch(step, ctx, HOTOPS_MIN_MS, 0);
+        if (spinSparse) nn.sparse = calibrateBatch(step, ctx, HOTOPS_MIN_MS, spinSparse);
+        const sparseMs = timeBatch(step, ctx, nn.sparse, spinSparse, HOTOPS_REPS);
         // Adjudication 3: also time the SPARSE batch PER-PICK and record sparse p50/p99/p999 (the audit-1.9
         // O(cap)-scan / CH-probe tail). REPORT-ONLY for 2a; the sparse latency gate lands in 2b. 0-alloc:
         // per-pick clock into the reused ring (sketch populated cold).
@@ -477,8 +504,8 @@ async function main() {
             : { samples: 0, p50: 0, p99: 0, p999: 0, max: 0 };
         for (let i = 0; i < CAP; i++) built.b.setEligible(i, true);   // restore dense for the B/op probe
         if (weights) { for (let i = 0; i < CAP; i++) { const w = 1 + (i & 7); if (lane.usesSetWeight) built.b.setWeight(i, w); weights[i] = w; } }
-        const hotOpsDense = denseMs > 0 ? (HOTOPS_BATCH / denseMs) * 1000 : 0;
-        const hotOpsSparse = sparseMs > 0 ? (HOTOPS_SPARSE_BATCH / sparseMs) * 1000 : 0;
+        const hotOpsDense = denseMs > 0 ? (nn.dense / denseMs) * 1000 : 0;
+        const hotOpsSparse = sparseMs > 0 ? (nn.sparse / sparseMs) * 1000 : 0;
 
         // T16 latency: sample pick latency on the CANONICAL DENSE pool (identical each cycle -> the
         // per-cycle p999 is comparable, so the early/late ratio measures kernel DRIFT, not the varying
@@ -511,7 +538,8 @@ async function main() {
         const rebuildP99 = rebuildSamples > 0 ? +rebuildSketch.quantile(0.99).toFixed(0) : 0;
         return {
             seed, invariant: firstFail === null ? 'green' : firstFail,
-            hotOpsDense, hotOpsSparse, latency, latencySparse, rebuildP99, rebuildSamples,
+            hotOpsDense, hotOpsSparse, hotOpsDenseN: nn.dense, hotOpsSparseN: nn.sparse,
+            latency, latencySparse, rebuildP99, rebuildSamples,
             // JSON.stringify(Infinity) === null, so a non-finite (FAIL) B/op would read as "not measured"
             // to the 2b report tool. Record it as null AND flag hotBopNonFinite so the gate re-derives a FAIL.
             hotBytesPerOp: (bop.bop === null || !Number.isFinite(bop.bop)) ? null : +bop.bop.toFixed(3),
@@ -618,9 +646,13 @@ async function main() {
             const rollup = {
                 lane: laneId, cycle, tier,
                 heapUsedMB: b.heapUsedMB, rssMB: b.rssMB,
+                // S2: the gated pause is the MEAN workload pause (gcPauseAvgMs); the per-cycle MAX is
+                // extreme-value noise and stays telemetry (gcPauseMs, its 1.0 name kept for continuity).
                 gcMajor: b.workloadMajor, gcPauseMs: b.workloadMaxPauseMs, gcMinor: b.workloadMinor,
+                gcPauseAvgMs: b.workloadAvgPauseMs, gcPauseCount: b.workloadPauseCount,
                 hotOpsDense: +core.hotOpsDense.toFixed(0),
                 hotOpsSparse: +core.hotOpsSparse.toFixed(0),
+                hotOpsDenseN: core.hotOpsDenseN, hotOpsSparseN: core.hotOpsSparseN,
                 latency: core.latency,
                 latencySparse: core.latencySparse,
                 rebuildP99: core.rebuildP99, rebuildSamples: core.rebuildSamples,

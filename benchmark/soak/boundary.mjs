@@ -44,6 +44,8 @@ export async function closeLaneCycle(gc, tracker, dropRefs, opts) {
     const workloadMajor = gs.gc.major;
     const workloadMinor = gs.gc.minor;
     const workloadMaxPauseMs = +gs.gc.maxMs.toFixed(3);
+    const workloadAvgPauseMs = +gs.gc.avgMs.toFixed(3);   // S2: the gated pause (0 when no GC ran)
+    const workloadPauseCount = gs.gc.count;
 
     // 3) drop references
     if (dropRefs) dropRefs();
@@ -78,7 +80,7 @@ export async function closeLaneCycle(gc, tracker, dropRefs, opts) {
     gc.reset();
 
     return {
-        workloadMajor, workloadMinor, workloadMaxPauseMs,
+        workloadMajor, workloadMinor, workloadMaxPauseMs, workloadAvgPauseMs, workloadPauseCount,
         heapUsedMB, rssMB, trackerSize: live, forcedGcTries: tries, heapSampledAfterGc,
     };
 }

@@ -136,3 +136,19 @@ it false-FAILs a correct kernel. Two decisions change:
   late-quarter p95 -- identical to the unbounded list up to 1024 samples per lane.
 - Teeth: PL (clean `SOAK_CYCLES=1500 SOAK_PICKS=70000 SOAK_LANES=RoundRobin` must PASS) and ML (the same
   with `SOAK_MUSTFAIL=slowleak`, ~1 KB retained per lane-cycle, must FAIL `heap`).
+
+## Amendment 2026-10-03 -- audit 2026-09-29 (S2)
+
+- **Timing gates are noise-aware.** On a shared CPU the clean kernel FAILed `gcPause` (a per-cycle MAX
+  pause -- extreme-value noise), `hotOps` (500k-pick dense batches of 4-8 ms) and `hotOpsSparse` (one
+  repeat), with N=3 windows where one noisy cycle moves the median. Now: (1) hotOps batches are sized by
+  time -- each lane calibrates once, in its warm-up cycle, to the smallest power-of-two length taking
+  >= 25 ms, then times 5 repeats of that fixed length (median); (2) `GATE_N` = 5 (active floor 11 cycles);
+  (3) a timing drift FAILs only if it breaches its ratio bound AND an exact one-sided Mann-Whitney test
+  (early vs late, 5 vs 5, smallest p = 1/252) gives p < 0.01; (4) `gcPause` gates the MEAN workload pause.
+  The audit also suggested "drop > 3 early MADs"; it is recorded but NOT gated, because a gradual decay
+  widens its own early window and the rule rejected exactly that (the decay teeth: p = 0.004 and the ratio
+  breached, yet drop < 3 MAD).
+- Teeth: MT1 (`decay`) trips `hotOps`, MT2 (`decaysparse`) trips `hotOpsSparse` and NOT `hotOps`. Under the
+  decay modes the batch re-calibrates per cycle with the spin, which dominates the pick cost. `gcPause`
+  still has no mutant control (audit S8; Phase 2 teeth coverage).

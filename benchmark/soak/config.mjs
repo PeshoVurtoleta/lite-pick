@@ -9,10 +9,12 @@
  */
 
 // N = the number of post-warmup cycles each side of the early/late split needs; a gate is
-// active only at >= 2*N + WARMUP cycles. N=3, WARMUP=1 -> the floor of 7 (audit 1.2).
-export const GATE_N = 3;
+// active only at >= 2*N + WARMUP cycles. N=5, WARMUP=1 -> the floor of 11. N was 3 (floor 7) until S2
+// (audit 2026-09-29): one noisy cycle moved a median of three, and an exact one-sided Mann-Whitney test
+// cannot reach p < 0.01 with 3 samples per side (its smallest p is 1/20); with 5 it is 1/252.
+export const GATE_N = 5;
 export const WARMUP_CYCLES = 1;
-export const MIN_ACTIVE_CYCLES = 2 * GATE_N + WARMUP_CYCLES; // 7
+export const MIN_ACTIVE_CYCLES = 2 * GATE_N + WARMUP_CYCLES; // 11
 
 export const PICKS_MIN = 20000;
 export const PICKS_MAX = 1 << 24;   // 16777216

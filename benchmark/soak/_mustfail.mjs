@@ -18,6 +18,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { MIN_ACTIVE_CYCLES } from './config.mjs';
+
+// Every control runs exactly the active floor (2N + warm-up cycles), so its drift gates are ACTIVE.
+const CYC = String(MIN_ACTIVE_CYCLES);
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const PICK = readFileSync(join(ROOT, 'Pick.js'), 'utf8');
@@ -129,13 +133,13 @@ const A = 20000, Q = 100000;   // alloc mutants can use a short main loop; quali
 // INCONCLUSIVE (S5) -- a FAIL used to mask that.
 const NOTE_RR = 'soak: NOTE -- hotAlloc[RoundRobin]';
 control('M1 160KB-array/8192', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c & 8191) === 0) { this.__o = new Array(40000); }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 control('M2 retained-log/8th', patch(PICK, RR_ANCHOR, RR_INJECT('if (!this.__log) this.__log = []; if ((this.__c & 7) === 0) this.__log.push({ a: this.__c });')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 control('M3 64KB-burst/24576', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c % 24576) === 0) { this.__o = new Array(8192); }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 control('M4 2-field-object/64', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c & 63) === 0) { this.__o = { a: this.__c, b: 0 }; }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 
 // --- quality mutants, driven through the SmoothWRR / WeightedRandom oracles ----------------------
 // M5: SmoothWRR ignores weight in the accumulator -> a PERSISTENT ratio corruption (near-uniform
@@ -144,7 +148,7 @@ control('M4 2-field-object/64', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c 
 // corrects a transient accumulator offset over a long quiet window, so it is not a lasting defect.)
 control('M5 SmoothWRR ignores-weight',
     patch(PICK, '                const c = cur[i] + wt[i];', '                const c = cur[i] + 1;'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality');
 // M6: the H3 weight-0 regression -- BOTH the pick-loop guard AND the setWeight credit-reset removed,
 // so a node drained to weight 0 keeps its stale credit and gets returned. The lane-agnostic H3 guard
 // (weights[picked]===0) fires; the same guard protects CH/BL (see report note).
@@ -152,27 +156,27 @@ control('M6 SmoothWRR weight-0 (H3)',
     patch(
         patch(PICK, '            if (el[i] && wt[i] > 0) {       // eligible AND positive weight: a weight-0 node is never a candidate', '            if (el[i]) {'),
         '        this._current[i] = 0;               // reset credit: a reweighted node holds no stale accumulator', '        /* mutant: setWeight credit-reset removed (H3) */'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR' }, 1, 'quality');
 // M6b: the SAME H3 defect in ConsistentHash's Maglev build -- a weight-0 backend is given a table
 // slot (+1 quota) instead of zero, so it becomes reachable and gets picked. Proves the weight-0 guard
 // has teeth on the KEYED lanes too, not only SmoothWRR.
 control('M6b CH weight-0 (H3, keyed)',
     patch(PICK, 'const q = Math.floor(wt[b] / total * M);', 'const q = Math.floor(wt[b] / total * M) + 1;'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'ConsistentHash' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'ConsistentHash' }, 1, 'quality');
 control('M7 biased WR sampler',
     patch(PICK, '            const cand = u < prob[col] ? col : alias[col];', '            const cand = col;'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' }, 1, 'quality');
 
 // --- increment 2a: load / keyed oracles (oracles.mjs), each proven through main ------------------
 // M8: P2C returns the WORSE of the two choices -> load balance collapses -> the max-mean bound trips.
 control('M8 P2C worst-of-two',
     patch(PICK, 'return this._inflight[b] < this._inflight[a] ? b : a;', 'return this._inflight[b] > this._inflight[a] ? b : a;'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality');
 // M9: LeastConn picks the MOST-loaded eligible node -> the argmin oracle trips. (SED/NQ share the
 // identical oracleArgmin path, differing only in the recomputed score; see report note.)
 control('M9 LeastConn non-argmin',
     patch(PICK, '                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }', '                if (best < 0 || c > bestLoad) { best = i; bestLoad = c; }'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 1, 'quality');
 // M10: ConsistentHash rotates the start slot per call (in ITS OWN fast path) -> a key no longer
 // sticks -> the consecutive-equality stickiness check trips.
 // M10: the reviewer's exact mutant -- a slot rotation that advances PER setEligible (this.__ROT++ in
@@ -182,39 +186,39 @@ control('M10 CH stickiness break (per-setEligible rotation)',
     patchAll(
         patch(PICK, '    setEligible(i, up) {\n        _vIdx(i, this._cap);', '    setEligible(i, up) {\n        this.__ROT = (this.__ROT | 0) + 1;\n        _vIdx(i, this._cap);'),
         '        let slot = (keyHash >>> 0) % M;', '        let slot = ((keyHash >>> 0) + (this.__ROT | 0)) % M;', 2),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality');
 // M11: BoundedLoad drops the +1 that counts the incoming request (the H4 bug) -> under-caps -> the
 // reference walk disagrees with the pick.
 control('M11 BoundedLoad H4 under-cap',
     patch(PICK, 'const cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;   // > 0: total>0, live>0', 'const cap = capActive ? Math.ceil((1 + this._eps) * total / this._live) : 0;'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality');
 
 // M12: PeakEWMA ignores the cost comparison (no latency steering, the H1 black-hole shape) -> the
 // busy slow node is no longer avoided and gets ~uniform share -> the slowNode-share oracle trips.
 control('M12 PeakEWMA H1 no-steer',
     patch(PICK, '        return costB < costA ? b : a;         // lower cost wins; tie -> the first draw', '        return a;'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'PeakEWMA' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'PeakEWMA' }, 1, 'quality');
 
 // M13 (T6 tiny lanes): P2C returns PICK_NONE on a live===1 pool (breaking the cap-1 shortcut). On the
 // tiny P2C lane (cap 1 when cycle%3===0) this makes pick() fail closed with a healthy node up -> the
 // fail-closed-IFF safety invariant trips at a checkpoint. Proves the tiny cap-1 path is really driven.
 control('M13 P2C cap-1 mispick',
     patchAll(PICK, '        if (this._live === 1) return a;       // only one eligible: it is both choices', '        if (this._live === 1) return PICK_NONE;', 2),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'invariants');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'invariants');
 
 // M14 (T16): a ~1-in-97 pick stall that GROWS with a process-global counter, so later cycles are slower
 // than early ones -> the p99 tail drifts up across the run -> latencyP99 trips. The stall is rare enough
 // that the median (p50 / dense throughput) is barely moved -- it is a TAIL regression.
 control('M14 latency tail inflate (growing stall)',
     patch(PICK, RR_ANCHOR, RR_INJECT('globalThis.__L = (globalThis.__L | 0) + 1; if ((globalThis.__L % 97) === 0) { let x = 0; const n = 120 * (1 + (globalThis.__L >> 16)); for (let z = 0; z < n; z++) x += z; this.__s = x; }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'latencyP99');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'latencyP99');
 
 // M15 (NIT B): BoundedLoad note() double-counts -> _total desyncs from the true sum(inflight). The BL
 // oracle recomputes total INDEPENDENTLY, so the kernel's wrong cap makes its pick disagree with the
 // reference -> trips. (A shared-state oracle reading b._total would be blind to this.)
 control('M15 BoundedLoad _total desync',
     patch(PICK, '        const t = this._total + delta;', '        const t = this._total + delta * 2;'),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality');
 
 // M16 (NIT1): a periodic allocation RARER than one B/op pass (64KB every 2^20 picks, ~0.0625 B/op = 3x
 // the bound). The MIN estimator misses it (it lands in only one pass per cycle, like a one-off), but it
@@ -222,12 +226,12 @@ control('M15 BoundedLoad _total desync',
 // A genuine one-off (once per process) does NOT recur and correctly does not fire.
 control('M16 64KB/2^20 periodic (recurrence)',
     patch(PICK, RR_ANCHOR, RR_INJECT('globalThis.__P20 = (globalThis.__P20 | 0) + 1; if ((globalThis.__P20 & 0xFFFFF) === 0) { this.__o = new Array(8192); }')),
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 
 // --- POOL LANE teeth (T14-15): each assertion proven by a REAL Pool.js mutant via the SOAK_POOL seam
 // (Pool.js stays byte-frozen -- the mutant is a scratch copy). These catch REAL Pool bugs, not harness
 // self-injections. The three required harness MODES (poolleak/poolnote/poolunhandled) are also run. ----
-const PA = { SOAK_CYCLES: '7', SOAK_PICKS: String(A) };
+const PA = { SOAK_CYCLES: CYC, SOAK_PICKS: String(A) };
 // A1: note(+1) on dispatch removed -> b._total stays 0 while inflight grows -> A1 fails IN FLIGHT.
 poolControl('MP1 note-removed (A1 totalInflight)',
     patchPool('                    b.note(i, 1);', '                    ;'),
@@ -278,13 +282,13 @@ function cfgCase(name, env, flags) { if (!want('CFG ' + name)) return; record('C
 cfgCase('SOAK_CYCLES=abc', { SOAK_CYCLES: 'abc' });
 cfgCase('SOAK_CYCLES=-5', { SOAK_CYCLES: '-5' });
 cfgCase('SOAK_CYCLES=2.5', { SOAK_CYCLES: '2.5' });
-cfgCase('SOAK_CYCLES=3 (below 7)', { SOAK_CYCLES: '3' });
+cfgCase('SOAK_CYCLES=3 (below the floor)', { SOAK_CYCLES: '3' });
 cfgCase('SOAK_PICKS=xyz', { SOAK_PICKS: 'xyz' });
 cfgCase('SOAK_CYCLE typo (unknown key)', { SOAK_CYCLE: '5' });
-cfgCase('CYCLES+DURATION mutually exclusive', { SOAK_CYCLES: '7', SOAK_DURATION: '1m' });
+cfgCase('CYCLES+DURATION mutually exclusive', { SOAK_CYCLES: CYC, SOAK_DURATION: '1m' });
 cfgCase('SOAK_DURATION=45 (no unit)', { SOAK_DURATION: '45' });
-cfgCase('SOAK_OUT empty', { SOAK_OUT: '', SOAK_CYCLES: '7' });
-cfgCase('unpinned semi-space', { SOAK_CYCLES: '7' }, ['--expose-gc']);
+cfgCase('SOAK_OUT empty', { SOAK_OUT: '', SOAK_CYCLES: CYC });
+cfgCase('unpinned semi-space', { SOAK_CYCLES: CYC }, ['--expose-gc']);
 
 // --- the 1.0.0-revert check (audit 1.5): the ORIGINAL buggy kernel (before the 1.0.1 audit fixes) must
 // be CAUGHT by the new quality gates -- the whole point of adding them. git show the pre-fix Pick.js into
@@ -296,7 +300,7 @@ if (want('REVERT 1.0.0 kernel (H1/H3/H4)')) {
     try {
         const old = execFileSync('git', ['show', '8c1ecc7:Pick.js'], { cwd: ROOT, encoding: 'utf8' });
         const p = writeMutant(old, 'revert100');
-        record(name, runSoak(p, { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR,BoundedLoad,PeakEWMA' }), 1, 'quality');
+        record(name, runSoak(p, { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR,BoundedLoad,PeakEWMA' }), 1, 'quality');
     } catch (e) {
         allOk = false;
         out.push('  MISS ' + name.padEnd(34) + ' <<< could not run: ' + String(e.message || e).slice(0, 80));
@@ -323,6 +327,12 @@ if (want('I2 SOAK_DURATION=10s')) {
     record('I2 SOAK_DURATION=10s', runSoak(writeMutant(PICK, 'I2'), { SOAK_DURATION: '10s', SOAK_LANES: 'SED,NQ,SmoothWRR' }), 3, 'drift gates need');
 }
 
+// --- S2 (audit 2026-09-29): the timing gates are noise-aware (time-sized batches, N=5, MAD + exact
+// one-sided Mann-Whitney). A real, sustained slowdown must still trip THEIR OWN gate: `decay` spins a
+// cycle-scaled busy loop inside BOTH timed batches, `decaysparse` inside the sparse batch only. ------------
+modeControl('MT1 decay -> hotOps', { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'decay' }, 1, 'gate hotOps[RoundRobin]');
+modeControl('MT2 decaysparse -> hotOpsSparse', { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'decaysparse' }, 1, 'gate hotOpsSparse[RoundRobin]');
+
 // --- S4 (audit 2026-09-29): the harness's own memory is O(lanes). PL: a clean 1500-cycle run (3000
 // records) must PASS the heap gate -- the kept record array used to grow the heap ~1 KB/record and FAIL
 // it. ML: the same run retaining ~1 KB per lane-cycle (SOAK_MUSTFAIL=slowleak) must FAIL it. ------------
@@ -333,7 +343,7 @@ modeControl('ML slowleak 1KB/lane-cycle (heap)', { ...LONG, SOAK_MUSTFAIL: 'slow
 
 // --- pass-control: the CLEAN kernel through the same path must exit 0 ----------------------------
 control('P clean kernel (pass-control)', PICK,
-    { SOAK_CYCLES: '7', SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0, null);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0, null);
 poolControl('P2 clean pool (pass-control)', patchPool("from '" + REAL_PICK_URL + "'", "from '" + REAL_PICK_URL + "'"),
     { ...PA, SOAK_LANES: 'PoolP2C' }, 0, null);
 
@@ -349,9 +359,9 @@ function reportControl(name, soakEnv, wantExit) {
     catch (e) { status = e.status === undefined ? -1 : e.status; stderr = String(e.stderr || ''); }
     record(name, { status, stderr }, wantExit, null);
 }
-reportControl('RPT clean non-smoke -> integrity OK', { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0);
+reportControl('RPT clean non-smoke -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0);
 reportControl('RPT clean smoke -> integrity OK', { SOAK_SMOKE: '1', SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0);
-reportControl('RPT genuine FAIL stream -> integrity OK', { SOAK_CYCLES: '7', SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 0);
+reportControl('RPT genuine FAIL stream -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 0);
 
 for (const l of out) process.stdout.write(l + '\n');
 process.stdout.write('MUSTFAIL(through main.mjs): ' + (allOk ? 'all controls behaved AS REQUIRED (gates have teeth)' : 'A CONTROL MISBEHAVED -- gate is hollow or over-eager') + '\n');

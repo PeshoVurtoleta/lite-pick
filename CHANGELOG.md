@@ -6,6 +6,14 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-03
+
+Bug-fix release from the re-audit at `audit/2026-09-29/` (audited commit `1848f7b`; N1, N2, D1 and T2
+reproduced on darwin/arm64 Node 26 before fixing). Fixes two `Pool.run` regressions that 1.0.1 shipped
+(N1, N2) and the RECIPES PeakEWMA recipe (D1). No new API, no removed API; the one new observable is the
+`LITE_PICK_CLOCK_INVALID` error code. Low items L2/L3/L4/L7/L8 and N4/N5/N6 are deferred to 1.1.0 and
+recorded in [ADR 0013](./decisions/0013-audit-1.0.1.md).
+
 ### Fixed
 
 - **`Pool.run` no longer penalizes an endpoint for a caller abort (N1, audit 2026-09-29).** In 1.0.1
@@ -25,9 +33,9 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   fastest node: in a simulation of 4 nodes with node 0 failing in 1 us, 9824 of 20000 requests failed
   (49.1%). It also never imported `PICK_NONE`, so copied as written it threw `ReferenceError` on every
   call. The loop now mirrors Pool: the measured rtt on success, `max(elapsed, PENALTY_NS)` on failure,
-  nothing on a caller abort (95 of 20000 failed, 0.48%). The cost description (here and in README) now gives the three-case
-  1.0.1 cost, not `(inflight + 1) x ewma`. A new doc-test (`test/RecipesDoc.test.js`, in
-  `npm test`) runs the snippet verbatim and fails above 5%.
+  nothing on a caller abort (95 of 20000 failed, 0.48%). The cost description (RECIPES and README) now
+  gives the three-case 1.0.1 cost, not `(inflight + 1) x ewma`. A new doc-test
+  (`test/RecipesDoc.test.js`, in `npm test`) runs the snippet verbatim and fails above 5%.
 - **The non-finite clock error has a code (N7).** `Pool.run`'s "clock() must return a finite number"
   error (pre-dispatch, and the feedback-path cause) now carries `code: 'LITE_PICK_CLOCK_INVALID'`, like
   every other Pool error. The message is unchanged.
@@ -39,6 +47,9 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   transitions, and checks the following sequence against a reference smooth WRR; the mutant now fails.
 - **Benchmark-only: the `soak:teeth` MP4 Pool anchor follows the N2 rename** (`keyed` -> `useKey` in
   the pick line); every teeth anchor resolves again.
+- **CI: the lockfile matches `package.json` again** (`@zakkster/lite-adaptive` ^1.11.0; `npm ci` failed in
+  every job), and the Node 18 floor job runs `npm test` with no install (the unit suites import only
+  `node:*` and the package's own files).
 
 ### Changed
 
@@ -46,11 +57,9 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   in-flight count `inf < ceil(x)` equals `inf < x`, so behaviour is unchanged; the call was pure cost.
   Measured on a skewed 64-node table with Smi keys: +1% to +16% ops/ms (noisy; Node 26 and Node 22,
   Apple M4). The documented cap is still `ceil((1 + eps) x (_total + 1) / live)`.
-
 - **Benchmark-only: the soak nightly is manual-only (`workflow_dispatch`).** On Node 22 the redesigned
   harness false-FAILs a correct kernel (audit 2026-09-29 S1-S4); the schedule returns once the harness
   is green there.
-
 - **Benchmark-only: the endurance soak is redesigned (no runtime change).** Per the 2026-09-26 audit
   (RECOMMENDATIONS section 1), the old `benchmark/Soak.mjs` is replaced by `benchmark/soak/*` -- a
   harness whose drift gates measure TIME (per-lane early-vs-late medians across cycles), not lanes; a
@@ -61,8 +70,10 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   data spaces; provenance + fail-closed config; a `soak:teeth` must-fail battery (every gate proven to
   trip through the production path, including a 1.0.0-kernel revert that the new quality gates catch);
   and a `soak:report` tool that re-derives the verdict from the JSONL and diffs runs against a
-  baseline. `Pick.js`/`Pool.js`/`*.d.ts` are byte-identical; no version bump. See
-  [ADR 0014](./decisions/0014-soak-redesign.md).
+  baseline. That change left `Pick.js`/`Pool.js`/`*.d.ts` byte-identical. See
+  [ADR 0014](./decisions/0014-soak-redesign.md). Known open (audit 2026-09-29): on Node 22 it
+  false-FAILs a correct kernel (S1-S4), short or interrupted runs report PASS (S5), and the sha256
+  parity gate ADR 0014 describes does not exist yet (S6); these are the next work items.
 
 ## [1.0.1] - 2026-09-27
 

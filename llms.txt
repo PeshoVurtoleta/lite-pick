@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 1.0.1
+Version: 1.0.2
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,6 +14,7 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
+1.0.2 -- the re-audit bug-fix release (CHANGELOG [1.0.2], audit/2026-09-29) on top of
 1.0.1 -- the audit bug-fix release (CHANGELOG [1.0.1], decisions/0013) on top of
 1.0.0 -- the ROSTER-COMPLETE release -- which ships the substrate seams + TEN strategies: RoundRobin,
 SmoothWRR (the weighted default), P2C (power-of-two-choices -- also the O(1) least-connections

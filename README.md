@@ -144,7 +144,7 @@ Each `pick()` is **0 B/op** and **O(cap)** (NQ is O(1) when an early node is idl
 
 ## PeakEWMA -- latency-aware P2C (v0.7.0)
 
-When endpoints differ in **latency**, not just queue depth, count-based strategies keep re-probing a slow-but-up node: it drains its queue between visits, so its in-flight looks attractive again. `PeakEwmaBalancer` (Twitter Finagle's *peak-EWMA*) is power-of-two-choices over a **latency cost** -- `cost = (inflight + 1) x decayed-EWMA(rtt)` -- so a degraded node is avoided **even while idle** ([ADR 0009](./decisions/0009-peakewma.md)). It is `O(d) = O(1)` per pick and **0 B/op** on both the pick path and the feedback path.
+When endpoints differ in **latency**, not just queue depth, count-based strategies keep re-probing a slow-but-up node: it drains its queue between visits, so its in-flight looks attractive again. `PeakEwmaBalancer` (Twitter Finagle's *peak-EWMA*) is power-of-two-choices over a **latency cost** -- for a sampled node `cost = (inflight + 1) x max(decayed-EWMA(rtt), time busy since its last sample)`; an unsampled node costs 0 while idle and the pool's lifetime mean rtt while busy -- so a degraded node is avoided **even while idle** ([ADR 0009](./decisions/0009-peakewma.md)). It is `O(d) = O(1)` per pick and **0 B/op** on both the pick path and the feedback path.
 
 ```js
 import { PeakEwmaBalancer } from '@zakkster/lite-pick';

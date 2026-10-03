@@ -343,14 +343,17 @@ duck-typed and imports NOTHING from lite-query.
     (`constructor.KEYED === true`: ConsistentHash/BoundedLoad) REQUIRES a numeric `opts.key`
     (`code:'LITE_PICK_KEY_REQUIRED'` otherwise) and Pool drives `pick(key)`; a LATENCY balancer
     (`constructor.LATENCY === true`: PeakEWMA) REQUIRES an `opts.clock`
-    (`code:'LITE_PICK_CLOCK_REQUIRED'` otherwise), read (validated finite) BEFORE dispatch and passed
-    as `pick(now)`. The KEY reaches ONLY a keyed pick; the CLOCK reading NEVER reaches a keyed pick; a
-    non-keyed clocked run passes the reading to `pick(now)`.
+    (`code:'LITE_PICK_CLOCK_REQUIRED'` otherwise), read (validated finite, else
+    `code:'LITE_PICK_CLOCK_INVALID'`) BEFORE dispatch and passed as `pick(now)`. The CLOCK reading NEVER
+    reaches a key-routed pick; a LATENCY balancer never receives the KEY. An UNMARKED balancer keeps the
+    1.0.0 semantics: a supplied `opts.key` drives `pick(key)` verbatim (mark the class
+    `static KEYED = true` for key validation), else a clocked run passes the reading to `pick(now)`.
     FEEDBACK is loud and never re-runs fn (M4): occupancy `note(i, +/-1)` mirrors dispatch/settle for
     a note-duck-typed balancer; latency `recordRtt` is fed on settle when a clock is in use. A SUCCESS
     whose settle feedback fails (clock throws / non-finite, or `recordRtt` throws) rejects
     `code:'LITE_PICK_FEEDBACK'` carrying `.cause` and `.result` (fn's value -- fn ran once, nothing
-    lost). A FAILURE feeds a penalty `recordRtt(i, max(elapsed, failurePenaltyNs), done)` (H1); if THAT
+    lost). A FAILURE feeds a penalty `recordRtt(i, max(elapsed, failurePenaltyNs), done)` (H1) -- NOT
+    when the `signal` is aborted (a caller cancel is not the endpoint's fault); if THAT
     feedback fails, Pool throws fn's original error unchanged (identity) with a non-enumerable
     `liteFeedbackError` attached. A non-finite clock reading throws BEFORE dispatch; a
     backwards-stepping finite reading records NO sample and resolves normally. `opts.failurePenaltyNs`

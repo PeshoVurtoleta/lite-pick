@@ -20,6 +20,19 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   keys -> 1 of 8 backends). An unmarked balancer now receives the supplied key verbatim as
   `pick(key)`, as in 1.0.0 (the key wins over a clock reading, as in 1.0.0). A `LATENCY`-marked
   balancer still never receives the key. Mark a keyed class `static KEYED = true` to get key validation.
+- **RECIPES section 8 no longer teaches the PeakEWMA black hole (D1, audit 2026-09-29).** The manual
+  loop recorded `recordRtt(i, elapsed)` in a `finally`, so a node failing in 1 us looked like the
+  fastest node: in a simulation of 4 nodes with node 0 failing in 1 us, 9824 of 20000 requests failed
+  (49.1%). It also never imported `PICK_NONE`, so copied as written it threw `ReferenceError` on every
+  call. The loop now mirrors Pool: the measured rtt on success, `max(elapsed, PENALTY_NS)` on failure,
+  nothing on a caller abort (95 of 20000 failed, 0.48%). The cost description (here and in README) now gives the three-case
+  1.0.1 cost, not `(inflight + 1) x ewma`. A new doc-test (`test/RecipesDoc.test.js`, in
+  `npm test`) runs the snippet verbatim and fails above 5%.
+- **The non-finite clock error has a code (N7).** `Pool.run`'s "clock() must return a finite number"
+  error (pre-dispatch, and the feedback-path cause) now carries `code: 'LITE_PICK_CLOCK_INVALID'`, like
+  every other Pool error. The message is unchanged.
+- **`llms.txt` described the 1.0.1 key channel** ("the KEY reaches ONLY a keyed pick"); it now states
+  the N2 unmarked-balancer rule and the N1 abort exemption.
 - **Test-only: SmoothWRR's eligibility reset is now actually tested (T2, audit 2026-09-29).** A5 picked
   20 times (a multiple of the `[3,1,1]` cycle length), so every accumulator was already 0 and deleting
   the reset in `setEligible` passed the suite. A5b picks 21 times, asserts the reset on both
@@ -57,6 +70,24 @@ Bug-fix release: the fixes from the full audit at `audit/2026-09-26/` (audited c
 `8c1ecc7`; H1-H4 and M1 independently reproduced on darwin/arm64 Node 26 before fixing). No new
 strategy, no new public class, no removed API -- caller-visible behaviour changes only where a
 documented contract was wrong or unsafe. See [ADR 0013](./decisions/0013-audit-1.0.1.md).
+
+### Behaviour changes
+
+Added after release (audit 2026-09-29 N7) for semver-strict consumers. Each is a fix to a documented
+contract, but code that relied on the old behaviour sees a difference:
+
+- A string index now throws: `setEligible('2', false)` is a `RangeError` (1.0.0 coerced it and
+  flipped node 2). All index-taking methods share the same validation.
+- `recordRtt('1', ...)` throws `RangeError` (1.0.0 threw `TypeError`).
+- TypeScript: `PeakEwmaBalancer.pick()` and `ConsistentHashBalancer.pick()` / `BoundedLoadBalancer.pick()`
+  without an argument no longer compile (`pick(now)` / `pick(keyHash)` are required on the concrete
+  classes; `BalancerBase.pick` stays loose).
+- `Pool.run` with PeakEWMA and no `opts.clock` rejects `LITE_PICK_CLOCK_REQUIRED`; with a keyed balancer
+  and no numeric `opts.key` it rejects `LITE_PICK_KEY_REQUIRED` (1.0.0 ran both, wrongly).
+- `liteQueryFetcher` over a keyed pool cannot supply a routing key, so that misconfiguration surfaces
+  per fetch (`LITE_PICK_KEY_REQUIRED`), not at creation.
+- Two regressions shipped here are fixed in the next release: a caller abort was recorded as a 1 s
+  penalty (N1), and an unmarked balancer stopped receiving `opts.key` (N2).
 
 ### Fixed
 

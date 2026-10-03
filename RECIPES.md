@@ -196,41 +196,61 @@ signal dispatches nothing and rejects with the signal's `reason` (or a `LITE_PIC
 ## 8. Latency-aware routing -- PeakEWMA with rtt feedback
 
 PeakEWMA (latency-aware P2C, Finagle's peak-EWMA) steers away from *slow* endpoints,
-not just busy ones. It scores each candidate `(inflight + 1) x ewma(rtt)`, so a node
-that got slow gets less traffic even if its connection count looks fine. It needs two
-things you didn't need before: a **clock** (`now`, caller-supplied nanoseconds) and
-**rtt feedback** (`recordRtt`).
+not just busy ones. Of two random candidates it takes the cheaper one, where a sampled
+node costs `(inflight + 1) x max(decayed ewma(rtt), time busy since its last sample)`, an
+unsampled idle node costs 0 (it gets one probe), and an unsampled busy node is priced at
+the pool's lifetime mean rtt. So a node that got slow gets less traffic even if its
+connection count looks fine. It needs two things you didn't need before: a **clock**
+(`now`, caller-supplied nanoseconds) and **rtt feedback** (`recordRtt`).
 
-Manual loop:
+Manual loop. Record the measured rtt on SUCCESS, a PENALTY on FAILURE, and nothing when
+the caller cancelled -- exactly what Pool does for you below:
 
 ```js
-import { PeakEwmaBalancer } from '@zakkster/lite-pick';
+import { PeakEwmaBalancer, PICK_NONE } from '@zakkster/lite-pick';
 
 const TAU_NS = 30_000_000;                    // 30ms EWMA TIME CONSTANT (half-life = tau x ln2 ~= 21ms)
+const PENALTY_NS = 1_000_000_000;             // a failed call is priced at >= 1s (Pool's failurePenaltyNs)
 const inflight = new Uint32Array(CAP);
 const lb = new PeakEwmaBalancer(CAP, eligible, inflight, TAU_NS);
 const nowNs = () => Number(process.hrtime.bigint());
 
-async function handle(req) {
-  const now = nowNs();
-  const i = lb.pick(now);                      // decay-on-read, 0 B/op
+async function handle(req, signal) {
+  const start = nowNs();
+  const i = lb.pick(start);                    // decay-on-read, 0 B/op
   if (i === PICK_NONE) return respond503();
   inflight[i]++;
-  const start = nowNs();
   try {
-    return await send(endpoints[i], req);
+    const res = await send(endpoints[i], req, signal);
+    const done = nowNs();
+    lb.recordRtt(i, done - start, done);       // SUCCESS: the measured rtt, snaps up / decays down
+    return res;
+  } catch (err) {
+    if (!(signal && signal.aborted)) {         // a caller cancel is not the endpoint's fault
+      const done = nowNs();
+      const elapsed = done - start;
+      // FAILURE: never record a fast failure as a tiny rtt -- that makes the node the cheapest
+      // pick (a black hole). Price it at least PENALTY_NS.
+      lb.recordRtt(i, elapsed > PENALTY_NS ? elapsed : PENALTY_NS, done);
+    }
+    throw err;
   } finally {
     inflight[i]--;
-    lb.recordRtt(i, nowNs() - start, nowNs()); // FEEDBACK: measured rtt, snaps up / decays down
   }
 }
 ```
+
+Do NOT put `recordRtt(i, elapsed)` in a `finally`: a node that fails in 1 us would then
+record a 1 us rtt and attract about half of all traffic (measured: 49.1% failed requests
+with one fast-failing node of four). The doc-test `test/RecipesDoc.test.js`
+runs this exact snippet and holds it under 5%.
 
 Or let Pool do the feedback for you. A latency balancer **requires** `opts.clock`
 (otherwise `run` rejects with a `LITE_PICK_CLOCK_REQUIRED`-coded error). Pool reads the
 clock before each dispatch, drives `pick(now)`, records the settled rtt on success, and
 -- new in 1.0.1 -- feeds a PENALTY on a thrown attempt so a fast-failing endpoint stops
-looking cheap:
+looking cheap (since 1.0.2, not when the `signal` is aborted -- a caller cancel is not the
+endpoint's fault):
 
 ```js
 import { Pool } from '@zakkster/lite-pick/pool';
@@ -275,8 +295,9 @@ Notes:
 - **Cold start.** An unsampled node costs 0 while idle (so it takes one probe request at
   a time) and the pool's lifetime mean sampled rtt once it is busy -- graceful, never NaN,
   never the old 1.0 ns black hole. A node that never records a sample (e.g. one that fails
-  fast so the caller records nothing) keeps winning while idle: record failures too (the
-  Pool `failurePenaltyNs` above does this for you).
+  fast so the caller records nothing) keeps winning while idle: record failures as a
+  penalty too (the manual loop's `PENALTY_NS` branch; Pool's `failurePenaltyNs` does it for
+  you).
 - `now` must be a FINITE number. A non-finite `now` degrades `pick` to P2C-random (no
   throw); `recordRtt` throws on a non-finite argument.
 - Pick `tauNs` around your p50-p90 rtt: smaller = reacts faster to a slowdown, larger =

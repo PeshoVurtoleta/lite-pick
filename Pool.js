@@ -59,6 +59,17 @@ function _scanUntried(b, tried, from) {
 }
 
 /**
+ * The coded error for a non-finite clock reading (N7: every Pool error carries a `.code`). Cold path.
+ * @param {unknown} v  the reading clock() returned
+ * @returns {Error}
+ */
+function _clockInvalid(v) {
+    const e = new Error('[lite-pick] clock() must return a finite number, got ' + String(v));
+    e.code = 'LITE_PICK_CLOCK_INVALID';
+    return e;
+}
+
+/**
  * Attach a feedback error to fn's error WITHOUT replacing it (identity is preserved): when `err` is
  * an extensible object, define a NON-enumerable `liteFeedbackError` property carrying `fe`. Never
  * throws (a frozen/sealed or primitive `err` is left untouched) -- the caller still gets fn's error.
@@ -254,7 +265,7 @@ export class Pool {
                 if (clock !== undefined) {
                     now = clock();
                     if (!Number.isFinite(now)) {
-                        throw new Error('[lite-pick] clock() must return a finite number, got ' + now);
+                        throw _clockInvalid(now);
                     }
                 }
 
@@ -313,7 +324,7 @@ export class Pool {
                         try {
                             const done = clock();
                             if (!Number.isFinite(done)) {
-                                throw new Error('[lite-pick] clock() must return a finite number, got ' + done);
+                                throw _clockInvalid(done);
                             }
                             let elapsed = done - now;
                             if (!(elapsed >= 0)) elapsed = 0;   // clamp (NaN-safe): backwards finite clock
@@ -340,7 +351,7 @@ export class Pool {
                         try {
                             const done = clock();
                             if (!Number.isFinite(done)) {
-                                throw new Error('[lite-pick] clock() must return a finite number, got ' + done);
+                                throw _clockInvalid(done);
                             }
                             // A backwards clock reading records NO sample: a fabricated 0 ns rtt would
                             // make the node look instant (cost 0 while idle) and drag down the pool mean.

@@ -386,7 +386,8 @@ test('B4 (M4): a non-finite clock reading throws BEFORE dispatch, in-flight net-
     let calls = 0;
     await assert.rejects(
         pool.run((i) => { void i; calls++; return 'ok'; }, { clock: () => NaN }),
-        /\[lite-pick\] clock\(\) must return a finite number/,
+        (e) => /\[lite-pick\] clock\(\) must return a finite number/.test(e.message) &&
+            e.code === 'LITE_PICK_CLOCK_INVALID',   // N7: coded like every other Pool error
     );
     assert.equal(calls, 0, 'fn never dispatched on a broken clock');
     for (let i = 0; i < n; i++) assert.equal(inflight[i], 0);

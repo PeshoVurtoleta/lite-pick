@@ -94,7 +94,8 @@ export class Pool {
      * with up to `opts.tries` genuinely DISTINCT-endpoint failover attempts on a throw (failover
      * targets are spread across keys for a keyed run and cursor-rotated for an unkeyed run). A keyed
      * balancer requires `opts.key` and a latency balancer requires `opts.clock` (a `LITE_PICK_KEY_REQUIRED`
-     * / `LITE_PICK_CLOCK_REQUIRED`-coded error otherwise).
+     * / `LITE_PICK_CLOCK_REQUIRED`-coded error otherwise); a non-finite clock reading rejects with a
+     * `LITE_PICK_CLOCK_INVALID`-coded error before dispatch.
      *
      * Rejections: `LITE_PICK_NONE` when no endpoint is eligible; the last error when every attempt
      * fails; an already-aborted `signal` dispatches NOTHING and rejects (the signal's `reason`, or a

@@ -308,3 +308,34 @@ it false-FAILs a correct kernel. Two decisions change:
   recorded per pool cycle (report-only).
 - Stream schema 4. `soak:report --baseline` with an older-schema baseline prints "not compared" and
   continues (teeth: `RPT baseline: older schema`).
+
+## Amendment 2026-10-04 -- audit 2026-09-29 (S7): the P2C oracle is calibrated, not derived
+
+- **Why** (researched first: `research/s7-p2c-oracle-bound.md`): the balls-in-bins theorems (Azar et al.,
+  Berenbrink et al.) give the SHAPE of a healthy P2C's gap -- log2(ln n) + O(1) -- but no usable
+  constant, and a P2C that ignores its comparison a share of the time (Peres-Talwar-Wieder's
+  (1+beta)-choice process) differs from a healthy one by only a few units at n <= 256. The per-trial
+  bound `4 log2(ln live) + 4` sat 3-4x above any healthy gap, so the 50%-broken P2C (M8b) passed every
+  cycle. A threshold that thin has to come from measurement.
+- **Statistic:** the SUM of the 8 trial gaps. With every pick on an eligible node the mean is exactly 32,
+  so each gap is an integer and the sum is exact -- no float threshold. Averaging is what separates the
+  two distributions: one trial's gap is a noisy integer; the mean of eight moves by 1-3 units.
+- **Calibration:** `benchmark/soak/_calibrate-p2c.mjs` drives the real `P2cBalancer` through the same
+  `p2cTrials()` the oracle calls, at the soak's shape -- cap 256 with a fresh random eligible subset per
+  cycle, because `_draw`'s fallback scan (taken on ~13% of draws at live 8 of 256) favors a node that
+  follows a run of down nodes, so the healthy distribution depends on WHICH nodes are up, not only on how
+  many. 100,000 clean cycles per live count, 8..256: 0 backstop, 0 lost picks; largest clean sum 13 at
+  live 8 rising to 20 at 256. Limit = running maximum over live counts <= n, + 4 (monotone because the
+  healthy gap grows with n). Tail at live 200: sum 18 in 0.4% of cycles, 19 in 0.009%, limit 24. A
+  resumed run reproduces an uninterrupted one exactly (a live count's seed never depends on the job split;
+  231 live counts cross-checked).
+- **Backstop and lost picks:** fewer than 2 of 8 trials may exceed `ceil(log2(ln live)) + 3` (the fix
+  plan's rule, kept for gross breakage), and every pick must land on an eligible node.
+- **Teeth:** M8b (ignore 50%) and M8c (ignore 80%) are kernel mutants through main.mjs; power per live
+  count is in `benchmark/soak/p2c-power.json`. Weakest point: the 50% mutant at live 8-11 is caught in
+  58-65% of cycles (the two distributions overlap most at small n), so detecting it there takes a few
+  cycles, not one; at the soak's frozen live counts (~165-200) every cycle catches it.
+- **Not done:** the oracle shape (32 x live balls from empty, no completions) is unchanged. Changing it,
+  CAP, or the kernel's `_draw` requires re-running the calibration -- `test/SoakP2C.test.js` only guards
+  the table against the evidence file, not the evidence against a changed kernel. The `_draw` fallback's
+  "unbiased" comment is inaccurate at sparse eligibility; a kernel note for 1.1.0, not a soak change.

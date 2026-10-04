@@ -1,6 +1,6 @@
 # Research: calibrating the soak's P2C oracle (Phase 3, S7)
 
-**Status:** DECIDED 2026-10-04 -- all recommendations accepted (option C, calibration target 100k clean cycles per live count.) Not implemented yet.
+**Status:** DECIDED 2026-10-04 -- all recommendations accepted (option C, calibration target 100k clean cycles per live count). IMPLEMENTED 2026-10-04: see the decisions/0014 S7 amendment and section 7 below.
 **Question:** the soak checks P2C (pick two distinct eligible nodes at random, send to the less loaded)
 by dropping 32 x live requests into empty nodes, 8 independent trials per cycle, and failing a trial if
 `max - mean > 4 x log2(ln live) + 4`. The audit (S7) found that bound 3-4x too loose: a P2C that ignores
@@ -109,3 +109,28 @@ log n broken); the numbers come from our own measurement, said so in the code.
 ## 6. Decisions needed
 1. Adopt option C (averaged statistic + per-trial backstop)?
 2. Calibration target: no false alarm in 100k clean cycles per live count -- enough, or more?
+
+## 7. What the implementation measured (2026-10-04)
+Calibrated on the real kernel, 100,000 clean cycles at EVERY live count 8..256 (24.9M cycles, ~65 min on
+10 cores), cap 256, a random eligible subset per cycle. Share of cycles the final oracle fails:
+
+| live | limit (sum of 8 gaps) | healthy max seen | 50%-ignore caught | 80%-ignore caught | research estimate, 50% |
+|---|---|---|---|---|---|
+| 8 | 17 | 13 | 0.65 | 1.00 | 0.66 |
+| 16 | 20 | 16 | 0.78 | 1.00 | 0.97 |
+| 32 | 21 | 17 | 0.99 | 1.00 | 1.00 |
+| 64 | 23 | 18 | 1.00 | 1.00 | 1.00 |
+| 200 (soak) | 24 | 19 | 1.00 | 1.00 | -- |
+| 256 | 24 | 20 | 1.00 | 1.00 | 1.00 |
+
+The lesson in the n = 16 row: the research thresholds came from 1,000 clean cycles; 100 times more clean
+cycles found rarer, larger healthy sums, the limit rose, and power at small n fell (0.97 -> 0.78). That is
+the false-alarm vs. power trade made visible -- the longer you look at a healthy system, the more extreme
+the "healthy" values you must accept. At the live counts the soak actually reaches (~165-200), nothing is
+lost: every cycle catches the half-broken P2C, and the healthy tail sits 5 units under the limit, each unit
+~45x rarer than the one before it.
+
+One finding that changed the method: the kernel's `_draw` falls back to a scan from a random start after 64
+missed draws (~13% of draws at 8 live of 256), and that scan favors a node right after a run of down nodes.
+So the healthy gap depends on WHICH nodes are up, and the calibration draws a fresh random subset each
+cycle, as the soak's chaos does, instead of a fixed contiguous block.

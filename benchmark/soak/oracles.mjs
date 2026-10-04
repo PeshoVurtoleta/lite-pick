@@ -77,7 +77,7 @@ export const _p2c = new Int32Array(3);
 // the largest clean sum seen at any live count <= live, + 4 (0.5 on the average gap). That file is the
 // evidence; test/SoakP2C.test.js fails if this table and it disagree. The literature gives the SHAPE (gap
 // ~ log2 ln n healthy, ~ log n / beta for a (1+beta)-choice P2C); the numbers are our measurement.
-export const P2C_SUM_LIMIT = Object.freeze([CALIBRATION_PENDING]);
+export const P2C_SUM_LIMIT = Object.freeze([[8, 17], [9, 18], [13, 19], [16, 20], [26, 21], [37, 22], [55, 23], [130, 24]]);
 const P2C_MAX_LIVE = 256;
 const _p2cLimit = new Int32Array(P2C_MAX_LIVE + 1).fill(-1);
 for (let n = P2C_MIN_LIVE; n <= P2C_MAX_LIVE; n++) for (const [at, v] of P2C_SUM_LIMIT) if (n >= at) _p2cLimit[n] = v;

@@ -182,6 +182,22 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 - **Benchmark-only: `soak:teeth` accepts `MUSTFAIL_ONLY=<regex>`** to run a subset of controls (dev aid;
   the full battery is the gate), and keeps a child's stderr on an exit-0 run too (it was discarded, so a
   control could not assert a line printed by a passing run).
+- **Benchmark-only: the soak's P2C oracle is calibrated and catches a half-broken P2C (S7, audit
+  2026-09-29; decided in `research/s7-p2c-oracle-bound.md`, option C).** Before, each of the 8 trials
+  was judged alone against `4 log2(ln live) + 4` -- 3-4x above anything a healthy P2C produces -- so a
+  P2C that ignores its load comparison on half its picks never failed a cycle (measured: the new M8b
+  control exited 0 on the old oracle in all 11 cycles). Now the oracle sums the 8 trial gaps and fails
+  the cycle when the sum exceeds a limit CALIBRATED per live count on the real kernel: 100,000 clean
+  cycles at every live count 8..256 (24.9M cycles, `benchmark/soak/_calibrate-p2c.mjs`; the evidence is
+  `benchmark/soak/p2c-calibration.json`), limit = the largest clean sum at that live count or below,
+  + 4 (0.5 on the average gap). A per-trial backstop (`ceil(log2(ln live)) + 3`, fail when 2+ of 8 trials
+  exceed it) and a lost-pick check (every pick must land on an eligible node) stay. Clean: 0 failures,
+  0 backstop and 0 lost picks in the calibration. Mutants, share of cycles caught
+  (`benchmark/soak/p2c-power.json`): ignore-the-comparison 50% -- 58-65% at live 8-11, >= 90% from 19,
+  >= 99% from 31, 100% from 49 (the soak's frozen state has ~165-200 live); 80% -- 100% at every live
+  count. A live count outside 8..256 is INSUFFICIENT, never a silent pass. New teeth: M8b (50%), M8c
+  (80%). `test/SoakP2C.test.js` (in `npm test`) fails if the table in `oracles.mjs` and the calibration
+  evidence disagree, and runs the real kernel at the soak's live range (clean never fails, 50% caught).
 
 ## [1.0.2] - 2026-10-03
 

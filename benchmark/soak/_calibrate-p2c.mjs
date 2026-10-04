@@ -3,7 +3,12 @@
  * research/s7-p2c-oracle-bound.md, option C, decided 2026-10-04).
  *
  *     node benchmark/soak/_calibrate-p2c.mjs [--cycles 100000] [--from 8] [--to 256] [--jobs 8]
- *          [--seed 0x5EED] [--out benchmark/soak/p2c-calibration.json] [--mutant 0|50|80]
+ *          [--seed 0x5EED] [--out benchmark/soak/p2c-calibration.json] [--mutant 0|50|80 --table <json>]
+ *          [--partial <rows.jsonl>]
+ *
+ * --partial makes a long run resumable: every finished live count is appended there as one JSON line,
+ * and a restart skips the live counts already in it (each live count's seed depends only on --seed and
+ * the live count, never on the job split, so a resumed run is identical to an uninterrupted one).
  *
  * For every live count in [from, to] it runs `cycles` CLEAN oracle cycles of the real P2cBalancer at the
  * soak's shape (cap 256, a fresh random eligible subset of that size per cycle, membership changed with
@@ -22,7 +27,7 @@
  */
 
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
-import { writeFileSync, readFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, appendFileSync, existsSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { P2cBalancer, Prng } from '../../Pick.js';
 import { p2cTrials, _p2c, p2cTrialCap, P2C_TRIALS, P2C_MIN_LIVE } from './oracles.mjs';
@@ -32,11 +37,11 @@ const SUM_BINS = 1024;    // sum-of-gaps histogram (clamped)
 const MARGIN = 4;         // 0.5 on the AVERAGE of 8 gaps == 4 on their sum
 
 function args() {
-    const a = process.argv.slice(2), o = { cycles: 100000, from: P2C_MIN_LIVE, to: CAP, jobs: 8, seed: 0x5EED, out: null, mutant: 0, table: null };
+    const a = process.argv.slice(2), o = { cycles: 100000, from: P2C_MIN_LIVE, to: CAP, jobs: 8, seed: 0x5EED, out: null, mutant: 0, table: null, partial: null };
     for (let i = 0; i < a.length; i += 2) {
         const k = a[i].replace(/^--/, ''), v = a[i + 1];
         if (!(k in o)) { process.stderr.write('unknown option --' + k + '\n'); process.exit(2); }
-        o[k] = (k === 'out' || k === 'table') ? v : Number(v);
+        o[k] = (k === 'out' || k === 'table' || k === 'partial') ? v : Number(v);
     }
     if (!(o.from >= P2C_MIN_LIVE && o.to <= CAP && o.from <= o.to && o.cycles >= 1 && o.jobs >= 1)) {
         process.stderr.write('bad range: from ' + o.from + ' to ' + o.to + ' cycles ' + o.cycles + ' jobs ' + o.jobs + '\n');
@@ -94,9 +99,6 @@ if (!isMainThread) {
     const o = args();
     const lives = [];
     for (let n = o.from; n <= o.to; n++) lives.push(n);
-    // Balance by cost (~ live picks per cycle): deal the largest live counts first to the lightest job.
-    const jobs = Array.from({ length: Math.min(o.jobs, lives.length) }, () => ({ lives: [], cost: 0 }));
-    for (const n of [...lives].sort((x, y) => y - x)) { jobs.sort((x, y) => x.cost - y.cost); jobs[0].lives.push(n); jobs[0].cost += n; }
     // --mutant: the oracle's limits come from a finished clean calibration (--table <json>).
     let limits = null;
     if (o.mutant !== 0) {
@@ -106,10 +108,27 @@ if (!isMainThread) {
         for (let n = P2C_MIN_LIVE; n <= CAP; n++) for (const [at, v] of cal.breakpoints) if (n >= at) limits[n] = v;
     }
     const t0 = Date.now(), results = new Map();
+    if (o.partial && existsSync(o.partial)) {
+        for (const line of readFileSync(o.partial, 'utf8').split('\n')) {
+            if (!line) continue;
+            const r = JSON.parse(line);
+            if (r.cycles !== o.cycles || r.seed !== o.seed || r.mutant !== o.mutant) {
+                process.stderr.write('partial row for live ' + r.live + ' was made with other options -- refusing to mix\n');
+                process.exit(2);
+            }
+            if (r.live >= o.from && r.live <= o.to) results.set(r.live, r);
+        }
+        process.stderr.write('resuming: ' + results.size + ' live counts already in ' + o.partial + '\n');
+    }
+    const todo = lives.filter((n) => !results.has(n));
+    // Balance by cost (~ live picks per cycle): deal the largest live counts first to the lightest job.
+    const jobs = Array.from({ length: Math.min(o.jobs, todo.length) }, () => ({ lives: [], cost: 0 }));
+    for (const n of [...todo].sort((x, y) => y - x)) { jobs.sort((x, y) => x.cost - y.cost); jobs[0].lives.push(n); jobs[0].cost += n; }
     await Promise.all(jobs.map((j) => new Promise((resolve, reject) => {
         const w = new Worker(new URL(import.meta.url), { workerData: { lives: j.lives, cycles: o.cycles, seed: o.seed, mutant: o.mutant, limits } });
         w.on('message', (r) => {
             results.set(r.live, r);
+            if (o.partial) appendFileSync(o.partial, JSON.stringify({ ...r, seed: o.seed, mutant: o.mutant }) + '\n');
             process.stderr.write('live ' + r.live + ' maxSum ' + r.maxSum + ' backstop ' + r.backstop + ' lost ' + r.lost + ' (' + results.size + '/' + lives.length + ', ' + ((Date.now() - t0) / 1000).toFixed(0) + ' s)\n');
         });
         w.on('error', reject);

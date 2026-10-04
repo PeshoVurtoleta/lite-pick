@@ -1,6 +1,6 @@
 # Research: oracles for the hashing, least-load and weighted lanes (Phase 3, S14)
 
-**Status:** research for a decision (2026-10-04). Nothing here is implemented yet.
+**Status:** DECIDED 2026-10-04 -- all recommendations accepted (all four recommendations; the soak keyed-lane table size is decided in the implementation burst with a measurement.) Not implemented yet.
 **Question:** the audit's fix plan (2026-09-29, section 3.4) proposes new soak oracles that do not
 re-implement the kernel's own walk: (a) a BoundedLoad **cap property**, (b) a ConsistentHash
 **disruption property** -- "removing 1 of N backends moves <= 1/N + 2% of keys", (c) a WeightedRandom

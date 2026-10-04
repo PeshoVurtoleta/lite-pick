@@ -1,6 +1,6 @@
 # Research: calibrating the soak's P2C oracle (Phase 3, S7)
 
-**Status:** research for a decision (2026-10-04). Nothing here is implemented yet.
+**Status:** DECIDED 2026-10-04 -- all recommendations accepted (option C, calibration target 100k clean cycles per live count.) Not implemented yet.
 **Question:** the soak checks P2C (pick two distinct eligible nodes at random, send to the less loaded)
 by dropping 32 x live requests into empty nodes, 8 independent trials per cycle, and failing a trial if
 `max - mean > 4 x log2(ln live) + 4`. The audit (S7) found that bound 3-4x too loose: a P2C that ignores

@@ -240,3 +240,18 @@ it false-FAILs a correct kernel. Two decisions change:
   every run; it is now report-only by declaration. The meta-test feeds both gates input far past their
   bounds and fails if either can FAIL again; re-enabling one requires a control. A missing `gcPauseAvgMs`
   no longer makes a run INCONCLUSIVE.
+
+## Amendment 2026-10-04 -- audit 2026-09-29 (S12)
+
+- **`soak:report` integrity fails closed.** Required summary counters (a deleted one is an issue, not a
+  skipped check); contiguous `seq`; per-lane cycle grids with no hole or duplicate, and exactly
+  `header.config.cycles` per lane for a cycle-bound run that ended; any `fatal` record re-derives FAIL; a
+  second summary is accepted only as the fatal handler's. `--baseline` uses `totalViolations`, diffs pool
+  lanes, and validates the baseline (integrity, not overridden). The HTML carries the integrity status,
+  issues and fatal messages. The remaining residual is unchanged: consistent forgery of the cycle records
+  themselves needs a MAC (out of scope).
+- **Teeth.** `RPT S12 ...` controls tamper with genuine streams (dropped cycles plus deleted counters, a seq
+  gap, a fatal after the end, string breaches through the HTML path, a weight-0 and a pool regression vs a
+  clean baseline, a tampered baseline); each must exit 1 naming its issue. Against the pre-S12 report all
+  seven MISS (six exit 0, the string case's HTML path threw a TypeError). Genuine cycle-bound, duration-bound
+  and mixed kernel+pool streams still pass integrity.

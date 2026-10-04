@@ -8,12 +8,18 @@
  *   1. INTEGRITY: re-derive the verdict from the raw CYCLE records (via the SAME pure gates.mjs the run
  *      used, plus the failure signals the cycles carry) and check the stream is COMPLETE and consistent
  *      (record counts, a full lane x cycle grid, reason==='end', the exactly-derivable counters match).
+ *      S12 (audit 2026-09-29) closed the fail-open paths: every summary counter is REQUIRED (deleting one
+ *      no longer skips its check), `seq` must run 0..n-1 with no gap or duplicate, a cycle-bound run that
+ *      ended must hold exactly header.config.cycles cycles per lane, and ANY `fatal` record (also one after
+ *      the end summary) re-derives FAIL. Each issue is also printed to stderr as `soak:report: ISSUE <text>`.
  *      Exit 1 if it disagrees with the recorded verdict or the stream is inconsistent/incomplete -- so an
  *      edited summary or a dropped set of records is caught. (Consistent forgery of the cycle records
  *      themselves would need a MAC and is out of scope.)
  *   2. MARGINS: print each lane's gate margins (how close each gate came to its bound).
  *   3. REGRESSION (--baseline): diff two runs and FAIL on a real regression -- throughput down > 15%,
- *      latency p99 up > 25%, heap up > 2 MB, or a quality violation appearing where there was none.
+ *      latency p99 up > 25%, heap up > 2 MB, or a quality violation appearing where there was none (ALL
+ *      kinds: oracle, weight-0, chi-square), or a pool lane failing where it passed. The baseline must
+ *      itself pass integrity and not be an overridden stream.
  *
  * With --out it writes a self-contained HTML page of inline-SVG time-series (heap / throughput / p99 /
  * hot B/op per lane over cycles). It uses NO charting peer: lite-charts is a browser-canvas module with
@@ -75,26 +81,52 @@ function mostRecentJsonl() {
     return join(OUT_DIR, names[names.length - 1]);
 }
 
-/** Parse a soak JSONL into { header, cycles, summary }. Fails closed on a bad stream. */
+/** Parse a soak JSONL into { header, cycles, summary, fatals, loadIssues }. Fails closed on a bad stream.
+ *  `summary` is the LAST summary (a crash after the end writes a second, reason 'fatal'); a fatal stream
+ *  with no summary at all gets a synthesized FAIL summary (`synthesized`) and an issue. */
 function load(path) {
     let text;
     try { text = readFileSync(path, 'utf8'); } catch { die(2, 'cannot read ' + path); }
     const lines = text.split('\n').filter((l) => l.trim() !== '');
     if (!lines.length) die(2, 'empty stream ' + path);
-    let header = null, summary = null;
-    const cycles = [];
-    for (const l of lines) {
+    let header = null, summary = null, summaries = 0;
+    const cycles = [], fatals = [], loadIssues = [];
+    let seqBad = null;
+    for (let i = 0; i < lines.length; i++) {
         let o;
-        try { o = JSON.parse(l); } catch { die(2, 'malformed JSONL line in ' + path); }
+        try { o = JSON.parse(lines[i]); } catch { die(2, 'malformed JSONL line in ' + path); }
+        if (o === null || typeof o !== 'object') die(2, 'non-object JSONL line in ' + path);
+        // S12: seq is contiguous from 0 in file order -- a dropped, duplicated or reordered record shows.
+        if (seqBad === null && o.seq !== i) seqBad = 'seq: record ' + i + ' has seq ' + JSON.stringify(o.seq) + ' (need ' + i + ')';
         if (o.type === 'header') header = o;
         else if (o.type === 'cycle') cycles.push(o);
-        else if (o.type === 'summary') summary = o;
-        else if (o.type === 'fatal') { /* a crash record; surfaced below */ summary = summary || { reason: 'fatal', verdict: 'FAIL', fatal: true }; }
+        else if (o.type === 'summary') { summary = o; summaries++; }
+        else if (o.type === 'fatal') fatals.push(o);
     }
+    if (seqBad !== null) loadIssues.push(seqBad);
     if (!header) die(2, 'no header record in ' + path);
     if (header.schemaVersion !== SCHEMA) die(2, 'unsupported schemaVersion ' + header.schemaVersion + ' (need ' + SCHEMA + ') in ' + path);
-    if (!summary) die(2, 'no summary record in ' + path + ' (an aborted run with no fatal handler?)');
-    return { header, cycles, summary, path };
+    let synthesized = false;
+    if (!summary) {
+        if (!fatals.length) die(2, 'no summary record in ' + path + ' (an aborted run with no fatal handler?)');
+        summary = { reason: 'fatal', verdict: 'FAIL', fatal: true };
+        synthesized = true;
+        loadIssues.push('no summary record: the run died before writing one (' + fatals[0].kind + ')');
+    }
+    // A second summary is legitimate only as the fatal handler's, after a fatal record.
+    if (summaries > 1 && !(summary.reason === 'fatal' && fatals.length)) loadIssues.push(summaries + ' summary records (only a crash after the end writes a second)');
+    return { header, cycles, summary, fatals, loadIssues, synthesized, path };
+}
+
+/** The summary counters main always writes (S12: REQUIRED -- a deleted counter is an issue, not a skip). */
+const SUMMARY_COUNTERS = ['rollups', 'cyclesRun', 'qualityViolations', 'invariantFailures', 'retentionFailures',
+    'poolFailures', 'findings', 'warnings', 'unhandledCount'];
+
+/** A pool cycle that failed any assertion (also used by the baseline diff). */
+function poolCycleFailed(c) {
+    return c.assert1 === false || c.assert2 === false || c.assert3 === false ||
+        c.assert4 === false || c.assert5_outcome === false || c.assert6_retention === false || c.lostRun === true ||
+        (c.trackerSize | 0) !== 0 || c.badCode != null || c.outcomeMiss != null;
 }
 
 /** The chaos phases that SHOULD fire for a lane -- MUST match main.mjs:applicablePhases (kept in sync;
@@ -126,8 +158,18 @@ function laneIdsOf(cycles) {
  *  does NOT defend against consistent forgery of the cycle records themselves (that needs a MAC; out of
  *  scope). Returns { gate, verdict, lanes, issues }. */
 function rederive(doc) {
-    const { header, cycles, summary } = doc;
-    const issues = [];
+    const { header, cycles, summary, fatals } = doc;
+    const issues = doc.loadIssues.slice();
+    // S12: required counters (a non-negative integer each) -- skipped only for a synthesized summary,
+    // which already carries its own issue.
+    if (!doc.synthesized) {
+        for (const k of SUMMARY_COUNTERS) {
+            if (!Number.isInteger(summary[k]) || summary[k] < 0) issues.push('summary.' + k + ' missing or not a count (' + JSON.stringify(summary[k]) + ')');
+        }
+        if (summary.breaches !== undefined && !(Array.isArray(summary.breaches) && summary.breaches.every((b) => typeof b === 'string'))) {
+            issues.push('summary.breaches is not an array of strings');
+        }
+    }
     const kt = cycles.filter((c) => c.tier !== 'pool');
     const poolC = cycles.filter((c) => c.tier === 'pool');
     const lanes = laneIdsOf(cycles);
@@ -138,15 +180,34 @@ function rederive(doc) {
     if (summary.reason && summary.reason !== 'end' && summary.reason !== 'signal') issues.push('run did not complete (reason=' + summary.reason + ')');
     const forever = !!header.config && header.config.cycles === 0 && header.config.durationMs === 0;
     const interrupted = !!summary.reason && summary.reason !== 'end' && !(summary.reason === 'signal' && forever);
-    if (typeof summary.rollups === 'number' && cycles.length !== summary.rollups) issues.push('cycle records ' + cycles.length + ' != summary.rollups ' + summary.rollups);
-    if (typeof summary.cyclesRun === 'number' && cycles.length !== summary.cyclesRun) issues.push('cycle records ' + cycles.length + ' != summary.cyclesRun ' + summary.cyclesRun);
+    if (!doc.synthesized && cycles.length !== summary.rollups) issues.push('cycle records ' + cycles.length + ' != summary.rollups ' + summary.rollups);
+    if (!doc.synthesized && cycles.length !== summary.cyclesRun) issues.push('cycle records ' + cycles.length + ' != summary.cyclesRun ' + summary.cyclesRun);
     // laneRoster is REQUIRED (fail closed): without it the grid check would silently pass a dropped lane.
     if (!Array.isArray(header.laneRoster)) die(2, 'header has no laneRoster (stream predates it) -- regenerate the soak');
     const byLane = new Map();
-    for (const c of cycles) { if (!byLane.has(c.lane)) byLane.set(c.lane, new Set()); byLane.get(c.lane).add(c.cycle); }
+    for (const c of cycles) {
+        if (!byLane.has(c.lane)) byLane.set(c.lane, new Set());
+        const set = byLane.get(c.lane);
+        if (set.has(c.cycle)) issues.push('duplicate cycle record: ' + c.lane + ' cycle ' + c.cycle);
+        set.add(c.cycle);
+    }
     for (const id of header.laneRoster) if (!byLane.has(id)) issues.push('lane missing from stream: ' + id);
+    for (const id of byLane.keys()) if (header.laneRoster.indexOf(id) === -1) issues.push('lane not in header.laneRoster: ' + id);
     const gridCounts = header.laneRoster.filter((id) => byLane.has(id)).map((id) => byLane.get(id).size);
     if (gridCounts.length && gridCounts.some((n) => n !== gridCounts[0])) issues.push('ragged lane x cycle grid (lanes have differing cycle counts)');
+    // S12: each lane's cycles are 0..k-1 (no hole), and a cycle-bound run that ENDED ran exactly
+    // header.config.cycles of them -- dropping whole cycles AND the summary counters no longer passes.
+    for (const [id, set] of byLane) {
+        for (let k = 0; k < set.size; k++) if (!set.has(k)) { issues.push('cycle grid hole: ' + id + ' has ' + set.size + ' cycles but not cycle ' + k); break; }
+    }
+    const wantCycles = header.config && Number.isInteger(header.config.cycles) ? header.config.cycles : null;
+    if (wantCycles === null) issues.push('header.config.cycles missing');
+    else if (wantCycles > 0 && summary.reason === 'end') {
+        for (const id of header.laneRoster) {
+            const n = byLane.has(id) ? byLane.get(id).size : 0;
+            if (n !== wantCycles) issues.push('lane ' + id + ' has ' + n + ' cycles, header.config.cycles = ' + wantCycles);
+        }
+    }
     // Validate the gate-shaping config against the source-of-truth constants (shrinks the header.config
     // trust residual: a tampered warmupCycles/gateN that would force SMOKE is caught). `smoke` stays a
     // legitimate runtime choice and is trusted (documented in ADR 0014).
@@ -176,9 +237,7 @@ function rederive(doc) {
     const qViol = kt.reduce((s, c) => s + ((c.quality && c.quality.totalViolations) | 0), 0);
     const invFail = cycles.filter((c) => c.invariant && c.invariant !== 'green').length;
     const trackFail = cycles.filter((c) => (c.trackerSize | 0) !== 0).length;
-    const poolFail = poolC.filter((c) => c.assert1 === false || c.assert2 === false || c.assert3 === false ||
-        c.assert4 === false || c.assert5_outcome === false || c.assert6_retention === false || c.lostRun === true ||
-        (c.trackerSize | 0) !== 0 || c.badCode != null || c.outcomeMiss != null).length;
+    const poolFail = poolC.filter(poolCycleFailed).length;
 
     // qualityViolations is EXACTLY re-derivable (main sums cycle.quality.totalViolations) -> require it.
     if ((summary.qualityViolations | 0) !== qViol) issues.push('qualityViolations: summary ' + (summary.qualityViolations | 0) + ' != cycles ' + qViol);
@@ -223,7 +282,8 @@ function rederive(doc) {
     const cycleFail = qViol > 0 || invFail > 0 || trackFail > 0 || poolFail > 0 || phasesNotFiredDerived.length > 0;
     const runLevelFail = (summary.findings | 0) !== 0 || (summary.warnings | 0) !== 0 || (summary.unhandledCount | 0) !== 0;
     let verdict = gate.verdict;
-    if (summary.fatal || summary.reason === 'fatal') verdict = VERDICT.FAIL;   // main: a crash is never PASS
+    // main: a crash is never PASS. S12: ANY fatal record counts, also one written after the end summary.
+    if (fatals.length || summary.fatal || summary.reason === 'fatal') verdict = VERDICT.FAIL;
     else if (cycleFail || runLevelFail) verdict = VERDICT.FAIL;
     else if (verdict === VERDICT.PASS && !smoke && inconclusiveDerived.length !== 0) verdict = VERDICT.INCONCLUSIVE;
     return { gate, verdict, lanes, issues };
@@ -257,6 +317,7 @@ const file = args.file || mostRecentJsonl();
 const doc = load(file);
 const { header, cycles, summary } = doc;
 const { gate, verdict, lanes, issues } = rederive(doc);
+const breachList = Array.isArray(summary.breaches) ? summary.breaches.filter((b) => typeof b === 'string') : [];
 
 process.stdout.write('soak:report ' + file.replace(ROOT, '') + '\n');
 process.stdout.write('  pkg ' + header.pkgVersion + '  git ' + (header.gitSha ? header.gitSha.slice(0, 7) : '?') +
@@ -275,10 +336,9 @@ process.stdout.write('  kernel ' + (kh.pickSha256 ? kh.pickSha256.slice(0, 12) :
 const integrityOk = verdict === summary.verdict && issues.length === 0;
 process.stdout.write('  verdict recorded=' + summary.verdict + '  re-derived=' + verdict +
     (integrityOk ? '  [integrity OK]' : '  [INTEGRITY MISMATCH]') + '\n');
-for (const iss of issues) process.stdout.write('    ! ' + iss + '\n');
-if (summary.breaches && summary.breaches.length) {
-    for (const b of summary.breaches) process.stdout.write('    breach: ' + b + '\n');
-}
+for (const iss of issues) { process.stdout.write('    ! ' + iss + '\n'); process.stderr.write('soak:report: ISSUE ' + iss + '\n'); }
+for (const f of doc.fatals) process.stdout.write('    FATAL ' + f.kind + (f.lane != null ? ' lane=' + f.lane : '') + (f.cycle != null ? ' cycle=' + f.cycle : '') + ': ' + f.message + '\n');
+for (const b of breachList) process.stdout.write('    breach: ' + b + '\n');
 for (const why of gate.inconclusive) process.stdout.write('    inconclusive: ' + why + '\n');
 for (const nt of gate.notes) process.stdout.write('    note: ' + nt + '\n');
 
@@ -298,6 +358,14 @@ for (const pl of gate.perLane) {
 let regressionFail = false;
 if (args.baseline) {
     const base = load(args.baseline);
+    // S12: the baseline must itself be sound evidence -- integrity OK and not an overridden stream.
+    const bd = rederive(base);
+    const bkh = base.header.kernel || {};
+    if (bd.issues.length || bd.verdict !== base.summary.verdict) {
+        for (const iss of bd.issues) process.stderr.write('soak:report: ISSUE baseline: ' + iss + '\n');
+        die(1, 'BASELINE INTEGRITY MISMATCH -- ' + (bd.verdict !== base.summary.verdict ? 're-derived ' + bd.verdict + ' != recorded ' + base.summary.verdict : bd.issues.length + ' issue(s)'));
+    }
+    if ((bkh.kernelOverride === true || bkh.poolOverride === true) && !args.allowOverride) die(1, 'the BASELINE ran an overridden kernel/pool; pass --allow-override to compare against it');
     const bwarm = base.header.config ? base.header.config.warmupCycles : 0;
     const bN = base.header.config ? base.header.config.gateN : 3;
     const cwarm = header.config ? header.config.warmupCycles : 0;
@@ -318,8 +386,9 @@ if (args.baseline) {
         const baseP99 = lateMedian(base.cycles, lane, 'latency.p99', bwarm, bN);
         const curHeap = lateMedian(cycles, lane, 'heapUsedMB', cwarm, cN);
         const baseHeap = lateMedian(base.cycles, lane, 'heapUsedMB', bwarm, bN);
-        const curQ = cycles.filter((c) => c.lane === lane).reduce((s, c) => s + ((c.quality && c.quality.violations) | 0), 0);
-        const baseQ = base.cycles.filter((c) => c.lane === lane).reduce((s, c) => s + ((c.quality && c.quality.violations) | 0), 0);
+        // S12: totalViolations (oracle + weight-0 + chi-square), not `violations` (oracle only).
+        const curQ = cycles.filter((c) => c.lane === lane).reduce((s, c) => s + ((c.quality && c.quality.totalViolations) | 0), 0);
+        const baseQ = base.cycles.filter((c) => c.lane === lane).reduce((s, c) => s + ((c.quality && c.quality.totalViolations) | 0), 0);
         const notes = [];
         if (baseOps && curOps != null) {
             const d = (curOps - baseOps) / baseOps * 100;
@@ -335,11 +404,20 @@ if (args.baseline) {
         if (baseQ === 0 && curQ > 0) { regressionFail = true; notes.push('QUALITY 0 -> ' + curQ + ' violations'); }
         if (notes.length) process.stdout.write('    ' + lane.padEnd(20) + notes.join('; ') + '\n');
     }
+    // S12: pool lanes are diffed too -- a pool lane dropped, or failing where the baseline passed.
+    const poolLanesOf = (cs) => [...new Set(cs.filter((c) => c.tier === 'pool').map((c) => c.lane))];
+    const curPool = poolLanesOf(cycles);
+    for (const pl of poolLanesOf(base.cycles)) {
+        if (curPool.indexOf(pl) === -1) { regressionFail = true; process.stdout.write('    ' + pl.padEnd(20) + 'LANE MISSING from current run (was in baseline)\n'); continue; }
+        const curF = cycles.filter((c) => c.lane === pl && poolCycleFailed(c)).length;
+        const baseF = base.cycles.filter((c) => c.lane === pl && poolCycleFailed(c)).length;
+        if (baseF === 0 && curF > 0) { regressionFail = true; process.stdout.write('    ' + pl.padEnd(20) + 'POOL 0 -> ' + curF + ' failing cycle(s)\n'); }
+    }
     if (!regressionFail) process.stdout.write('    no regression on shared lanes\n');
 }
 
 // SVG report (--out) -----------------------------------------------------------------------------
-if (args.out) { writeFileSync(args.out, renderHtml(doc, gate, verdict)); process.stdout.write('  wrote ' + args.out + '\n'); }
+if (args.out) { writeFileSync(args.out, renderHtml(doc, gate, verdict, integrityOk, issues, breachList)); process.stdout.write('  wrote ' + args.out + '\n'); }
 
 // exit: integrity mismatch, a regression, or an overridden kernel/pool is a hard failure.
 if (overridden && !args.allowOverride) die(1, 'NOT A RELEASE SOAK -- the stream ran an overridden ' + (kh.kernelOverride ? 'kernel' : 'pool') + ' (SOAK_KERNEL/SOAK_POOL); pass --allow-override to analyse it anyway');
@@ -367,7 +445,7 @@ function sparkline(values, w, h, color) {
         '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.5"/>' +
         '<title>min ' + min.toFixed(2) + ' max ' + max.toFixed(2) + '</title></svg>';
 }
-function renderHtml(doc, gate, verdict) {
+function renderHtml(doc, gate, verdict, integrityOk, issues, breachList) {
     const { header, cycles, summary } = doc;
     const lanes = laneIdsOf(cycles);
     const metrics = [
@@ -401,7 +479,12 @@ function renderHtml(doc, gate, verdict) {
         '<div class="meta">pkg ' + esc(header.pkgVersion) + ' &middot; git ' + esc(header.gitSha ? header.gitSha.slice(0, 7) : '?') + (header.gitDirty ? '-dirty' : '') +
         ' &middot; ' + esc(String(summary.cyclesRun)) + ' cycles &middot; ' + esc(String(lanes.length)) + ' lanes &middot; ' + esc(String(summary.wallSec)) + 's' +
         ' &middot; node ' + esc(header.node || '?') + '</div>' +
-        (summary.breaches && summary.breaches.length ? '<div class="meta" style="color:#ef4444">' + summary.breaches.map(esc).join('<br>') + '</div>' : '') +
+        // S12: the integrity status and any fatal record are part of the evidence -- show them.
+        '<div class="meta">integrity: <b style="color:' + (integrityOk ? '#10b981' : '#ef4444') + '">' + (integrityOk ? 'OK' : 'MISMATCH') + '</b>' +
+        ' &middot; recorded ' + esc(summary.verdict) + ', re-derived ' + esc(verdict) +
+        (issues.length ? '<br>' + issues.map(esc).join('<br>') : '') + '</div>' +
+        (doc.fatals.length ? '<div class="meta" style="color:#ef4444">' + doc.fatals.map((f) => 'FATAL ' + esc(f.kind) + ': ' + esc(f.message)).join('<br>') + '</div>' : '') +
+        (breachList.length ? '<div class="meta" style="color:#ef4444">' + breachList.map(esc).join('<br>') + '</div>' : '') +
         '<table><thead><tr><th>lane</th>' + head + '</tr></thead><tbody>' + rows + '</tbody></table>' +
         '<div class="meta" style="margin-top:16px">Time axis = cycle. Generated by benchmark/soak/SoakReport.mjs (no charting peer; inline SVG).</div>' +
         '</body></html>';

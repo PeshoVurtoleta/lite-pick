@@ -70,6 +70,17 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   `gcMajor` gate first; its only effect was near-miss noise under load. Both are still computed and
   recorded (`gcPause.wouldFail`), never a FAIL, and a missing `gcPauseAvgMs` no longer makes a run
   INCONCLUSIVE. `npm test` fails if either becomes FAIL-capable again without a control.
+- **Benchmark-only: `soak:report` fails closed on a tampered stream or baseline (S12, audit
+  2026-09-29).** Deleting fields used to skip checks: dropping 8 of 11 cycles per lane and deleting
+  `summary.rollups`/`cyclesRun` re-derived "integrity OK". Now every summary counter is required, `seq`
+  must run 0..n-1, a cycle-bound run that ended must hold exactly `header.config.cycles` cycles per lane
+  (no holes, no duplicates), and any `fatal` record re-derives FAIL, also one written after the end
+  summary. `--baseline` compares all quality violations (`totalViolations`: a weight-0 regression used
+  to read "no regression"), diffs pool lanes too, and refuses a baseline that fails integrity or ran an
+  overridden kernel/pool. A string `summary.breaches` is an issue instead of a TypeError, and the HTML
+  shows the integrity status, every issue and every fatal message. Each issue is also printed to stderr
+  as `soak:report: ISSUE <text>`. Seven new teeth controls (`RPT S12 ...`) edit genuine streams and must
+  be caught; all seven pass against the pre-S12 report, six of them with exit 0.
 - **Repository: LF line endings on every OS.** A new `.gitattributes` (`* text=auto eol=lf`). Windows
   runners check out with `core.autocrlf=true`, which broke `test/RecipesDoc.test.js` (red on
   windows-latest since it was added) and `test/SoakTeeth.test.js`, and would make a Windows checkout of

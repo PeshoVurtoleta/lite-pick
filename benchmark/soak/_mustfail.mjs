@@ -133,7 +133,8 @@ let lastT = Date.now();   // per-control wall time (the battery's cost is budget
  */
 function matchWant(stderr, spec) {
     const lines = stderr.split('\n');
-    if (spec.startsWith('soak: ')) return lines.some((l) => l.startsWith(spec));
+    // 'soak: ' (soak NOTE / INCONCLUSIVE) and 'soak:report: ' (report ISSUE / verdict) specs: a line prefix.
+    if (spec.startsWith('soak: ') || spec.startsWith('soak:report: ')) return lines.some((l) => l.startsWith(spec));
     const toks = spec.split(' ').filter(Boolean);
     for (const l of lines) {
         if (!l.startsWith('soak: BREACH ')) continue;
@@ -499,6 +500,54 @@ if (want('RPT overridden pool -> not a release soak')) {
     reportControl('RPT overridden pool -> not a release soak', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_POOL: pp }, 1);
 }
 reportControl('RPT genuine FAIL stream -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 0);
+
+// --- S12 (audit 2026-09-29): soak:report fails CLOSED on a tampered stream or baseline. Each control edits
+// a GENUINE stream (generated once per env, cached) and asserts the report exits 1 naming the issue -- the
+// untampered streams pass above. `edit(records)` returns the edited record list (seq left as written unless
+// the edit is about seq). ----------------------------------------------------------------------------------
+const streamCache = new Map();
+function genuineStream(env) {
+    const key = JSON.stringify(env);
+    if (!streamCache.has(key)) {
+        const p = join(TMP, 'gen-' + (idx++) + '.jsonl');
+        try { execFileSync(NODE, NODE_FLAGS.concat(['benchmark/soak/main.mjs']), { cwd: ROOT, env: Object.assign({}, process.env, env, { SOAK_OUT: p }), stdio: 'ignore', timeout: RUN_TIMEOUT_MS }); } catch { /* a FAIL stream is still a genuine stream */ }
+        streamCache.set(key, p);
+    }
+    return streamCache.get(key);
+}
+function editedStream(src, edit) {
+    const recs = readFileSync(src, 'utf8').split('\n').filter((l) => l.trim() !== '').map((l) => JSON.parse(l));
+    const p = join(TMP, 'tamper-' + (idx++) + '.jsonl');
+    writeFileSync(p, edit(recs).map((r) => JSON.stringify(r)).join('\n') + '\n');
+    return p;
+}
+const reseq = (recs) => recs.map((r, i) => Object.assign(r, { seq: i }));   // a CONSISTENT forger renumbers
+function runReport(file, extra) {
+    const r = spawnSync(NODE, ['benchmark/soak/SoakReport.mjs', file].concat(extra || []), { cwd: ROOT, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: RUN_TIMEOUT_MS });
+    return { status: r.status === null ? -1 : r.status, stderr: String(r.stderr || '') };
+}
+function tamperControl(name, env, edit, wantSpec, baselineOf, moreArgs) {
+    if (!want(name)) return;
+    if (LIST) return listed(name, 'report', env, 1, wantSpec);
+    const cur = edit ? editedStream(genuineStream(env), edit) : genuineStream(env);
+    const extra = (baselineOf ? ['--baseline', baselineOf()] : []).concat(moreArgs || []);
+    record(name, runReport(cur, extra), 1, wantSpec);
+}
+const RPT_ENV = { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' };
+// drop 8 of the 11 cycles of every lane AND delete the two counters that used to be the only cycle check.
+tamperControl('RPT S12 dropped cycles + deleted counters', RPT_ENV, (recs) => reseq(recs.filter((r) => !(r.type === 'cycle' && r.cycle >= 3)).map((r) => {
+    if (r.type === 'summary') { delete r.rollups; delete r.cyclesRun; } return r;
+})), 'soak:report: ISSUE summary.rollups missing');
+tamperControl('RPT S12 seq gap', RPT_ENV, (recs) => recs.filter((r, i) => i !== 5), 'soak:report: ISSUE seq: record 5');
+tamperControl('RPT S12 fatal after the end', RPT_ENV, (recs) => recs.concat([{ type: 'fatal', seq: recs.length, kind: 'uncaughtException', lane: null, cycle: null, message: 'late crash', stack: null }]),
+    'soak:report: INTEGRITY MISMATCH -- re-derived verdict FAIL');
+tamperControl('RPT S12 string breaches (no crash)', RPT_ENV, (recs) => recs.map((r) => { if (r.type === 'summary') r.breaches = 'none'; return r; }),
+    'soak:report: ISSUE summary.breaches is not an array of strings', null, ['--out', join(TMP, 'tamper.html')]);   // the HTML path used to TypeError
+// baseline diffs: a weight-0 regression (totalViolations, not oracle-only violations) and a pool regression.
+const WR_ENV = { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' };
+tamperControl('RPT S12 baseline: weight-0 regression', { ...WR_ENV, SOAK_MUSTFAIL: 'weight0' }, null, 'soak:report: REGRESSION vs baseline', () => genuineStream(WR_ENV));
+tamperControl('RPT S12 baseline: pool regression', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolleak' }, null, 'soak:report: REGRESSION vs baseline', () => genuineStream({ ...PA, SOAK_LANES: 'PoolP2C' }));
+tamperControl('RPT S12 baseline integrity', RPT_ENV, null, 'soak:report: BASELINE INTEGRITY MISMATCH', () => editedStream(genuineStream(RPT_ENV), (recs) => recs.filter((r, i) => i !== 5)));
 
 if (out.length === 0) { allOk = false; out.push('  MISS MUSTFAIL_ONLY=' + process.env.MUSTFAIL_ONLY + ' selected no control'); }
 if (LIST) {

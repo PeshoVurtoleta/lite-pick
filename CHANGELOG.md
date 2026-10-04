@@ -56,6 +56,24 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   if it saw none (and the snapshots agree). Clean kernels still read 0 B/op; cost ~4% of soak runtime.
   New kernel mutants: M17 (SED weight-blind score), M18 (NQ never-queue shortcut removed), M19 (2 KB per
   pick -> hotAlloc gross tier). Declared gaps: 11 -> 8.
+- **Benchmark-only: the teeth battery covers every check that can decide a soak verdict (audit
+  2026-09-29).** No declared gaps remain. New controls: M20 (a kernel whose `setEligible(i, true)` is
+  ignored -> the freeze self-check) and MM8 (new mode `phaseskip` -> the chaos-phase self-check). Three
+  checks no kernel, Pool mutant or mode can reach are listed as `UNREACHABLE` in `teeth.mjs`, each with a
+  proof in `npm test`: the zero-work `totalPicks` gate and the "hotAlloc measured nothing" INCONCLUSIVE
+  (unit runs of the real gate code), and the lite-leak `tracker` findings line (main.mjs registers no
+  kernel, so it cannot report; pinned to the source).
+- **Benchmark-only: two soak gates are report-only (audit 2026-09-29).** `rebuild` could never activate
+  (~8 timed rebuilds per lane-cycle against 2000 samples needed per window). `gcPause` could not trip
+  on its own: with the semi-space pinned at 4 MB the mean scavenge pause plateaus near 1 ms (Apple M4),
+  below its early x 2 + 1 ms bound, and every mutant that pushed it higher promoted and failed the hard
+  `gcMajor` gate first; its only effect was near-miss noise under load. Both are still computed and
+  recorded (`gcPause.wouldFail`), never a FAIL, and a missing `gcPauseAvgMs` no longer makes a run
+  INCONCLUSIVE. `npm test` fails if either becomes FAIL-capable again without a control.
+- **Repository: LF line endings on every OS.** A new `.gitattributes` (`* text=auto eol=lf`). Windows
+  runners check out with `core.autocrlf=true`, which broke `test/RecipesDoc.test.js` (red on
+  windows-latest since it was added) and `test/SoakTeeth.test.js`, and would make a Windows checkout of
+  `Pick.js` fail `npm run parity`.
 - **Benchmark-only: a real parity gate for the shipped code (S6, audit 2026-09-29).** ADR 0014 said a
   sha256 parity gate kept the kernel byte-identical across the soak redesign; none existed. Now
   `npm run parity` checks `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` and `test/invariants.mjs`

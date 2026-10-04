@@ -1,0 +1,5 @@
+# LF everywhere, on every OS (audit 2026-09-29 follow-up). Windows runners check out with core.autocrlf=true,
+# which turned LF into CRLF: test/RecipesDoc.test.js and test/SoakTeeth.test.js read source text by
+# LF patterns (red on windows-latest), and benchmark/soak/parity.json pins LF bytes (a CRLF Pick.js never
+# matches its sha256). Binary files are detected by text=auto and left alone.
+* text=auto eol=lf

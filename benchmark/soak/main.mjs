@@ -635,7 +635,9 @@ async function main() {
             // T8 self-check accumulation: merge this cycle's per-phase counts into the lane's totals.
             if (!phaseTotals.has(laneId)) { phaseTotals.set(laneId, {}); phaseApplicable.set(laneId, applicablePhases(lane, core.hasRebuild)); }
             const pt = phaseTotals.get(laneId);
-            for (const k in core.phase) pt[k] = (pt[k] || 0) + core.phase[k];
+            // MUSTFAIL=phaseskip teeth: drop the 'recover' phase's count (a scheduler that never reaches a
+            // regime) -> the T8 self-check must FAIL with a `phases` breach.
+            for (const k in core.phase) if (!(MF === 'phaseskip' && k === 'recover')) pt[k] = (pt[k] || 0) + core.phase[k];
 
             if (tier === 'kernel') lanesSeen.add(laneId);
             if (!core.quality.green) {
@@ -664,7 +666,7 @@ async function main() {
             const rollup = {
                 lane: laneId, cycle, tier,
                 heapUsedMB: b.heapUsedMB, rssMB: b.rssMB,
-                // S2: the gated pause is the MEAN workload pause (gcPauseAvgMs); the per-cycle MAX is
+                // S2: the pause metric is the MEAN workload pause (gcPauseAvgMs, report-only since 9c3); the MAX is
                 // extreme-value noise and stays telemetry (gcPauseMs, its 1.0 name kept for continuity).
                 gcMajor: b.workloadMajor, gcPauseMs: b.workloadMaxPauseMs, gcMinor: b.workloadMinor,
                 gcPauseAvgMs: b.workloadAvgPauseMs, gcPauseCount: b.workloadPauseCount,

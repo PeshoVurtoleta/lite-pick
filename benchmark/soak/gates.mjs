@@ -27,6 +27,15 @@ export const VERDICT = Object.freeze({ PASS: 'PASS', FAIL: 'FAIL', INCONCLUSIVE:
 // and that each one is tripped by a must-fail control (or is a declared gap in teeth.mjs).
 export const GATE_NAMES = Object.freeze(['gcMajor', 'hotAlloc', 'heap', 'rss', 'hotOps', 'hotOpsSparse', 'gcPause',
     'latencyP99', 'rebuild', 'totalPicks']);
+// Judged and recorded, but NEVER a FAIL (verdict STUB; teeth burst 9c3, audit 2026-09-29):
+//   rebuild -- the rebuild-storm phase yields ~8 timed rebuilds per lane-cycle, so a 5-cycle window never
+//     reaches LAT_MIN_SAMPLES (2000): the gate could only ever be STUB. Explicit now, instead of implicit.
+//   gcPause -- with semi-space pinned at 4 MB a scavenge copies at most ~4 MB, so the MEAN pause plateaus
+//     near 1 ms (Apple M4) and cannot pass early*2+1 ms; every mutant that raised it far enough promoted
+//     and tripped the hard gcMajor gate first (ring-of-survivors mutants: 1.05 ms vs a ~1.2 ms limit, and
+//     0.43 ms with gcMajor + heap failing). A gate that can only fire on noise is pure flake risk (ADR 0014).
+// test/SoakTeeth.test.js pins both: making either FAIL-capable again fails it until a control proves it.
+export const REPORT_ONLY_GATES = Object.freeze(['rebuild', 'gcPause']);
 
 // Named gate constants (one-line tunable; NEVER widen to make a gate pass).
 export const HEAP_MULT = 1.10;         // late heap median <= early median * this ...
@@ -44,7 +53,8 @@ export const LAT_ADD_TICKS = 2;        // wall-clock granularity floor = this * 
                                        // Two ticks is the minimal floor; a real regression exceeds it easily.
 export const LAT_ADD_NS_FALLBACK = 100; // used only if timerFloorNs is unavailable
 export const LAT_MIN_SAMPLES = 2000;   // per early/late window; below this the gate is INACTIVE (never PASS)
-// S2 (audit 2026-09-29): a TIMING drift (hotOps, hotOpsSparse, gcPause, latencyP99) FAILs only when it
+// S2 (audit 2026-09-29): a TIMING drift (hotOps, hotOpsSparse, latencyP99; gcPause computes the same test
+// but is report-only since 9c3) FAILs only when it
 // breaches its ratio bound (the minimum effect size, above) AND is statistically real: an exact one-sided
 // Mann-Whitney test of the early vs late window gives p < MW_ALPHA. With N=5 per side the smallest
 // attainable p is 1/252 = 0.004, so p < 0.01 needs (near-)complete separation of the two windows -- one or
@@ -226,8 +236,8 @@ function pushRow(st, r) {
     st.elRss.push(r.rssMB);
     st.elOps.push(r.hotOpsDense);
     st.elOpsSparse.push(r.hotOpsSparse);
-    // S2: gate the MEAN workload pause (gcPauseAvgMs); the per-cycle max (gcPauseMs) is telemetry. A record
-    // without it (a pre-S2 stream) makes the gate INCONCLUSIVE, never a NaN that compares false = PASS.
+    // S2: the MEAN workload pause (gcPauseAvgMs) is the gcPause metric (report-only since 9c3); the per-cycle
+    // max (gcPauseMs) is telemetry. A record without it (a pre-S2 stream) marks the metric missing.
     if (typeof r.gcPauseAvgMs === 'number' && Number.isFinite(r.gcPauseAvgMs)) st.elPause.push(r.gcPauseAvgMs);
     else st.pauseMissing = true;
     // Gate on p99 (top 1% ~ 960 of 96000 samples): p999 individual sub-microsecond-pick timing is
@@ -370,26 +380,25 @@ export class GateAccumulator {
             opsSparseGate = { verdict: reportOnlyThroughput ? VERDICT.STUB : (spFail ? VERDICT.FAIL : VERDICT.PASS), earlyMedian: r0(sp.early), lateMedian: r0(sp.late), limit: r0(spLimit), earlyMad: r0(sp.mad), p: +sp.p.toFixed(4), reportOnly: reportOnlyThroughput };
             if (opsSparseGate.verdict === VERDICT.FAIL) breaches.push('hotOpsSparse[' + laneName + '] late=' + r0(sp.late) + ' < limit=' + r0(spLimit) + ' (p=' + sp.p.toFixed(4) + ')');
 
-            // S2: the MEAN pause (not the per-cycle max), same significance rule in the upward direction.
+            // gcPause is REPORT-ONLY (REPORT_ONLY_GATES): the MEAN pause, same significance rule upward, is
+            // computed and recorded (wouldFail), never a breach and never INCONCLUSIVE.
             if (st.pauseMissing) {
-                pauseGate = { verdict: VERDICT.INCONCLUSIVE, reason: 'gcPauseAvgMs missing from a record' };
-                inconclusive.push('gcPause[' + laneName + '] has records without gcPauseAvgMs');
+                pauseGate = { verdict: VERDICT.STUB, reportOnly: true, reason: 'gcPauseAvgMs missing from a record' };
             } else {
                 const pz = shiftStats(elPause, +1);
                 const pLimit = pz.early * GCPAUSE_MULT + GCPAUSE_ADD_MS;
                 const pFail = pz.late > pLimit && pz.p < MW_ALPHA;
-                pauseGate = { verdict: pFail ? VERDICT.FAIL : VERDICT.PASS, earlyMedianMs: r2(pz.early), lateMedianMs: r2(pz.late), limitMs: r2(pLimit), earlyMadMs: r2(pz.mad), p: +pz.p.toFixed(4) };
-                if (pFail) breaches.push('gcPause[' + laneName + '] mean late=' + r2(pz.late) + 'ms > limit=' + r2(pLimit) + 'ms (p=' + pz.p.toFixed(4) + ')');
+                pauseGate = { verdict: VERDICT.STUB, reportOnly: true, wouldFail: pFail, earlyMedianMs: r2(pz.early), lateMedianMs: r2(pz.late), limitMs: r2(pLimit), earlyMadMs: r2(pz.mad), p: +pz.p.toFixed(4) };
             }
         }
 
         const gates = {
             gcMajor: gcMajorGate, hotAlloc: hotAllocGate,
             heap: heapGate, rss: rssGate, hotOps: opsGate, hotOpsSparse: opsSparseGate, gcPause: pauseGate,
-            // T16: latency p99 drift + rebuild p99 drift (both report-only for tiny lanes). p999/max are
-            // in the cycle record; the gate is on p99 (the robust tail; see the accumulation note above).
+            // T16: latency p99 drift (report-only for tiny lanes) + rebuild p99 (REPORT-ONLY everywhere, see
+            // REPORT_ONLY_GATES). p999/max are in the cycle record; latency gates on p99 (the robust tail).
             latencyP99: latencyGate('latencyP99', laneName, elLatP999, elLatSamples, opts.smoke, post >= activeFloor, reportOnlyThroughput, latAddNs, breaches),
-            rebuild: latencyGate('rebuild', laneName, elRebuildP99, elRebuildSamples, opts.smoke, post >= activeFloor, reportOnlyThroughput, latAddNs, breaches),
+            rebuild: latencyGate('rebuild', laneName, elRebuildP99, elRebuildSamples, opts.smoke, post >= activeFloor, true, latAddNs, breaches),
         };
         for (const k of Object.keys(gates)) {
             const v = gates[k].verdict;

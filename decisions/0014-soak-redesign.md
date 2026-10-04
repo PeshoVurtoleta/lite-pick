@@ -224,3 +224,19 @@ it false-FAILs a correct kernel. Two decisions change:
   `sampleWindows` now brackets each window with `v8.GCProfiler` (synchronous stop(), every GC listed) and
   keeps the snapshot checks as a second condition. Clean lanes read 0 B/op as before; ~4% runtime. Gaps 8,
   all for 9c3.
+- **Burst 9c3 (2026-10-04) -- no declared gaps.** M20 (`setEligible(i, true)` ignored -> `invariants
+  kind=freeze` on SED) and MM8 (new mode `phaseskip` -> `phases`). `teeth.mjs` gains `UNREACHABLE`: checks
+  no kernel/Pool mutant or mode can reach through main.mjs, each proven in `npm test` instead -- `totalPicks`
+  and "hotAlloc measured nothing" by unit runs of `GateAccumulator`, `tracker` by a source pin (main.mjs
+  registers no lite-leak kernel, so findings/warnings cannot occur; retention via `tracker.size()` is the
+  live check).
+- **gcPause and rebuild are report-only (`REPORT_ONLY_GATES`).** This closes the gcPause open risk above.
+  The search for a gcPause mutant showed the gate has no independent teeth: with the semi-space pinned at
+  4 MB a scavenge copies at most ~4 MB, so the mean pause plateaus near 1 ms on an Apple M4 (a growing
+  ring of young survivors: 0.07 -> 1.05 ms, limit ~1.2 ms), and every mutant that raised it promoted
+  objects and failed the hard `gcMajor` = 0 gate (and heap/hotOps) first. A gate that can fire only on
+  noise is the flake risk without the protection, so it now records `wouldFail` and never FAILs. `rebuild`
+  never reached `LAT_MIN_SAMPLES` (~8 timed rebuilds per lane-cycle vs 2000 per window) and was a STUB on
+  every run; it is now report-only by declaration. The meta-test feeds both gates input far past their
+  bounds and fails if either can FAIL again; re-enabling one requires a control. A missing `gcPauseAvgMs`
+  no longer makes a run INCONCLUSIVE.

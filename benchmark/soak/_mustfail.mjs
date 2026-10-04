@@ -310,6 +310,14 @@ control('M19 2KB/pick sustained (hotAlloc gross)',
     patch(PICK, RR_ANCHOR, RR_INJECT('this.__o = new Array(256);')),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 1, 'gate=hotAlloc lane=RoundRobin');
 
+// --- burst 9c3 (audit 2026-09-29) ---------------------------------------------------------------------
+// M20: setEligible(i, true) is ignored (a node, once down, never comes back -- BalancerBase, so every lane
+// without its own override). Chaos then drains eligibility, and the freeze self-check (>= 8 positive-weight
+// eligible nodes on a weighted lane, or the quality oracles judge a degenerate pool) trips on SED.
+control('M20 setEligible up ignored (freeze)',
+    patch(PICK, '        const now = up ? 1 : 0;', '        const now = 0;'),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'SED' }, 1, 'invariants lane=SED kind=freeze');
+
 // M16 (NIT1): a periodic allocation RARER than one B/op pass (64KB every 2^20 picks, ~0.0625 B/op = 3x
 // the bound). The MIN estimator misses it (it lands in only one pass per cycle, like a one-off), but it
 // RECURS every cycle -> the cross-cycle recurrence rule (max(pass1,pass2) > bound in >=2 cycles) trips.
@@ -372,6 +380,8 @@ modeControl('MM4 imbalance -> RR quality', { SOAK_CYCLES: CYC, SOAK_PICKS: Strin
 modeControl('MM5 rss -> rss + gcMajor', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'rss' }, 1, ['gate=rss lane=RoundRobin', 'gate=gcMajor lane=RoundRobin']);
 modeControl('MM6 poolbadcode -> A4', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolbadcode' }, 1, 'pool=A4 lane=PoolP2C');
 modeControl('MM7 poolretain -> A6', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolretain' }, 1, 'pool=A6 lane=PoolP2C');
+// phaseskip: the T8 self-check (every applicable chaos phase fired) must FAIL when one never counts.
+modeControl('MM8 phaseskip -> phases', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'phaseskip' }, 1, 'phases lane=RoundRobin');
 // I3 (S5): a lane whose quality windows never fill (RoundRobin at the 20000-pick floor) is INCONCLUSIVE.
 modeControl('I3 quality windows never sufficient', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin' }, 3, 'soak: INCONCLUSIVE -- quality windows never sufficient for lane(s): RoundRobin');
 

@@ -46,7 +46,9 @@ export const MUSTFAIL_MODES = Object.freeze(['leak', 'heap', 'slowleak', 'rss', 
     // pool-lane teeth (T14-15): poolleak->quiescence(A2), poolnote->totalInflight(A1), poolbadcode->
     // rejection-codes(A4), poolretain->retention(A6), poolunhandled->A7. (A3 accounting is proven by the
     // real Pool.js mutant MP3; the never-wired `pooldrop` mode was removed, audit 2026-09-29.)
-    'poolleak', 'poolnote', 'poolbadcode', 'poolretain', 'poolunhandled']);
+    'poolleak', 'poolnote', 'poolbadcode', 'poolretain', 'poolunhandled',
+    // the T8 chaos self-check (teeth 9c3): phaseskip drops one phase's count -> `phases` breach.
+    'phaseskip']);
 
 const DURATION_RE = /^[1-9]\d*(s|m|h)$/;
 const INT_RE = /^-?\d+$/;

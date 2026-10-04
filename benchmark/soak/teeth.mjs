@@ -5,7 +5,7 @@
  * proves yet. A gate without a control is a gate nobody has seen trip -- the S11/coverage finding. The meta-
  * test test/SoakTeeth.test.js lists the battery (`MUSTFAIL_LIST=1 node _mustfail.mjs`: builds every mutant,
  * runs nothing) and FAILS when
- *   1. a check is neither covered by a control nor a declared gap (a new gate / oracle / mode with no teeth);
+ *   1. a check is neither covered by a control, nor UNREACHABLE (with a proof), nor a declared gap;
  *   2. a declared gap IS covered (stale -- delete it, so this list only ever shrinks honestly);
  *   3. a control's spec is not well-formed against this manifest (validSpec: an unknown family, gate,
  *      pool assertion, lane, kind or line cause -- a typo'd spec can never match and would only MISS at
@@ -25,7 +25,7 @@
  * Zero-dep (Node 18 runs `npm test` with no install): imports only the soak's own pure modules.
  */
 
-import { GATE_NAMES } from './gates.mjs';
+import { GATE_NAMES, REPORT_ONLY_GATES } from './gates.mjs';
 import { MUSTFAIL_MODES } from './config.mjs';
 import { ROSTER } from './lanes.mjs';
 import { POOL_LANES } from './pool-lane.mjs';
@@ -37,7 +37,7 @@ export const POOL_ASSERTIONS = Object.freeze(['A1', 'A2', 'A3', 'A4', 'A5', 'A6'
 /** `soak: BREACH quality ... kind=` values (oracle violation, weight-0 pick, chi-square rejection). */
 export const QUALITY_KINDS = Object.freeze(['oracle', 'weightZero', 'chiSquare']);
 /** Every `soak: INCONCLUSIVE -- <cause>` line prefix (gates.mjs inconclusive[], main.mjs quality lanes). */
-export const INCONCLUSIVE_CAUSES = Object.freeze(['run interrupted before its end', 'lane ', 'hotAlloc[', 'gcPause[',
+export const INCONCLUSIVE_CAUSES = Object.freeze(['run interrupted before its end', 'lane ', 'hotAlloc[',
     'quality windows never sufficient']);
 /** Every `soak: NOTE -- <gate>[` report-only line (gates.mjs notes[]). */
 export const NOTE_GATES = Object.freeze(['hotAlloc']);
@@ -47,7 +47,8 @@ function breachCheck(spec) { return { id: spec, kind: 'breach', tokens: spec.spl
 /** The full universe, derived from the lists above (each list is itself pinned to the code by the test). */
 export function checks() {
     const out = [];
-    for (const g of GATE_NAMES) out.push(breachCheck('gate=' + g));
+    // A report-only gate can never FAIL, so it has nothing to trip (the meta-test pins that it cannot).
+    for (const g of GATE_NAMES) if (REPORT_ONLY_GATES.indexOf(g) === -1) out.push(breachCheck('gate=' + g));
     for (const l of ROSTER) out.push(breachCheck('quality lane=' + l));
     for (const k of QUALITY_KINDS) out.push(breachCheck('quality kind=' + k));
     out.push(breachCheck('invariants'), breachCheck('invariants kind=freeze'), breachCheck('retention'));
@@ -60,20 +61,26 @@ export function checks() {
 }
 
 /**
- * Declared gaps: check id -> why it has no control yet. Burst 9c3 (audit 2026-09-29) adds the controls (or
- * a decision) and deletes these lines; the meta-test fails on any line whose check became covered. NEVER
- * add a line here to make the meta-test pass for a NEW gate -- a new gate ships with its control.
+ * Checks that main.mjs CANNOT produce from any kernel mutant, Pool mutant or SOAK_MUSTFAIL mode -- each
+ * with the reason. The meta-test holds one proof per entry instead of a control: a unit run of the REAL
+ * gate code (GateAccumulator, the same object main.mjs feeds) showing the check fires on the input main
+ * can never build, or a source pin on the reason itself (so the entry is revisited if the reason goes away).
+ * A covered check may not stay here (the meta-test fails), and an entry needs its proof.
  */
-export const GAPS = Object.freeze({
-    'gate=gcPause': '9c3: needs a mutant that lengthens late GC pauses',
-    'gate=rebuild': '9c3: the rebuild series can never activate (too few samples); make it report-only or add a micro-bench',
-    'gate=totalPicks': '9c3: needs a run that does no work',
-    'invariants kind=freeze': '9c3: needs a run that drains positive-weight eligibility below 8',
-    'phases': '9c3: needs a run where a chaos phase never fires',
-    'tracker': '9c3: needs a run with a lite-leak tracker finding',
-    'soak: INCONCLUSIVE -- hotAlloc[': '9c3: needs a lane whose every hot window saw a GC',
-    'soak: INCONCLUSIVE -- gcPause[': '9c3: only reachable from a malformed record; prove via the report path or drop',
+export const UNREACHABLE = Object.freeze({
+    'gate=totalPicks': 'config requires >= 1 lane and SOAK_PICKS >= 20000, and every lane-cycle runs them; ' +
+        'only a stream with zero work (soak:report) or a harness bug reaches it -- proof: unit',
+    'soak: INCONCLUSIVE -- hotAlloc[': 'measureHotBytesPerOp returns either a B/op or gcFree 0 (the gross ' +
+        'FAIL); "measured nothing without a scavenge-FAIL" exists only in a stream -- proof: unit',
+    'tracker': 'main.mjs registers no lite-leak kernel, so tracker.audit() and onWarning can never report; ' +
+        'retention (tracker.size) is the live check (MM1, MP6) -- proof: source pin (no registerKernel)',
 });
+
+/**
+ * Declared gaps: check id -> why it has no control yet. Empty since teeth burst 9c3 (audit 2026-09-29).
+ * NEVER add a line here to make the meta-test pass for a NEW gate -- a new gate ships with its control.
+ */
+export const GAPS = Object.freeze({});
 
 /** Values a `k=v` token of a BREACH spec may carry (lane ids: kernel, `#tiny`, pool). */
 const TOKEN_VALUES = {

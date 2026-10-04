@@ -7,7 +7,9 @@
  * control for, and nothing proved the battery covered them all. This suite lists the battery without
  * running it (MUSTFAIL_LIST=1: every mutant is BUILT, so a stale patch anchor fails here, in `npm test`,
  * instead of at nightly time) and checks it against the manifest benchmark/soak/teeth.mjs:
- *   - every check is covered by a control or is a declared gap, and no declared gap is covered (stale);
+ *   - every check is covered by a control, or is UNREACHABLE from main.mjs with a proof here (a unit run of
+ *     the real gate code, or a source pin), or is a declared gap -- and no gap/unreachable entry is covered;
+ *   - a report-only gate (REPORT_ONLY_GATES) cannot FAIL even on input built to breach it;
  *   - every control's spec is well-formed (a typo'd spec could only MISS);
  *   - the manifest matches the code (gate names, breach families, pool assertions, quality kinds,
  *     INCONCLUSIVE / NOTE causes), so a new gate cannot slip in without a check;
@@ -22,9 +24,9 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import {
-    checks, covers, validSpec, GAPS, BREACH_FAMILIES, POOL_ASSERTIONS, QUALITY_KINDS, INCONCLUSIVE_CAUSES, NOTE_GATES,
+    checks, covers, validSpec, GAPS, UNREACHABLE, BREACH_FAMILIES, POOL_ASSERTIONS, QUALITY_KINDS, INCONCLUSIVE_CAUSES, NOTE_GATES,
 } from '../benchmark/soak/teeth.mjs';
-import { GATE_NAMES, GateAccumulator } from '../benchmark/soak/gates.mjs';
+import { GATE_NAMES, REPORT_ONLY_GATES, GateAccumulator, VERDICT } from '../benchmark/soak/gates.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const src = (rel) => readFileSync(join(ROOT, rel), 'utf8');
@@ -52,8 +54,8 @@ test('every control spec is well-formed against the manifest', () => {
     assert.deepEqual(bad, []);
 });
 
-test('every check is covered by a control or is a declared gap', () => {
-    const uncovered = CHECKS.filter((k) => !CONTROLS.some((c) => covers(c, k)) && !(k.id in GAPS)).map((k) => k.id);
+test('every check is covered by a control, unreachable with a proof, or a declared gap', () => {
+    const uncovered = CHECKS.filter((k) => !CONTROLS.some((c) => covers(c, k)) && !(k.id in GAPS) && !(k.id in UNREACHABLE)).map((k) => k.id);
     assert.deepEqual(uncovered, [], 'checks with no control (add one; never a GAPS line for a new gate)');
 });
 
@@ -63,6 +65,62 @@ test('no declared gap is stale (covered, or not a check)', () => {
     assert.deepEqual(notACheck, [], 'GAPS keys that are no check id');
     const nowCovered = CHECKS.filter((k) => (k.id in GAPS) && CONTROLS.some((c) => covers(c, k))).map((k) => k.id);
     assert.deepEqual(nowCovered, [], 'covered now: delete these GAPS lines');
+});
+
+// --- UNREACHABLE: one proof per entry, against the REAL gate code main.mjs feeds -------------------------
+const OPTS = { smoke: false, lanes: ['RoundRobin'], interrupted: false, timerFloorNs: 41, poolLaunched: 0 };
+/** A plausible cycle record (the fields GateAccumulator reads), with `over` applied per cycle. */
+function rec(cycle, over) {
+    return Object.assign({
+        lane: 'RoundRobin', cycle, tier: 'kernel', heapUsedMB: 20, rssMB: 80, hotOpsDense: 2e8, hotOpsSparse: 1e8,
+        gcPauseAvgMs: 0.1, latency: { p99: 100, samples: 96000 }, rebuildP99: 0, rebuildSamples: 0, gcMajor: 0,
+        totalPicks: 100000, hotBytesPerOp: 0, hotBopNonFinite: false, hotBopGcFree: 128, hotBopPassMax: 0,
+    }, over(cycle));
+}
+function judge(over) {
+    const acc = new GateAccumulator({ warmupCycles: 1, gateN: 5, lanes: ['RoundRobin'] });
+    for (let c = 0; c < 11; c++) acc.push(rec(c, over));
+    return acc.compute(OPTS);
+}
+const PROOFS = {
+    'gate=totalPicks': () => {
+        const g = judge(() => ({ totalPicks: 0 }));
+        assert.equal(g.verdict, VERDICT.FAIL);
+        assert.ok(g.breaches.some((b) => b.startsWith('totalPicks=0')), g.breaches.join(' | '));
+    },
+    'soak: INCONCLUSIVE -- hotAlloc[': () => {
+        const g = judge(() => ({ hotBytesPerOp: null, hotBopGcFree: 64 }));
+        assert.equal(g.verdict, VERDICT.INCONCLUSIVE);
+        assert.ok(g.inconclusive.some((w) => w.startsWith('hotAlloc[RoundRobin]')), g.inconclusive.join(' | '));
+    },
+    'tracker': () => {
+        const main = src('benchmark/soak/main.mjs');
+        assert.ok(/tracker\.audit\(\)/.test(main), 'the tracker check exists');
+        assert.ok(!/registerKernel/.test(main), 'main.mjs now registers a lite-leak kernel: the tracker check is reachable -- add a control and drop the UNREACHABLE entry');
+    },
+};
+
+test('every UNREACHABLE entry is a check, uncovered, not a gap, and has a proof', () => {
+    const ids = CHECKS.map((k) => k.id);
+    assert.deepEqual(Object.keys(UNREACHABLE).filter((u) => ids.indexOf(u) === -1), [], 'UNREACHABLE keys that are no check id');
+    assert.deepEqual(Object.keys(UNREACHABLE).filter((u) => u in GAPS), [], 'both UNREACHABLE and a gap');
+    const covered = CHECKS.filter((k) => (k.id in UNREACHABLE) && CONTROLS.some((c) => covers(c, k))).map((k) => k.id);
+    assert.deepEqual(covered, [], 'a control reaches these: delete their UNREACHABLE entries');
+    assert.deepEqual(sorted(Object.keys(PROOFS)), sorted(Object.keys(UNREACHABLE)));
+});
+
+for (const id of Object.keys(PROOFS)) test('UNREACHABLE proof: ' + id, PROOFS[id]);
+
+test('report-only gates cannot FAIL, even on input built to breach them', () => {
+    assert.deepEqual(sorted(REPORT_ONLY_GATES), ['gcPause', 'rebuild']);
+    // late rebuild p99 x10000 with 5000 samples per window; late mean pause x500 -- both far past their bounds.
+    const g = judge((c) => ({ rebuildSamples: 1000, rebuildP99: c >= 6 ? 1e6 : 100, gcPauseAvgMs: c >= 6 ? 50 : 0.1 }));
+    for (const name of REPORT_ONLY_GATES) {
+        assert.equal(g.perLane[0].gates[name].verdict, VERDICT.STUB, name);
+        assert.ok(!g.breaches.some((b) => b.startsWith(name + '[')), name + ' breached');
+    }
+    assert.equal(g.perLane[0].gates.gcPause.wouldFail, true, 'the report still records that gcPause WOULD fail');
+    assert.equal(g.verdict, VERDICT.PASS);
 });
 
 test('GATE_NAMES is exactly what computeGates() judges', () => {

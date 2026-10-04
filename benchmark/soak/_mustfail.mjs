@@ -539,12 +539,12 @@ function runReport(file, extra) {
     const r = spawnSync(NODE, ['benchmark/soak/SoakReport.mjs', file].concat(extra || []), { cwd: ROOT, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: RUN_TIMEOUT_MS });
     return { status: r.status === null ? -1 : r.status, stderr: String(r.stderr || '') };
 }
-function tamperControl(name, env, edit, wantSpec, baselineOf, moreArgs) {
+function tamperControl(name, env, edit, wantSpec, baselineOf, moreArgs, wantStatus = 1) {
     if (!want(name)) return;
-    if (LIST) return listed(name, 'report', env, 1, wantSpec);
+    if (LIST) return listed(name, 'report', env, wantStatus, wantSpec);
     const cur = edit ? editedStream(genuineStream(env), edit) : genuineStream(env);
     const extra = (baselineOf ? ['--baseline', baselineOf()] : []).concat(moreArgs || []);
-    record(name, runReport(cur, extra), 1, wantSpec);
+    record(name, runReport(cur, extra), wantStatus, wantSpec);
 }
 const RPT_ENV = { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' };
 // drop 8 of the 11 cycles of every lane AND delete the two counters that used to be the only cycle check.
@@ -560,6 +560,17 @@ tamperControl('RPT S12 string breaches (no crash)', RPT_ENV, (recs) => recs.map(
 const WR_ENV = { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' };
 tamperControl('RPT S12 baseline: weight-0 regression', { ...WR_ENV, SOAK_MUSTFAIL: 'weight0' }, null, 'soak:report: REGRESSION vs baseline', () => genuineStream(WR_ENV));
 tamperControl('RPT S12 baseline: pool regression', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolleak' }, null, 'soak:report: REGRESSION vs baseline', () => genuineStream({ ...PA, SOAK_LANES: 'PoolP2C' }));
+// Baseline semantics (research/soak-baseline.md, accepted 2026-10-04): timing is REPORT-ONLY (a 2x faster
+// baseline only NOTEs), heap FAILs on +5 MB -- but only against a baseline from the same Node major.
+const scaleOps = (k) => (recs) => recs.map((r) => { if (r.type === 'cycle' && typeof r.hotOpsDense === 'number') r.hotOpsDense *= k; return r; });
+const shiftHeap = (mb) => (recs) => recs.map((r) => { if (r.type === 'cycle' && typeof r.heapUsedMB === 'number') r.heapUsedMB += mb; return r; });
+const otherNode = (recs) => recs.map((r) => { if (r.type === 'header') r.node = 'v20.0.0'; return r; });
+tamperControl('RPT baseline: timing is report-only', RPT_ENV, null, 'soak:report: NOTE RoundRobin throughput -50.0% vs baseline (report-only',
+    () => editedStream(genuineStream(RPT_ENV), scaleOps(2)), null, 0);
+tamperControl('RPT baseline: heap +5 MB fails', RPT_ENV, null, 'soak:report: REGRESSION vs baseline',
+    () => editedStream(genuineStream(RPT_ENV), shiftHeap(-5)));
+tamperControl('RPT baseline: other Node major -> heap not compared', RPT_ENV, null, 'soak:report: NOTE * heap not compared',
+    () => editedStream(genuineStream(RPT_ENV), (recs) => otherNode(shiftHeap(-5)(recs))), null, 0);
 tamperControl('RPT S12 baseline integrity', RPT_ENV, null, 'soak:report: BASELINE INTEGRITY MISMATCH', () => editedStream(genuineStream(RPT_ENV), (recs) => recs.filter((r, i) => i !== 5)));
 
 if (out.length === 0) { allOk = false; out.push('  MISS MUSTFAIL_ONLY=' + process.env.MUSTFAIL_ONLY + ' selected no control'); }

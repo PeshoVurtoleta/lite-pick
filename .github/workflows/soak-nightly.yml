@@ -11,6 +11,12 @@ name: soak-nightly
 #
 # Exit codes of the burn-in: 0 PASS, 1 FAIL, 2 bad config, 3 INCONCLUSIVE (not enough evidence -- e.g. a
 # runner too slow to reach the 11-cycle active floor in 45 minutes). All but 0 fail the job.
+#
+# BASELINE (research/soak-baseline.md, accepted 2026-10-04): the burn-in diffs tonight against the last fully
+# green nightly's JSONL, kept as the `soak-baseline` workflow artifact (90 days; read with `actions: read`
+# only -- no write access to the repo). It FAILs on heap (same Node major), quality, pool or a missing lane;
+# throughput and p99 are report-only (one run vs one run on another VM is noise). No green run with the
+# artifact yet (bootstrap, or expired) -> the report runs without a baseline and says so.
 
 on:
   schedule:
@@ -25,6 +31,9 @@ jobs:
     name: burn-in (45m, ubuntu / node 22)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read   # find the last green nightly and download its soak-baseline artifact
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,10 +51,59 @@ jobs:
           SOAK_DURATION: 45m
           SOAK_REQUIRE_PROVENANCE: '1'
         run: npm run soak
-      # Re-derive the verdict from the stream (integrity) and render the HTML report -- also on a FAIL.
+      # The last fully green nightly's JSONL (the whole workflow succeeded, so its burn-in uploaded one).
+      # Kept OUTSIDE benchmark/out so the report's "most recent stream" stays tonight's.
+      - name: fetch baseline (last green nightly)
+        id: baseline
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow soak-nightly.yml --branch "$GITHUB_REF_NAME" \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$id" ]; then
+            echo "::notice::no green nightly yet -- soak:report runs without a baseline (bootstrap)"
+            exit 0
+          fi
+          if gh run download "$id" --repo "$GITHUB_REPOSITORY" --name soak-baseline --dir baseline; then
+            echo "file=baseline/soak-baseline.jsonl" >> "$GITHUB_OUTPUT"
+            echo "baseline: soak-baseline from green run $id"
+          else
+            echo "::notice::green run $id has no soak-baseline artifact (expired, or predates it) -- no baseline"
+          fi
+      # Re-derive the verdict from the stream (integrity), diff against the baseline, render the HTML report --
+      # also on a FAIL. The baseline itself must pass integrity (S12) -- a restored file is untrusted input.
       - name: soak:report
         if: always()
-        run: node benchmark/soak/SoakReport.mjs --out benchmark/out/soak-report.html
+        shell: bash
+        env:
+          BASELINE: ${{ steps.baseline.outputs.file }}
+        run: |
+          set -euo pipefail
+          args=(--out benchmark/out/soak-report.html)
+          if [ -n "${BASELINE:-}" ]; then args+=(--baseline "$BASELINE"); fi
+          node benchmark/soak/SoakReport.mjs "${args[@]}"
+      # Tonight becomes tomorrow's baseline -- only when everything above passed.
+      - name: stage baseline for the next night
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(benchmark/out/*.jsonl)
+          if [ "${#files[@]}" -ne 1 ]; then echo "::error::expected exactly one soak JSONL, found ${#files[@]}"; exit 1; fi
+          mkdir -p baseline-out
+          cp "${files[0]}" baseline-out/soak-baseline.jsonl
+      - name: upload baseline
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-baseline
+          path: baseline-out/soak-baseline.jsonl
+          retention-days: 90
+          if-no-files-found: error
       - name: upload burn-in artifacts
         if: always()
         uses: actions/upload-artifact@v4

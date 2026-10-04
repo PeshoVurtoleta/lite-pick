@@ -16,10 +16,14 @@
  *      edited summary or a dropped set of records is caught. (Consistent forgery of the cycle records
  *      themselves would need a MAC and is out of scope.)
  *   2. MARGINS: print each lane's gate margins (how close each gate came to its bound).
- *   3. REGRESSION (--baseline): diff two runs and FAIL on a real regression -- throughput down > 15%,
- *      latency p99 up > 25%, heap up > 2 MB, or a quality violation appearing where there was none (ALL
- *      kinds: oracle, weight-0, chi-square), or a pool lane failing where it passed. The baseline must
- *      itself pass integrity and not be an overridden stream.
+ *   3. REGRESSION (--baseline): diff two runs. FAILs on what does not depend on the machine: heap up
+ *      > 2 MB (only when both ran the same Node major -- heap shifts with V8), a quality violation appearing
+ *      where there was none (ALL kinds: oracle, weight-0, chi-square), a pool lane failing where it passed,
+ *      or a lane missing. Throughput (down > 15%) and p99 (up > 25%) are REPORT-ONLY: one run against one
+ *      run on a different VM is noise (research/soak-baseline.md: 16.6% between two runs on the SAME
+ *      machine; hosted runners +/-10-20%) -- they print `soak:report: NOTE ...` and never fail. A zero or
+ *      missing baseline value is a NOTE ("not compared"), never a silent skip. The baseline must itself pass
+ *      integrity and not be an overridden stream.
  *
  * With --out it writes a self-contained HTML page of inline-SVG time-series (heap / throughput / p99 /
  * hot B/op per lane over cycles). It uses NO charting peer: lite-charts is a browser-canvas module with
@@ -54,7 +58,8 @@ const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const OUT_DIR = join(ROOT, 'benchmark', 'out');
 
 // Regression thresholds (--baseline). A change worse than these on a shared lane is a FAIL.
-const REG = { hotOpsDownPct: 15, p99UpPct: 25, heapUpMB: 2 };
+const REG = { hotOpsDownPct: 15, p99UpPct: 25, heapUpMB: 2 };   // throughput/p99: report-only (see header)
+const nodeMajor = (v) => { const m = /^v(\d+)\./.exec(String(v || '')); return m ? +m[1] : null; };
 
 function die(code, msg) { process.stderr.write('soak:report: ' + msg + '\n'); process.exit(code); }
 
@@ -373,7 +378,12 @@ if (args.baseline) {
     const baseLanes = laneIdsOf(base.cycles);
     const baseSet = new Set(baseLanes);
     const curSet = new Set(lanes);
-    process.stdout.write('  vs baseline ' + args.baseline.replace(ROOT, '') + ' (' + base.header.pkgVersion + '/' + (base.header.gitSha ? base.header.gitSha.slice(0, 7) : '?') + '):\n');
+    process.stdout.write('  vs baseline ' + args.baseline.replace(ROOT, '') + ' (' + base.header.pkgVersion + '/' + (base.header.gitSha ? base.header.gitSha.slice(0, 7) : '?') + ', node ' + (base.header.node || '?') + '):\n');
+    // A report-only observation: stdout for the reader, stderr `soak:report: NOTE` for the teeth / CI log.
+    const note = (lane, text) => { process.stdout.write('    ' + lane.padEnd(20) + text + '\n'); process.stderr.write('soak:report: NOTE ' + lane + ' ' + text + '\n'); };
+    const cm = nodeMajor(header.node), bm = nodeMajor(base.header.node);
+    const heapComparable = cm !== null && cm === bm;
+    if (!heapComparable) note('*', 'heap not compared: baseline ran node ' + (base.header.node || '?') + ', this run ' + (header.node || '?') + ' (heap shifts with the V8 version)');
     // A baseline lane MISSING from the current run is a regression (a lane silently dropped), not "no data".
     for (const bl of baseLanes) if (!curSet.has(bl)) { regressionFail = true; process.stdout.write('    ' + bl.padEnd(20) + 'LANE MISSING from current run (was in baseline)\n'); }
     const currentOnly = lanes.filter((l) => !baseSet.has(l));
@@ -390,16 +400,20 @@ if (args.baseline) {
         const curQ = cycles.filter((c) => c.lane === lane).reduce((s, c) => s + ((c.quality && c.quality.totalViolations) | 0), 0);
         const baseQ = base.cycles.filter((c) => c.lane === lane).reduce((s, c) => s + ((c.quality && c.quality.totalViolations) | 0), 0);
         const notes = [];
-        if (baseOps && curOps != null) {
+        // Timing: REPORT-ONLY (machine-dependent). A zero/missing baseline value is said, not skipped.
+        if (!(baseOps > 0) || curOps == null) note(lane, 'throughput not compared (baseline ' + baseOps + ', current ' + curOps + ')');
+        else {
             const d = (curOps - baseOps) / baseOps * 100;
-            if (d < -REG.hotOpsDownPct) { regressionFail = true; notes.push('THROUGHPUT ' + pct(d) + ' (> ' + REG.hotOpsDownPct + '% down)'); }
+            if (d < -REG.hotOpsDownPct) note(lane, 'throughput ' + pct(d) + ' vs baseline (report-only; > ' + REG.hotOpsDownPct + '% down)');
         }
-        if (baseP99 && curP99 != null) {
+        if (!(baseP99 > 0) || curP99 == null) note(lane, 'p99 not compared (baseline ' + baseP99 + ', current ' + curP99 + ')');
+        else {
             const d = (curP99 - baseP99) / baseP99 * 100;
-            if (d > REG.p99UpPct) { regressionFail = true; notes.push('p99 ' + pct(d) + ' (> ' + REG.p99UpPct + '% up)'); }
+            if (d > REG.p99UpPct) note(lane, 'p99 ' + pct(d) + ' vs baseline (report-only; > ' + REG.p99UpPct + '% up)');
         }
-        if (baseHeap != null && curHeap != null && (curHeap - baseHeap) > REG.heapUpMB) {
-            regressionFail = true; notes.push('HEAP +' + (curHeap - baseHeap).toFixed(1) + ' MB (> ' + REG.heapUpMB + ' MB)');
+        if (heapComparable) {
+            if (baseHeap == null || curHeap == null) note(lane, 'heap not compared (baseline ' + baseHeap + ', current ' + curHeap + ')');
+            else if ((curHeap - baseHeap) > REG.heapUpMB) { regressionFail = true; notes.push('HEAP +' + (curHeap - baseHeap).toFixed(1) + ' MB (> ' + REG.heapUpMB + ' MB)'); }
         }
         if (baseQ === 0 && curQ > 0) { regressionFail = true; notes.push('QUALITY 0 -> ' + curQ + ' violations'); }
         if (notes.length) process.stdout.write('    ' + lane.padEnd(20) + notes.join('; ') + '\n');
@@ -413,7 +427,7 @@ if (args.baseline) {
         const baseF = base.cycles.filter((c) => c.lane === pl && poolCycleFailed(c)).length;
         if (baseF === 0 && curF > 0) { regressionFail = true; process.stdout.write('    ' + pl.padEnd(20) + 'POOL 0 -> ' + curF + ' failing cycle(s)\n'); }
     }
-    if (!regressionFail) process.stdout.write('    no regression on shared lanes\n');
+    if (!regressionFail) process.stdout.write('    no regression on shared lanes (heap' + (heapComparable ? '' : ' not compared') + ', quality, pool, lanes; timing is report-only)\n');
 }
 
 // SVG report (--out) -----------------------------------------------------------------------------

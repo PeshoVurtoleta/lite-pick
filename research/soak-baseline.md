@@ -1,6 +1,10 @@
 # Research: a baseline for the nightly soak
 
-**Status:** research for a decision (2026-10-04). Nothing here is implemented yet.
+**Status:** DECIDED 2026-10-04 -- all section-7 recommendations accepted ("they can always be improved
+with evidence"): (1) nightly timing diffs report-only; (2) storage = workflow artifacts; (3) option C on
+the roadmap with its own research note first (ROADMAP Post-1.0 #8b); (4) option B later, conditional (#8c).
+Option A is implemented: `soak:report --baseline` semantics + the `soak-baseline` artifact in
+`.github/workflows/soak-nightly.yml`.
 **Question:** the audit's fix plan (2026-09-29) says: keep the last green nightly's JSONL as a
 "baseline artifact" and run `soak:report --baseline` against it every night, "which is what LKP/0-day
 and the Node.js benchmark CI provide for their projects". Before copying that, how do those projects

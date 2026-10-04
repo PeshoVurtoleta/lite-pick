@@ -90,6 +90,16 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   printing which runtime boxes. Every failure prints a `probe: FAIL -- <what>` line. New: `npm run
   soak:probe`, and teeth controls PP (clean probe passes) and PM (`PROBE_MUSTFAIL=sampleralloc`, one small
   object per sampled pick, must FAIL). The soak's own comment claiming a 0 B/op sampler is corrected.
+- **Benchmark-only: the nightly soak diffs against the last green nightly (audit 2026-09-29; decided
+  in `research/soak-baseline.md`).** The burn-in downloads the last fully green run's `soak-baseline`
+  artifact (90-day retention, `actions: read` only) and runs `soak:report --baseline`, then uploads its
+  own stream as the next baseline if it passed; with no baseline yet it says so and runs without one.
+  `--baseline` now FAILs only on what does not depend on the machine: heap up > 2 MB (only against the
+  same Node major), quality violations or pool failures appearing, a lane missing. Throughput and p99
+  are report-only (`soak:report: NOTE ...`): two runs on the same machine differed by 16.6%, over the
+  15% bar, and hosted runners vary +/-10-20%. A zero or missing baseline value is a NOTE, never a silent
+  skip. Teeth: `RPT baseline: ...` (timing only notes; heap +5 MB fails; another Node major is not
+  heap-compared).
 - **Repository: LF line endings on every OS.** A new `.gitattributes` (`* text=auto eol=lf`). Windows
   runners check out with `core.autocrlf=true`, which broke `test/RecipesDoc.test.js` (red on
   windows-latest since it was added) and `test/SoakTeeth.test.js`, and would make a Windows checkout of

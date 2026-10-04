@@ -268,3 +268,14 @@ it false-FAILs a correct kernel. Two decisions change:
   the runtime boxes. Clean Node 22: sampler adds 0.011-0.019 over 6 runs. Each failure prints `probe: FAIL --
   <what>`; a pass prints `probe: ok`. `soak:teeth` runs PP (clean, must pass) and PM
   (`PROBE_MUSTFAIL=sampleralloc`, must FAIL: +32 B/op on Node 26, +43.5 on Node 22).
+
+## Amendment 2026-10-04 -- the nightly baseline (decided in research/soak-baseline.md)
+
+- The fix plan's "keep the last green nightly as the baseline" was researched before adoption (LKP/0-day,
+  Node.js compare.js, rustc-perf, Perfherder, benchstat, GitHub-runner noise studies) and measured here:
+  one run against one run is not a timing signal on hosted runners (same-machine run-to-run 16.6% on
+  WeightedRandom throughput; runners +/-10-20%). Decided: `--baseline` gates heap (same Node major),
+  quality, pool and lane presence; throughput/p99 are report-only NOTEs; the baseline is the last fully
+  green run's `soak-baseline` workflow artifact (`actions: read` only), validated by S12 before use.
+  Release-time same-runner interleaved A/B (ROADMAP #8b, research note first) is the path to a real timing
+  gate; a history window (#8c) only if the report-only notes prove useful.

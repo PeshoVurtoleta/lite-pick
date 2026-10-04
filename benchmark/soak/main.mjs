@@ -62,6 +62,21 @@ function breach(head, detail) {
 let fatalCtx = null;             // set once stream/summarize exist, so main().catch can write a fatal
 
 /** The chaos phases that SHOULD fire for a lane (T8 self-check applicability, from lane flags). */
+/**
+ * The keyed balancers' OWNED weights (CH/BL copy weights at construction; there is no batch-reweight API, so
+ * the allZero phase and the freeze restore write this array and call ONE rebuild()). S14: fail closed if the
+ * private field is gone -- a kernel rename used to turn both into silent no-ops (`if (bw)`). A public
+ * setWeights() is a 1.1.0 kernel item.
+ */
+function keyedWeights(b, lane) {
+    const bw = b._weights;
+    if (!(bw instanceof Uint32Array)) {
+        throw new Error('soak: keyed lane ' + lane.name + ' exposes no Uint32Array _weights -- the allZero phase and the ' +
+            'freeze restore would be silent no-ops (kernel renamed the field?)');
+    }
+    return bw;
+}
+
 function applicablePhases(lane, hasRebuild) {
     const a = ['flap', 'allDown', 'recover', 'sparse'];
     if (lane.weighted) a.push('weightRetune', 'allZero');
@@ -347,8 +362,8 @@ async function main() {
                     // allZero: for KEYED lanes, write the balancer-owned weights + ONE rebuild (per-node
                     // setWeight would be CAP Maglev rebuilds, ~64KB each -> a workload major GC).
                     if (lane.keyed) {
-                        const bw = built.b._weights;
-                        for (let i = 0; i < CAP; i++) { if (bw) bw[i] = 0; weights[i] = 0; }
+                        const bw = keyedWeights(built.b, lane);
+                        for (let i = 0; i < CAP; i++) { bw[i] = 0; weights[i] = 0; }
                         if (hasRebuild) built.b.rebuild();
                     } else {
                         for (let i = 0; i < CAP; i++) { if (lane.usesSetWeight) built.b.setWeight(i, 0); weights[i] = 0; }
@@ -405,8 +420,8 @@ async function main() {
                 // with ONE batched rebuild (write b._weights for all nodes, then a single rebuild()) so CH/BL
                 // reach the freeze with >= 8 positive-weight eligible nodes and their weight-0 guard is ARMED.
                 // Per-node setWeight would be CAP Maglev rebuilds (a workload major GC); this is exactly one.
-                if (lane.keyed && lane.weighted && CAP >= 8 && built.b._weights) {
-                    const bw = built.b._weights;
+                if (lane.keyed && lane.weighted && CAP >= 8) {
+                    const bw = keyedWeights(built.b, lane);
                     for (let i = 0; i < CAP; i++) { const w = 1 + (i & 7); bw[i] = w; weights[i] = w; }
                     if (typeof built.b.rebuild === 'function') built.b.rebuild();
                 }
@@ -454,12 +469,20 @@ async function main() {
         const oracleRng = new Prng((seed ^ 0x0D15EA5E) >>> 0);
         const oracle = evaluateOracle(lane.name, built.b, eligible, inflight, weights, KEYS, KEY_COUNT, CAP, oracleRng);
         if (oracle !== null) {
+            // S14: property oracles (ConsistentHash down-marking / rebuild, BoundedLoad cap) report their own
+            // count and breach kind; WeightedRandom keeps its window chi-square AND adds the per-category pass.
+            const isWR = lane.name === 'WeightedRandom';
+            const propViol = oracle.propViol | 0;
+            const rejViolation = isWR && quality.rejections > quality.rejMax ? 1 : 0;
+            const total = oracle.viol + propViol + quality.weightZero + rejViolation;
             quality = {
                 windows: qw.windows, oracleChecks: oracle.checks, oracleViol: oracle.viol,
-                violations: oracle.viol, weightZero: quality.weightZero, rejections: 0, skipped: 0,
-                insufficientData: oracle.insufficient,
-                totalViolations: oracle.viol + quality.weightZero,
-                green: oracle.viol === 0 && quality.weightZero === 0,
+                propertyChecks: oracle.propChecks | 0, propertyViol: propViol,
+                violations: oracle.viol, weightZero: quality.weightZero,
+                rejections: isWR ? quality.rejections : 0, rejMax: isWR ? quality.rejMax : 0, skipped: isWR ? quality.skipped : 0,
+                insufficientData: oracle.insufficient || (isWR && quality.insufficientData),
+                totalViolations: total,
+                green: total === 0,
             };
         }
         // boxingRegime reflects whether the WORKLOAD clock crossed the SMI limit (a real long-run concern
@@ -655,6 +678,7 @@ async function main() {
                 const q = core.quality;
                 const kinds = [];
                 if (q.violations > 0) kinds.push('oracle');
+                if (q.propertyViol > 0) kinds.push('property');
                 if (q.weightZero > 0) kinds.push('weightZero');
                 if (q.rejections > q.rejMax) kinds.push('chiSquare');
                 breach('quality lane=' + laneId + ' cycle=' + cycle + ' kind=' + (kinds.join(',') || 'unknown'), JSON.stringify(q));

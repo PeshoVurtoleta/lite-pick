@@ -46,7 +46,7 @@ export const HOTOPS_RATIO = 0.60;      // late hotOps median >= this * early med
 export const GCPAUSE_MULT = 2;         // late MEAN-pause median <= early median * this ...
 export const GCPAUSE_ADD_MS = 1;       //   ... + this many ms
 export const GC_MAJOR_MAX = 0;         // hard: zero workload major GC per lane-cycle
-export const LAT_P999_MULT = 1.5;      // latency p99 / rebuild p99: late <= early * this + addNs
+export const LAT_P99_MULT = 1.5;       // latency p99 / rebuild p99: late <= early * this + addNs
 export const LAT_ADD_TICKS = 2;        // wall-clock granularity floor = this * timerFloorNs (from
                                        // provenance): sub-us individual-pick timing is near performance.now()
                                        // resolution, so a pure 1.5x ratio false-fails on a <=1-tick wobble.
@@ -87,7 +87,7 @@ export class EarlyLate {
     lateSum() { let s = 0; const c = this.lateCount; for (let i = 0; i < c; i++) s += this.lateRing[i]; return s; }
 }
 
-/** A latency-style drift gate (latencyP999 / rebuild p99): late median <= early median * LAT_P999_MULT,
+/** A latency-style drift gate (latencyP99 / rebuild p99): late median <= early median * LAT_P99_MULT,
  * ACTIVE only when the early AND late windows each hold >= LAT_MIN_SAMPLES; else report-only (never PASS
  * vacuously). Returns a gate object; pushes a breach to `breaches` on FAIL. */
 function latencyGate(name, laneName, elVal, elSamples, smoke, active, reportOnly, addNs, breaches) {
@@ -98,7 +98,7 @@ function latencyGate(name, laneName, elVal, elSamples, smoke, active, reportOnly
         return { verdict: VERDICT.STUB, reason: 'insufficientSamples', earlySamples: earlyS, lateSamples: lateS, minSamples: LAT_MIN_SAMPLES };
     }
     const { early, late, p } = shiftStats(elVal, +1);
-    const limit = early * LAT_P999_MULT + addNs;
+    const limit = early * LAT_P99_MULT + addNs;
     // S2: over the limit AND a significant upward shift (one noisy late cycle no longer FAILs).
     const verdict = (late > limit && p < MW_ALPHA) ? VERDICT.FAIL : VERDICT.PASS;
     if (verdict === VERDICT.FAIL) breaches.push(name + '[' + laneName + '] late=' + r0(late) + 'ns > limit=' + r0(limit) + 'ns (early=' + r0(early) + ', floor=' + r0(addNs) + 'ns, p=' + p.toFixed(4) + ')');

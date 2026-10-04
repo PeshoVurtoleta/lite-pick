@@ -1,0 +1,53 @@
+{
+ "meta": {
+  "tool": "benchmark/soak/_calibrate-s14.mjs",
+  "node": "v26.8.2",
+  "gitSha": "917b56d",
+  "seed": 1300,
+  "seconds": 265,
+  "date": "2026-10-04T08:51:35.865Z"
+ },
+ "consistentHash": {
+  "events": 20000,
+  "skipped": 0,
+  "m": 4099,
+  "oracleViol": 0,
+  "propViolAtCurrentBound": 0,
+  "currentBound": 0.08,
+  "movedShare": {
+   "p50": 0.022113022113022112,
+   "p99": 0.03960639606396064,
+   "p999": 0.04567901234567901,
+   "max": 0.05004930966469428
+  }
+ },
+ "weightedRandom": {
+  "cycles": 2000,
+  "skipped": 63,
+  "draws": 4194304,
+  "zCrit": 6,
+  "violations": 0,
+  "maxAbsZ": {
+   "p50": 2.924568351466569,
+   "p99": 3.9990549991271735,
+   "max": 4.576227274552364
+  }
+ },
+ "wrPower": {
+  "every16th": {
+   "cycles": 292,
+   "caught": 292,
+   "share": 1
+  },
+  "oneWeight1": {
+   "cycles": 298,
+   "caught": 247,
+   "share": 0.8289
+  },
+  "oneWeight8": {
+   "cycles": 287,
+   "caught": 287,
+   "share": 1
+  }
+ }
+}

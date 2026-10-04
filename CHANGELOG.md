@@ -198,6 +198,34 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   count. A live count outside 8..256 is INSUFFICIENT, never a silent pass. New teeth: M8b (50%), M8c
   (80%). `test/SoakP2C.test.js` (in `npm test`) fails if the table in `oracles.mjs` and the calibration
   evidence disagree, and runs the real kernel at the soak's live range (clean never fails, 50% caught).
+- **Benchmark-only: the soak's hash, tie and weighted oracles check stated properties, sized on the real
+  kernel (S14, audit 2026-09-29; decided in `research/s14-hash-and-tie-oracles.md`).**
+  - LeastConn/SED/NQ accept any pick in the argmin SET (tie order is unspecified; a rotating tie-break is
+    planned for 1.1). Scores compare by integer cross-multiplication. New PASS control M9b (ties to the
+    highest index): the old exact-index oracle failed it.
+  - ConsistentHash gains two properties beside the stickiness re-walk: marking one home node down moves NO
+    other key (0 in 20,000 calibration events), and a weight-0 rebuild leaves no key on the drained node,
+    moves at most 8% of the other keys (measured p50 2.2%, p99 4.0%, max 5.0%) and is undone exactly by
+    restoring the weight. New teeth: MH1, modulo-N hashing (the slot depends on the live count) -- caught by
+    the properties only; MH2, a rebuild that reshuffles the table -- the old oracles exited 0 on it. The
+    stickiness flap never restored the nodes it flapped (it re-read the eligibility it had just cleared);
+    fixed.
+  - BoundedLoad keeps its reference walk and adds the cap properties from the MTZ definition: home under cap
+    -> the pick is home; some eligible under-cap backend in the probe window -> the pick is one of them; else
+    an eligible backend in the window. M11 now asserts both kinds.
+  - WeightedRandom adds a per-category binomial pass (4M controlled draws, |z| <= 6 per node) beside the
+    window chi-square, which at ~180 categories cannot see a 10% error. Clean: max |z| 4.58 in 1,937 cycles.
+    A +10% error is caught in 100% of cycles on every 16th node or on one weight-8 node, 83% on one weight-1
+    node. New teeth M7b: a pick-level +10% bias that leaves the alias table intact -- the old checks exited 0.
+  - The soak's keyed lanes use a Maglev table of M = 4099 (was 257). At 257, 63 of the 256 backends had no
+    slot and weights 1-8 collapsed into two classes; at 4099 every backend's share follows its weight. Cost:
+    +18% keyed-lane time, 0 major GCs. M = 25601 (Maglev's own M >= 100 N) forced 17 workload major GCs.
+  - The PeakEWMA oracle drains every node (it drained only nodes with `d & 7` in {0, 4}).
+  - Hygiene: chaos fails closed if a keyed balancer's private `_weights` is missing (a rename made two
+    phases silent no-ops); `LAT_P999_MULT` is `LAT_P99_MULT` (it gates p99); provenance runs git in the
+    repository with stderr captured and counts only tracked changes as dirty. Stream schema 5.
+  - Thresholds come from `benchmark/soak/_calibrate-s14.mjs` (evidence `benchmark/soak/s14-calibration.json`);
+    `test/SoakOracles.test.js` (in `npm test`) pins them and checks each property on the real kernel.
 
 ## [1.0.2] - 2026-10-03
 

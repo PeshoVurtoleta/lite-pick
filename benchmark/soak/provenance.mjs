@@ -20,18 +20,26 @@ import * as G from './gates.mjs';
 // records gained gcPauseAvgMs/hotOps*N (S2). soak:report imports this constant (one source of truth).
 // 4: pool cycle records gain assert8/downDispatch (S10), assert9/inflightArea/attemptArea (Little's law),
 // simulated RTTs (rttP50Ns/rttP99Ns/rttMeanNs/svcMeanNs), simUs/events/traceHash (S9 deterministic simulation).
-export const SCHEMA_VERSION = 4;
+// 5: keyed lanes run at M = 4099 (was 257; S14), and oracle-lane quality records gain propertyChecks /
+// propertyViol (+ rejMax/skipped kept for WeightedRandom, which now also runs a per-category oracle).
+export const SCHEMA_VERSION = 5;
 
 const PICK_PATH = fileURLToPath(KERNEL_URL);   // the RESOLVED kernel (SOAK_KERNEL override or in-tree)
 const POOL_PATH = fileURLToPath(POOL_URL);     // the RESOLVED pool (SOAK_POOL override or in-tree) -- S6: it
                                                // hashed the in-tree Pool.js even when a mutant was loaded
 
+// S14: git runs in the repository that holds this file (the SHA must not depend on the caller's cwd), with
+// stderr captured (a "fatal: not a git repository" is reported in `error`, not printed), and `dirty` counts
+// only TRACKED changes (an untracked scratch file does not make a run's kernel dirty).
+const REPO = fileURLToPath(new URL('../..', import.meta.url));
+const GIT_OPTS = { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] };
+
 function gitInfo() {
     try {
-        const sha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+        const sha = execFileSync('git', ['rev-parse', 'HEAD'], GIT_OPTS).trim();
         let dirty = null;   // null (unknown), never false, if the status probe fails
         try {
-            const st = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
+            const st = execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], GIT_OPTS);
             dirty = st.trim().length > 0;
         } catch (e) { /* dirty stays null: we could not determine it */ }
         return { sha, dirty, error: null };
@@ -106,7 +114,7 @@ export function buildHeader(cfg) {
             gcPauseMult: G.GCPAUSE_MULT, gcPauseAddMs: G.GCPAUSE_ADD_MS,
             gcMajorMax: G.GC_MAJOR_MAX, hotAllocMax: G.HOTALLOC_MAX,
             mwAlpha: G.MW_ALPHA,   // S2: timing drifts also need a one-sided Mann-Whitney p < this
-            latP99Mult: G.LAT_P999_MULT, rssKeep: G.RSS_KEEP, rssLate: G.RSS_LATE,
+            latP99Mult: G.LAT_P99_MULT, rssKeep: G.RSS_KEEP, rssLate: G.RSS_LATE,
         },
         timerFloorNs: timerFloorNs(),
     };

@@ -1,6 +1,6 @@
 # Research: oracles for the hashing, least-load and weighted lanes (Phase 3, S14)
 
-**Status:** DECIDED 2026-10-04 -- all recommendations accepted (all four recommendations; the soak keyed-lane table size is decided in the implementation burst with a measurement.) Not implemented yet.
+**Status:** DECIDED 2026-10-04 -- all four recommendations accepted. IMPLEMENTED 2026-10-04 (table size M = 4099, decided by measurement): see section 7 and the decisions/0014 S14 amendment.
 **Question:** the audit's fix plan (2026-09-29, section 3.4) proposes new soak oracles that do not
 re-implement the kernel's own walk: (a) a BoundedLoad **cap property**, (b) a ConsistentHash
 **disruption property** -- "removing 1 of N backends moves <= 1/N + 2% of keys", (c) a WeightedRandom
@@ -129,3 +129,17 @@ expectation).
    reference Maglev simulation of the same (M, N)"? And should the soak's keyed lanes keep M = 257
    (fast, but 2:1 slot skew at N = 256) or move to a larger prime table?
 3. WeightedRandom: size the 10% mutant to k <= 16 or use per-category tests at large k?
+
+## 7. What the implementation measured (2026-10-04)
+- **Table size.** For the soak's 256 backends weighted 1..8: M 257 gives 63 backends no slot and collapses
+  the weights into two classes (0.5 and 1.5 slots on average); M 4099 gives every backend slots in proportion
+  to its weight (rebuild 65 us); M 25601 follows Maglev's own M >= 100 N but its rebuilds forced 17 major GCs
+  in a soak of the keyed lanes. Chosen: 4099. Lesson: a test table that is too small does not just make the
+  test less precise -- it silently changes WHAT is tested (here: weights).
+- **Rebuild disruption at 4099** (20,000 events, eligibility 50-100%): other keys moved p50 2.2%, p99 4.0%,
+  max 5.0% -- about twice the M >= 100 N figure (1.1% median at 25601), as Eisenbud et al. predict. Bound 8%.
+  Down-marking moved 0 other keys and restoring the weight brought back 100% of keys, in every event.
+- **Weighted random.** 4M draws per cycle make a 10% error on one weight-1 node of ~180 a ~6-7 sigma event:
+  caught in 83% of cycles (100% for a weight-8 node); clean cycles never exceeded |z| 4.58 against a limit of 6.
+- **Mutants that only the new checks catch:** modulo-N hashing (MH1), a reshuffling rebuild (MH2), and a
+  pick-level weighted bias (M7b) -- the last two exit 0 on the previous oracles.

@@ -239,6 +239,13 @@ control('M6b CH weight-0 (H3, keyed)',
 control('M7 biased WR sampler',
     patch(PICK, '            const cand = u < prob[col] ? col : alias[col];', '            const cand = col;'),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' }, 1, 'quality lane=WeightedRandom kind=chiSquare');
+// M7b (S14): every 16th node is picked 10% too often, by a PICK-level bias (any other candidate is
+// rejection-redrawn 1 time in 11) -- the alias table stays exact, so the table-reconstruction invariant cannot
+// see it, and the window chi-square at ~180 categories has ~2% power per window. The per-category binomial
+// pass must catch it.
+control('M7b WR every 16th node +10% (pick-level bias)',
+    patch(PICK, '            if (el[cand]) return cand;', '            if (el[cand] && ((cand & 15) === 0 || rng.nextBelow(11) !== 0)) return cand;'),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'WeightedRandom' }, 1, 'quality lane=WeightedRandom kind=oracle');
 
 // --- increment 2a: load / keyed oracles (oracles.mjs), each proven through main ------------------
 // M8: P2C returns the WORSE of the two choices -> load balance collapses -> the max-mean bound trips.
@@ -259,6 +266,12 @@ control('M8c P2C ignores the comparison 80%',
 control('M9 LeastConn non-argmin',
     patch(PICK, '                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }', '                if (best < 0 || c > bestLoad) { best = i; bestLoad = c; }'),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 1, 'quality lane=LeastConn kind=oracle');
+// M9b (S14, a PASS control): LeastConn breaks ties toward the HIGHEST index instead of the lowest. Tie order
+// is unspecified (a rotating tie-break is planned for 1.1), so the argmin-SET oracle must accept it; the old
+// exact-index oracle failed it (over-eager).
+control('M9b LeastConn ties -> highest index (must PASS)',
+    patch(PICK, '                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }', '                if (best < 0 || c <= bestLoad) { best = i; bestLoad = c; }'),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 0, null);
 // M10: ConsistentHash rotates the start slot per call (in ITS OWN fast path) -> a key no longer
 // sticks -> the consecutive-equality stickiness check trips.
 // M10: the reviewer's exact mutant -- a slot rotation that advances PER setEligible (this.__ROT++ in
@@ -273,7 +286,19 @@ control('M10 CH stickiness break (per-setEligible rotation)',
 // reference walk disagrees with the pick.
 control('M11 BoundedLoad H4 under-cap',
     patch(PICK, 'const cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;   // > 0: total>0, live>0', 'const cap = capActive ? Math.ceil((1 + this._eps) * total / this._live) : 0;'),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad kind=oracle');
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, ['quality lane=BoundedLoad kind=oracle', 'quality lane=BoundedLoad kind=property']);
+// MH1 / MH2 (S14): ConsistentHash design errors the stickiness re-walk cannot see, caught by the stated
+// properties. MH1 is MODULO-N HASHING -- the slot depends on the live count, the very thing consistent hashing
+// exists to avoid: a flap down-and-up restores the count, so the stickiness flap (2) passes, but marking one
+// node down moves every other key (property 3). MH2 makes the Maglev permutation depend on the total weight, so any
+// rebuild reshuffles the whole table (property 4: moved share >> CH_REBUILD_MOVED_MAX).
+control('MH1 CH modulo-N hashing (slot depends on live)',
+    patchAll(PICK, '        let slot = (keyHash >>> 0) % M;', '        let slot = ((keyHash >>> 0) + this._live) % M;', 2),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash kind=property');
+control('MH2 CH rebuild reshuffles (permutation depends on total weight)',
+    patch(patch(PICK, '        const offset = new Int32Array(N);', '        const offset = new Int32Array(N); let __t = 0; for (let q = 0; q < N; q++) __t += wt[q];'),
+        '            offset[b] = h1 % M;', '            offset[b] = (h1 + __t) % M;'),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash kind=property');
 
 // M12: PeakEWMA ignores the cost comparison (no latency steering, the H1 black-hole shape) -> the
 // busy slow node is no longer avoided and gets ~uniform share -> the slowNode-share oracle trips.

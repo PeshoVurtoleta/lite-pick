@@ -34,8 +34,8 @@ import { POOL_LANES } from './pool-lane.mjs';
 export const BREACH_FAMILIES = Object.freeze(['gate', 'invariants', 'phases', 'pool', 'quality', 'retention', 'tracker']);
 /** Pool-lane assertions (pool-lane.mjs A1..A6, A8 down-dispatch, A9 Little's law; A7 = unhandled rejection). */
 export const POOL_ASSERTIONS = Object.freeze(['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8', 'A9']);
-/** `soak: BREACH quality ... kind=` values (oracle violation, weight-0 pick, chi-square rejection). */
-export const QUALITY_KINDS = Object.freeze(['oracle', 'weightZero', 'chiSquare']);
+/** `soak: BREACH quality ... kind=` values (oracle violation, S14 property violation, weight-0 pick, chi-square rejection). */
+export const QUALITY_KINDS = Object.freeze(['oracle', 'property', 'weightZero', 'chiSquare']);
 /** Every `soak: INCONCLUSIVE -- <cause>` line prefix (gates.mjs inconclusive[], main.mjs quality lanes). */
 export const INCONCLUSIVE_CAUSES = Object.freeze(['run interrupted before its end', 'lane ', 'hotAlloc[',
     'quality windows never sufficient']);

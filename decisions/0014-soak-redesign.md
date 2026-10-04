@@ -44,7 +44,7 @@ Replace `benchmark/Soak.mjs` with `benchmark/soak/*`:
 - **`/pool` lanes** (`pool-lane.mjs`): async dispatch/settle/failover/abort driven by the DES, with a
   per-outcome oracle (success/failover/failAll/hung/abort), `totalInflight === sum(inflight)` checked
   in flight, a lost-run deadline, and zero-unhandled-rejection + retention assertions.
-- **Latency** (`latency.mjs`): per-pick timing into a pre-allocated ring, fed cold into a strict-range
+- **Latency** (inlined in `main.mjs`; there is no `latency.mjs`): per-pick timing into a pre-allocated ring, fed cold into a strict-range
   DDSketch (`@zakkster/lite-sketch`). **The gate is on p99, not p999**: individual sub-microsecond pick
   p999 is dominated by OS-scheduling jitter, so a 1.5x p999 ratio false-fails a clean kernel; p99 is the
   robust kernel tail. The granularity floor is `2 * timerFloorNs` (from provenance), not a hard-coded
@@ -339,3 +339,40 @@ it false-FAILs a correct kernel. Two decisions change:
   CAP, or the kernel's `_draw` requires re-running the calibration -- `test/SoakP2C.test.js` only guards
   the table against the evidence file, not the evidence against a changed kernel. The `_draw` fallback's
   "unbiased" comment is inaccurate at sparse eligibility; a kernel note for 1.1.0, not a soak change.
+
+## Amendment 2026-10-04 -- audit 2026-09-29 (S14): property oracles, sized on the real kernel
+
+- **Why** (researched first: `research/s14-hash-and-tie-oracles.md`): the keyed oracles re-walked the
+  kernel's own probe, so a DESIGN error shared by both passed both; the argmin oracle hard-coded a tie
+  order the kernel no longer promises; the WeightedRandom chi-square's power was never shown.
+- **Properties, added beside the re-walks** (`oracles.mjs`, breach `kind=property`, quality record
+  `propertyChecks` / `propertyViol`): ConsistentHash down-marking moves no other key (Karger's monotonicity)
+  and a weight-0 rebuild is bounded (<= 8% of other keys) and exactly reversible; BoundedLoad's cap
+  properties (P1-P3, stated from the MTZ definition with the cap counting the incoming request). Evaluated
+  only at >= 8 live nodes: a 2-3 entry table moves most keys on any rebuild, and draining the only positive
+  weight falls back to the documented all-zero table (both seen as false alarms on the tiny lane).
+- **Table size** (decision 2's open question, measured): rebuild cost and weight fidelity for 256 backends
+  weighted 1..8 -- M 257: 15 us, 63 zero-slot backends, weights in two classes; M 4099: 65 us, slots
+  proportional to weight; M 25601: 0.5 ms, and a soak of the keyed lanes forced 17 workload major GCs;
+  M 65537 (the library default): 10.6 ms. Chosen: 4099, the smallest prime >= 16 x CAP (+18% keyed-lane time,
+  0 major GCs). Rebuild disruption of other keys at 4099 over 20,000 events: p50 2.2%, p99 4.0%, max 5.0%
+  (roughly normal, sigma ~0.77 points), so the 8% bound sits ~7.5 sigma out; MH2's reshuffle moves ~all.
+- **WeightedRandom** (decision 3): per-category binomial tests, 4M draws on the frozen state, |z| <= 6
+  (Bonferroni: < 6e-7 per clean cycle at 256 categories), skipped below half the weight mass up (the kernel's
+  documented non-proportional fallback). Measured: clean max |z| 4.58 in 1,937 cycles; +10% on one weight-1
+  node of ~180 caught in 83% of cycles, on one weight-8 node or every 16th node in 100%.
+- **Two findings while building it.** (1) The stickiness flap's restore loop tested `el[i]`, the shared
+  eligibility it had just cleared, so nothing came back up: at M 257 it tested "every non-home node down" and
+  left the pool that way. Fixed with a `_flap` scratch; at M 4099 almost every node is a home, so the flap
+  touches 1-3 nodes and the calibration is unchanged to the last digit. (2) A table-scaling WeightedRandom
+  mutant is already caught by the alias-reconstruction INVARIANT, so it proves nothing about the oracle; M7b
+  biases the PICK instead (the table stays exact) -- the old checks exit 0 on it.
+- **Teeth**: M9b (PASS: ties to the highest index), MH1 (modulo-N hashing: property only), MH2 (reshuffling
+  rebuild), M7b (pick-level bias), M11 (now asserts oracle AND property). Calibration:
+  `benchmark/soak/_calibrate-s14.mjs` through the oracle's own `_oracleStat`; evidence
+  `benchmark/soak/s14-calibration.json`; `test/SoakOracles.test.js` guards thresholds vs evidence.
+- **Not done here (kernel, 1.1.0):** a public `setWeights()` (chaos fails closed on `_weights` meanwhile);
+  the low-load affinity metric (waits on the N4 decision); `_build` at M 65537 costs 10.6 ms against 0.5 ms at
+  25601 -- consistent with `(j % M) * skip` leaving int32 range (the audit's L7 additive-stepping fix). Also
+  open from the S14 table: the pool lane's A1 cap check uses a batch-wide T (catches "no cap", not H4's
+  off-by-one).

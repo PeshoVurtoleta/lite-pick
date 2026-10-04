@@ -24,7 +24,7 @@ import {
 
 export const CAP = 256;
 export const MASK = CAP - 1;          // pow2 modulo mask for the hot loop
-export const M_CH = 257;              // Maglev table size for keyed lanes (prime >= CAP)
+export const M_CH = 4099;             // Maglev table size for keyed lanes: the smallest prime >= 16 x CAP (S14)
 export const TINY_CAPS = [1, 2, 3];   // cap = TINY_CAPS[cycle % 3]
 const M_TINY = 17;                    // small prime Maglev table for the tiny keyed lanes
 

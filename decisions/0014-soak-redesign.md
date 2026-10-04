@@ -376,3 +376,13 @@ it false-FAILs a correct kernel. Two decisions change:
   25601 -- consistent with `(j % M) * skip` leaving int32 range (the audit's L7 additive-stepping fix). Also
   open from the S14 table: the pool lane's A1 cap check uses a batch-wide T (catches "no cap", not H4's
   off-by-one).
+
+## Amendment 2026-10-04 -- 1.1.0 B1: the P2C oracle re-calibrated on the uniform fallback
+
+The S7 calibration was measured on the biased sparse fallback (`_draw`, audit L2), which matters below ~40
+live of 256. After the 1.1.0 fix the full calibration was re-run (100,000 clean cycles x live 8..256, 77 min
+on 8 cores; 0 backstop, 0 lost picks): one breakpoint moved (`[16, 20]` -> `[17, 20]`, i.e. live 16's limit
+is 19). Power of the 50%-ignore mutant fell at live 8-11 (38-63% per cycle, was 58-65%) because part of the
+old detection came from the fallback bias amplifying the mutant, not from the oracle; 100% from live 49 as
+before. Evidence: `benchmark/soak/p2c-calibration.json`, `benchmark/soak/p2c-power.json` (the `gitSha` in
+their meta is the parent commit; the kernel was the B1 working tree).

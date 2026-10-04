@@ -96,3 +96,15 @@ at construction (Fork 4 already says so), and each `_build` / `setWeight` / `reb
 Maglev table (`M x 4` bytes) PLUS the populate scratch (a few `Int32Array(N)` + a `Uint8Array(M)`),
 so a rebuild leaves cold garbage. This is a COLD-path cost only; `pick()` remains 0 B/op. The
 README honest-cost table is corrected to match (it no longer says weight views are "never copied").
+
+## Amendment 2026-10-04 (1.1.0, audit 2026-09-29 L3 + L7)
+
+- **L3: no give-up past the probe window.** 1.0.x returned `PICK_NONE` when the home slot and the next 64
+  slots all mapped to down backends, even with backends up. 1.1.0 runs a cold O(M) forward sweep there
+  (`_sweep`), the idea of Linux IPVS `mh-fallback`; `PICK_NONE` now means no eligible backend owns a slot.
+  BoundedLoad uses the same sweep when its window holds nothing eligible (cap ignored). The fail-closed oracle
+  is `reachableInTable` (was `reachableWithinBound`).
+- **L7: additive stepping.** `_build` walks each permutation with `c += skip; if (c >= M) c -= M` instead of
+  `(offset + j*skip) % M` -- identical tables (golden fingerprints in `test/ConsistentHash.test.js`), so an
+  upgrade moves no key; 10.5 ms -> 1.3 ms per rebuild at the default M = 65537 (1.7x at 4099).
+- **`setWeights(weights)`:** copy all weights, one rebuild (the soak used to write `_weights` directly).

@@ -10,7 +10,8 @@
  *   A3. MINIMAL DISRUPTION: removing 1 of N backends remaps only ~1/N of keys (<= 2/N).
  *   A4. ELIGIBILITY PROBE: an ineligible hashed backend probes forward to the next eligible one
  *       (never returns a down / out-of-range index).
- *   A5. FAIL CLOSED: PICK_NONE when the whole pool is down; and when the probe window is exhausted.
+ *   A5. FAIL CLOSED: PICK_NONE when the whole pool is down -- and (1.1.0, L3) ONLY when no eligible backend
+ *       owns a table slot: past the probe window a full-table sweep finds a far one.
  *   A6. WEIGHTED DISTRIBUTION: slot share is ~proportional to weight.
  *   A7. KEY COERCION: keyHash is coerced `>>> 0` -- NaN/undefined -> 0, negatives wrap, never throws.
  *   A8. VALIDATION: the constructor throws typeof-first (M non-number, non-prime, capacity > M,
@@ -116,17 +117,64 @@ test('A5: fail closed -- whole pool down -> PICK_NONE; single eligible always re
     for (let k = 0; k < 5000; k++) assert.equal(b.pick(k * 2654435761), 5);
 });
 
-test('A5b: probe-bound fail-closed -- PICK_NONE past the window under a mass outage', () => {
-    // A degenerate tiny table where a whole contiguous window can be down: force the bound.
-    const N = 3, m = 127;
-    const el = up(N);
-    const b = new ConsistentHashBalancer(N, el, null, m);
-    // Down two of three so long down-runs exist in the table; still, any pick is eligible or NONE.
-    b.setEligible(0, false); b.setEligible(1, false);
-    for (let k = 0; k < 2000; k++) {
-        const p = b.pick(k);
-        assert.ok(p === 2 || p === PICK_NONE, 'only the eligible backend or fail-closed: ' + p);
+test('A5b (1.1.0, L3): past the probe window a full-table sweep -- never PICK_NONE while a backend is up', () => {
+    // 100 backends, M = 101: each owns ~1 slot, so with ONLY backend 99 up most keys face > 64 consecutive
+    // down slots. 1.0.x returned PICK_NONE for them; the L3 sweep (IPVS mh-fallback idea) finds 99.
+    const N = 100, m = 101;
+    const b = new ConsistentHashBalancer(N, up(N), null, m);
+    for (let i = 0; i < 99; i++) b.setEligible(i, false);
+    for (let k = 0; k < 2000; k++) assert.equal(b.pick(k), 99, 'key ' + k);
+    // A backend with weight 0 owns no slot: up but unreachable -> PICK_NONE is the honest answer.
+    const w = new Uint32Array(N).fill(1); w[99] = 0;
+    const z = new ConsistentHashBalancer(N, up(N), w, m);
+    for (let i = 0; i < 99; i++) z.setEligible(i, false);
+    for (let k = 0; k < 200; k++) assert.equal(z.pick(k), PICK_NONE);
+});
+
+test('L7 (1.1.0): additive Maglev stepping builds the IDENTICAL table (golden fingerprints from 1.0.2)', () => {
+    // FNV-1a over the uint16 halves of every lookup slot, recorded from the 1.0.2 multiply build. Equal
+    // tables mean an upgrade moves no key; the additive build is 7.8x faster at the default M = 65537.
+    const fnv = (a) => {
+        let h = 0x811c9dc5;
+        for (let i = 0; i < a.length; i++) {
+            h ^= a[i] & 0xff; h = Math.imul(h, 0x01000193);
+            h ^= (a[i] >>> 8) & 0xff; h = Math.imul(h, 0x01000193);
+        }
+        return (h >>> 0).toString(16).padStart(8, '0');
+    };
+    const grad = (n) => Uint32Array.from({ length: n }, (_, i) => 1 + (i & 7));
+    const cases = [
+        [3, 7, null, 1, '240ae81d'],
+        [8, 101, null, 0x9e3779b9, 'c7e090e9'],
+        [256, 4099, grad(256), 0x9e3779b9, '4ca1b5e6'],
+        [256, 65537, grad(256), 0x9e3779b9, 'e1a7633d'],
+        [100, 65537, null, 42, '9dfb7821'],
+        [10, 257, Uint32Array.from({ length: 10 }, (_, i) => (i === 3 ? 0 : 1 + i)), 7, '28f4545c'],
+    ];
+    for (const [cap, m, w, seed, want] of cases) {
+        assert.equal(fnv(new ConsistentHashBalancer(cap, up(cap), w, m, seed)._lookup), want, 'cap ' + cap + ' M ' + m);
     }
+});
+
+test('setWeights (1.1.0): one rebuild, same table as per-backend setWeight, a bad array changes nothing', () => {
+    const N = 16, w = Uint32Array.from({ length: N }, (_, i) => 1 + (i % 5));
+    const a = new ConsistentHashBalancer(N, up(N), null, 1031);
+    const b = new ConsistentHashBalancer(N, up(N), null, 1031);
+    for (let i = 0; i < N; i++) a.setWeight(i, w[i]);
+    let builds = 0;
+    const orig = b._build.bind(b);
+    b._build = () => { builds++; orig(); };
+    b.setWeights(w);
+    assert.equal(builds, 1, 'exactly one rebuild');
+    assert.deepEqual(b._lookup, a._lookup);
+    w[0] = 99;
+    assert.equal(b._weights[0], 1, 'the weights are COPIED, not aliased');
+    const before = Uint32Array.from(b._lookup);
+    for (const bad of [null, [1, 2], new Uint32Array(N - 1), new Float64Array(N)]) {
+        assert.throws(() => b.setWeights(bad), RangeError);
+    }
+    assert.equal(builds, 1, 'a rejected setWeights does not rebuild');
+    assert.deepEqual(b._lookup, before);
 });
 
 test('A6: weighted distribution -- slot share ~proportional to weight', () => {

@@ -103,7 +103,7 @@ export const _p2c = new Int32Array(3);
 // the largest clean sum seen at any live count <= live, + 4 (0.5 on the average gap). That file is the
 // evidence; test/SoakP2C.test.js fails if this table and it disagree. The literature gives the SHAPE (gap
 // ~ log2 ln n healthy, ~ log n / beta for a (1+beta)-choice P2C); the numbers are our measurement.
-export const P2C_SUM_LIMIT = Object.freeze([[8, 17], [9, 18], [13, 19], [16, 20], [26, 21], [37, 22], [55, 23], [130, 24]]);
+export const P2C_SUM_LIMIT = Object.freeze([[8, 17], [9, 18], [13, 19], [17, 20], [26, 21], [37, 22], [55, 23], [130, 24]]);
 const P2C_MAX_LIVE = 256;
 const _p2cLimit = new Int32Array(P2C_MAX_LIVE + 1).fill(-1);
 for (let n = P2C_MIN_LIVE; n <= P2C_MAX_LIVE; n++) for (const [at, v] of P2C_SUM_LIMIT) if (n >= at) _p2cLimit[n] = v;
@@ -283,6 +283,9 @@ function oracleBoundedLoad(b, el, inf, keys, keyCount, cap, rng) {
             if (el[i]) { if (firstEligible < 0) firstEligible = i; if (total === 0 || inf[i] < capOcc) { ref = i; break; } }
         }
         if (ref < 0) ref = firstEligible;
+        if (ref < 0) {   // L3 (1.1.0): nothing eligible in the window -> the first eligible in a full forward sweep
+            for (let p = 0; p < M; p++) { slot++; if (slot >= M) slot = 0; if (el[lookup[slot]]) { ref = lookup[slot]; break; } }
+        }
         const pick = b.pick(key);
         if (ref >= 0) { checks++; if (pick !== ref) viol++; }
         // PROPERTIES (S14), stated from the MTZ definition rather than this oracle's own walk order: the
@@ -290,7 +293,8 @@ function oracleBoundedLoad(b, el, inf, keys, keyCount, cap, rng) {
         // request ((1+eps)(T+1)/live, the H4 fix). (P1) home eligible and under cap -> the pick IS home;
         // (P2) some eligible under-cap backend in the window -> the pick is eligible, IN the window, and
         // under cap (any of them -- no order assumed); (P3) none under cap -> the pick is an eligible
-        // backend in the window, or PICK_NONE iff the window holds no eligible backend at all.
+        // backend in the window; (P4, L3) none in the window -> an eligible backend from anywhere in the table,
+        // PICK_NONE iff no eligible backend owns a slot.
         const home = lookup[(key >>> 0) % M];
         let underExists = 0, eligibleExists = 0, pickInWindow = 0;
         let s2 = (key >>> 0) % M;
@@ -305,7 +309,11 @@ function oracleBoundedLoad(b, el, inf, keys, keyCount, cap, rng) {
         if (el[home] && (total === 0 || inf[home] < capOcc)) { if (pick !== home) propViol++; }
         else if (underExists) { if (!pickOk || !(total === 0 || inf[pick] < capOcc)) propViol++; }
         else if (eligibleExists) { if (!pickOk) propViol++; }
-        else if (pick !== -1) propViol++;
+        else {
+            let anyInTable = 0;
+            for (let t2 = 0; t2 < M; t2++) if (el[lookup[t2]]) { anyInTable = 1; break; }
+            if (anyInTable ? !(pick >= 0 && el[pick]) : pick !== -1) propViol++;
+        }
         if (pick >= 0) { inf[pick]++; b.note(pick, 1); }
         if ((t & 3) === 0) { const d = rng.nextBelow(cap); if (inf[d] > 0) { inf[d]--; b.note(d, -1); } }
     }

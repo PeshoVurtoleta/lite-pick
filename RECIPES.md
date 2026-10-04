@@ -352,11 +352,12 @@ Notes:
   untouched, so only that backend's keys reroute (~`1/N`); everyone else stays put. A health
   flap costs nothing (the bounded probe absorbs it) -- it never rebuilds.
 - **Add / reweight** rebuilds the table (cold): `new ConsistentHashBalancer(N + 1, ...)`, or
-  `lb.setWeight(i, w)` / `lb.rebuild()`. Pass a `Uint32Array` of weights for proportional shares.
+  `lb.setWeight(i, w)` / `lb.rebuild()`, or `lb.setWeights(weights)` to retune every backend with ONE
+  rebuild (1.1.0). Pass a `Uint32Array` of weights for proportional shares.
 - **Cost:** the table is `M x 4` bytes (~256KB at the `65537` default) -- a cold, one-time
   allocation. Turn `M` down for a small pool (any prime `>= N`).
-- `pick(keyHash)` coerces `keyHash >>> 0` and never throws; it returns `PICK_NONE` only when the
-  pool is down or no eligible backend is reachable within the probe bound.
+- `pick(keyHash)` coerces `keyHash >>> 0` and never throws; it returns `PICK_NONE` only when no
+  eligible backend owns a table slot (1.1.0: past the 64-slot probe window it sweeps the whole table).
 - **Through `/pool`, a keyed balancer REQUIRES `opts.key`** (an integer), or `pool.run`
   rejects with a `LITE_PICK_KEY_REQUIRED`-coded error -- the key never routes silently to
   backend 0. The key drives the keyed `pick(key)` only; it is never passed to a latency

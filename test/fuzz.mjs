@@ -25,7 +25,7 @@ import {
 } from '../Pick.js';
 import {
     checkBase, recomputeEligibleWeight, recomputeEligibleWeighted,
-    allFinite, minEligibleScore, checkConsistentHash, reachableWithinBound,
+    allFinite, minEligibleScore, checkConsistentHash, reachableInTable,
     checkBoundedLoad, checkWeightedRandom,
 } from './invariants.mjs';
 
@@ -146,7 +146,7 @@ const SPECS = {
         // pick falls back to the first eligible, so PICK_NONE holds iff none is reachable).
         weighted: true, loadAware: true, usesSetWeight: true, keyed: true, boundedLoad: true,
         make: (cap, el, inf, w) => new BoundedLoadBalancer(cap, el, inf, 0.25, w, CH_FUZZ_M, 0xC0FFEE),
-        mass: (ctx) => reachableWithinBound(ctx.b, ctx.el, ctx.keyHash, CH_PROBE_LIMIT),
+        mass: (ctx) => reachableInTable(ctx.b, ctx.el),
         // Structural (table maps in-range, pick eligible/in-range) AND the owned _total stays exact.
         extra: (b, ctx, p) => checkConsistentHash(b, ctx.el, ctx.cap, p) || checkBoundedLoad(b, ctx.inflight, ctx.cap),
     },
@@ -166,7 +166,7 @@ const SPECS = {
         make: (cap, el, _inf, w) => new ConsistentHashBalancer(cap, el, w, CH_FUZZ_M, 0xC0FFEE),
         // Fail-closed IFF for a bounded-probe consistent hash is per-KEY: PICK_NONE holds exactly
         // when no eligible backend is reachable from the key's slot within the probe bound.
-        mass: (ctx) => reachableWithinBound(ctx.b, ctx.el, ctx.keyHash, CH_PROBE_LIMIT),
+        mass: (ctx) => reachableInTable(ctx.b, ctx.el),
         // Structural: the table maps only to in-range indices, and the pick is eligible/in-range.
         extra: (b, ctx, p) => checkConsistentHash(b, ctx.el, ctx.cap, p),
     },

@@ -18,7 +18,7 @@ import {
     PICK_NONE, CH_PROBE_LIMIT,
 } from './kernel.mjs';
 import {
-    checkBase, checkConsistentHash, reachableWithinBound, checkBoundedLoad, checkWeightedRandom,
+    checkBase, checkConsistentHash, reachableInTable, checkBoundedLoad, checkWeightedRandom,
     recomputeLive, recomputeEligibleWeight, recomputeEligibleWeighted, allFinite,
 } from '../../test/invariants.mjs';
 
@@ -198,7 +198,7 @@ export function massOf(lane, ctx) {
         case 'live': return recomputeLive(ctx.eligible, ctx.cap);
         case 'eligibleWeight': return recomputeEligibleWeight(ctx.eligible, ctx.weights, ctx.cap);
         case 'eligibleWeighted': return recomputeEligibleWeighted(ctx.eligible, ctx.weights, ctx.cap);
-        case 'reachable': return reachableWithinBound(ctx.b, ctx.eligible, ctx.keyHash, CH_PROBE_LIMIT);
+        case 'reachable': return reachableInTable(ctx.b, ctx.eligible);
         default: throw new Error('[soak] unknown massKind ' + lane.massKind);
     }
 }

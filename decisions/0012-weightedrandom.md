@@ -104,3 +104,11 @@ the in-repo PRNG. It is the AWS ALB `weighted_random` family at the in-process h
 - Walker, "An Efficient Method for Generating Discrete Random Variables with General Distributions" (ACM TOMS,
   1977) -- the original alias method.
 - ADR 0005 (this package) -- the rejection-sampling eligible-draw precedent (bounded retry + zero-alloc scan).
+
+## Amendment 2026-10-04 (1.1.0, audit 2026-09-29 L2): a weight-proportional fallback
+
+The sparse fallback (first eligible positive-weight node after a random start) was biased the same way as
+P2C's (ADR 0005 amendment) and ignored weights. 1.1.0 walks the cumulative eligible weight from a uniform
+`u` in [0, eligible weight) -- the fast path's distribution, in a separate cold method (`_sparsePick`) so the
+fractional `u` never lives in `pick()`'s body: the first version kept it inline and the PerfGate heavy-outage
+lane read 12 scavenges at 8N (the zero-box law). `setWeights(weights)` (copy all, one rebuild) is added.

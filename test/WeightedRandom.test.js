@@ -255,3 +255,29 @@ test('M1: setWeight rejects a non-integer/out-of-range index; no rebuild, caller
     assert.equal(b._builds, builds, 'a rejected setWeight must not rebuild the alias table');
     assert.deepEqual(Uint32Array.from(weights), before, 'caller weights unchanged after a rejected setWeight');
 });
+
+test('L2 (1.1.0): the sparse-pool fallback is WEIGHT-PROPORTIONAL over the eligible nodes', () => {
+    // Nodes 0 (weight 1) and 1 (weight 3) of 100 eligible, the rest weight 1 and down: most draws miss and
+    // reach the fallback, which must keep the 1:3 ratio (1.0.x: first eligible after a random start).
+    const weights = new Uint32Array(100).fill(1); weights[1] = 3;
+    const el = new Uint8Array(100); el[0] = 1; el[1] = 1;
+    const b = new WeightedRandomBalancer(100, el, weights, 11);
+    const c = [0, 0];
+    for (let i = 0; i < 200000; i++) c[b.pick()]++;
+    const share = c[1] / 200000;
+    assert.ok(Math.abs(share - 0.75) < 0.01, 'node 1 share ' + share.toFixed(4) + ' (want 0.75 +- 0.01)');
+});
+
+test('setWeights (1.1.0): one rebuild, copies into the caller array, a bad array changes nothing', () => {
+    const weights = w([1, 2, 3, 4]);
+    const b = new WeightedRandomBalancer(4, new Uint8Array(4).fill(1), weights);
+    const builds = b._builds;
+    const next = w([4, 3, 2, 1]);
+    b.setWeights(next);
+    assert.equal(b._builds, builds + 1, 'exactly one rebuild');
+    assert.deepEqual(Uint32Array.from(weights), next, 'copied into the weights array the balancer was built with');
+    assert.equal(checkWeightedRandom(b, weights, 4), null);
+    for (const bad of [null, [1, 2, 3, 4], w([1, 2, 3]), new Float64Array(4)]) assert.throws(() => b.setWeights(bad), RangeError);
+    assert.equal(b._builds, builds + 1, 'a rejected setWeights does not rebuild');
+    assert.deepEqual(Uint32Array.from(weights), next);
+});

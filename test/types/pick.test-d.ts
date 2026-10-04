@@ -162,6 +162,9 @@ void chSize;
 const chPick: number = ch.pick(0xdeadbeef);
 void chPick;
 ch.setWeight(0, 5);
+ch.setWeights(new Uint32Array(8).fill(2));   // 1.1.0 batch reweight, one rebuild
+// @ts-expect-error -- setWeights takes a Uint32Array, not a number[].
+ch.setWeights([1, 2, 3]);
 ch.rebuild();
 ch.setEligible(1, false);
 
@@ -189,6 +192,7 @@ void blSize;
 bl.note(0, 1);
 bl.note(0, -1);
 bl.setWeight(0, 5);                          // inherited COLD reweight + rebuild
+bl.setWeights(new Uint32Array(8).fill(2));   // inherited 1.1.0 batch reweight
 bl.rebuild();                               // inherited COLD rebuild
 
 // @ts-expect-error -- inflight must be a Uint32Array, not a number[].
@@ -217,6 +221,7 @@ const wrLive: number = wr.live;
 const wrPick: number = wr.pick();
 void wrCap; void wrLive; void wrPick;
 wr.setWeight(0, 5);
+wr.setWeights(new Uint32Array(8).fill(2));   // 1.1.0 batch reweight, one rebuild
 wr.rebuild();
 wr.setEligible(1, false);
 

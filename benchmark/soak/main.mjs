@@ -62,21 +62,6 @@ function breach(head, detail) {
 let fatalCtx = null;             // set once stream/summarize exist, so main().catch can write a fatal
 
 /** The chaos phases that SHOULD fire for a lane (T8 self-check applicability, from lane flags). */
-/**
- * The keyed balancers' OWNED weights (CH/BL copy weights at construction; there is no batch-reweight API, so
- * the allZero phase and the freeze restore write this array and call ONE rebuild()). S14: fail closed if the
- * private field is gone -- a kernel rename used to turn both into silent no-ops (`if (bw)`). A public
- * setWeights() is a 1.1.0 kernel item.
- */
-function keyedWeights(b, lane) {
-    const bw = b._weights;
-    if (!(bw instanceof Uint32Array)) {
-        throw new Error('soak: keyed lane ' + lane.name + ' exposes no Uint32Array _weights -- the allZero phase and the ' +
-            'freeze restore would be silent no-ops (kernel renamed the field?)');
-    }
-    return bw;
-}
-
 function applicablePhases(lane, hasRebuild) {
     const a = ['flap', 'allDown', 'recover', 'sparse'];
     if (lane.weighted) a.push('weightRetune', 'allZero');
@@ -359,12 +344,11 @@ async function main() {
                     for (let k = 0; k < up; k++) built.b.setEligible(chaosRng.nextBelow(CAP), true);
                     phase.sparse++; qw.reset();
                 } else if (roll < 76 && lane.weighted) {
-                    // allZero: for KEYED lanes, write the balancer-owned weights + ONE rebuild (per-node
+                    // allZero: for KEYED lanes, setWeights (all zero) = ONE rebuild (per-node
                     // setWeight would be CAP Maglev rebuilds, ~64KB each -> a workload major GC).
                     if (lane.keyed) {
-                        const bw = keyedWeights(built.b, lane);
-                        for (let i = 0; i < CAP; i++) { bw[i] = 0; weights[i] = 0; }
-                        if (hasRebuild) built.b.rebuild();
+                        for (let i = 0; i < CAP; i++) weights[i] = 0;
+                        built.b.setWeights(weights);   // 1.1.0 public batch API: copy + ONE rebuild
                     } else {
                         for (let i = 0; i < CAP; i++) { if (lane.usesSetWeight) built.b.setWeight(i, 0); weights[i] = 0; }
                     }
@@ -417,13 +401,12 @@ async function main() {
                 // dense pool that would erase exactly the drift the audit targets. The dense restore
                 // happens AFTER the loop, only for the B/op and hotOps micro-benches.
                 // Keyed CH/BL: chaos may have driven the frozen weights near all-zero; restore the gradient
-                // with ONE batched rebuild (write b._weights for all nodes, then a single rebuild()) so CH/BL
+                // with ONE batched rebuild (setWeights: copy all nodes, then a single rebuild) so CH/BL
                 // reach the freeze with >= 8 positive-weight eligible nodes and their weight-0 guard is ARMED.
                 // Per-node setWeight would be CAP Maglev rebuilds (a workload major GC); this is exactly one.
                 if (lane.keyed && lane.weighted && CAP >= 8) {
-                    const bw = keyedWeights(built.b, lane);
-                    for (let i = 0; i < CAP; i++) { const w = 1 + (i & 7); bw[i] = w; weights[i] = w; }
-                    if (typeof built.b.rebuild === 'function') built.b.rebuild();
+                    for (let i = 0; i < CAP; i++) weights[i] = 1 + (i & 7);
+                    built.b.setWeights(weights);   // 1.1.0 public batch API: copy + ONE rebuild
                 }
                 qw.reset();
                 // weight0 teeth: a DIRECT weight->0 write (no setWeight/no rebuild) so the kernel's

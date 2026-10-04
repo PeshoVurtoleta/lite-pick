@@ -254,3 +254,13 @@ test('never returns a down/oob index under adversarial flapping + notes', () => 
     }
     assert.ok(Number.isFinite(bl.totalInflight) && bl.totalInflight >= 0);
 });
+
+test('L3 (1.1.0): nothing eligible in the probe window -> the full-table sweep, cap ignored (never a dead pick)', () => {
+    // 100 backends, M = 101 (~1 slot each), only backend 99 up and loaded far over any cap: every key still
+    // resolves to 99 -- 1.0.x returned PICK_NONE when the 65-slot window held no eligible backend.
+    const N = 100, inflight = new Uint32Array(N);
+    const bl = new BoundedLoadBalancer(N, new Uint8Array(N).fill(1), inflight, 0.25, null, 101);
+    for (let i = 0; i < 99; i++) bl.setEligible(i, false);
+    inflight[99] = 50; bl.note(99, 50);
+    for (let k = 0; k < 2000; k++) assert.equal(bl.pick(k), 99, 'key ' + k);
+});

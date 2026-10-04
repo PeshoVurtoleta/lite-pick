@@ -121,9 +121,13 @@ export class Prng {
         return this._s;
     }
 
-    /** A uint32 in [0, n) via multiply-shift (no modulo bias for the balance gate). */
+    /**
+     * An integer in [0, n): floor(r / 2^32 x n) for a uniform uint32 r (L8, 1.1.0: this is a scaled floor,
+     * not a multiply-shift). r / 2^32 is exact in a double, and so is the product while n < 2^21; the 2^32
+     * values of r fall into n buckets whose sizes differ by at most one, a relative bias <= n / 2^32
+     * (~6e-8 at n = 256) -- no modulo bias.
+     */
     nextBelow(n) {
-        // (rand * n) >>> 32 -- unbiased enough for selection, one Math.imul-free mul.
         return Math.floor((this.next() / 4294967296) * n);
     }
 
@@ -416,8 +420,8 @@ export class P2cBalancer extends BalancerBase {
 
     /**
      * A uniformly random ELIGIBLE index, or PICK_NONE if none. Expected O(1) (rejection
-     * sampling); a rotated linear scan from a random start is the zero-alloc fallback under
-     * degenerate sparsity (unbiased first-eligible-after-a-random-offset). Internal.
+     * sampling); under degenerate sparsity (64 misses) the zero-alloc fallback draws k in [0, live)
+     * and walks to the k-th eligible index -- uniform by construction (L2, 1.1.0). Internal.
      * @returns {number}
      */
     _draw() {
@@ -427,15 +431,14 @@ export class P2cBalancer extends BalancerBase {
             const i = this._rng.nextBelow(cap);
             if (el[i]) return i;
         }
-        // Degenerate (very sparse eligibility): scan from a random start, wrapping, and
-        // return the first eligible found. Zero-alloc; live > 0 guarantees a hit.
-        let i = this._rng.nextBelow(cap);
-        for (let k = 0; k < cap; k++) {
-            if (el[i]) return i;
-            i++;
-            if (i >= cap) i = 0;
+        // Degenerate (very sparse eligibility): the k-th eligible index, k uniform in [0, live). The
+        // 1.0.x fallback took the first eligible after a random start, which favours a node that follows
+        // a long run of down nodes (nodes {0,1} of 100: 63.5% / 36.5%). Zero-alloc, O(cap).
+        let k = this._rng.nextBelow(this._live);
+        for (let i = 0; i < cap; i++) {
+            if (el[i]) { if (k === 0) return i; k--; }
         }
-        return PICK_NONE;
+        return PICK_NONE;   // unreachable while _live matches the shared view (a direct write is UB, H2)
     }
 
     /**
@@ -938,9 +941,9 @@ function chIsPrime(n) {
  * `peerDependencies` STAYS `{}` until a shipped code path imports it.
  *
  * Bound: O(1) per pick, 0 B/op (integer ops over the prebuilt table -- no allocation). Fails closed
- * (PICK_NONE) when the whole pool is down OR no eligible backend is reachable within the probe bound
- * (a near-total outage may return PICK_NONE even if a far eligible slot exists -- safe, never a dead
- * pick, over-conservative only under mass outage; ADR 0010).
+ * (PICK_NONE) only when no eligible backend owns a table slot (the whole pool down, or only weight-0
+ * backends up). Past the 64-slot probe window a cold O(M) sweep finds a far eligible slot (L3, 1.1.0 --
+ * 1.0.x returned PICK_NONE there; ADR 0010 amendment).
  */
 export class ConsistentHashBalancer extends BalancerBase {
     /**
@@ -1027,7 +1030,12 @@ export class ConsistentHashBalancer extends BalancerBase {
         }
         // Maglev populate honoring the quota. The permutation is surjective over all M slots, so a
         // backend with remaining quota always reaches an empty slot while one exists -> no stall.
-        const next = new Int32Array(N);
+        // L7 (1.1.0): ADDITIVE stepping. Backend b's permutation is offset, offset+skip, offset+2skip, ...
+        // (mod M); `cur[b]` holds its next position and advances by `skip[b]` with one conditional subtract.
+        // The SAME sequence as `(offset + j*skip) % M` -- identical tables, so an upgrade moves no key --
+        // without the multiply, which cost 10.5 ms per rebuild at M = 65537 (1.3 ms now).
+        const cur = new Int32Array(N);
+        for (let b = 0; b < N; b++) cur[b] = offset[b];
         const filledCount = new Int32Array(N);
         const taken = new Uint8Array(M);
         let filled = 0;
@@ -1035,12 +1043,13 @@ export class ConsistentHashBalancer extends BalancerBase {
             let progressed = false;
             for (let b = 0; b < N; b++) {
                 if (filledCount[b] >= quota[b]) continue;
-                let j = next[b];
-                let c = (offset[b] + (j % M) * skip[b]) % M;
-                while (taken[c]) { j++; c = (offset[b] + (j % M) * skip[b]) % M; }
+                const sk = skip[b];
+                let c = cur[b];
+                while (taken[c]) { c += sk; if (c >= M) c -= M; }
                 lookup[c] = b;
                 taken[c] = 1;
-                next[b] = j + 1;
+                c += sk; if (c >= M) c -= M;
+                cur[b] = c;
                 filledCount[b]++;
                 filled++;
                 progressed = true;
@@ -1070,6 +1079,22 @@ export class ConsistentHashBalancer extends BalancerBase {
         this._build();
     }
 
+    /**
+     * COLD (1.1.0): replace ALL backend weights at once and rebuild the table ONCE. Per-backend `setWeight`
+     * rebuilds on every call (N rebuilds to retune N backends); this is the batch form. `weights` is COPIED
+     * into the balancer-owned weights (indices [0, capacity)); validated before any write, so a bad call
+     * changes nothing.
+     * @param {Uint32Array} weights  new per-backend weights (length >= capacity)
+     */
+    setWeights(weights) {
+        if (!(weights instanceof Uint32Array) || weights.length < this._cap) {
+            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+        }
+        const wt = this._weights;
+        for (let i = 0; i < this._cap; i++) wt[i] = weights[i];
+        this._build();
+    }
+
     /** COLD: rebuild the lookup table from the current owned weights (e.g. after a membership change). */
     rebuild() {
         this._build();
@@ -1080,8 +1105,8 @@ export class ConsistentHashBalancer extends BalancerBase {
      *
      * slot = (keyHash >>> 0) % M; if `lookup[slot]` is eligible return it, else forward-probe up to
      * CH_PROBE_LIMIT (64) slots for the next eligible backend. `keyHash` is coerced `>>> 0` (NaN -> 0
-     * deterministically) and pick NEVER throws (the fail-closed contract). Returns PICK_NONE when the
-     * whole pool is down or no eligible backend is reachable within the bound.
+     * deterministically) and pick NEVER throws (the fail-closed contract). Past the window a cold
+     * full-table sweep (`_sweep`, L3); PICK_NONE only when no eligible backend owns a table slot.
      * @param {number} keyHash  a caller-supplied integer key hash (coerced to uint32)
      * @returns {number}
      */
@@ -1091,12 +1116,30 @@ export class ConsistentHashBalancer extends BalancerBase {
         let slot = (keyHash >>> 0) % M;           // integer key; NaN >>> 0 = 0 (never throws)
         let i = lookup[slot];
         if (el[i]) return i;
-        // Bounded forward-probe past down slots. Past the bound we fail closed: a near-total outage
-        // may return PICK_NONE even if a far eligible slot exists -- safe, never a dead pick.
+        // Bounded forward-probe past down slots; past the window, the cold full-table sweep (L3).
         for (let p = 0; p < CH_PROBE_LIMIT; p++) {
             slot++;
             if (slot >= M) slot = 0;
             i = lookup[slot];
+            if (el[i]) return i;
+        }
+        return this._sweep(slot);
+    }
+
+    /**
+     * COLD (L3, 1.1.0): past the CH_PROBE_LIMIT window, sweep the WHOLE table forward from `slot` and return
+     * the first eligible backend -- the same idea as Linux IPVS `mh-fallback`. 1.0.x returned PICK_NONE here,
+     * so a near-total outage (65+ consecutive slots on down backends) could fail closed while backends were
+     * up. Now PICK_NONE means no eligible backend owns a table slot. O(M), 0 B/op, only on that path.
+     * @param {number} slot  the last probed slot
+     * @returns {number}
+     */
+    _sweep(slot) {
+        const M = this._m, el = this._eligible, lookup = this._lookup;
+        for (let p = 0; p < M; p++) {
+            slot++;
+            if (slot >= M) slot = 0;
+            const i = lookup[slot];
             if (el[i]) return i;
         }
         return PICK_NONE;
@@ -1144,8 +1187,8 @@ export class ConsistentHashBalancer extends BalancerBase {
  * at 0; `totalInflight` exposes it.
  *
  * Bound: O(1) per pick (modulo + table read + bounded cap-aware probe), 0 B/op on BOTH `pick()` and
- * `note()` (torture + PerfGate). Fails closed (PICK_NONE) ONLY when no eligible backend is reachable
- * within the probe window (M8's contract) -- NEVER merely because backends are over cap.
+ * `note()` (torture + PerfGate). Fails closed (PICK_NONE) ONLY when no eligible backend owns a table
+ * slot (M8's contract, with the L3 sweep) -- NEVER merely because backends are over cap.
  */
 export class BoundedLoadBalancer extends ConsistentHashBalancer {
     /**
@@ -1211,7 +1254,8 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
      * slots) and return the FIRST backend that is ELIGIBLE AND under cap = ceil((1+eps) x (_total+1) /
      * live). If none in the window is under cap, fall back to the FIRST eligible seen (sticky wins -- the cap is
      * a soft preference, never a dead pick). `_total === 0` skips the cap test -> pure ConsistentHash.
-     * PICK_NONE ONLY when no eligible backend is reachable within the window.
+     * Nothing eligible in the window: the cold full-table sweep (L3). PICK_NONE ONLY when no eligible
+     * backend owns a table slot.
      * @param {number} keyHash  a caller-supplied integer key hash (coerced to uint32)
      * @returns {number}
      */
@@ -1243,7 +1287,8 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
                 if (firstEligible < 0) firstEligible = i;    // remember the first eligible (fallback)
             }
         }
-        return firstEligible;   // -1 (PICK_NONE) iff NO eligible backend was reachable in the window
+        // Nothing eligible in the window: the cold full-table sweep (L3), cap ignored (never a dead pick).
+        return firstEligible >= 0 ? firstEligible : this._sweep(slot);
     }
 }
 
@@ -1384,6 +1429,21 @@ export class WeightedRandomBalancer extends BalancerBase {
         this._build();
     }
 
+    /**
+     * COLD (1.1.0): replace ALL weights at once and rebuild the alias table ONCE -- the batch form of
+     * `setWeight` (which rebuilds per call). The values are COPIED into the weights array this balancer was
+     * built with (the caller's array, indices [0, capacity)); validated before any write.
+     * @param {Uint32Array} weights  new per-endpoint weights (length >= capacity)
+     */
+    setWeights(weights) {
+        if (!(weights instanceof Uint32Array) || weights.length < this._cap) {
+            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+        }
+        const wt = this._weights;
+        for (let i = 0; i < this._cap; i++) wt[i] = weights[i];
+        this._build();
+    }
+
     /** COLD: rebuild the alias table from the current caller weights (e.g. after a membership change). */
     rebuild() {
         this._build();
@@ -1408,15 +1468,26 @@ export class WeightedRandomBalancer extends BalancerBase {
             const cand = u < prob[col] ? col : alias[col];
             if (el[cand]) return cand;
         }
-        // Degenerate (very sparse eligibility): scan from a random start for the first eligible,
-        // positive-weight node. Zero-alloc; returns PICK_NONE only if none exists.
-        const wt = this._weights;
-        let i = rng.nextBelow(cap);
-        for (let k = 0; k < cap; k++) {
-            if (el[i] && wt[i] > 0) return i;
-            i++;
-            if (i >= cap) i = 0;
+        return this._sparsePick();                // degenerate sparsity: the cold fallback (L2)
+    }
+
+    /**
+     * COLD (L2, 1.1.0): the very-sparse fallback, WEIGHT-PROPORTIONAL over the eligible positive-weight nodes
+     * like the fast path -- u uniform in [0, eligible weight), walk the cumulative weights. The 1.0.x
+     * fallback (first eligible after a random start) favoured a node after a long down run. Its own method so
+     * the fractional `u` never lives in pick()'s body (the zero-box law); returns an index. Zero-alloc, O(cap).
+     * @returns {number}
+     */
+    _sparsePick() {
+        const cap = this._cap, el = this._eligible, wt = this._weights;
+        let s = 0;
+        for (let i = 0; i < cap; i++) if (el[i]) s += wt[i];
+        if (s === 0) return PICK_NONE;            // no eligible positive-weight node
+        let u = (this._rng.next() / 4294967296) * s;
+        let last = PICK_NONE;
+        for (let i = 0; i < cap; i++) {
+            if (el[i] && wt[i] > 0) { u -= wt[i]; last = i; if (u < 0) return i; }
         }
-        return PICK_NONE;                         // no eligible positive-weight node
+        return last;                              // float residue: the last positive-weight eligible node
     }
 }

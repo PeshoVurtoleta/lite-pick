@@ -6,7 +6,41 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
+Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; burst B1 -- the plain fixes).
+
+### Added
+
+- **`setWeights(weights)` on `ConsistentHashBalancer`, `BoundedLoadBalancer` (inherited) and
+  `WeightedRandomBalancer`.** Replace every weight at once with ONE table rebuild; `setWeight` rebuilds per
+  call, so retuning N backends cost N rebuilds. The array is copied (CH/BL into the balancer-owned weights,
+  WeightedRandom into the weights array it was built with) and validated before any write (RangeError).
+
+### Fixed
+
+- **P2C, PeakEWMA and WeightedRandom: the very-sparse fallback was biased (audit L2).** After 64 rejected
+  draws the 1.0.x fallback took the first eligible node after a random start, so a node that follows a long
+  run of down nodes won more often: nodes {0, 1} of 100 up gave 63.5% / 36.5%. P2C/PeakEWMA now draw a
+  uniform k-th eligible node (50.1% / 49.9%); WeightedRandom walks the cumulative eligible weight, so its
+  fallback keeps the weight ratio like its fast path. Only the >= 64-miss path changes; 0 B/op (PerfGate
+  heavy-outage lane, Node 22 and 26).
+- **ConsistentHash and BoundedLoad: no `PICK_NONE` while a backend is reachable (audit L3).** When the home
+  slot and the next 64 slots all mapped to down backends, `pick` returned `PICK_NONE` even with backends up.
+  It now sweeps the whole table (cold, O(M), only on that path) -- the idea of Linux IPVS `mh-fallback`.
+  `PICK_NONE` now means no eligible backend owns a table slot. Behaviour change: a key that used to fail
+  closed under a near-total outage now reaches a far backend.
+
 ### Changed
+
+- **ConsistentHash / BoundedLoad tables build ~8x faster at the default M (audit L7).** Additive Maglev
+  stepping (`c += skip`) instead of `(offset + j * skip) % M`: 10.5 ms -> 1.3 ms per rebuild at M = 65537,
+  1.7x at 4099. The tables are IDENTICAL to 1.0.x (golden fingerprints in the tests), so upgrading moves no key.
+- `Prng.nextBelow`'s comment now says what it does (a scaled floor with relative bias <= n / 2^32, not a
+  multiply-shift) (audit L8).
+- Benchmark-only: the soak uses `setWeights` instead of writing the private `_weights`, and its P2C oracle
+  was re-calibrated on the fixed fallback (100,000 clean cycles per live count again; 0 backstop, 0 lost
+  picks). One limit moved: live 16 is 19 (was 20). The 50%-ignore mutant is now caught in 38-63% of cycles
+  at live 8-11 (it was 58-65%: the biased fallback had amplified the mutant's imbalance), 86% at 16, >= 99%
+  from 31 and 100% from 49 -- the soak's frozen state has ~165-200 live.
 
 - **Benchmark-only: a soak run without the evidence to judge is INCONCLUSIVE, not PASS (S5, audit
   2026-09-29).** A non-smoke run where any lane has fewer than 2N post-warmup cycles (e.g.

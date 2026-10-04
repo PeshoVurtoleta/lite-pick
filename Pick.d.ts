@@ -220,7 +220,8 @@ export const CH_PROBE_LIMIT: number;
  * lookup table (M x 4 bytes; the 65537 default is ~256KB, a COLD one-time allocation) and an internal
  * weights array; `setWeight` / `rebuild` rebuild the table (COLD). A health flap is absorbed by the
  * probe -- never a rebuild -- so removing a backend (`setEligible(i, false)`) remaps only ~1/N keys.
- * Fails closed (`PICK_NONE`) when the pool is down or no eligible backend is reachable within the bound.
+ * Fails closed (`PICK_NONE`) only when no eligible backend owns a table slot: past the 64-slot probe window
+ * a cold O(M) sweep finds a far eligible backend (1.1.0; 1.0.x returned `PICK_NONE` there).
  */
 export class ConsistentHashBalancer extends BalancerBase {
     /** Marker: keyed; /pool requires a numeric `opts.key`. Inherited by BoundedLoadBalancer. */
@@ -238,9 +239,17 @@ export class ConsistentHashBalancer extends BalancerBase {
     readonly tableSize: number;
     /** Cold path: reconfigure backend `i`'s weight (uint32) and rebuild the table. */
     setWeight(i: number, w: number): void;
+    /**
+     * Cold path (1.1.0): replace ALL weights (copied, length >= capacity) and rebuild the table ONCE --
+     * the batch form of `setWeight`. Validated before any write; throws RangeError on a bad array.
+     */
+    setWeights(weights: Uint32Array): void;
     /** Cold path: rebuild the lookup table from the current owned weights. */
     rebuild(): void;
-    /** Map an integer `keyHash` to a backend index (bounded probe past down slots), or `PICK_NONE`. */
+    /**
+     * Map an integer `keyHash` to a backend index (bounded probe past down slots, then a cold full-table
+     * sweep -- 1.1.0), or `PICK_NONE` only when no eligible backend owns a table slot.
+     */
     pick(keyHash: number): number;
 }
 
@@ -261,9 +270,9 @@ export class ConsistentHashBalancer extends BalancerBase {
  * using BoundedLoad you update `inflight[i]` AND call `note(i, +/-1)` in LOCKSTEP (or drive it through
  * the /pool adapter, which does both): `note` maintains `_total`, it does not write `inflight`. A
  * direct mutation of `inflight` without the matching `note` desyncs `_total` -- UB. It inherits the Maglev table + `setWeight` /
- * `rebuild` / `tableSize` from ConsistentHashBalancer (reused verbatim). `pick()` and `note()` are
- * both 0 B/op / O(1). Fails closed (`PICK_NONE`) ONLY when no eligible backend is reachable within
- * the probe window -- NEVER merely because backends are over cap. NOT the P2C-with-cap "overload"
+ * `setWeights` / `rebuild` / `tableSize` from ConsistentHashBalancer (reused verbatim). `pick()` and `note()` are
+ * both 0 B/op / O(1). Fails closed (`PICK_NONE`) ONLY when no eligible backend owns a table slot (the
+ * 1.1.0 full-table sweep past the probe window) -- NEVER merely because backends are over cap. NOT the P2C-with-cap "overload"
  * variant (that is byte-identical to P2C; the cap is only load-bearing on a sticky hash -- ADR 0011).
  */
 export class BoundedLoadBalancer extends ConsistentHashBalancer {
@@ -323,6 +332,11 @@ export class WeightedRandomBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, weights: Uint32Array, seed?: number);
     /** Cold path: reconfigure endpoint `i`'s weight (uint32) and rebuild the alias table. */
     setWeight(i: number, w: number): void;
+    /**
+     * Cold path (1.1.0): replace ALL weights (copied into the weights array this balancer was built with,
+     * length >= capacity) and rebuild the alias table ONCE. Validated before any write.
+     */
+    setWeights(weights: Uint32Array): void;
     /** Cold path: rebuild the alias table from the current caller weights (e.g. after a membership change). */
     rebuild(): void;
     /** Pick an endpoint index proportional to weight (eligibility by rejection sampling), or `PICK_NONE`. O(1). */

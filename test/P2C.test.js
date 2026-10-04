@@ -114,3 +114,15 @@ test('A5 (smoke): P2C peak load far below a random single-draw foil', () => {
     assert.ok(p2cGap < rndGap / 2, 'P2C gap ' + p2cGap + ' should be << random gap ' + rndGap);
     assert.ok(p2cGap <= 8, 'P2C gap ' + p2cGap + ' should be a small ln ln n constant');
 });
+
+test('L2 (1.1.0): the sparse-pool fallback is UNIFORM over the eligible nodes', () => {
+    // Nodes {0, 1} of 100 eligible: ~27% of draws miss 64 times and reach the fallback. The 1.0.x fallback
+    // (first eligible after a random start) gave node 0 the 98-node gap before it: 63.5% / 36.5%.
+    const el = new Uint8Array(100), inf = new Uint32Array(100);
+    el[0] = 1; el[1] = 1;
+    const b = new P2cBalancer(100, el, inf, 7);
+    const c = [0, 0];
+    for (let i = 0; i < 200000; i++) c[b._draw()]++;
+    const share = c[0] / 200000;
+    assert.ok(Math.abs(share - 0.5) < 0.01, 'node 0 share ' + share.toFixed(4) + ' (want 0.5 +- 0.01)');
+});

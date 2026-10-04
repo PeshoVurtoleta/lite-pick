@@ -88,19 +88,14 @@ export function checkConsistentHash(b, eligible, cap, lastPick) {
 }
 
 /**
- * The independent reachability oracle for ConsistentHash's fail-closed IFF: is an eligible backend
- * reachable from `keyHash`'s slot within the bounded forward-probe (initial slot + `bound` probes)?
- * Reads the table + eligibility exactly as pick() does, so a mismatch flags an off-by-one / stale
- * table. Returns 1 (reachable) or 0 (fail-closed within the bound).
+ * The independent reachability oracle for ConsistentHash's fail-closed IFF (L3, 1.1.0): does ANY eligible
+ * backend own a table slot? pick() probes the window and then sweeps the whole table, so it returns
+ * PICK_NONE iff this is 0. Reads the table + eligibility directly, O(M). Returns 1 (reachable) or 0.
+ * (1.0.x: reachableWithinBound -- reachability within the 64-slot window only.)
  */
-export function reachableWithinBound(b, eligible, keyHash, bound) {
+export function reachableInTable(b, eligible) {
     const M = b._m, lookup = b._lookup;
-    let slot = (keyHash >>> 0) % M;
-    if (eligible[lookup[slot]]) return 1;
-    for (let p = 0; p < bound; p++) {
-        slot++; if (slot >= M) slot = 0;
-        if (eligible[lookup[slot]]) return 1;
-    }
+    for (let s = 0; s < M; s++) if (eligible[lookup[s]]) return 1;
     return 0;
 }
 

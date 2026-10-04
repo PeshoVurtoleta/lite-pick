@@ -236,11 +236,15 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     the 65537 default -- disclosed cold cost, M configurable down for small pools).
   - `pick(keyHash)` -> number. Maps an INTEGER key: slot = (keyHash >>> 0) % M, read `lookup[slot]`,
     and if down forward-probe up to CH_PROBE_LIMIT (64) slots for the next eligible backend. O(1),
-    0 B/op. `keyHash` is coerced `>>> 0` (NaN -> 0) and pick NEVER throws. `PICK_NONE` when the pool is
-    down OR no eligible backend is reachable within the bound (a mass outage may fail closed even if a
-    far eligible slot exists -- safe, never a dead pick). KEY IS A CALLER INTEGER -- no per-pick string
+    0 B/op. `keyHash` is coerced `>>> 0` (NaN -> 0) and pick NEVER throws. Past the 64-slot window a
+    COLD full-table sweep finds a far eligible backend (1.1.0, L3; 1.0.x returned PICK_NONE there), so
+    `PICK_NONE` ONLY when no eligible backend owns a table slot. KEY IS A CALLER INTEGER -- no per-pick string
     hashing (the one zero-GC hazard); hash string keys yourself, cold. No hashing dependency added.
   - `setWeight(i, w)` -> void. COLD. Set backend i's weight (uint32) and REBUILD the table.
+  - `setWeights(weights)` -> void. COLD (1.1.0). Replace ALL weights (a Uint32Array, length >= capacity,
+    COPIED) and rebuild ONCE -- the batch form of setWeight. Validated before any write (RangeError).
+    The table is built by additive Maglev stepping (1.1.0, L7): identical tables to 1.0.x, ~8x faster
+    at the default M.
   - `rebuild()` -> void. COLD. Rebuild the table from the current owned weights (e.g. after a
     membership change). A health flap does NOT rebuild -- the bounded probe absorbs it.
   - `tableSize` -- readonly number. The Maglev table size M (prime).
@@ -268,14 +272,15 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     stricter global-slot-by-weight definition)
     (a hot home OVERFLOWS to a neighbour). If none in the window is under cap, fall back to the FIRST
     eligible seen (sticky wins; the cap is a soft preference). `_total === 0` skips the cap -> pure
-    ConsistentHash. O(1), 0 B/op, NEVER throws. `PICK_NONE` ONLY when no eligible backend is reachable
-    in the window -- NEVER merely because backends are over cap (fail OPEN on overload).
+    ConsistentHash. O(1), 0 B/op, NEVER throws. Nothing eligible in the window -> the cold full-table
+    sweep (1.1.0, L3), cap ignored. `PICK_NONE` ONLY when no eligible backend owns a table slot -- NEVER
+    merely because backends are over cap (fail OPEN on overload).
   - `note(i, delta)` -> void. WARM feedback path (not the hot pick path): the SOLE writer of `_total`
     (dispatch note(i,+1) / settle note(i,-1)), so the cap's mean stays O(1)-current without a scan.
     `i` is validated in range (RangeError), `delta` typeof-first as an integer; `_total` clamps at 0.
     0 B/op on the success path.
   - `totalInflight` -- readonly number. The owned running occupancy sum (for tests / observability).
-  - `setWeight(i, w)` / `rebuild()` / `tableSize` -- inherited from ConsistentHashBalancer (COLD
+  - `setWeight(i, w)` / `setWeights(weights)` / `rebuild()` / `tableSize` -- inherited from ConsistentHashBalancer (COLD
     rebuild of the Maglev table; the readonly prime table size).
   - THE PIVOT (decisions/0011): P2C-over-inflight with a `(1+eps) x mean` cap is byte-identical to
     plain P2C (an under-cap draw always has lower inflight than an over-cap one), so the cap is only
@@ -296,14 +301,16 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - `pick()` -> number. Draws one column (`prng.nextBelow(cap)`) + one probability compare against a
     fresh `prng.next()` uniform -> a candidate (`col` or `_alias[col]`), which is ALWAYS a positive-
     weight node (a weight-0 node is NEVER a column). REJECTION SAMPLING on eligibility: if the candidate
-    is ineligible, redraw up to a bounded 64, then fall back to a 0-B/op rotated linear scan from a
-    random start for the first eligible positive-weight node. Because a candidate is always positive-
+    is ineligible, redraw up to a bounded 64, then fall back to a 0-B/op WEIGHT-PROPORTIONAL walk over
+    the eligible positive-weight nodes (1.1.0, L2; 1.0.x took the first eligible after a random start,
+    which favoured a node after a long down run). Because a candidate is always positive-
     weight, rejecting the ineligible draws RENORMALIZES the weight distribution over the SURVIVING
     eligible mass (each eligible node's share converges to weight[i] / sum(eligible weights)). O(1),
     0 B/op, NEVER throws. `PICK_NONE` IFF live === 0 OR no eligible node has a positive weight. NEVER a
     dead pick, a weight-0 return, or an out-of-range index.
   - `setWeight(i, w)` -> void. COLD. Set endpoint i's weight (uint32) and REBUILD the alias table (the
-    SmoothWRR sole-writer precedent). `rebuild()` -> void. COLD. Re-derive the table from the current
+    SmoothWRR sole-writer precedent). `setWeights(weights)` -> void. COLD (1.1.0): copy ALL weights into
+    the array the balancer was built with, rebuild ONCE. `rebuild()` -> void. COLD. Re-derive the table from the current
     caller weights. An eligibility flap NEVER rebuilds (anti-flap; only setWeight/rebuild/membership).
   - vs SmoothWRR: SmoothWRR is deterministic/smooth/low-variance but O(cap)/pick and owns accumulator
     state; WeightedRandom is a STATELESS O(1) sample (no accumulator to desync) with sampling variance --

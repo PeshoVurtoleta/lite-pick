@@ -58,3 +58,11 @@ Three forks around the random eligible draw and the load counters had to be sett
 - The balance anchor (test/balance.mjs) demonstrates the ceiling: at n=1024, k=32 balls/bin,
   P2C peak-to-mean gap ~2 vs a random single-draw foil's ~21, and P2C's gap stays ~2-3 as n
   grows while random's grows -- the additive `ln ln n` property, measured, not asserted.
+
+## Amendment 2026-10-04 (1.1.0, audit 2026-09-29 L2): the fallback was not unbiased
+
+The fallback above ("unbiased first-eligible-after-a-random-offset") is biased: a node that follows a long
+run of down nodes owns that whole run. Measured: nodes {0, 1} of 100 eligible -> 63.5% / 36.5% (27% of draws
+reach the fallback at 2% eligibility). 1.1.0 draws `k = nextBelow(live)` and walks to the k-th eligible index
+(still O(cap), 0 B/op, only after 64 misses): 50.1% / 49.9%, pinned by `test/P2C.test.js`. PeakEWMA reuses
+this draw. Research: `research/1.1.0-kernel-and-api.md` section 2.2.

@@ -510,7 +510,7 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
 
 ---
 
-## 16. See what the balancer is doing -- stats, describe(), codes, assertConsistent (1.1.0)
+## 16. See what the balancer is doing -- stats, describe(), codes, events, assertConsistent (1.1.0)
 
 Counters you export, a snapshot for an admin endpoint, a consistency check for your tests:
 
@@ -536,6 +536,21 @@ app.get('/admin/lb', (req, res) => res.json(lb.describe()));   // JSON-safe snap
   down; BoundedLoad: also over cap). `STAT_FALLBACK_SCANS` rising means the pool is mostly down
   (each one is an O(cap) or O(M) scan). Picks and `PICK_NONE` are not counted -- you see those.
 - Match errors on `e.code` (`LITE_PICK_INDEX`, `LITE_PICK_ARRAY`, ...), never on the message.
+- Trace each request through `/pool` with `node:diagnostics_channel` (Node >= 20.16 / 22.3):
+
+  ```js
+  import dc from 'node:diagnostics_channel';
+  import { POOL_CHANNEL_DISPATCH, POOL_CHANNEL_SETTLE } from '@zakkster/lite-pick/pool';
+
+  dc.subscribe(POOL_CHANNEL_DISPATCH, (m) => {          // { pool, endpoint, attempt, key, now }
+    if (m.attempt > 0) metrics.count('lb.failover');
+  });
+  dc.subscribe(POOL_CHANNEL_SETTLE, (m) => {            // { pool, endpoint, attempt, ok, error, aborted }
+    if (!m.ok && !m.aborted) metrics.count('lb.error.' + m.endpoint);
+  });
+  ```
+
+  The message object is REUSED: read or copy its fields inside the handler, never keep `m`.
 - In tests, call `lb.assertConsistent()` after driving the balancer: it throws
   `LITE_PICK_INCONSISTENT` when someone wrote `eligible[i]` or `weights[i]` directly, or changed
   BoundedLoad's `inflight` without `note()`. It is O(cap) -- not for the request path.

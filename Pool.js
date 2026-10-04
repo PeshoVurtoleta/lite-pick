@@ -28,6 +28,82 @@ import { VERSION, PICK_NONE } from './Pick.js';
 /** Re-exported so a /pool-only importer can read the version without importing the core. */
 export { VERSION };
 
+/** diagnostics_channel name (1.1.0, D7): published once per DISPATCH -- an endpoint was chosen, its in-flight
+ *  count raised, and `fn` is about to be called. Message: `{ pool, endpoint, attempt, key, now }`. */
+export const POOL_CHANNEL_DISPATCH = 'lite-pick:pool:dispatch';
+/** diagnostics_channel name (1.1.0, D7): published once per attempt when `fn` SETTLES (resolves or throws), before
+ *  any rtt feedback or failover. Message: `{ pool, endpoint, attempt, ok, error, aborted }`. */
+export const POOL_CHANNEL_SETTLE = 'lite-pick:pool:settle';
+
+/**
+ * The two channels, or null where `node:diagnostics_channel` is not reachable without an import (browsers,
+ * Node < 20.16 / 22.3 -- no `process.getBuiltinModule`). Loaded synchronously and optionally, so Pool stays
+ * browser-safe and has no top-level await (which would break `require()` of this module). Observability must
+ * never break a Pool: any failure here means no channels.
+ * @returns {{ dispatch: object, settle: object } | null}
+ */
+function _channels() {
+    try {
+        if (typeof process !== 'object' || process === null || typeof process.getBuiltinModule !== 'function') return null;
+        const dc = process.getBuiltinModule('node:diagnostics_channel');
+        if (!dc || typeof dc.channel !== 'function') return null;
+        return { dispatch: dc.channel(POOL_CHANNEL_DISPATCH), settle: dc.channel(POOL_CHANNEL_SETTLE) };
+    } catch {
+        return null;
+    }
+}
+const _ch = _channels();
+const _chDispatch = _ch !== null ? _ch.dispatch : null;
+const _chSettle = _ch !== null ? _ch.settle : null;
+
+/*
+ * ONE reused message object per channel (measured, research 7.2: a fresh object per publish cost 315-458
+ * scavenges / 10M; a reused one 0). Subscribers run synchronously inside publish() and must COPY what they
+ * need. The references are cleared after every publish, so a message never keeps a Pool or an error alive.
+ * A publish NESTED inside a subscriber (a subscriber that starts a run) gets a fresh object, so the outer
+ * publish's remaining subscribers still read their own event.
+ *
+ * The endpoint and attempt number are read off the run's `held` array (the endpoints dispatched so far, newest
+ * last), so run() itself only adds a guarded call per event. Measured with NOBODY subscribed (semi-space pinned
+ * at 1 MB, 3.5M runs): the same bytes as 1.0.x (4443 scavenges both) and the same 57-register run() frame.
+ */
+const _dMsg = { pool: null, endpoint: -1, attempt: 0, key: undefined, now: undefined };
+const _sMsg = { pool: null, endpoint: -1, attempt: 0, ok: false, error: undefined, aborted: false };
+let _dDepth = 0, _sDepth = 0;
+
+/** Publish a dispatch event (only called when the channel has subscribers). */
+function _pubDispatch(pool, held, key, now) {
+    const m = _dDepth === 0 ? _dMsg : { pool: null, endpoint: -1, attempt: 0, key: undefined, now: undefined };
+    m.pool = pool; m.endpoint = held[held.length - 1]; m.attempt = held.length - 1; m.key = key; m.now = now;
+    _dDepth++;
+    try {
+        _chDispatch.publish(m);
+    } finally {
+        _dDepth--;
+        m.pool = null; m.key = undefined; m.now = undefined;
+    }
+}
+
+/** Publish a settle event (only called when the channel has subscribers). */
+function _pubSettle(pool, held, ok, error, aborted) {
+    const m = _sDepth === 0 ? _sMsg : { pool: null, endpoint: -1, attempt: 0, ok: false, error: undefined, aborted: false };
+    m.pool = pool; m.endpoint = held[held.length - 1]; m.attempt = held.length - 1;
+    m.ok = ok; m.error = error; m.aborted = aborted;
+    _sDepth++;
+    try {
+        _chSettle.publish(m);
+    } finally {
+        _sDepth--;
+        m.pool = null; m.error = undefined;
+    }
+}
+/** fn resolved. */
+function _pubSettleOk(pool, held) { _pubSettle(pool, held, true, undefined, false); }
+/** fn threw (the endpoint's failure). */
+function _pubSettleErr(pool, held, error) { _pubSettle(pool, held, false, error, false); }
+/** fn threw after the caller's signal aborted (a cancel, not the endpoint's fault). */
+function _pubSettleAbort(pool, held, error) { _pubSettle(pool, held, false, error, true); }
+
 /**
  * Distinct-endpoint re-pick bound (M2): after a failed attempt Pool re-picks up to this many times
  * while the strategy keeps returning an already-tried endpoint, before falling back to a linear scan
@@ -320,6 +396,8 @@ export class Pool {
                     b.note(i, 1);
                     noteApplied[noteApplied.length - 1] = true;
                 }
+                // D7 (1.1.0): guarded -- with nobody subscribed this is one property read, no message is built.
+                if (_chDispatch !== null && _chDispatch.hasSubscribers) _pubDispatch(this, held, key, now);
 
                 let out;
                 let ok = false;
@@ -330,7 +408,11 @@ export class Pool {
                     lastErr = err;
                     // N1: a caller abort is not the endpoint's fault. Check it BEFORE the penalty, so a
                     // cancel never feeds the 1 s penalty into the EWMA (peak rule) or the pool mean.
-                    if (signal && signal.aborted) throw err;   // abort: stop failover, propagate
+                    if (signal && signal.aborted) {
+                        if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleAbort(this, held, err);
+                        throw err;                              // abort: stop failover, propagate
+                    }
+                    if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleErr(this, held, err);
                     if (rtt) {
                         // H1 penalty feedback in its OWN try/catch: fn's error identity is preserved.
                         // Boolean flag, not a null sentinel: a hook that throws `null` is still a failure.
@@ -359,6 +441,7 @@ export class Pool {
                     continue;                                   // keep inflight[i] elevated, re-pick distinct
                 }
                 if (ok) {
+                    if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleOk(this, held);
                     if (rtt) {
                         // Settle feedback runs OUTSIDE the attempt's try/catch (never re-runs fn). If it
                         // fails, REJECT loudly with LITE_PICK_FEEDBACK carrying .cause and .result.

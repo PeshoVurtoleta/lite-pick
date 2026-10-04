@@ -397,7 +397,7 @@ VERSION;              // -> '1.0.2'
 
 ## Observability (v1.1.0)
 
-Four cold tools, none on the pick path:
+Five tools, none on the pick path:
 
 ```js
 import { P2cBalancer, STAT_COUNT, STAT_FALLBACK_SCANS } from '@zakkster/lite-pick';
@@ -416,6 +416,7 @@ try { lb.setEligible(99, true); } catch (e) { e.code; } // 'LITE_PICK_INDEX' -- 
 
 - **Counters** (`STAT_FALLBACK_SCANS`, `STAT_REBUILDS`, `STAT_DISPLACED`) count only what you cannot see from outside: the very-sparse fallback or full-table sweep ran, a table was rebuilt, a keyed pick left its home backend. A counter on every pick was measured and rejected (RoundRobin 2.1 -> 5.7 ns); you already see every pick and every `PICK_NONE`. A displaced pick pays ~0.5 ns; a healthy pick pays nothing. Float64 counters are exact to 2^53 (a `Uint32Array` wraps in ~7 minutes at 10M/s).
 - **Error codes.** Every throw keeps its class and adds a stable `code`: `LITE_PICK_CAPACITY`, `_ARRAY`, `_INDEX`, `_WEIGHT`, `_OPTION`, `_ARGUMENT`, `_ABSTRACT`, `_INCONSISTENT`, plus Pool's `_KEY_REQUIRED`, `_CLOCK_REQUIRED`, `_CLOCK_INVALID`, `_ABORTED`, `_NONE`, `_FEEDBACK`. Match on `code`, not the message.
+- **Pool events** (`node:diagnostics_channel`): `lite-pick:pool:dispatch` and `lite-pick:pool:settle` per attempt (`POOL_CHANNEL_DISPATCH` / `POOL_CHANNEL_SETTLE` from `/pool`). Nobody subscribed costs nothing measurable (same time and bytes as 1.0.x); a subscriber costs ~10 ns per event and allocates nothing -- one reused message object, so copy what you need inside the handler. Node >= 20.16 / 22.3 only; never in the browser, never inside `pick()`.
 - **`assertConsistent()`** recounts what the balancer caches (live, SmoothWRR's eligible weight, WeightedRandom's table weight sum, BoundedLoad's noted total) -- the check for the misuses that `setEligible` / `setWeight` / `note` exist to prevent.
 
 ## Wiring it up -- `@zakkster/lite-pick/pool` (v0.5.0)

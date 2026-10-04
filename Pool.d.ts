@@ -9,6 +9,40 @@
 export const VERSION: string;
 
 /**
+ * `node:diagnostics_channel` names (1.1.0). Pool publishes on them only where `process.getBuiltinModule`
+ * exists (Node >= 20.16 / 22.3; never in browsers), only when the channel has subscribers, and never from
+ * the kernel's `pick()`. Each channel reuses ONE message object: subscribers run synchronously inside the
+ * publish and must copy what they need -- after the publish the object's references are cleared.
+ */
+export const POOL_CHANNEL_DISPATCH: 'lite-pick:pool:dispatch';
+/** See `POOL_CHANNEL_DISPATCH`. */
+export const POOL_CHANNEL_SETTLE: 'lite-pick:pool:settle';
+
+/** A `lite-pick:pool:dispatch` message: an endpoint was chosen, its in-flight count raised, `fn` is next. */
+export interface PoolDispatchMessage {
+    readonly pool: Pool;
+    readonly endpoint: number;
+    /** 0 for the first attempt, 1 for the first failover, ... */
+    readonly attempt: number;
+    /** The routing key, for a key-routed run; else undefined. */
+    readonly key: number | undefined;
+    /** The clock reading that drove `pick(now)`, for a clocked run; else undefined. */
+    readonly now: number | undefined;
+}
+
+/** A `lite-pick:pool:settle` message: `fn` resolved or threw (published before rtt feedback / failover). */
+export interface PoolSettleMessage {
+    readonly pool: Pool;
+    readonly endpoint: number;
+    readonly attempt: number;
+    readonly ok: boolean;
+    /** What `fn` threw (undefined when `ok`). */
+    readonly error: unknown;
+    /** True when `fn` threw after the run's signal aborted (a caller cancel; no penalty, no failover). */
+    readonly aborted: boolean;
+}
+
+/**
  * The minimal abort-signal shape Pool reads (L15). A structural type -- NOT the global DOM
  * `AbortSignal` -- so a consumer compiling with `lib: ["ES2022"]` only (no DOM, no @types/node)
  * still type-checks. A real `AbortSignal` (DOM or node:) satisfies it.

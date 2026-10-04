@@ -424,6 +424,17 @@ duck-typed and imports NOTHING from lite-query.
   balancer). `ctx.key` is the query-cache key (arbitrary), NOT the integer routing key -- so this
   generic adapter does not drive `pick(key)`; supply routing keys via `pool.run` directly. Imports
   nothing from lite-query -- duck-typed, so `peerDependencies` stays empty.
+- `POOL_CHANNEL_DISPATCH` = 'lite-pick:pool:dispatch', `POOL_CHANNEL_SETTLE` = 'lite-pick:pool:settle'
+  (1.1.0) -- `node:diagnostics_channel` names. Per attempt, `run` publishes DISPATCH `{ pool, endpoint,
+  attempt, key, now }` (endpoint chosen, in-flight raised, fn next) and SETTLE `{ pool, endpoint, attempt,
+  ok, error, aborted }` (fn resolved or threw; before rtt feedback / failover). Guarded by
+  `hasSubscribers` (nobody subscribed: measured the same time and bytes as 1.0.x); ONE reused message per
+  channel (subscribed: ~10 ns per event, 0 extra allocation) -- copy what you need synchronously; after
+  the publish its references are cleared (it never retains a Pool or error). A run started inside a
+  subscriber gets a fresh message. Loaded via `process.getBuiltinModule` (Node >= 20.16 / 22.3): no
+  channels in browsers or on Node 18, and no top-level await. A throwing subscriber does not affect the
+  run (Node reports it as an uncaught exception on the next tick). Never inside the kernel's `pick()`.
+  Types: `PoolDispatchMessage`, `PoolSettleMessage`.
 
 ## Gates (every session)
 

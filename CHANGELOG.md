@@ -7,8 +7,8 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 ## [Unreleased]
 
 Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; bursts B1 -- the plain fixes --,
-B2 -- rotating ties and the BoundedLoad `minCap` --, B3 -- PeakEWMA's update rule and pool mean -- and B4 --
-observability, decisions/0015).
+B2 -- rotating ties and the BoundedLoad `minCap` --, B3 -- PeakEWMA's update rule and pool mean --, B4 --
+observability, decisions/0015 -- and B5 -- Pool's diagnostics_channel events).
 
 ### Added
 
@@ -30,6 +30,12 @@ observability, decisions/0015).
 - **`assertConsistent()` (audit H2).** Opt-in O(cap) recount of the cached state; throws
   `LITE_PICK_INCONSISTENT` after a direct `eligible[i]` / `weights[i]` write, a weight write without
   `rebuild()`, or a BoundedLoad inflight change without `note()`. RECIPES section 16 shows all four tools.
+- **Pool `node:diagnostics_channel` events: `lite-pick:pool:dispatch` and `lite-pick:pool:settle` (D7).** One of
+  each per attempt (`POOL_CHANNEL_DISPATCH` / `POOL_CHANNEL_SETTLE`; types `PoolDispatchMessage` /
+  `PoolSettleMessage`). Guarded by `hasSubscribers`: with nobody subscribed a run measures the same time and bytes
+  as 1.0.x. ONE reused message object per channel, references cleared after each publish (it never retains a Pool
+  or an error); a subscriber costs ~10 ns per event and allocates nothing. Loaded with `process.getBuiltinModule`,
+  so Node >= 20.16 / 22.3 only -- browsers and Node 18 get no channels, and the module has no top-level await.
 
 - **`BoundedLoadBalancer` opt-in `minCap` (8th constructor argument, default 0; readonly `minCap`).**
   `cap = max(minCap, ceil((1 + eps)(T + 1) / live))`. The paper's capacity (and HAProxy's) is 1 at low load,

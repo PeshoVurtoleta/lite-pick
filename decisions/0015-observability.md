@@ -63,4 +63,22 @@ sum, and BoundedLoad's noted total against the inflight sum. It detects the misu
 
 - No healthy-path cost: PerfGate 34/34 at 0 B/op on Node 22 and 26 with the counting sites in place.
 - The stats layout and the code list are semver API; both may only grow.
-- Pool's dispatch/settle events are not counters here: they belong to B5 (`diagnostics_channel`).
+- Pool's dispatch/settle events are not counters: they are channel events (Fork 5).
+
+## Fork 5 -- Pool events on `node:diagnostics_channel` (added with B5, 2026-10-04)
+
+`lite-pick:pool:dispatch` `{ pool, endpoint, attempt, key, now }` and `lite-pick:pool:settle` `{ pool, endpoint,
+attempt, ok, error, aborted }`, once per attempt, from `Pool.run` only (never the kernel). Plain channels, not
+`TracingChannel` (stable only from Node 26.8; `tracePromise` wraps and allocates per request).
+
+- Guarded by `hasSubscribers`, ONE reused message object per channel (research 7.2: a fresh object per publish
+  cost 315-458 scavenges / 10M). Its references are cleared after the publish, so a message never retains a
+  Pool or an error; a publish nested inside a subscriber gets a fresh object so the outer event stays intact.
+- Measured (darwin arm64, Node 26, semi-space pinned at 1 MB, 3.5M runs over P2C): nobody subscribed, the
+  same time (~125 ns/run) and the same bytes (4443 scavenges) as 1.0.x, and the same 57-register `run` frame;
+  both channels subscribed, +18-24 ns/run (two events) and still 4443 scavenges. (An unpinned semi-space showed
+  2642 vs 2942 scavenges for identical bytes -- V8's dynamic sizing, not allocation; pin it when comparing.)
+- Loaded with `process.getBuiltinModule('node:diagnostics_channel')` inside a try/catch: browsers, Node 18 and
+  anything without it get no channels, and the module needs no top-level await (which would break `require()`
+  of it on Node 22+). Observability can never break a Pool.
+- A throwing subscriber does not affect the run: Node reports it as an uncaught exception on the next tick.

@@ -5,7 +5,8 @@
  * runtime fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { Pool, liteQueryFetcher, VERSION, type AbortLike, type RunOptions } from '../../Pool.js';
+import { Pool, liteQueryFetcher, VERSION, type AbortLike, type RunOptions,
+    POOL_CHANNEL_DISPATCH, POOL_CHANNEL_SETTLE, type PoolDispatchMessage, type PoolSettleMessage } from '../../Pool.js';
 import { LeastConnBalancer, BoundedLoadBalancer, PeakEwmaBalancer } from '../../Pick.js';
 
 // VERSION is a string (re-exported from the core).
@@ -106,3 +107,14 @@ void latOut;
 // AbortLike carries an optional reason (thrown by run() when a pre-aborted signal has one).
 const abortReason: unknown = ({ aborted: true, reason: new Error('x') } as AbortLike).reason;
 void abortReason;
+
+// 1.1.0 diagnostics_channel names and message shapes.
+const chD: 'lite-pick:pool:dispatch' = POOL_CHANNEL_DISPATCH;
+const chS: 'lite-pick:pool:settle' = POOL_CHANNEL_SETTLE;
+void chD; void chS;
+function onDispatch(m: PoolDispatchMessage): number { return m.endpoint + m.attempt + (m.key ?? 0) + (m.now ?? 0); }
+function onSettle(m: PoolSettleMessage): boolean { return m.ok || m.aborted || m.error !== undefined || m.pool === null; }
+void onDispatch; void onSettle;
+declare const dm: PoolDispatchMessage;
+// @ts-expect-error -- messages are read-only (the object is reused; copy, never write)
+dm.endpoint = 3;

@@ -8,7 +8,8 @@
  *
  * Each oracle is falsifiable THROUGH main.mjs by a one-line kernel mutant (benchmark/soak/_mustfail.mjs):
  *   - LeastConn/SED/NQ : pick == argmin score (exact index, tie -> lowest, per the kernel). every 64th.
- *   - P2C              : max - mean inflight <= 4*log2(ln live) + 4 (balls-in-bins), homogeneous, live>=8.
+ *   - P2C              : balls-in-bins over 8 trials: the SUM of the gaps (max - mean) <= a limit calibrated
+ *                        per live count on the clean kernel (S7), plus a per-trial backstop. live 8..256.
  *   - ConsistentHash   : stickiness -- a key maps to the SAME backend across the epoch while its home is up.
  *   - BoundedLoad      : the pick is the first eligible under ceil((1+eps)(T+1)/live) along the probe,
  *                        else the first eligible (H4). every 64th.
@@ -57,26 +58,75 @@ function oracleArgmin(name, b, el, inf, wt, cap, rng) {
     return { checks, viol, insufficient: checks < MIN_CHECKS };
 }
 
-const P2C_TRIALS = 8;   // NIT A: independent balls-in-bins trials/cycle (one trial missed cycle-0 mutants)
+export const P2C_TRIALS = 8;       // independent balls-in-bins trials per cycle
+export const P2C_BALLS_PER_NODE = 32;
+export const P2C_MIN_LIVE = 8;
 
-/** P2C balls-in-bins bound: over P2C_TRIALS independent trials, max - mean load <= 4*log2(ln live) + 4.
- * A single trial can miss a broken P2C by luck; every trial that exceeds the bound is a violation. */
-function oracleP2C(b, el, inf, cap) {
-    let live = 0;
-    for (let i = 0; i < cap; i++) if (el[i]) live++;
-    if (live < 8) return { checks: 0, viol: 0, insufficient: true };   // bound is asymptotic; skip tiny
-    const balls = live * 32;
-    const bound = 4 * Math.log2(Math.log(live)) + 4;
-    let checks = 0, viol = 0;
+/** The per-trial backstop (audit fix plan 3.4): ceil(log2(ln live)) + 3. Shape from Azar et al. /
+ * Berenbrink et al. (healthy gap ~ log2 ln n + O(1)); the +3 is a calibration choice, not a theorem. */
+export function p2cTrialCap(live) { return Math.ceil(Math.log2(Math.log(live))) + 3; }
+
+// _p2c[0] = sum of the P2C_TRIALS gaps, [1] = trials whose gap > p2cTrialCap(live), [2] = trials whose
+// picks did not ALL land on eligible nodes (a lost or ineligible pick). Module scratch: 0-alloc.
+export const _p2c = new Int32Array(3);
+
+// The calibrated limit on the SUM of the P2C_TRIALS gaps, as [first live count, limit] breakpoints (the
+// limit holds until the next breakpoint; the last one holds to 256). Made by
+//     node benchmark/soak/_calibrate-p2c.mjs --cycles 100000 --jobs 10 --out benchmark/soak/p2c-calibration.json
+// on the real P2cBalancer at the soak's shape (cap 256, a random eligible subset per cycle): limit(live) =
+// the largest clean sum seen at any live count <= live, + 4 (0.5 on the average gap). That file is the
+// evidence; test/SoakP2C.test.js fails if this table and it disagree. The literature gives the SHAPE (gap
+// ~ log2 ln n healthy, ~ log n / beta for a (1+beta)-choice P2C); the numbers are our measurement.
+export const P2C_SUM_LIMIT = Object.freeze([CALIBRATION_PENDING]);
+const P2C_MAX_LIVE = 256;
+const _p2cLimit = new Int32Array(P2C_MAX_LIVE + 1).fill(-1);
+for (let n = P2C_MIN_LIVE; n <= P2C_MAX_LIVE; n++) for (const [at, v] of P2C_SUM_LIMIT) if (n >= at) _p2cLimit[n] = v;
+
+/** The calibrated sum-of-gaps limit for this live count, or -1 outside the calibrated range (cannot judge). */
+export function p2cSumLimit(live) {
+    return (live >= P2C_MIN_LIVE && live <= P2C_MAX_LIVE && (live | 0) === live) ? _p2cLimit[live] : -1;
+}
+
+/**
+ * The ONE P2C trial routine -- the soak oracle and benchmark/soak/_calibrate-p2c.mjs both call it, so
+ * the calibration measures exactly the statistic the oracle judges. Each trial: zero the in-flight
+ * counts, drop P2C_BALLS_PER_NODE x live picks (no completions), gap = max - mean over the eligible
+ * nodes. With every pick on an eligible node the mean is exactly P2C_BALLS_PER_NODE, so the gap is an
+ * integer and the sum is exact (no float threshold). Writes _p2c; returns nothing.
+ */
+export function p2cTrials(b, el, inf, cap, live) {
+    const balls = live * P2C_BALLS_PER_NODE;
+    const tcap = p2cTrialCap(live);
+    let sumGap = 0, over = 0, lost = 0;
     for (let trial = 0; trial < P2C_TRIALS; trial++) {
         for (let i = 0; i < cap; i++) inf[i] = 0;                       // controlled experiment (reuse buffer)
         for (let t = 0; t < balls; t++) { const p = b.pick(); if (p >= 0) inf[p]++; }
         let mx = 0, sum = 0;
         for (let i = 0; i < cap; i++) if (el[i]) { const c = inf[i]; if (c > mx) mx = c; sum += c; }
-        checks++;
-        if ((mx - sum / live) > bound) viol++;
+        if (sum !== balls) { lost++; continue; }
+        const gap = mx - P2C_BALLS_PER_NODE;
+        sumGap += gap;
+        if (gap > tcap) over++;
     }
-    return { checks, viol, insufficient: false };
+    _p2c[0] = sumGap; _p2c[1] = over; _p2c[2] = lost;
+}
+
+/**
+ * P2C balls-in-bins oracle (audit 2026-09-29 S7; research/s7-p2c-oracle-bound.md, option C):
+ *   (1) the SUM of the P2C_TRIALS gaps must not exceed the calibrated limit for this live count -- the
+ *       averaged statistic that catches a P2C ignoring its comparison on half its picks;
+ *   (2) backstop: fewer than 2 trials may exceed p2cTrialCap(live) -- gross breakage, no table needed;
+ *   (3) every pick lands on an eligible node (otherwise the gap is meaningless -- fail closed).
+ * A live count outside the calibrated table is INSUFFICIENT (cannot judge), never a silent pass.
+ */
+function oracleP2C(b, el, inf, cap) {
+    let live = 0;
+    for (let i = 0; i < cap; i++) if (el[i]) live++;
+    const limit = p2cSumLimit(live);
+    if (limit < 0) return { checks: 0, viol: 0, insufficient: true };
+    p2cTrials(b, el, inf, cap, live);
+    const viol = (_p2c[0] > limit ? 1 : 0) + (_p2c[1] >= 2 ? 1 : 0) + (_p2c[2] > 0 ? 1 : 0);
+    return { checks: P2C_TRIALS, viol, insufficient: false };
 }
 
 // BLOCKER 2 / NIT B: pre-allocated oracle scratch (0-alloc, reused across lane-cycles).

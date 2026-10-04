@@ -245,6 +245,15 @@ control('M7 biased WR sampler',
 control('M8 P2C worst-of-two',
     patch(PICK, 'return this._inflight[b] < this._inflight[a] ? b : a;', 'return this._inflight[b] > this._inflight[a] ? b : a;'),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality lane=P2C kind=oracle');
+// M8b / M8c (S7): P2C IGNORES its comparison on 50% / 80% of picks and keeps the first draw -- the
+// (1+beta)-choice process, beta 0.5 / 0.2. The old per-trial bound (4 log2 ln n + 4) never caught the 50%
+// one; the averaged statistic with the calibrated limit must (research/s7-p2c-oracle-bound.md).
+control('M8b P2C ignores the comparison 50%',
+    patch(PICK, 'return this._inflight[b] < this._inflight[a] ? b : a;', 'return this._rng.nextBelow(10) < 5 ? a : (this._inflight[b] < this._inflight[a] ? b : a);'),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality lane=P2C kind=oracle');
+control('M8c P2C ignores the comparison 80%',
+    patch(PICK, 'return this._inflight[b] < this._inflight[a] ? b : a;', 'return this._rng.nextBelow(10) < 8 ? a : (this._inflight[b] < this._inflight[a] ? b : a);'),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'P2C' }, 1, 'quality lane=P2C kind=oracle');
 // M9: LeastConn picks the MOST-loaded eligible node -> the argmin oracle trips. (SED/NQ share the
 // identical oracleArgmin path, differing only in the recomputed score; see report note.)
 control('M9 LeastConn non-argmin',

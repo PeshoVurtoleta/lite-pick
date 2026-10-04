@@ -199,7 +199,7 @@ PeakEWMA (latency-aware P2C, Finagle's peak-EWMA) steers away from *slow* endpoi
 not just busy ones. Of two random candidates it takes the cheaper one, where a sampled
 node costs `(inflight + 1) x max(decayed ewma(rtt), time busy since its last sample)`, an
 unsampled idle node costs 0 (it gets one probe), and an unsampled busy node is priced at
-the pool's lifetime mean rtt. So a node that got slow gets less traffic even if its
+the pool's recent mean rtt (a decaying mean since 1.1.0). So a node that got slow gets less traffic even if its
 connection count looks fine. It needs two things you didn't need before: a **clock**
 (`now`, caller-supplied nanoseconds) and **rtt feedback** (`recordRtt`).
 
@@ -293,11 +293,27 @@ preserved. A backwards-stepping but finite clock records no sample and resolves 
 
 Notes:
 - **Cold start.** An unsampled node costs 0 while idle (so it takes one probe request at
-  a time) and the pool's lifetime mean sampled rtt once it is busy -- graceful, never NaN,
+  a time) and the pool's decaying mean sampled rtt once it is busy (every sample weighted
+  by `exp(-age/tau)`, so a slow first hour does not price new nodes forever) -- graceful, never NaN,
   never the old 1.0 ns black hole. A node that never records a sample (e.g. one that fails
   fast so the caller records nothing) keeps winning while idle: record failures as a
   penalty too (the manual loop's `PENALTY_NS` branch; Pool's `failurePenaltyNs` does it for
   you).
+- **Set a per-attempt timeout.** A request that never returns records no sample, so a
+  hung node is priced only by the busy floor (time since its last response). Put a timer
+  on each ATTEMPT, inside `fn` (or `send` in the manual loop): the attempt throws, the
+  elapsed time goes in as a peak sample, and Pool fails over. Do NOT use the run's own
+  `signal` for this -- aborting it is a caller cancel, which records nothing:
+
+  ```js
+  const body = await pool.run(
+    (i, signal) => fetchFrom(endpoints[i], {
+      // Node >= 20.3: the caller's cancel OR this attempt's own 2 s timer
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(2_000)]) : AbortSignal.timeout(2_000),
+    }),
+    { clock, tries: 2, signal: req.signal },
+  );
+  ```
 - `now` must be a FINITE number. A non-finite `now` degrades `pick` to P2C-random (no
   throw); `recordRtt` throws on a non-finite argument.
 - Pick `tauNs` around your p50-p90 rtt: smaller = reacts faster to a slowdown, larger =

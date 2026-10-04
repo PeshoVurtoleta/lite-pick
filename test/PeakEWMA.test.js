@@ -12,6 +12,8 @@
  *   A5. FAIL CLOSED: PICK_NONE iff the whole pool is down; a single eligible node is always returned.
  *   A6. TIE-BREAK to the first draw: an all-equal cold pool picks IDENTICALLY to P2C on the same seed.
  *   A7. VALIDATION: the constructor and recordRtt throw typeof-first on bad inputs, before allocation.
+ *   L4. (1.1.0) the update is Finagle's observe() exactly: 10 ms, one tau, then 5 ms -> 6.84 ms.
+ *   D4. (1.1.0) the unsampled-busy price is a DECAYING pool mean that follows a latency-regime change.
  */
 
 import { test } from 'node:test';
@@ -197,16 +199,79 @@ test('L6: a negative dt is clamped in recordRtt and ewmaAt (no inflation)', () =
     assert.equal(b._ewma[0], 1e6, 'recordRtt clamps a negative dt (no inflation of the stored estimate)');
 });
 
-test('H1: _samp[0] / _samp[1] (sample sum / count) stay exact across samples', () => {
+test('D4: _samp[0] / _samp[1] are the exactly decayed sample sum / count (tau -> large recovers the plain mean)', () => {
     const b = new PeakEwmaBalancer(4, up(4), new Uint32Array(4), TAU);
-    const samples = [[0, 100], [1, 250], [0, 300], [2, 50], [3, 1000]];
-    let sum = 0;
-    for (let k = 0; k < samples.length; k++) {
-        b.recordRtt(samples[k][0], samples[k][1], 10 * (k + 1));
-        sum += samples[k][1];
+    const samples = [[0, 100, 10], [1, 250, 400000], [0, 300, 900000], [2, 50, 2500000], [3, 1000, 2600000]];
+    let sum = 0, cnt = 0, last = 0;
+    for (const [i, rtt, t] of samples) {
+        b.recordRtt(i, rtt, t);
+        const w = Math.exp(-(t - last) / TAU);
+        sum = sum * w + rtt; cnt = cnt * w + 1; last = t;
     }
-    assert.equal(b._samp[0], sum, 'running sample sum exact');
-    assert.equal(b._samp[1], samples.length, 'running sample count exact');
+    assert.equal(b._samp[0], sum, 'decayed sample sum exact');
+    assert.equal(b._samp[1], cnt, 'decayed sample count exact');
+    assert.equal(b._samp[2], 2600000, 'the time of the newest sample');
+    const slow = new PeakEwmaBalancer(4, up(4), new Uint32Array(4), 1e300);   // tau >> every gap
+    for (const [i, rtt, t] of samples) slow.recordRtt(i, rtt, t);
+    assert.equal(slow._samp[0], 1700, 'with no decay the sum is the plain sum');
+    assert.equal(slow._samp[1], samples.length, 'and the count the plain count');
+});
+
+test('L4: the blend is Finagle observe() exactly -- 10 ms, one tau, then 5 ms gives 6.84 ms (1.0.x: 4.51)', () => {
+    const tau = 1e9, w = Math.exp(-1);
+    const b = new PeakEwmaBalancer(2, up(2), new Uint32Array(2), tau);
+    b.recordRtt(0, 10e6, 0);
+    b.recordRtt(0, 5e6, tau);
+    assert.ok(Math.abs(b._ewma[0] - 6.84e6) < 0.01e6, 'research/1.1.0 5.1 example: ' + b._ewma[0]);
+    assert.equal(b._ewma[0], 10e6 * w + 5e6 * (1 - w), 'value x w + sample x (1 - w)');
+    // The peak compares with the STORED value, not the decayed one: 8 ms is below the stored 10 ms, so
+    // it BLENDS (8.74 ms) -- 1.0.x compared with the decayed 3.68 ms and snapped to 8 ms.
+    const c = new PeakEwmaBalancer(2, up(2), new Uint32Array(2), tau);
+    c.recordRtt(0, 10e6, 0);
+    c.recordRtt(0, 8e6, tau);
+    assert.equal(c._ewma[0], 10e6 * w + 8e6 * (1 - w));
+    // Above the stored value it snaps, whatever the age.
+    c.recordRtt(0, 20e6, 50 * tau);
+    assert.equal(c._ewma[0], 20e6, 'a sample above the stored estimate replaces it');
+    // Continuous at the boundary: a sample EQUAL to the stored value leaves it unchanged at any dt.
+    const d = new PeakEwmaBalancer(2, up(2), new Uint32Array(2), tau);
+    d.recordRtt(0, 7e6, 0);
+    d.recordRtt(0, 7e6, 3 * tau);
+    assert.ok(Math.abs(d._ewma[0] - 7e6) < 1e-6, 'sample == stored value is a fixed point');
+});
+
+test('D4: the unsampled-busy price follows a latency-regime change (a lifetime mean would not)', () => {
+    // Node 2 (down: never picked) feeds the pool 10 ms for 20 tau, then 1 ms for 20 tau. Node 0 is
+    // sampled at 3 ms and idle; node 1 is UNSAMPLED with one request in flight -> cost 2 x pool mean.
+    // Decaying mean ~1 ms -> node 1 costs ~2 ms and wins. A lifetime mean (5.5 ms -> 11 ms) loses to 3 ms.
+    const tau = 1e6, el = Uint8Array.from([1, 1, 0]), inf = Uint32Array.from([0, 1, 0]);
+    const b = new PeakEwmaBalancer(3, el, inf, tau, 0xC0FFEE);
+    let now = 0;
+    for (let k = 0; k < 2000; k++) { now += tau / 100; b.recordRtt(2, 10e6, now); }
+    const slowMean = b._samp[0] / b._samp[1];
+    assert.ok(Math.abs(slowMean - 10e6) < 1, 'a constant stream: the mean IS the sample (' + slowMean + ')');
+    for (let k = 0; k < 2000; k++) { now += tau / 100; b.recordRtt(2, 1e6, now); }
+    const mean = b._samp[0] / b._samp[1];
+    assert.ok(mean < 1.001e6, 'after 20 tau the mean has followed the new regime: ' + mean);
+    b.recordRtt(0, 3e6, now);
+    for (let i = 0; i < 500; i++) assert.equal(b.pick(now), 1, 'the busy cold node is priced at the CURRENT mean');
+});
+
+test('D4: the pool mean never goes NaN -- an overflowed sum restarts after a long gap; a backwards clock decays nothing', () => {
+    const tau = 1e6;
+    const b = new PeakEwmaBalancer(2, up(2), new Uint32Array(2), tau);
+    b.recordRtt(0, 1.7e308, 0);
+    b.recordRtt(1, 1.7e308, 0);
+    assert.equal(b._samp[0], Infinity, 'the sum overflows (disclosed)');
+    b.recordRtt(0, 5e5, 1e4 * tau);           // exp(-1e4) === 0: Infinity x 0 would be NaN
+    assert.equal(b._samp[0], 5e5, 'the sum restarts at the sample');
+    assert.ok(Number.isFinite(b._samp[1]) && b._samp[1] === 1, 'the count restarts at 1');
+    const c = new PeakEwmaBalancer(2, up(2), new Uint32Array(2), tau);
+    c.recordRtt(0, 100, 5000);
+    c.recordRtt(1, 300, 1000);                // a backwards reading: weight 1, no decay, newest time kept
+    assert.equal(c._samp[0], 400);
+    assert.equal(c._samp[1], 2);
+    assert.equal(c._samp[2], 5000, 'the pool stamp never moves backwards');
 });
 
 test('M1: recordRtt rejects a non-integer index; no sample recorded', () => {

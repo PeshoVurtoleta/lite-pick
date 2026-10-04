@@ -462,7 +462,18 @@ cfgCase('unpinned semi-space', { SOAK_CYCLES: CYC }, ['--expose-gc']);
 // be CAUGHT by the new quality gates -- the whole point of adding them. git show the pre-fix Pick.js into
 // a scratch file and drive the H3 (SmoothWRR/CH weight-0), H4 (BoundedLoad cap) and H1 (PeakEWMA) lanes;
 // it must exit 1 on a quality breach. (Pool.js/markers unchanged in the fix, so the kernel-lane soak loads
-// the old kernel fine.) ---------------------------------------------------------------------------------
+// the old kernel fine.) The soak reweights keyed lanes through setWeights() (1.1.0 B1), which 1.0.0 lacks:
+// REVERT_SHIM supplies what the pre-B1 soak did -- write the owned _weights, then ONE rebuild() -- and fails
+// closed if _weights is gone. Without it the run CRASHES on the first allZero phase (a MISS, never a catch).
+// ---------------------------------------------------------------------------------------------------------
+const REVERT_SHIM = `
+ConsistentHashBalancer.prototype.setWeights = function (w) {
+    const bw = this._weights;
+    if (!(bw instanceof Uint32Array)) throw new Error('REVERT shim: the 1.0.0 kernel exposes no Uint32Array _weights');
+    for (let i = 0; i < this.capacity; i++) bw[i] = w[i];
+    this.rebuild();
+};
+`;
 if (want('REVERT 1.0.0 kernel (H1/H3/H4)')) {
     const name = 'REVERT 1.0.0 kernel (H1/H3/H4)';
     const env = { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'SmoothWRR,BoundedLoad,PeakEWMA' };
@@ -471,7 +482,8 @@ if (want('REVERT 1.0.0 kernel (H1/H3/H4)')) {
     if (LIST) listed(name, 'main', env, 1, REVERT_SPECS);
     else try {
         const old = execFileSync('git', ['show', '8c1ecc7:Pick.js'], { cwd: ROOT, encoding: 'utf8' });
-        const p = writeMutant(old, 'revert100');
+        if (typeof old !== 'string' || old.indexOf('setWeights(') !== -1) throw new Error('8c1ecc7:Pick.js already has setWeights -- drop REVERT_SHIM');
+        const p = writeMutant(old + REVERT_SHIM, 'revert100');
         record(name, runSoak(p, env), 1, REVERT_SPECS);
     } catch (e) {
         allOk = false;

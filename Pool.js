@@ -315,7 +315,7 @@ export class Pool {
                 } catch (err) {
                     lastErr = err;
                     // N1: a caller abort is not the endpoint's fault. Check it BEFORE the penalty, so a
-                    // cancel never feeds the 1 s penalty into the EWMA (peak rule) or the lifetime mean.
+                    // cancel never feeds the 1 s penalty into the EWMA (peak rule) or the pool mean.
                     if (signal && signal.aborted) throw err;   // abort: stop failover, propagate
                     if (rtt) {
                         // H1 penalty feedback in its OWN try/catch: fn's error identity is preserved.

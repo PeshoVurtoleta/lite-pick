@@ -135,6 +135,7 @@ const SPECS = {
         extra: (b, ctx) => {
             if (!allFinite(b._ewma, ctx.cap)) return '_ewma has a non-finite cell';
             if (!allFinite(b._stamp, ctx.cap)) return '_stamp has a non-finite cell';
+            if (!allFinite(b._samp, 3)) return '_samp (decaying pool mean) has a non-finite cell';
             return null;
         },
     },

@@ -124,3 +124,28 @@ becomes the CHEAPEST pick -- a black hole that doubled failure rates. Refinement
   until that response completes (no exact per-dispatch "busy since" stamp yet -- 1.1.0); the lifetime
   mean never forgets a latency-regime change (a decaying mean is a 1.1.0 item). The buffer-based
   clock API that avoids boxing `now` is also 1.1.0 (see the boxing limitation in README/GUIDE).
+
+## Amendment 2026-10-04 (1.1.0, audit L4, research D3-D5): Finagle's update, a decaying mean, no busy-since stamp
+
+Fork 3's rule decayed first and then blended: `e = ewma x w; ewma = sample > e ? sample : e + (sample - e)(1 - w)`,
+which is `ewma x w^2 + sample x (1 - w)`. Finagle's `PeakEwma.observe` and tower's `RttEstimate::update` are
+`sample > ewma ? sample : ewma x w + sample x (1 - w)`, the peak compared with the STORED estimate. 1.1.0 adopts
+theirs exactly (10 ms, one tau, then 5 ms: 6.84 ms, was 4.51 ms; pinned in test L4). Kept different, on purpose:
+both of them call the update with a 0 sample on every load read, so their estimate also depends on how often a
+node is read; `pick()` here stays a pure read, so the estimate is a function of the samples and the clock only.
+
+The unsampled-busy price was the lifetime mean `sum / count`. It is now a decaying mean: on each sample both
+decay by `exp(-dt/tau)` since the newest sample (any node), then take the sample at weight 1. Every sample
+weighs `exp(-age/tau)`; with no decay it IS the old mean, and the read in `pick()` is unchanged (the two decay
+factors cancel in the ratio). Chosen over a time-weighted blend (`mean x w + sample x (1 - w)`), which would
+weigh each sample by the gap before it rather than equally. Finagle's busy-unsampled Penalty and tower's
+caller-chosen default RTT were the other options (research section 5.2); the 1.0.1 failure penalty still
+guards the black hole. A backwards reading folds in at weight 1 and does not move the pool stamp; when the
+decay underflows to 0 the sum restarts, so an overflowed sum never becomes `Infinity x 0 = NaN`.
+
+The 1.0.1 "busy since" stamp is dropped (research section 5.3): no reference keeps one, `inflight` is
+caller-owned so the kernel cannot see the 0 -> 1 transition, and a per-attempt timeout already turns a hung
+request into a penalized peak sample (Pool test C1c). The busy floor (`max(decayedEWMA, dt)` while busy) stays.
+recordRtt measured 8.8 -> 8.6 ns all-blend (two `exp` now), 5.8 -> 4.9 ns all-peak (the node skips `exp`); 0 B/op
+on both paths (PerfGate). Zero-box note: the NaN guard multiplies first and maps NaN to 0, so it merges two
+doubles; a `pw > 0 ? ... : sampleNs` ternary merged a double with the tagged argument and Maglev boxed it.

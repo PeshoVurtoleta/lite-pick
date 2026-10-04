@@ -1,8 +1,8 @@
 {
   "files": {
-    "Pick.js": "3809a853d842fd667edb84fd4898bfdf187fda1d866ddcf1090e6e8415832c23",
-    "Pool.js": "225bdc63d0f9c318f694271a41a66784ef446b8579312b169dd31a7cbbfc280e",
-    "Pick.d.ts": "94a9c2d2ac8618ccd7ab024ed8edc07bdf1f3a4437b471d777eec7086e637d75",
+    "Pick.js": "0d54374d4b8946421290366a9290082d939c8fb7d423e3bb8cd66ecfcf901c0b",
+    "Pool.js": "4f58d40a080b33a4510f388fd70e3c54c0fea537fb9163ddd7536aea11cbd73f",
+    "Pick.d.ts": "9447c4d888116e0778825e723b6f563199e1d29488a1a78cfeef80f3f21de2b0",
     "Pool.d.ts": "d4cc1c3aa4b4ce67115d9cece34404c9b4930c0ecf0ba97bf63d432cba222815",
     "test/invariants.mjs": "e37f59be3fa9813c2c226b2a3b65e2b8d71d66a5fd963cd12f4957d62506b0fa"
   }

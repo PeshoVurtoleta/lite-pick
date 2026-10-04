@@ -200,27 +200,34 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - `new PeakEwmaBalancer(capacity, eligible, inflight, tauNs, seed?=0x9e3779b9)` -- `inflight` is a
     caller-owned Uint32Array (length >= capacity) read LIVE; `tauNs` is the EWMA TIME CONSTANT in
     nanoseconds (finite, > 0; half-life = tauNs x ln2). The per-endpoint EWMA state (`_ewma` /
-    `_stamp`, Float64) plus a lifetime running-mean-of-samples pair are BALANCER-OWNED and written
+    `_stamp`, Float64) plus a decaying pool mean (`_samp`: decayed sum, decayed count, newest-sample
+    time; 1.1.0) are BALANCER-OWNED and written
     ONLY by `recordRtt`. Cold start seeds `_ewma` to 1.0 with an UNSAMPLED sentinel (`_stamp = -1`).
     LATENCY marker (`static LATENCY = true`): /pool REQUIRES `opts.clock` for this strategy.
   - `pick(now)` -> number. Draws two DISTINCT eligible endpoints (ADR 0005's rejection sampling,
     reused), lower COST wins; a tie goes to the first draw. Per-candidate cost (pure read, 0 B/op):
     an unsampled node costs 0 WHILE IDLE (graceful least-connections; holds one probe in flight
-    until its first sample) and `(inflight+1) x lifetime-mean-sampled-rtt ONCE BUSY` (so a
+    until its first sample) and `(inflight+1) x decaying-mean-sampled-rtt ONCE BUSY` (every sample
+    weighted by exp(-age/tau), so it follows a latency-regime change; 1.1.0) (so a
     cold-but-busy node is NOT the old 1.0 ns black hole); a sampled node costs
     `(inflight+1) x max(decayedEWMA, dt)` while busy (a hung node -- dt grows, no completion -- gets
     MORE expensive), else `(inflight+1) x decayedEWMA`. `dt = max(now - stamp, 0)` (clamped, L6).
     `now` is caller-supplied nanoseconds. Decays ON READ -> O(d)=O(1), 0 B/op. `PICK_NONE` when the
     whole pool is down. CAVEAT: an idle-then-busy node is priced by time-since-last-response until
-    that response completes (exact busy-since stamp = 1.1.0). A node that fails fast and records
-    nothing keeps winning while idle -- record failures (the /pool failure penalty does).
+    that response completes; there is NO busy-since stamp, by decision (1.1.0 D5: Finagle/tower/
+    Linkerd keep none) -- a request that never returns is handled by a PER-ATTEMPT TIMEOUT inside
+    `fn` (the attempt throws and /pool records max(elapsed, failurePenaltyNs) as a peak; aborting
+    the run's own `signal` is a caller cancel and records nothing). A node that fails fast and
+    records nothing keeps winning while idle -- record failures (the /pool failure penalty does).
   - `ewmaAt(i, now)` -> number. The decayed EWMA rtt estimate for endpoint i at `now`. Pure read. An
     unsampled node (`_stamp < 0`) returns the baseline 1.0 undecayed; otherwise
     `_ewma[i] x exp(-max(now - stamp, 0)/tau)`.
   - `recordRtt(i, sampleNs, now)` -> void. WARM feedback path (not the hot pick path): the FIRST
-    sample initializes the EWMA EXACTLY to `sampleNs` (clock-magnitude-independent); thereafter the
-    Finagle peak rule -- the cost SNAPS UP to a larger sample instantly and DECAYS DOWN over ~tau --
-    and it folds the sample into the lifetime mean. `now` / `sampleNs` are caller-supplied
+    sample initializes the EWMA EXACTLY to `sampleNs` (clock-magnitude-independent); thereafter
+    Finagle's observe() exactly (1.1.0, L4): a sample ABOVE THE STORED estimate replaces it (snaps up
+    instantly), else `ewma x w + sample x (1 - w)`, `w = exp(-max(now - stamp, 0)/tau)` (eases down
+    over ~tau; 1.0.x decayed twice, `ewma x w^2 + ...`). It also folds the sample into the decaying
+    pool mean (sum and count decay by exp(-dt/tau) since the newest sample). `now` / `sampleNs` are caller-supplied
     nanoseconds, consistent with `pick(now)`. THROWS `RangeError` on a non-integer / out-of-range
     index (incl. a numeric string like '2' -- which used to work; a string index now throws
     RangeError, not TypeError) or a non-finite/negative `sampleNs`; 0 B/op on the success path.

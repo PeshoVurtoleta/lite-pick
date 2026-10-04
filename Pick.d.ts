@@ -175,16 +175,20 @@ export class NqBalancer extends BalancerBase {
 /**
  * PeakEwmaBalancer -- latency-aware power-of-two-choices (M7, Twitter Finagle's peak-EWMA).
  * Draws two distinct eligible endpoints and returns the LOWER COST (three cases: unsampled+idle -> 0;
- * unsampled+busy -> `(inflight + 1) x lifetime mean`; sampled -> `(inflight + 1) x max(decayedEWMA,
+ * unsampled+busy -> `(inflight + 1) x decaying pool mean`; sampled -> `(inflight + 1) x max(decayedEWMA,
  * dt-while-busy)`); a slow endpoint (high decayed EWMA rtt) is avoided even with a short queue,
  * and a hung node grows more expensive over time. `inflight` is the
  * caller-owned Uint32Array read LIVE; the EWMA state (`_ewma` / `_stamp`, Float64) is BALANCER-OWNED
  * and written ONLY by `recordRtt` (the warm feedback path). `pick(now)` decays on READ -- never
  * writes -- so it is 0 B/op, as is `recordRtt`. `now` / `sampleNs` are caller-supplied nanoseconds.
  * Cold start: an unsampled node costs 0 WHILE IDLE (graceful least-connections) and the pool's
- * lifetime mean sampled rtt ONCE BUSY, so a fast-failing or hung node cannot masquerade as a 1.0 ns
- * node and become a black hole; a hung node's busy floor grows with `dt` so it gets more expensive,
- * not less. Never NaN. O(d)=O(1). Fails closed (`PICK_NONE`) when the whole pool is down.
+ * DECAYING mean sampled rtt ONCE BUSY (1.1.0: every sample weighted by exp(-age/tau), so it follows a
+ * latency-regime change), so a fast-failing or hung node cannot masquerade as a 1.0 ns node and become
+ * a black hole; a hung node's busy floor grows with `dt` so it gets more expensive, not less. The
+ * update is Finagle's (1.1.0): a sample above the stored estimate replaces it, else
+ * `ewma x w + sample x (1 - w)`, `w = exp(-dt/tau)`. Never NaN. O(d)=O(1). Fails closed
+ * (`PICK_NONE`) when the whole pool is down. A request that never returns is handled by a per-attempt
+ * timeout (the attempt throws; /pool records `max(elapsed, failurePenaltyNs)`), not by the kernel.
  * Latency-aware: @zakkster/lite-pick/pool REQUIRES an `opts.clock` for this strategy.
  */
 export class PeakEwmaBalancer extends BalancerBase {
@@ -200,7 +204,11 @@ export class PeakEwmaBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, tauNs: number, seed?: number);
     /** The decayed EWMA rtt estimate for endpoint `i` at time `now` (ns). Pure read, zero-alloc. */
     ewmaAt(i: number, now: number): number;
-    /** Warm feedback path: record an rtt sample (ns) for endpoint `i` at time `now` (ns). 0 B/op. */
+    /**
+     * Warm feedback path: record an rtt sample (ns) for endpoint `i` at time `now` (ns). The first sample
+     * sets the estimate exactly; then a larger sample replaces it, a smaller one blends in as
+     * `ewma x w + sample x (1 - w)` (Finagle, 1.1.0). Also feeds the decaying pool mean. 0 B/op.
+     */
     recordRtt(i: number, sampleNs: number, now: number): void;
     /** Pick by latency-aware power-of-two-choices at time `now` (ns), or `PICK_NONE`. O(d)=O(1). */
     pick(now: number): number;

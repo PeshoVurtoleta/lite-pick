@@ -702,8 +702,10 @@ export class NqBalancer extends BalancerBase {
  *     cost 0 whenever idle and keeps winning. Callers MUST record failures too (@zakkster/lite-pick/pool
  *     does this from 1.0.1) or a fast-failing endpoint is a black hole the kernel alone cannot see.
  *   - unsampled AND busy (`inflight > 0`) -> `(inflight + 1) x mean`, where `mean` is the pool's
- *     LIFETIME mean sampled rtt (`_samp[0] / _samp[1]` = sum / count, or 1.0 before ANY sample). A
- *     cold-but-busy node is priced at the pool mean, NOT the old 1.0 ns that made it a black hole (H1).
+ *     DECAYING mean sampled rtt (1.1.0; `_samp[0] / _samp[1]` = decayed sum / decayed count, every
+ *     sample weighted by exp(-age/tau); 1.0 before ANY sample). A cold-but-busy node is priced at the
+ *     pool mean, NOT the old 1.0 ns that made it a black hole (H1), and the mean follows a
+ *     latency-regime change within a few tau (1.0.x's lifetime mean never forgot one).
  *   - sampled -> `(inflight + 1) x base`, `base = max(decayedEWMA, dt)` WHILE BUSY else `decayedEWMA`
  *     (`decayedEWMA = ewma x exp(-dt/tau)`, `dt = max(now - stamp, 0)`). The busy floor means a hung
  *     node -- inflight > 0 and no completion, so `dt` grows without bound -- gets MORE expensive over
@@ -724,18 +726,24 @@ export class NqBalancer extends BalancerBase {
  *
  * Cold start: `_ewma` seeds to 1.0 and `_stamp` to a NEGATIVE "unsampled" sentinel (-1). An unsampled
  * node costs 0 WHILE IDLE (so it holds one request in flight at a time until its first recordRtt) and
- * the pool's lifetime mean ONCE BUSY (1.0 only before the very first sample), so a cold node that took
+ * the pool's decaying mean ONCE BUSY (1.0 only before the very first sample), so a cold node that took
  * work is never mistaken for a 1.0 ns node and cannot become a black hole once samples flow (H1). The
  * first `recordRtt` initializes the EWMA EXACTLY to the sample (clock-independent); the peak rule
  * applies only from the second sample on. It is never NaN.
  *
- * ACCEPTED CAVEATS (1.1 refinements): (a) a node that was idle and then receives a request is priced by
- * the time since its LAST response (the `dt` floor / the mean) until that in-flight request completes --
- * there is no precise per-dispatch "busy since" stamp yet, so the busy floor uses time-since-last-sample
- * as its proxy, over-pricing a node that has just started a fresh (not hung) request. (b) `mean` is a
- * LIFETIME mean over every sample ever recorded -- it never forgets a latency-regime change; decaying it
- * is a 1.1 item. `_samp[0]` (the running sum) saturates to +Infinity after ~1.8e308 of summed rtt and
- * stays Infinity (a cold-but-busy node then prices at Infinity) -- never NaN.
+ * Update rule (1.1.0, L4): Finagle's `observe()` exactly. A sample above the STORED estimate replaces
+ * it; otherwise `ewma = ewma x w + sample x (1 - w)`, `w = exp(-dt/tau)`. (1.0.x decayed the estimate
+ * first and then blended, `ewma x w^2 + sample x (1 - w)`, and forgot a slow period faster than
+ * designed: 10 ms, one tau, then a 5 ms sample gave 4.51 ms where Finagle gives 6.84 ms.) One
+ * deliberate difference: Finagle and tower also fold a 0 sample in on every READ, so their estimate
+ * depends on how often a node is read; ours is a pure function of the samples and the clock.
+ *
+ * ACCEPTED CAVEAT (research/1.1.0-kernel-and-api.md 5.3, D5): a node that was idle and then receives a
+ * request is priced by the time since its LAST response (the `dt` floor / the mean) until that
+ * in-flight request completes -- there is no per-dispatch "busy since" stamp, by decision: Finagle,
+ * tower and Linkerd do not keep one either, and a stamp would need a new call on every dispatch. The
+ * answer to a request that never returns is a per-attempt TIMEOUT: the attempt throws, and the caller
+ * (or @zakkster/lite-pick/pool) records `max(elapsed, penalty)` as a peak sample.
  *
  * Contract: `now` (in `pick(now)` / `recordRtt`) and `sampleNs` MUST be FINITE numbers. `recordRtt`
  * throws on a non-finite argument (the warm path); `pick(now)` never throws (the fail-closed
@@ -787,12 +795,13 @@ export class PeakEwmaBalancer extends BalancerBase {
         this._rng = new Prng(seed);
         this._ewma = new Float64Array(capacity);
         this._stamp = new Float64Array(capacity);
-        // Lifetime running mean of ALL rtt samples (O(1), warm-path maintained in recordRtt): the price
-        // an unsampled-but-BUSY node pays, so a cold node is not mistaken for a 1.0 ns node once it has
-        // work in flight. mean = _samp[0] / _samp[1] (sum / count); count 0 (no sample yet) -> 1.0. Held
-        // in a pre-allocated Float64Array (the hot-path law: pre-allocate typed-array scalars, never a
-        // per-op object). _samp[0] saturates to +Infinity past ~1.8e308 of summed rtt -- never NaN.
-        this._samp = new Float64Array(2);
+        // Decaying pool mean of ALL rtt samples (1.1.0, D4; O(1), warm-path maintained in recordRtt): the
+        // price an unsampled-but-BUSY node pays, so a cold node is not mistaken for a 1.0 ns node once it
+        // has work in flight. [0] decayed sum, [1] decayed count, [2] time of the newest sample. Both sums
+        // decay by the same factor, so mean = _samp[0] / _samp[1] needs no decay on read; count 0 (no
+        // sample yet) -> 1.0. Held in a pre-allocated Float64Array (the hot-path law: pre-allocate
+        // typed-array scalars, never a per-op object). Never NaN: the count is >= 1 after any sample.
+        this._samp = new Float64Array(3);
         // Cold start: _ewma seeds to 1.0 and _stamp to a NEGATIVE "unsampled" sentinel (-1). The
         // sentinel makes ewmaAt read the baseline UNDECAYED (graceful LeastConn) regardless of the
         // caller's clock magnitude -- a plain _stamp=0 would decay as exp(-now/tau) -> 0 under a
@@ -830,10 +839,11 @@ export class PeakEwmaBalancer extends BalancerBase {
     /**
      * Record an rtt SAMPLE for endpoint i at time `now` (the warm feedback path -- NOT the hot
      * pick path). The FIRST sample (an unsampled node, `_stamp < 0`) initializes the EWMA EXACTLY
-     * to the sample, clock-magnitude-independent. Thereafter the Finagle peak rule applies: decay
-     * the stored estimate to `now`, then SNAP UP to the sample if it is larger (a spike is felt
-     * instantly) else ease toward it (it decays back over ~tau). The balancer is the SOLE writer of
-     * `_ewma` / `_stamp`. Zero-alloc on the success path.
+     * to the sample, clock-magnitude-independent. Thereafter Finagle's peak rule (1.1.0, L4): a
+     * sample above the STORED estimate replaces it (a spike is felt instantly), else
+     * `ewma x w + sample x (1 - w)` with `w = exp(-dt/tau)` (it eases back over ~tau). Every sample
+     * also feeds the decaying pool mean. The balancer is the SOLE writer of `_ewma` / `_stamp` /
+     * `_samp`. Zero-alloc on the success path.
      * @param {number} i  endpoint index
      * @param {number} sampleNs  observed rtt in nanoseconds (finite, >= 0)
      * @param {number} now  caller-supplied nanoseconds (finite), consistent with pick(now)
@@ -847,26 +857,38 @@ export class PeakEwmaBalancer extends BalancerBase {
             throw new RangeError('[lite-pick] sampleNs must be a finite number >= 0');
         }
         if (!Number.isFinite(now)) throw new RangeError('[lite-pick] now must be a finite number');
-        if (this._stamp[i] < 0) {
-            this._ewma[i] = sampleNs;   // first sample: exact init, no decay (clock-independent)
+        const v = this._ewma[i];
+        if (this._stamp[i] < 0 || sampleNs > v) {
+            this._ewma[i] = sampleNs;   // first sample: exact init (clock-independent); else the PEAK: snap up
         } else {
+            // L4 (1.1.0): Finagle's observe() exactly -- value x w + sample x (1 - w), the peak compared
+            // with the STORED value. 1.0.x decayed twice (value x w^2 + sample x (1 - w)).
             let dt = now - this._stamp[i];
             if (dt < 0) dt = 0;         // L6: clamp a non-monotonic clock -- exp(+x) must never inflate
             const w = Math.exp(-dt / this._tau);
-            const e = this._ewma[i] * w;
-            this._ewma[i] = sampleNs > e ? sampleNs : e + (sampleNs - e) * (1 - w);
+            this._ewma[i] = v * w + sampleNs * (1 - w);
         }
         this._stamp[i] = now;
-        // O(1) warm running lifetime mean over ALL samples: the price a cold-but-busy node pays in
-        // pick(). Kept in an unboxed Float64Array (see the ctor); _samp[0] saturates to +Infinity, never NaN.
-        this._samp[0] += sampleNs;
-        this._samp[1] += 1;
+        // O(1) warm DECAYING pool mean (1.1.0, D4): the sum and the count both decay by exp(-dt/tau) since
+        // the newest sample from ANY node, then take this one at weight 1, so mean = sum / count weights
+        // every sample by exp(-age/tau). Unboxed Float64Array (see the ctor). An overflowed (+Infinity) sum
+        // times an underflowed pw === 0 is NaN; that reads as 0, so the sum restarts and is never NaN.
+        // Zero-box: the guard merges two DOUBLES. `pw > 0 ? s[0] * pw + sampleNs : sampleNs` merged a double
+        // with the tagged parameter, and Maglev boxed it (~16 B/op, PerfGate 8N: 24 scavenges).
+        const s = this._samp;
+        let pdt = now - s[2];
+        if (pdt < 0) pdt = 0;           // L6: a backwards reading folds in at weight 1 and decays nothing
+        else s[2] = now;
+        const pw = Math.exp(-pdt / this._tau);
+        const kept = s[0] * pw;
+        s[0] = (kept === kept ? kept : 0) + sampleNs;
+        s[1] = s[1] * pw + 1;
     }
 
     /**
      * Pick by latency-aware power-of-two-choices: two distinct eligible draws, LOWER COST wins (a tie
      * goes to the first draw). Cost is the three-case function documented on the class (unsampled+idle
-     * -> 0; unsampled+busy -> (inflight+1) x lifetime mean; sampled -> (inflight+1) x max(decayedEWMA,
+     * -> 0; unsampled+busy -> (inflight+1) x decaying pool mean; sampled -> (inflight+1) x max(decayedEWMA,
      * dt-while-busy)), NOT a plain (inflight+1) x ewmaAt. PICK_NONE (fail closed) iff the whole pool is
      * down. O(d)=O(1), 0 B/op (pure read -- no write, no clock call; the mean division runs only in the
      * unsampled-and-busy arm, never in the both-sampled steady state).
@@ -885,7 +907,7 @@ export class PeakEwmaBalancer extends BalancerBase {
         const inf = this._inflight, ewma = this._ewma, stamp = this._stamp, tau = this._tau;
         // Per-candidate cost (pure READ, scalar-only, 0 B/op). See the class JSDoc for the three cases.
         //   unsampled + idle -> 0 (costs 0 while idle until its first recordRtt; NOT a one-shot probe).
-        //   unsampled + busy -> (inf+1) x lifetime mean  (the mean DIVISION runs ONLY here -- never in
+        //   unsampled + busy -> (inf+1) x pool mean  (the mean DIVISION runs ONLY here -- never in
         //                       the both-sampled steady state -- priced at the pool mean, not 1.0 ns).
         //   sampled          -> (inf+1) x base, base = decayed EWMA, floored at dt WHILE BUSY so a hung
         //                       node (dt grows, no completion) gets MORE expensive, not less.

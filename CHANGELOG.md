@@ -6,8 +6,8 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
-Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; bursts B1 -- the plain fixes --
-and B2 -- rotating ties and the BoundedLoad `minCap`).
+Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; bursts B1 -- the plain fixes --,
+B2 -- rotating ties and the BoundedLoad `minCap` -- and B3 -- PeakEWMA's update rule and pool mean).
 
 ### Added
 
@@ -47,6 +47,28 @@ and B2 -- rotating ties and the BoundedLoad `minCap`).
   single wrapped loop cost +55-85% and was rejected); NQ stops at the first idle endpoint after the cursor
   (~10 ns where 1.0.x returned the always-idle endpoint 0 in ~7 ns). The fuzzer's NQ check now accepts any
   idle endpoint, and still catches an NQ that ignores idle endpoints.
+- **PeakEWMA: the update is Finagle's exactly (audit L4).** 1.0.x decayed the estimate and then blended,
+  `ewma x w^2 + sample x (1 - w)`, so it forgot a slow period faster than designed: 10 ms, one tau, then a 5 ms
+  sample gave 4.51 ms. It is now `ewma x w + sample x (1 - w)` (6.84 ms, pinned by a test), and the peak test
+  compares the sample with the STORED estimate (1.0.x compared with the decayed one, so 8 ms after a 10 ms
+  peak snapped to 8 ms; it now blends to 8.74 ms). The rule is now continuous where the old one jumped. One
+  deliberate difference stays: Finagle and tower fold a 0 sample in on every read, so their estimate depends
+  on how often a node is read; ours depends only on the samples and the clock.
+- **PeakEWMA: an unsampled-but-busy node is priced at a DECAYING pool mean (research D4).** 1.0.x used the
+  lifetime mean of every sample ever recorded, so a slow first hour priced new nodes high forever. The sum and
+  the count now both decay by `exp(-dt/tau)` (the balancer's own tau) since the newest sample, so every sample
+  is weighted by `exp(-age/tau)`; after a regime change from 10 ms to 1 ms the mean reads ~1 ms within a few
+  tau (the lifetime mean read 5.5 ms). `_samp` grows a third cell (the newest-sample time). An overflowed sum
+  restarts after a long gap instead of staying `+Infinity`. `recordRtt` costs no more: 8.8 -> 8.6 ns when every
+  sample blends (two `exp` now, one before), 5.8 -> 4.9 ns when every sample is a peak (no `exp` for the node).
+  0 B/op (PerfGate; a first draft merged a double with the `sampleNs` argument in one ternary and Maglev boxed
+  it, ~16 B/op -- caught by the gate, fixed).
+- **PeakEWMA: no busy-since stamp; set a per-attempt timeout (research D5).** The 1.0.1 docs promised a
+  per-dispatch stamp for 1.1.0. Finagle, tower and Linkerd keep none, and it would need a new call on every
+  dispatch. The documented answer to a request that never returns is a timer on each ATTEMPT, inside `fn`: the
+  attempt throws and Pool records `max(elapsed, failurePenaltyNs)` as a peak, then fails over (new test C1c).
+  Aborting the run's own `signal` is a caller cancel and still records nothing. RECIPES section 8 shows the
+  `AbortSignal.any` pattern.
 - **ConsistentHash / BoundedLoad tables build ~8x faster at the default M (audit L7).** Additive Maglev
   stepping (`c += skip`) instead of `(offset + j * skip) % M`: 10.5 ms -> 1.3 ms per rebuild at M = 65537,
   1.7x at 4099. The tables are IDENTICAL to 1.0.x (golden fingerprints in the tests), so upgrading moves no key.
@@ -57,6 +79,11 @@ and B2 -- rotating ties and the BoundedLoad `minCap`).
   picks). One limit moved: live 16 is 19 (was 20). The 50%-ignore mutant is now caught in 38-63% of cycles
   at live 8-11 (it was 58-65%: the biased fallback had amplified the mutant's imbalance), 86% at 16, >= 99%
   from 31 and 100% from 49 -- the soak's frozen state has ~165-200 live.
+- Benchmark-only: the REVERT teeth control (the 1.0.0 kernel must trip the H1/H3/H4 quality gates) crashed
+  from B1 on, because the soak now reweights through `setWeights`, which 1.0.0 lacks; a crash counts as a
+  MISS, so the teeth run failed rather than passing silently. The control now adds a `setWeights` shim to the
+  old kernel that does what the soak did before (write `_weights`, one `rebuild()`), failing closed without
+  `_weights`. All three gates catch it again.
 
 - **Benchmark-only: a soak run without the evidence to judge is INCONCLUSIVE, not PASS (S5, audit
   2026-09-29).** A non-smoke run where any lane has fewer than 2N post-warmup cycles (e.g.

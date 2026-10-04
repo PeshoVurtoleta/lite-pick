@@ -763,6 +763,33 @@ test('C1b (N1): a plain failure (no abort) still feeds the H1 penalty', async ()
     assert.ok(pe.ewmaAt(victim, clock()) > 1e8, 'the penalty landed on a real failure');
 });
 
+test('C1c (D5, 1.1.0): a per-attempt timeout INSIDE fn is a failure -- it records the elapsed time as a peak and fails over', async () => {
+    // The hung-node answer (research/1.1.0 5.3): an attempt-level timer, not the run's signal. The run's
+    // signal stays un-aborted, so the timeout is the endpoint's fault: max(elapsed, penalty) is recorded.
+    const n = 4;
+    const inflight = new Uint32Array(n);
+    const pe = new PeakEwmaBalancer(n, up(n), inflight, 1e9, 0xABCDEF);
+    const pool = new Pool(pe, inflight);
+    let t = 0;
+    const clock = () => t;
+    for (let r = 0; r < 100; r++) await pool.run(() => { t += 1e6; return 'ok'; }, { clock });   // ~1 ms each
+    const ac = new AbortController();     // the CALLER's signal: never aborted here
+    let hung = -1;
+    const out = await pool.run((i, signal) => {
+        assert.equal(signal, ac.signal, 'fn sees the run signal; its own timer is separate');
+        if (hung < 0) {
+            hung = i;
+            t += 3e9;                     // the attempt's own 3 s timer fires
+            throw new DOMException('attempt timed out', 'TimeoutError');
+        }
+        t += 1e6;
+        return 'ok:' + i;
+    }, { clock, tries: 2, signal: ac.signal, failurePenaltyNs: 1e9 });
+    assert.ok(out.startsWith('ok:') && out !== 'ok:' + hung, 'failed over to another endpoint');
+    assert.ok(pe._ewma[hung] >= 3e9, 'the elapsed 3 s (> the 1 s penalty) is the peak sample: ' + pe._ewma[hung]);
+    for (let i = 0; i < n; i++) assert.equal(inflight[i], 0, 'net-zero on node ' + i);
+});
+
 test('C2 (N2): an UNMARKED wrapper around ConsistentHash still routes by opts.key (1.0.0 semantics)', async () => {
     const n = 8;
     const inflight = new Uint32Array(n);

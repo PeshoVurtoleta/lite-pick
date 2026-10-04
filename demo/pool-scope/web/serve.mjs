@@ -19,6 +19,7 @@
 
 import { createServer } from 'node:http';
 import { readFile, realpath } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { extname, join, relative, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -50,6 +51,9 @@ function resolvePort() {
 
 const PORT = resolvePort();
 const ROOT = resolve(argVal('--root', PKG_ROOT));
+// The REAL root (symlinks in its own path resolved once, at start): a file's realpath is compared against
+// this, so a checkout under a symlinked directory (macOS /tmp -> /private/tmp) is not 403 on every file.
+const ROOT_REAL = realpathSync(ROOT);
 
 // Only these authorities are accepted in the Host header (DNS-rebinding defence): the loopback names
 // the browser uses, with the exact serving port. A missing or foreign Host is refused (421).
@@ -139,11 +143,18 @@ const server = createServer(async (req, res) => {
             return;
         }
 
-        // Realpath the target so a symlink cannot escape ROOT (fail closed if it does).
+        // Realpath the target so a symlink cannot escape ROOT (fail closed if it does) -- AND re-run the
+        // allowlist on the RESOLVED path (audit 2026-09-29 D4): an allowed-looking name inside the demo tree
+        // that is a symlink to e.g. ../../../.git/config used to pass, because only the LEXICAL path was
+        // allowlisted. Now both the requested and the resolved file must be allowlisted.
         const real = await realpath(abs);
-        const realRel = relative(ROOT, real);
+        const realRel = relative(ROOT_REAL, real);
         if (realRel.startsWith('..') || isAbsolute(realRel)) {
             send(res, 403, 'text/plain; charset=utf-8', '403 forbidden', isHead);
+            return;
+        }
+        if (!isAllowed('/' + realRel.split('\\').join('/'))) {
+            send(res, 404, 'text/plain; charset=utf-8', '404 not found', isHead);
             return;
         }
 

@@ -23,9 +23,9 @@
       inline detectors/share/hot-keys. Proves the optional-peer graceful degradation in the browser too.
     -->
     <script>
-        var q = new URLSearchParams(location.search);
-        if (q.has('nosketch')) globalThis.POOL_SCOPE_NO_SKETCH = 1;
-        if (q.has('noadaptive')) globalThis.POOL_SCOPE_NO_ADAPTIVE = 1;
+        const poolScopeQuery = new URLSearchParams(location.search);
+        if (poolScopeQuery.has('nosketch')) globalThis.POOL_SCOPE_NO_SKETCH = 1;
+        if (poolScopeQuery.has('noadaptive')) globalThis.POOL_SCOPE_NO_ADAPTIVE = 1;
     </script>
     <!--
       L25: every specifier is pinned to an EXACT version (no ^ / ~ / latest). Subresource-integrity
@@ -52,24 +52,26 @@
         // Visible CDN-failure degradation (L25): reveal a banner instead of leaving a blank page if a
         // module fails to load. Three signals: a <script>/<link> load error, an esm.sh/dynamic-import
         // error/rejection, and a definitive readiness check (main.mjs sets __poolScopeReady when it starts).
+        // The banner lives in <body>, after this <head> script: looked up on first use, then cached.
+        let $poolScopeCdnBanner = null;
         function poolScopeCdnError() {
-            var b = document.getElementById('cdn-error');
-            if (b) b.hidden = false;
+            if ($poolScopeCdnBanner === null) $poolScopeCdnBanner = document.getElementById('cdn-error');
+            if ($poolScopeCdnBanner) $poolScopeCdnBanner.hidden = false;
         }
 
-        addEventListener('error', function (e) {
-            var t = e && e.target;
+        addEventListener('error', (e) => {
+            const t = e && e.target;
             if (t && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) {
                 poolScopeCdnError();
                 return;
             }
-            var f = '' + (e && (e.filename || e.message || ''));
+            const f = '' + (e && (e.filename || e.message || ''));
             if (f.indexOf('esm.sh') >= 0 || f.indexOf('dynamically imported module') >= 0) poolScopeCdnError();
         }, true);
-        addEventListener('unhandledrejection', function () {
+        addEventListener('unhandledrejection', () => {
             poolScopeCdnError();
         });
-        setTimeout(function () {
+        setTimeout(() => {
             if (!globalThis.__poolScopeReady) poolScopeCdnError();
         }, 6000);
     </script>

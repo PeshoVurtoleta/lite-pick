@@ -100,6 +100,21 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   15% bar, and hosted runners vary +/-10-20%. A zero or missing baseline value is a NOTE, never a silent
   skip. Teeth: `RPT baseline: ...` (timing only notes; heap +5 MB fails; another Node major is not
   heap-compared).
+- **Demo-only (not in the package): Pool Scope cleanup.**
+  - `serve.mjs` (audit 2026-09-29 D4): the allowlist is now also applied to the RESOLVED path, so a
+    symlink inside the demo tree pointing at e.g. `.git/config` is 404 (it was served); the root is
+    realpath'd once, so serving from a symlinked checkout no longer 403s every file.
+  - Browser render layer (`web/main.mjs`), lite-law: no allocation in the per-frame loops. The colour
+    ramp is a 256-entry string table built once (no `'rgb(...)'` per cell); heat cells, Lorenz points
+    and scatter points are preallocated and updated in place; the scatter fade uses a numeric
+    `globalAlpha` instead of an `'rgba(...' + a.toFixed(2)` string per point; dash arrays and labels are
+    constants; each fallback canvas caches its 2d context and reads its size only on a ResizeObserver
+    change; control and tab buttons are looked up once.
+  - `web/index.html` inline scripts: `const`/`let` instead of `var`; the CDN-error banner lookup is
+    cached on first use.
+  - `tui.mjs`: exits 128 + signal on SIGINT/SIGTERM/SIGHUP (130/143/129) instead of 0.
+  - ASCII-only source: the UI glyphs in `tui.mjs` and `web/main.mjs` are `\u` escapes now (the TUI's
+    rendered frames are byte-identical).
 - **Repository: LF line endings on every OS.** A new `.gitattributes` (`* text=auto eol=lf`). Windows
   runners check out with `core.autocrlf=true`, which broke `test/RecipesDoc.test.js` (red on
   windows-latest since it was added) and `test/SoakTeeth.test.js`, and would make a Windows checkout of

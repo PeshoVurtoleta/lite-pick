@@ -90,22 +90,22 @@ const GRAD = new Array(GRAD_N);
     }
 })();
 
-const EIGHTHS = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const FULL = '█';
-const SHADE = '░';          // light shade (gauge track)
+const EIGHTHS = [' ', '\u2581', '\u2582', '\u2583', '\u2584', '\u2585', '\u2586', '\u2587', '\u2588'];
+const FULL = '\u2588';
+const SHADE = '\u2591';          // light shade (gauge track)
 // Heat-strip DENSITY tiers (notcurses idiom): light-shade -> full block, so per-cell load reads as
 // texture AND colour, not one uniform slab of solid blocks. Indexed by load magnitude.
-const HEAT_DENSITY = ['░', '▒', '▓', '█'];
-const DASH = '┄';           // dashed horizontal (mean line)
-const GHOST = '┈';          // dotted vertical (weight ghost / morph trail)
-const H_BAR = '─';          // box horizontal (chrome rule)
+const HEAT_DENSITY = ['\u2591', '\u2592', '\u2593', '\u2588'];
+const DASH = '\u2504';           // dashed horizontal (mean line)
+const GHOST = '\u2508';          // dotted vertical (weight ghost / morph trail)
+const H_BAR = '\u2500';          // box horizontal (chrome rule)
 
 // Pathology badge glyphs (design brief section 5).
-const G_OSC = '∿';          // tilde wave
-const G_PING = '⇄';         // anti-phase arrows
-const G_STARV = '∅';        // empty set
-const G_UNFAIR = '⚖';       // scales
-const G_OVER = '▲';         // triangle
+const G_OSC = '\u223f';          // tilde wave
+const G_PING = '\u21c4';         // anti-phase arrows
+const G_STARV = '\u2205';        // empty set
+const G_UNFAIR = '\u2696';       // scales
+const G_OVER = '\u25b2';         // triangle
 
 const BAR_ROWS = 8;
 const HEAT_COLS = 48;
@@ -235,8 +235,8 @@ class Renderer {
             C_DIM + '   frame ' + C_TEXT + frame + RESET + NL;
         // Sibling-backing indicator: which witnessed peer (or the inline fallback) backs each layer.
         s += C_FAINT + 'backing  ' + C_DIM + 'detectors ' + DET_COL + DETECTOR_BACKING + C_FAINT +
-            ' · ' + C_DIM + 'latency ' + LAT_COL + LATENCY_BACKING + C_FAINT +
-            ' · ' + C_DIM + 'hot-keys ' + HK_COL + HOTKEY_BACKING + RESET + NL;
+            ' \u00b7 ' + C_DIM + 'latency ' + LAT_COL + LATENCY_BACKING + C_FAINT +
+            ' \u00b7 ' + C_DIM + 'hot-keys ' + HK_COL + HOTKEY_BACKING + RESET + NL;
         s += C_FAINT + this._rule(64) + RESET + NL;
 
         // ---- HERO: bar-comb ------------------------------------------------------------
@@ -248,7 +248,7 @@ class Renderer {
             let line = ' ';
             for (let w = 0; w < cap; w++) {
                 if (!snap.wEligible[w]) {
-                    line += (r === 0 ? C_FAINT + '·' + RESET : ' ') + ' ';
+                    line += (r === 0 ? C_FAINT + '\u00b7' + RESET : ' ') + ' ';
                     continue;
                 }
                 const e = this.eighths[w] - r * 8;
@@ -287,12 +287,12 @@ class Renderer {
                     continue;
                 }
                 if (!snap.eligAt(w, k)) {
-                    line += C_FAINT + '·' + RESET;
+                    line += C_FAINT + '\u00b7' + RESET;
                     continue;
                 }
                 const load = snap.loadAt(w, k);
                 if (load <= 0) {
-                    line += C_FAINT + '·' + RESET;
+                    line += C_FAINT + '\u00b7' + RESET;
                     continue;
                 }
                 // Value-driven: COLOUR lerps green->amber->red along magnitude AND the density glyph
@@ -348,11 +348,11 @@ class Renderer {
         // ---- ALARM + badges ------------------------------------------------------------
         s += C_FAINT + this._rule(64) + RESET + NL;
         if (det.activeCount === 0) {
-            s += BOLD + C_GREEN + '  ● SYSTEM NOMINAL' + RESET + C_DIM +
+            s += BOLD + C_GREEN + '  \u25cf SYSTEM NOMINAL' + RESET + C_DIM +
                 '   no pathology detected' + RESET + NL;
         } else {
             const head = pulse ? (BOLD + C_RED) : (C_RED);
-            s += head + '  ● PATHOLOGY DETECTED / ' + det.activeCount + ' fault' +
+            s += head + '  \u25cf PATHOLOGY DETECTED / ' + det.activeCount + ' fault' +
                 (det.activeCount === 1 ? '' : 's') + RESET + '   ';
             if (det.osc) s += C_AMBER + G_OSC + ' OSCILLATION(w' + det.oscWorker + ') ' + RESET;
             if (det.ping) s += C_MAGENTA + G_PING + ' PING-PONG(w' + det.pingA + '/w' + det.pingB + ') ' + RESET;
@@ -553,9 +553,11 @@ function runInteractive(argv) {
         out.write(RESET + SHOW + ALT_OFF);
     }
 
-    function quit() {
+    /** Restore the terminal, then exit: 0 for a user quit (q / ESC), 128 + signal number for a signal
+     *  (the shell convention, audit 2026-09-29 info: SIGINT 130, SIGTERM 143, SIGHUP 129). */
+    function quit(code = 0) {
         restore();
-        process.exit(0);
+        process.exit(code);
     }
 
     function onKey(chunk) {
@@ -627,9 +629,10 @@ function runInteractive(argv) {
         det.reset();
     }
 
-    process.on('SIGINT', quit);
-    process.on('SIGTERM', quit);   // L23: restore the terminal on a kill / hangup too, not only Ctrl-C
-    process.on('SIGHUP', quit);
+    // A listener receives the signal NAME as its first argument -- so wrap, never pass `quit` directly.
+    process.on('SIGINT', () => quit(130));
+    process.on('SIGTERM', () => quit(143));   // L23: restore the terminal on a kill / hangup too, not only Ctrl-C
+    process.on('SIGHUP', () => quit(129));
     process.on('exit', restore);
 
     out.write(ALT_ON + CLR_SCREEN + HIDE);

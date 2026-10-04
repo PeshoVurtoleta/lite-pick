@@ -37,6 +37,7 @@ const KILLER_MAX = 96;                     // killer-graph trailing scatter dept
 const SCALE_FLOOR = 20;                    // heat colour scale floor so an overloaded cell reads red
 const FP_MEAN_MULT = 2.3;                  // fingerprint full-scale = live-mean load x this
 const FP_SCALE_FLOOR = 4;
+const TAU = Math.PI * 2;
 
 const COL = {
     bg1: '#0d1117', bg2: '#131922', bg3: '#1a2230', line: '#232b38',
@@ -46,9 +47,8 @@ const COL = {
 
 const G0 = [0x5f, 0xe3, 0x9f], G1 = [0xf5, 0xb9, 0x42], G2 = [0xf8, 0x71, 0x71];
 
-/** green -> amber -> red ramp along t in [0,1]; the reading IS the hue (btop idiom). */
-function ramp(t) {
-    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+/** green -> amber -> red colour at t in [0,1] (init-time only: it builds a string). */
+function rampRgb(t) {
     let a, b, u;
     if (t < 0.5) {
         a = G0;
@@ -64,6 +64,25 @@ function ramp(t) {
     const bl = (a[2] + (b[2] - a[2]) * u) | 0;
     return 'rgb(' + r + ',' + g + ',' + bl + ')';
 }
+
+// The ramp as a 256-entry lookup table of colour strings built ONCE: ramp() is then integer math + an
+// array read -- no string is built per cell / per bar / per frame (lite-law: zero alloc in a frame loop).
+const RAMP_N = 256;
+const RAMP_LUT = new Array(RAMP_N);
+for (let k = 0; k < RAMP_N; k++) RAMP_LUT[k] = rampRgb(k / (RAMP_N - 1));
+
+/** green -> amber -> red ramp along t in [0,1]; the reading IS the hue (btop idiom). 0 B per call. */
+function ramp(t) {
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    return RAMP_LUT[(t * (RAMP_N - 1) + 0.5) | 0];
+}
+
+// Init-time label / dash constants, reused every frame (no per-frame String() / array literal).
+const W_LABEL = [], T_LABEL = [], DIGIT = [];
+for (let i = 0; i < CAP; i++) W_LABEL.push('w' + i);
+for (let c = 0; c < HEAT_COLS; c++) T_LABEL.push('t' + c);
+for (let d = 0; d < 10; d++) DIGIT.push(String(d));
+const DASH_GHOST = [2, 2], DASH_MEAN = [5, 4], DASH_DIAG = [4, 4], DASH_NONE = [];
 
 /* ------------------------------------------------------------------------- cached DOM refs ---- */
 
@@ -94,6 +113,12 @@ const $wtableBody = $('wtable-body');
 const $wtable = $('wtable');
 const $inspector = $('inspector');
 const $giniGauge = $('gini-gauge');
+// Control buttons, looked up ONCE: inject kind -> button, and the scene tab buttons.
+const $injectBtn = new Map();
+for (const b of document.querySelectorAll('button.ctl.inject')) $injectBtn.set(b.getAttribute('data-inject'), b);
+const $ctlButtons = Array.from(document.querySelectorAll('button.ctl.inject, button.ctl[data-inject]'));
+const $tabButtons = Array.from($tabs.querySelectorAll('button'));
+const $wtableHead = $wtable.querySelector('thead');
 
 /* ------------------------------------------------------------------------- brick instances ---- */
 
@@ -141,42 +166,67 @@ $headAlloc.innerHTML = '<span class="ok">data 0 B/op</span> (pre-alloc rings)';
 let charts = null;                          // the lite-charts module, or null if it failed to load
 
 // ---- reusable chart data arrays (render layer; rebuilt each frame) --------------------------
-const heatData = [];                        // {x:'t0'..t47, y:'w0'..w11, v}
-const lorenzData = [];                      // {x, y} cumulative-population vs cumulative-share
-const killerData = [];                      // {x:p50, y:picks/sec} trailing ring
+const heatData = [];                        // {x:'t0'..t47, y:'w0'..w11, v} -- CAP x HEAT_COLS cells, built ONCE below
+// Lorenz points {x, y} (cumulative population vs cumulative share): CAP+1 point objects and one array VIEW
+// per live count n (0..CAP), all built ONCE; a frame fills the points in place and selects the view.
+const lorenzPts = [];
+for (let i = 0; i <= CAP; i++) lorenzPts.push({x: 0, y: 0});
+const lorenzViews = [];
+for (let n = 0; n <= CAP; n++) lorenzViews.push(lorenzPts.slice(0, n === 0 ? 2 : n + 1));
+const lorenzShares = new Float64Array(CAP);
+let lorenzData = lorenzViews[0];
+const killerData = [];                      // {x:p50, y:picks/sec} trailing window; point objects RECYCLED
 
 // ---- fallback canvases (created lazily when a chart cannot mount) ---------------------------
+// Each canvas is wrapped ONCE in a reused state object { canvas, ctx, w, h, dirty }: the 2d context is
+// cached (not re-fetched per frame), and the CSS size is read only when a ResizeObserver says it changed
+// (no per-frame layout read, no per-frame { ctx, w, h } allocation).
+const fitRO = typeof ResizeObserver === 'function'
+    ? new ResizeObserver((entries) => { for (const e of entries) if (e.target.__fit) e.target.__fit.dirty = true; })
+    : null;
+
 function makeCanvas(host) {
     const c = document.createElement('canvas');
     c.className = 'fallback';
     host.textContent = '';
     host.appendChild(c);
-    return c;
+    const fit = {canvas: c, ctx: c.getContext('2d'), w: 0, h: 0, dirty: true};
+    c.__fit = fit;
+    if (fitRO) fitRO.observe(c);
+    return fit;
 }
 
-function fitCanvas(c) {
-    const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
-    const w = c.clientWidth || c.parentElement.clientWidth || 600;
-    const h = c.clientHeight || c.parentElement.clientHeight || 220;
-    const pw = (w * dpr) | 0, ph = (h * dpr) | 0;
-    if (c.width !== pw || c.height !== ph) {
-        c.width = pw;
-        c.height = ph;
+function fitCanvas(fit) {
+    if (fit.dirty || !fitRO) {
+        const c = fit.canvas;
+        const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
+        const w = c.clientWidth || c.parentElement.clientWidth || 600;
+        const h = c.clientHeight || c.parentElement.clientHeight || 220;
+        const pw = (w * dpr) | 0, ph = (h * dpr) | 0;
+        if (c.width !== pw || c.height !== ph) {
+            c.width = pw;
+            c.height = ph;
+        }
+        fit.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        fit.w = w;
+        fit.h = h;
+        fit.dirty = false;
     }
-    const ctx = c.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    return {ctx, w, h};
+    return fit;
 }
 
 /* -------- FINGERPRINT: hand-rolled canvas hero (bar + mean/sigma band + weight-ghost) -------- */
 
 const fpCanvas = makeCanvas($('host-fingerprint'));
+let fpBase = 0, fpPlotH = 1, fpScaleNow = 1;   // per-frame scale state (no per-frame closure)
+const fpY = (v) => fpBase - Math.min(1, v / fpScaleNow) * fpPlotH;
 
 function drawFingerprint() {
     const {ctx, w, h} = fitCanvas(fpCanvas);
     ctx.clearRect(0, 0, w, h);
     const pad = 8, base = h - 16;
-    const plotH = base - pad;
+    fpBase = base;
+    fpPlotH = base - pad;
     // live weight sum + mean/std of live inflight (mean-relative scale, TUI-parity).
     let sumW = 0, meanLoad = 0, liveN = 0;
     for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) {
@@ -193,7 +243,8 @@ function drawFingerprint() {
     sig = liveN > 0 ? Math.sqrt(sig / liveN) : 0;
     let fpScale = meanLoad * FP_MEAN_MULT;
     if (fpScale < FP_SCALE_FLOOR) fpScale = FP_SCALE_FLOOR;
-    const yOf = (v) => base - Math.min(1, v / fpScale) * plotH;
+    fpScaleNow = fpScale;
+    const yOf = fpY;
     const colW = (w - pad * 2) / CAP;
     const barW = colW * 0.62;
     // +-1 sigma band
@@ -218,24 +269,24 @@ function drawFingerprint() {
         const ghost = sumW > 0 ? (drv.weights[i] / sumW) * (meanLoad * liveN) : 0;
         const yg = yOf(ghost);
         ctx.strokeStyle = 'rgba(156,162,174,0.55)';
-        ctx.setLineDash([2, 2]);
+        ctx.setLineDash(DASH_GHOST);
         ctx.strokeRect(x, yg, barW, Math.max(0.5, base - yg));
-        ctx.setLineDash([]);
+        ctx.setLineDash(DASH_NONE);
     }
     // mean line
     ctx.strokeStyle = COL.dim;
-    ctx.setLineDash([5, 4]);
+    ctx.setLineDash(DASH_MEAN);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(pad, yOf(meanLoad));
     ctx.lineTo(w - pad, yOf(meanLoad));
     ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.setLineDash(DASH_NONE);
     // worker index axis
     ctx.fillStyle = COL.faint;
     ctx.font = '10px "JetBrains Mono", monospace';
     ctx.textAlign = 'center';
-    for (let i = 0; i < CAP; i++) ctx.fillText(String(i % 10), pad + i * colW + colW / 2, h - 3);
+    for (let i = 0; i < CAP; i++) ctx.fillText(DIGIT[i % 10], pad + i * colW + colW / 2, h - 3);
 }
 
 /* -------- HEAT: lite-charts heatmap (worker x time), canvas fallback -------- */
@@ -243,15 +294,17 @@ function drawFingerprint() {
 const heatHost = $('host-heat');
 let heatChart = null, heatFallback = null;
 
+for (let wI = 0; wI < CAP; wI++) for (let c = 0; c < HEAT_COLS; c++) heatData.push({x: T_LABEL[c], y: W_LABEL[wI], v: 0});
+
+/** Refresh the heat cells IN PLACE (only `v` changes per frame; no object or label string per cell). */
 function buildHeatData() {
-    heatData.length = 0;
     const scale = snap.maxLoad > SCALE_FLOOR ? snap.maxLoad : SCALE_FLOOR;
     for (let wI = 0; wI < CAP; wI++) {
         for (let c = 0; c < HEAT_COLS; c++) {
             const k = HEAT_COLS - 1 - c;               // newest at the right
             let v = 0;
             if (k < snap.frames && snap.eligAt(wI, k)) v = snap.loadAt(wI, k);
-            heatData.push({x: 't' + c, y: 'w' + wI, v: v / scale});
+            heatData[wI * HEAT_COLS + c].v = v / scale;
         }
     }
 }
@@ -269,7 +322,7 @@ function drawHeatFallback() {
     for (let wI = 0; wI < CAP; wI++) {
         const y = pad + wI * cellH;
         ctx.fillStyle = COL.faint;
-        ctx.fillText('w' + wI, 0, y + cellH / 2);
+        ctx.fillText(W_LABEL[wI], 0, y + cellH / 2);
         for (let c = 0; c < HEAT_COLS; c++) {
             const k = HEAT_COLS - 1 - c;
             const x = labW + c * cellW;
@@ -291,23 +344,32 @@ const fairHost = $('host-fairness');
 let fairChart = null, fairFallback = null;
 
 function buildLorenz() {
-    // Lorenz: sort live workers' share ascending, plot cumulative population vs cumulative share.
-    lorenzData.length = 0;
-    const shares = [];
-    for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) shares.push(snap.wShare[i]);
-    shares.sort((a, b) => a - b);
-    const n = shares.length;
-    lorenzData.push({x: 0, y: 0});
+    // Lorenz: sort live workers' share ascending (insertion sort over <= CAP in a preallocated typed array),
+    // plot cumulative population vs cumulative share into the preallocated points.
+    let n = 0, total = 0;
+    for (let i = 0; i < CAP; i++) {
+        if (!snap.wEligible[i]) continue;
+        const v = snap.wShare[i];
+        let j = n++;
+        while (j > 0 && lorenzShares[j - 1] > v) { lorenzShares[j] = lorenzShares[j - 1]; j--; }
+        lorenzShares[j] = v;
+        total += v;
+    }
+    lorenzPts[0].x = 0;
+    lorenzPts[0].y = 0;
     if (n > 0) {
+        if (!(total > 0)) total = 1;
         let acc = 0;
-        const total = shares.reduce((s, v) => s + v, 0) || 1;
         for (let i = 0; i < n; i++) {
-            acc += shares[i];
-            lorenzData.push({x: (i + 1) / n, y: acc / total});
+            acc += lorenzShares[i];
+            lorenzPts[i + 1].x = (i + 1) / n;
+            lorenzPts[i + 1].y = acc / total;
         }
     } else {
-        lorenzData.push({x: 1, y: 1});
+        lorenzPts[1].x = 1;
+        lorenzPts[1].y = 1;
     }
+    lorenzData = lorenzViews[n];
 }
 
 function drawFairFallback() {
@@ -317,13 +379,13 @@ function drawFairFallback() {
     const px = pad, py = pad, pw = w - pad * 2, ph = h - pad * 2;
     // equality diagonal
     ctx.strokeStyle = COL.faint;
-    ctx.setLineDash([4, 4]);
+    ctx.setLineDash(DASH_DIAG);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(px, py + ph);
     ctx.lineTo(px + pw, py);
     ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.setLineDash(DASH_NONE);
     // Lorenz curve
     const g = snap.curGini;
     ctx.strokeStyle = g >= UNFAIR_GINI ? COL.red : COL.green;
@@ -368,8 +430,11 @@ let killerChart = null, killerFallback = null;
 function pushKiller() {
     const x = snap.p50, y = snap.curThroughput;
     if (x === x && y === y) {                 // both finite
-        killerData.push({x, y});
-        if (killerData.length > KILLER_MAX) killerData.shift();
+        // Recycle the oldest point once the window is full (no per-frame object).
+        const p = killerData.length >= KILLER_MAX ? killerData.shift() : {x: 0, y: 0};
+        p.x = x;
+        p.y = y;
+        killerData.push(p);
     }
 }
 
@@ -393,11 +458,15 @@ function drawKillerFallback() {
         const xx = px + (p.x / maxX) * pw;
         const yy = py + ph - (p.y / maxY) * ph;
         const age = i / Math.max(1, killerData.length - 1);   // fade the trail (recency = brighter)
-        ctx.fillStyle = i === killerData.length - 1 ? COL.cyan : 'rgba(125,211,252,' + (0.15 + age * 0.5).toFixed(2) + ')';
+        const newest = i === killerData.length - 1;
+        // A numeric globalAlpha over a constant colour -- not an 'rgba(..., a.toFixed(2))' string per point.
+        ctx.fillStyle = COL.cyan;
+        ctx.globalAlpha = newest ? 1 : 0.15 + age * 0.5;
         ctx.beginPath();
-        ctx.arc(xx, yy, i === killerData.length - 1 ? 4 : 2.5, 0, Math.PI * 2);
+        ctx.arc(xx, yy, newest ? 4 : 2.5, 0, TAU);
         ctx.fill();
     }
+    ctx.globalAlpha = 1;
     ctx.fillStyle = COL.faint;
     ctx.font = '10px "JetBrains Mono", monospace';
     ctx.textAlign = 'left';
@@ -507,11 +576,11 @@ function refreshCharts() {
 /* ================================================================================ DOM panels === */
 
 const BADGE_DEFS = [
-    ['osc', 'osc', '∿', (d) => 'OSCILLATION w' + d.oscWorker],
-    ['ping', 'ping', '⇄', (d) => 'PING-PONG w' + d.pingA + '/w' + d.pingB],
-    ['starv', 'starv', '∅', (d) => 'STARVATION w' + d.starvWorker],
-    ['unfair', 'unfair', '⚖', () => 'UNFAIR'],
-    ['over', 'over', '▲', (d) => 'OVERLOAD w' + d.overWorker + '=' + d.overLoad],
+    ['osc', 'osc', '\u223f', (d) => 'OSCILLATION w' + d.oscWorker],
+    ['ping', 'ping', '\u21c4', (d) => 'PING-PONG w' + d.pingA + '/w' + d.pingB],
+    ['starv', 'starv', '\u2205', (d) => 'STARVATION w' + d.starvWorker],
+    ['unfair', 'unfair', '\u2696', () => 'UNFAIR'],
+    ['over', 'over', '\u25b2', (d) => 'OVERLOAD w' + d.overWorker + '=' + d.overLoad],
 ];
 
 function paintAlarm() {
@@ -538,7 +607,7 @@ function paintHeader() {
     $headLive.textContent = snap.live + '/' + CAP;
     $headInflight.textContent = String(snap.totalInflight);
     $headThr.textContent = String(snap.curThroughput | 0);
-    const suffix = drv.hasLatSketch ? ' (±1%)' : '';
+    const suffix = drv.hasLatSketch ? ' (\u00b11%)' : '';
     $headLat.textContent = snap.p50.toFixed(0) + '/' + snap.p95.toFixed(0) + '/' + snap.p99.toFixed(0) + 'ms' + suffix;
 }
 
@@ -632,7 +701,7 @@ function paintHotKeys() {
         const wk = drv.keyWorker[key];
         html += '<div class="hk"><span style="color:' + COL.cyan + '">key ' + key + '</span>' +
             '<span class="track"><span class="fill" style="width:' + (share * 100).toFixed(1) + '%"></span></span>' +
-            '<span style="color:' + COL.faint + '">' + (share * 100).toFixed(1) + '% → w' + (wk >= 0 ? wk : '?') + '</span></div>';
+            '<span style="color:' + COL.faint + '">' + (share * 100).toFixed(1) + '% \u2192 w' + (wk >= 0 ? wk : '?') + '</span></div>';
     }
     $hotkeysList.innerHTML = html;
 }
@@ -694,12 +763,12 @@ function inject(kind) {
         det.reset();
         killIdx = 1;
         activeInjectors.clear();
-        for (const b of document.querySelectorAll('button.ctl.inject')) b.setAttribute('aria-pressed', 'false');
+        for (const b of $injectBtn.values()) b.setAttribute('aria-pressed', 'false');
         return;
     }
     if (kind !== 'reset') {
         activeInjectors.add(kind);
-        const b = document.querySelector('button.ctl.inject[data-inject="' + kind + '"]');
+        const b = $injectBtn.get(kind);
         if (b) b.setAttribute('aria-pressed', 'true');
     }
 }
@@ -715,7 +784,7 @@ $strategySelect.value = 'p2c';
 $strategySelect.addEventListener('change', () => setStrategy($strategySelect.value));
 $btnNext.addEventListener('click', () => setStrategy(STRATEGIES[(STRATEGIES.indexOf(drv.strategyName) + 1) % STRATEGIES.length]));
 
-for (const b of document.querySelectorAll('button.ctl.inject, button.ctl[data-inject]')) {
+for (const b of $ctlButtons) {
     b.addEventListener('click', () => inject(b.getAttribute('data-inject')));
 }
 
@@ -723,12 +792,12 @@ for (const b of document.querySelectorAll('button.ctl.inject, button.ctl[data-in
 $tabs.addEventListener('click', (ev) => {
     const btn = ev.target.closest('button[data-scene]');
     if (!btn) return;
-    for (const t of $tabs.querySelectorAll('button')) t.setAttribute('aria-selected', String(t === btn));
+    for (const t of $tabButtons) t.setAttribute('aria-selected', String(t === btn));
     $stage.setAttribute('data-scene', btn.getAttribute('data-scene'));
 });
 
 // worker table: sort + row select
-$wtable.querySelector('thead').addEventListener('click', (ev) => {
+$wtableHead.addEventListener('click', (ev) => {
     const th = ev.target.closest('th[data-sort]');
     if (th) sSort.set(th.getAttribute('data-sort'));
 });

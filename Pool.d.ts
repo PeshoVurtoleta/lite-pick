@@ -78,6 +78,9 @@ export interface RunOptions {
  * ergonomics and distinct-endpoint failover. `run` increments in-flight on dispatch, decrements
  * on settle, and on a thrown error keeps the failed endpoint elevated so a load-aware strategy
  * steers the next attempt elsewhere. NOT a 0 B/op path (the kernel `pick()` is).
+ * Every error it throws or rejects with carries a stable `code` (1.1.0; see `LitePickErrorCode` in the
+ * core): `LITE_PICK_ARGUMENT` / `LITE_PICK_ARRAY` from the constructor, `LITE_PICK_ARGUMENT` /
+ * `LITE_PICK_OPTION` from `run`'s arguments, and the run-time codes listed on `run`.
  */
 export class Pool {
     /**

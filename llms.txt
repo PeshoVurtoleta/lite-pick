@@ -125,6 +125,22 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
 
 - `VERSION` -- string. The source-of-truth version stamp (synced with package.json + this file).
 - `PICK_NONE` -- the -1 fail-closed sentinel returned by `pick()` when no endpoint is eligible.
+- ERROR CODES (1.1.0, semver API; messages are not): every error the kernel or /pool throws or rejects
+  with keeps its class (TypeError / RangeError / Error) and carries `code`: `LITE_PICK_CAPACITY`,
+  `LITE_PICK_ARRAY` (wrong typed array / too short / bad stats slab), `LITE_PICK_INDEX`,
+  `LITE_PICK_WEIGHT`, `LITE_PICK_OPTION` (constructor / run option: tauNs, M, eps, minCap,
+  failurePenaltyNs), `LITE_PICK_ARGUMENT` (recordRtt sample / now, note delta, Pool.run fn, Pool's
+  balancer, liteQueryFetcher args), `LITE_PICK_ABSTRACT`, `LITE_PICK_INCONSISTENT` (assertConsistent);
+  /pool adds `LITE_PICK_KEY_REQUIRED`, `LITE_PICK_CLOCK_REQUIRED`, `LITE_PICK_CLOCK_INVALID`,
+  `LITE_PICK_ABORTED`, `LITE_PICK_NONE`, `LITE_PICK_FEEDBACK`. Type: `LitePickErrorCode`.
+- `STAT_FALLBACK_SCANS` (0), `STAT_REBUILDS` (1), `STAT_DISPLACED` (2), `STAT_COUNT` (3 in 1.1.0) --
+  stats slab indices (1.1.0). FALLBACK_SCANS: the P2C / PeakEWMA / WeightedRandom very-sparse fallback
+  or the ConsistentHash / BoundedLoad full-table sweep ran. REBUILDS: a CH / BL / WR table build (the
+  constructor's too). DISPLACED: a CH / BL keyed pick did not return its home backend (home down, or BL
+  over cap). Counted only off the healthy pick path (a per-pick counter cost RoundRobin 2.1 -> 5.7 ns,
+  and the caller already sees every pick / PICK_NONE); a displaced pick pays ~0.5 ns. Never reset by the
+  library -- read deltas; Float64 is exact to 2^53. Indices are only ever APPENDED: size slabs with
+  STAT_COUNT, never a literal.
 - `Prng` -- class. Instance-local deterministic xorshift32.
   - `new Prng(seed = 0x9e3779b9)` -- 0 is remapped to the default.
   - `next()` -> uint32 in [1, 2^32). One xorshift32 step, zero-alloc.
@@ -141,6 +157,23 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     exact and is idempotent; throws `RangeError` on a non-integer or out-of-range index (incl. a
     numeric string like '2'). A direct `eligible[i]` write desyncs `live` (UB).
   - `pick()` -> number. ABSTRACT in the base (throws); overridden by each strategy.
+  - `attachStats(slab)` -> void (1.1.0). Cold. `slab` is a caller-owned `Float64Array` of length >=
+    STAT_COUNT, or `null` to detach; several balancers may share one (counts add). Without a slab the
+    counting sites write a shared scratch slab (no branch). RangeError `LITE_PICK_ARRAY` otherwise.
+  - `stats` -- readonly. The attached slab, or null.
+  - `describe()` -> object (1.1.0). Cold, ALLOCATES. A JSON-safe snapshot `{ strategy, capacity, live,
+    stats: null | { fallbackScans, rebuilds, displaced }, ... }` plus per-strategy fields: RoundRobin
+    `cursor`; SmoothWRR `weights` (copy), `eligibleWeight`; P2C `inflight` (sum); LeastConn `inflight`,
+    `tieCursor`; SED / NQ `inflight`, `weights`, `tieCursor`; PeakEWMA `tauNs`, `inflight`, `sampled`
+    (nodes with a sample), `poolMeanNs` (null before any); ConsistentHash `tableSize`, `weights`;
+    BoundedLoad those plus `eps`, `minCap`, `total` (noted), `inflight` (sum), `cap` (the cap a pick
+    would use now; null while inactive); WeightedRandom `weights`, `weightSum`. Node's `util.inspect` /
+    `console.log` print it under the class name (`Symbol.for('nodejs.util.inspect.custom')`, no import).
+  - `assertConsistent()` -> void (1.1.0, audit H2). Cold, opt-in, O(cap): recount the live count from
+    `eligible[]` (and reject a byte other than 0/1), SmoothWRR's eligible-weight total, WeightedRandom's
+    table weight sum, BoundedLoad's noted total vs the inflight sum; THROWS Error
+    `LITE_PICK_INCONSISTENT` on a mismatch (a direct `eligible[i]` / `weights[i]` write, a weight write
+    without rebuild(), an inflight change without note()). For tests and debug builds.
 - `RoundRobinBalancer extends BalancerBase` -- class. The baseline strategy (M1).
   - `new RoundRobinBalancer(capacity, eligible)` -- same shared-eligibility contract as the base.
   - `pick()` -> number. Next eligible index in round-robin order (a wrapping cursor that

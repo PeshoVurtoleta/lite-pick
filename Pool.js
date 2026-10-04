@@ -59,6 +59,20 @@ function _scanUntried(b, tried, from) {
 }
 
 /**
+ * A coded error (1.1.0): every error Pool throws or rejects with carries a stable `.code` (messages may
+ * change in any release; codes are semver API -- the same `LITE_PICK_*` family as the kernel's). Cold.
+ * @param {ErrorConstructor} Ctor
+ * @param {string} code
+ * @param {string} msg
+ * @returns {Error}
+ */
+function _err(Ctor, code, msg) {
+    const e = new Ctor(msg);
+    e.code = code;
+    return e;
+}
+
+/**
  * The coded error for a non-finite clock reading (N7: every Pool error carries a `.code`). Cold path.
  * @param {unknown} v  the reading clock() returned
  * @returns {Error}
@@ -102,10 +116,10 @@ export class Pool {
     constructor(balancer, inflight) {
         if (!balancer || typeof balancer.pick !== 'function' ||
             typeof balancer.capacity !== 'number' || typeof balancer.live !== 'number') {
-            throw new TypeError('[lite-pick] Pool needs a balancer with pick(), capacity, and live');
+            throw _err(TypeError, 'LITE_PICK_ARGUMENT', '[lite-pick] Pool needs a balancer with pick(), capacity, and live');
         }
         if (!(inflight instanceof Uint32Array) || inflight.length < balancer.capacity) {
-            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= balancer.capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= balancer.capacity');
         }
         this._b = balancer;
         this._inflight = inflight;
@@ -183,7 +197,7 @@ export class Pool {
      * @returns {Promise<T>}
      */
     async run(fn, opts) {
-        if (typeof fn !== 'function') throw new TypeError('[lite-pick] Pool.run needs a function');
+        if (typeof fn !== 'function') throw _err(TypeError, 'LITE_PICK_ARGUMENT', '[lite-pick] Pool.run needs a function');
         const o = opts != null ? opts : undefined;      // L1: run(fn, null) / run(fn) are valid
         const rawTries = o && o.tries != null ? (o.tries | 0) : 1;
         const tries = rawTries > 0 ? rawTries : 1;
@@ -232,7 +246,7 @@ export class Pool {
         if (o && o.failurePenaltyNs !== undefined) {
             const fp = o.failurePenaltyNs;
             if (typeof fp !== 'number' || !Number.isFinite(fp) || fp <= 0) {
-                throw new RangeError('[lite-pick] failurePenaltyNs must be a finite number > 0');
+                throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] failurePenaltyNs must be a finite number > 0');
             }
             failurePenaltyNs = fp;
         }
@@ -408,9 +422,9 @@ export class Pool {
  * @returns {(ctx: { key: any, signal?: { readonly aborted: boolean } }) => Promise<T>}
  */
 export function liteQueryFetcher(pool, perEndpoint, opts) {
-    if (!(pool instanceof Pool)) throw new TypeError('[lite-pick] liteQueryFetcher needs a Pool');
+    if (!(pool instanceof Pool)) throw _err(TypeError, 'LITE_PICK_ARGUMENT', '[lite-pick] liteQueryFetcher needs a Pool');
     if (typeof perEndpoint !== 'function') {
-        throw new TypeError('[lite-pick] liteQueryFetcher needs a per-endpoint function');
+        throw _err(TypeError, 'LITE_PICK_ARGUMENT', '[lite-pick] liteQueryFetcher needs a per-endpoint function');
     }
     const tries = opts && opts.tries != null ? opts.tries : 1;
     const clock = opts && typeof opts.clock === 'function' ? opts.clock : undefined;
@@ -418,7 +432,7 @@ export function liteQueryFetcher(pool, perEndpoint, opts) {
     // Validate once at creation (fail closed early), not on every fetch.
     if (failurePenaltyNs !== undefined &&
         (typeof failurePenaltyNs !== 'number' || !Number.isFinite(failurePenaltyNs) || failurePenaltyNs <= 0)) {
-        throw new RangeError('[lite-pick] failurePenaltyNs must be a finite number > 0');
+        throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] failurePenaltyNs must be a finite number > 0');
     }
     return function fetcher(ctx) {
         const key = ctx ? ctx.key : undefined;

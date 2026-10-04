@@ -395,6 +395,29 @@ VERSION;              // -> '1.0.2'
 
 `BalancerBase.pick()` is **abstract** -- it throws, so an unfinished strategy fails loudly rather than returning a dead index. Every shipped strategy (`RoundRobinBalancer`, `SmoothWRRBalancer`, `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`, `ConsistentHashBalancer`, `BoundedLoadBalancer`, `WeightedRandomBalancer`) extends it and reads the same eligibility view; you subclass it the same way to add your own. Flip eligibility only through `setEligible` (it keeps `live` exact) and give each balancer its own eligibility array (a shared `Eligibility` object is a 2.0 item).
 
+## Observability (v1.1.0)
+
+Four cold tools, none on the pick path:
+
+```js
+import { P2cBalancer, STAT_COUNT, STAT_FALLBACK_SCANS } from '@zakkster/lite-pick';
+
+const slab = new Float64Array(STAT_COUNT);   // yours; several balancers may share it
+lb.attachStats(slab);
+// ... later, on your metrics tick: the library never resets it, so read deltas
+const scans = slab[STAT_FALLBACK_SCANS];
+
+lb.describe();          // { strategy: 'P2C', capacity, live, stats: {...}, inflight } -- JSON-safe
+console.log(lb);        // Node prints the same snapshot under the class name
+lb.assertConsistent();  // in tests: throws LITE_PICK_INCONSISTENT after a direct eligible[i] write
+
+try { lb.setEligible(99, true); } catch (e) { e.code; } // 'LITE_PICK_INDEX' -- codes are semver API
+```
+
+- **Counters** (`STAT_FALLBACK_SCANS`, `STAT_REBUILDS`, `STAT_DISPLACED`) count only what you cannot see from outside: the very-sparse fallback or full-table sweep ran, a table was rebuilt, a keyed pick left its home backend. A counter on every pick was measured and rejected (RoundRobin 2.1 -> 5.7 ns); you already see every pick and every `PICK_NONE`. A displaced pick pays ~0.5 ns; a healthy pick pays nothing. Float64 counters are exact to 2^53 (a `Uint32Array` wraps in ~7 minutes at 10M/s).
+- **Error codes.** Every throw keeps its class and adds a stable `code`: `LITE_PICK_CAPACITY`, `_ARRAY`, `_INDEX`, `_WEIGHT`, `_OPTION`, `_ARGUMENT`, `_ABSTRACT`, `_INCONSISTENT`, plus Pool's `_KEY_REQUIRED`, `_CLOCK_REQUIRED`, `_CLOCK_INVALID`, `_ABORTED`, `_NONE`, `_FEEDBACK`. Match on `code`, not the message.
+- **`assertConsistent()`** recounts what the balancer caches (live, SmoothWRR's eligible weight, WeightedRandom's table weight sum, BoundedLoad's noted total) -- the check for the misuses that `setEligible` / `setWeight` / `note` exist to prevent.
+
 ## Wiring it up -- `@zakkster/lite-pick/pool` (v0.5.0)
 
 > **New to lite-pick as a load balancer?** [**RECIPES.md**](./RECIPES.md) is a beginner-to-advanced guide: it builds the kernel up into a real balancer step by step -- health/eligibility, load counters, the dispatch/settle loop, failover, latency feedback (PeakEWMA), the FE profile, and choosing a strategy. Start there; the sections below are the reference.

@@ -6,7 +6,9 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../../Pick.js';
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT,
+    STAT_FALLBACK_SCANS, STAT_REBUILDS, STAT_DISPLACED, STAT_COUNT } from '../../Pick.js';
+import type { LitePickErrorCode, BalancerDescription, BalancerStats } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -258,3 +260,35 @@ const peAsBase: BalancerBase = pe;
 const chAsBase: BalancerBase = ch;
 const blAsBase: BalancerBase = bl;
 void peAsBase; void chAsBase; void blAsBase;
+
+// 1.1.0 observability: codes, the stats slab, describe(), assertConsistent().
+const errCode: LitePickErrorCode = 'LITE_PICK_INDEX';
+void errCode;
+// @ts-expect-error -- not a lite-pick code
+const badCode: LitePickErrorCode = 'ERR_LITE_PICK_INDEX';
+void badCode;
+const iFb: 0 = STAT_FALLBACK_SCANS, iRb: 1 = STAT_REBUILDS, iDp: 2 = STAT_DISPLACED;
+void iFb; void iRb; void iDp;
+const obsSlab = new Float64Array(STAT_COUNT);
+const obsCh = new ConsistentHashBalancer(4, new Uint8Array(4), null, 257);
+obsCh.attachStats(obsSlab);
+obsCh.attachStats(null);
+const obsSlabBack: Float64Array | null = obsCh.stats;
+void obsSlabBack;
+// @ts-expect-error -- stats is readonly; attach through attachStats
+obsCh.stats = obsSlab;
+const obsD: BalancerDescription = obsCh.describe();
+const obsStats: BalancerStats | null = obsD.stats;
+void obsStats;
+const obsM: number = obsCh.describe().tableSize;
+void obsM;
+const obsBl = new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4), 0.25);
+const obsCap: number | null = obsBl.describe().cap;
+void obsCap;
+const obsPe = new PeakEwmaBalancer(4, new Uint8Array(4), new Uint32Array(4), 1e6);
+const obsMean: number | null = obsPe.describe().poolMeanNs;
+void obsMean;
+const obsBase: BalancerBase = obsPe;
+obsBase.assertConsistent();
+const obsName: string = new WeightedRandomBalancer(2, new Uint8Array(2), new Uint32Array(2)).describe().strategy;
+void obsName;

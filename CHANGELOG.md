@@ -7,9 +7,29 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 ## [Unreleased]
 
 Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; bursts B1 -- the plain fixes --,
-B2 -- rotating ties and the BoundedLoad `minCap` -- and B3 -- PeakEWMA's update rule and pool mean).
+B2 -- rotating ties and the BoundedLoad `minCap` --, B3 -- PeakEWMA's update rule and pool mean -- and B4 --
+observability, decisions/0015).
 
 ### Added
+
+- **Error codes on every throw (D7).** Each error keeps its class (TypeError / RangeError / Error) and carries a
+  stable `code`, which is semver API (messages are not): `LITE_PICK_CAPACITY`, `LITE_PICK_ARRAY`,
+  `LITE_PICK_INDEX`, `LITE_PICK_WEIGHT`, `LITE_PICK_OPTION`, `LITE_PICK_ARGUMENT`, `LITE_PICK_ABSTRACT`,
+  `LITE_PICK_INCONSISTENT`; Pool's constructor, `run` argument and `liteQueryFetcher` errors gain codes too.
+  The prefix is Pool's shipped `LITE_PICK_*` (not the research's `LITE_PICK_ERR_*`: renaming six shipped codes
+  would break callers). Type: `LitePickErrorCode`.
+- **Stats slab: `attachStats(slab)`, `stats`, `STAT_FALLBACK_SCANS`, `STAT_REBUILDS`, `STAT_DISPLACED`,
+  `STAT_COUNT` (D7).** A caller-owned `Float64Array` the balancer adds to and never resets. Only events the
+  caller cannot see are counted, and only off the healthy pick path: the very-sparse fallback / full-table sweep,
+  table builds, and keyed picks that leave their home backend. A per-pick counter was measured and left out
+  (RoundRobin 2.1 -> 5.7 ns); a displaced pick pays ~0.5 ns. P2C's sparse fallback moved into a cold module
+  function, out of the hot `_draw`.
+- **`describe()` on every balancer, and Node `util.inspect` output (D7).** A cold, JSON-safe snapshot (strategy,
+  capacity, live, counters, per-strategy state such as BoundedLoad's current cap or PeakEWMA's pool mean);
+  `console.log(lb)` prints it under the class name instead of the private fields.
+- **`assertConsistent()` (audit H2).** Opt-in O(cap) recount of the cached state; throws
+  `LITE_PICK_INCONSISTENT` after a direct `eligible[i]` / `weights[i]` write, a weight write without
+  `rebuild()`, or a BoundedLoad inflight change without `note()`. RECIPES section 16 shows all four tools.
 
 - **`BoundedLoadBalancer` opt-in `minCap` (8th constructor argument, default 0; readonly `minCap`).**
   `cap = max(minCap, ceil((1 + eps)(T + 1) / live))`. The paper's capacity (and HAProxy's) is 1 at low load,

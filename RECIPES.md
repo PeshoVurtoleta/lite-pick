@@ -510,5 +510,37 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
 
 ---
 
+## 16. See what the balancer is doing -- stats, describe(), codes, assertConsistent (1.1.0)
+
+Counters you export, a snapshot for an admin endpoint, a consistency check for your tests:
+
+```js
+import { ConsistentHashBalancer, STAT_COUNT, STAT_DISPLACED, STAT_FALLBACK_SCANS, STAT_REBUILDS }
+  from '@zakkster/lite-pick';
+
+const stats = new Float64Array(STAT_COUNT);   // ONE slab for every balancer is fine: counts add up
+lb.attachStats(stats);
+
+let last = new Float64Array(STAT_COUNT);
+setInterval(() => {                            // your metrics tick -- the library never resets the slab
+  metrics.gauge('lb.displaced', stats[STAT_DISPLACED] - last[STAT_DISPLACED]);   // affinity loss
+  metrics.gauge('lb.fallback', stats[STAT_FALLBACK_SCANS] - last[STAT_FALLBACK_SCANS]);
+  metrics.gauge('lb.rebuilds', stats[STAT_REBUILDS] - last[STAT_REBUILDS]);
+  last.set(stats);
+}, 10_000);
+
+app.get('/admin/lb', (req, res) => res.json(lb.describe()));   // JSON-safe snapshot
+```
+
+- `STAT_DISPLACED` rising means keys are leaving their home backend (ConsistentHash: the home is
+  down; BoundedLoad: also over cap). `STAT_FALLBACK_SCANS` rising means the pool is mostly down
+  (each one is an O(cap) or O(M) scan). Picks and `PICK_NONE` are not counted -- you see those.
+- Match errors on `e.code` (`LITE_PICK_INDEX`, `LITE_PICK_ARRAY`, ...), never on the message.
+- In tests, call `lb.assertConsistent()` after driving the balancer: it throws
+  `LITE_PICK_INCONSISTENT` when someone wrote `eligible[i]` or `weights[i]` directly, or changed
+  BoundedLoad's `inflight` without `note()`. It is O(cap) -- not for the request path.
+
+---
+
 See also: `README.md` (overview + gates), `llms.txt` (full API surface),
 `decisions/` (the ADRs behind each design call), `ROADMAP.md` (what's next).

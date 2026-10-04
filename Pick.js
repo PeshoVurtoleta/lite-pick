@@ -92,6 +92,74 @@ export const VERSION = '1.0.2';
 export const PICK_NONE = -1;
 
 /**
+ * Stats slab layout (1.1.0, D7). A balancer counts ONLY what its caller cannot see from outside, and only on
+ * cold or already-taken slow branches: a counter on every pick cost RoundRobin 2.1 -> 5.7 ns (a read-modify-
+ * write of one memory slot per pick), and the caller already sees every pick and every PICK_NONE. Attach a
+ * caller-owned Float64Array with `attachStats(slab)` (length >= STAT_COUNT; several balancers may share one).
+ * Counters only grow -- the library never resets them; read deltas. Float64 is exact to 2^53. New indices are
+ * only ever APPENDED, so size slabs with STAT_COUNT, never a literal.
+ */
+/** A fallback scan ran: the P2C / PeakEWMA / WeightedRandom very-sparse fallback, or the ConsistentHash /
+ *  BoundedLoad full-table sweep past the probe window. O(cap) or O(M) each -- a rising rate means a pool
+ *  that is mostly down. */
+export const STAT_FALLBACK_SCANS = 0;
+/** A lookup or alias table was (re)built: ConsistentHash / BoundedLoad / WeightedRandom, the constructor's
+ *  build included (it lands in the slab attached at that moment, i.e. the scratch slab). */
+export const STAT_REBUILDS = 1;
+/** ConsistentHash / BoundedLoad: a keyed pick that did NOT return its home slot's backend (home down, or --
+ *  BoundedLoad -- over cap). The affinity-loss signal. */
+export const STAT_DISPLACED = 2;
+/** The number of stats indices in this version (a slab must be at least this long). */
+export const STAT_COUNT = 3;
+
+/** Every balancer without an attached slab writes here, unconditionally (no branch in the counting sites).
+ *  Shared, never read. */
+const _STATS_SCRATCH = new Float64Array(STAT_COUNT);
+
+/** Node's custom-inspect hook, by its registry symbol: no import, and a plain unused key in browsers. */
+const _INSPECT = Symbol.for('nodejs.util.inspect.custom');
+
+/**
+ * A coded error (1.1.0, D7): the usual TypeError / RangeError / Error, plus a stable `code` -- error
+ * messages may change in any release, codes are semver API. Cold (only ever on a throw path).
+ * @param {ErrorConstructor} Ctor
+ * @param {string} code  a `LITE_PICK_*` code
+ * @param {string} msg
+ * @returns {Error}
+ */
+function _err(Ctor, code, msg) {
+    const e = new Ctor(msg);
+    e.code = code;
+    return e;
+}
+
+/** Sum of a Uint32Array over [0, n), for the cold describe() / assertConsistent(). */
+function _sum(a, n) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += a[i];
+    return s;
+}
+
+/**
+ * COLD (L2, 1.1.0): the P2C / PeakEWMA very-sparse fallback after 64 rejected draws -- the k-th eligible
+ * index, k uniform in [0, live). The 1.0.x fallback took the first eligible after a random start, which
+ * favours a node that follows a long run of down nodes (nodes {0,1} of 100: 63.5% / 36.5%). A module
+ * function (not a method) so P2C's `_draw` -- which PeakEWMA borrows with `.call` -- reaches it from either
+ * class, and so it stays out of the hot `_draw` body. Counts STAT_FALLBACK_SCANS. Zero-alloc, O(cap).
+ * @param {{ _cap: number, _eligible: Uint8Array, _live: number, _rng: Prng, _stats: Float64Array }} b
+ * @returns {number}
+ */
+function _kthEligible(b) {
+    b._stats[STAT_FALLBACK_SCANS] += 1;
+    const cap = b._cap, el = b._eligible;
+    let k = b._rng.nextBelow(b._live);
+    for (let i = 0; i < cap; i++) {
+        if (el[i]) { if (k === 0) return i; k--; }
+    }
+    return PICK_NONE;   // unreachable while _live matches the shared view (a direct write is UB, H2)
+}
+
+/**
  * Prng -- instance-local, deterministic xorshift32.
  *
  * One PRNG step is a few integer ops and allocates nothing, so a strategy can draw
@@ -148,7 +216,7 @@ export class Prng {
  */
 function _vIdx(i, cap) {
     if ((i >>> 0) !== i || i >= cap) {
-        throw new RangeError('[lite-pick] index out of range: ' + i);
+        throw _err(RangeError, 'LITE_PICK_INDEX', '[lite-pick] index out of range: ' + i);
     }
 }
 
@@ -176,15 +244,86 @@ export class BalancerBase {
      */
     constructor(capacity, eligible) {
         if (!Number.isInteger(capacity) || capacity < 1) {
-            throw new RangeError('[lite-pick] capacity must be an integer >= 1');
+            throw _err(RangeError, 'LITE_PICK_CAPACITY', '[lite-pick] capacity must be an integer >= 1');
         }
         if (!(eligible instanceof Uint8Array) || eligible.length < capacity) {
-            throw new RangeError('[lite-pick] eligible must be a Uint8Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] eligible must be a Uint8Array of length >= capacity');
         }
         this._cap = capacity;
         this._eligible = eligible;
         this._live = 0;
+        this._stats = _STATS_SCRATCH;   // D7: counting sites write here until attachStats() (no branch)
         for (let i = 0; i < capacity; i++) if (eligible[i]) this._live++;
+    }
+
+    /**
+     * Cold (1.1.0, D7): count this balancer's internal events into a caller-owned Float64Array (see
+     * STAT_FALLBACK_SCANS / STAT_REBUILDS / STAT_DISPLACED). `null` detaches. Several balancers may share
+     * one slab (their counts add up). The library never resets it.
+     * @param {Float64Array|null} slab  length >= STAT_COUNT
+     */
+    attachStats(slab) {
+        if (slab === null) { this._stats = _STATS_SCRATCH; return; }
+        if (!(slab instanceof Float64Array) || slab.length < STAT_COUNT) {
+            throw _err(RangeError, 'LITE_PICK_ARRAY',
+                '[lite-pick] stats must be a Float64Array of length >= STAT_COUNT (' + STAT_COUNT + '), or null');
+        }
+        this._stats = slab;
+    }
+
+    /** The attached stats slab, or null. */
+    get stats() {
+        return this._stats === _STATS_SCRATCH ? null : this._stats;
+    }
+
+    /**
+     * Cold (1.1.0, D7): a plain-object snapshot for logs and admin endpoints -- the strategy, capacity, live
+     * count, the attached counters (null when none) and each strategy's own state. Allocates; never call it
+     * per pick. Arrays are plain copies, so the snapshot is JSON-safe and does not track later changes.
+     * @returns {object}
+     */
+    describe() {
+        const s = this._stats;
+        return {
+            strategy: 'BalancerBase',
+            capacity: this._cap,
+            live: this._live,
+            stats: s === _STATS_SCRATCH ? null
+                : { fallbackScans: s[STAT_FALLBACK_SCANS], rebuilds: s[STAT_REBUILDS], displaced: s[STAT_DISPLACED] },
+        };
+    }
+
+    /** `util.inspect` / `console.log` in Node print describe() under the class name. Browsers ignore it. */
+    [_INSPECT](depth, options, inspect) {
+        const name = this.constructor.name;
+        if (depth < 0) return '[' + name + ']';
+        const d = this.describe();
+        if (typeof inspect !== 'function') return d;
+        return name + ' ' + inspect(d, Object.assign({}, options, { depth: options.depth == null ? null : options.depth - 1 }));
+    }
+
+    /**
+     * Cold, opt-in (1.1.0, audit H2): recount the cached state from the arrays it caches and THROW (code
+     * LITE_PICK_INCONSISTENT) on any mismatch. The usual cause is a direct `eligible[i] = ...` write, which
+     * bypasses setEligible() and desyncs `live` (PICK_NONE with a node up, wrong ratios). O(cap); for tests
+     * and debug builds, not the request path. Strategies add their own caches (SmoothWRR's eligible-weight
+     * total, WeightedRandom's weight sum, BoundedLoad's noted total).
+     */
+    assertConsistent() {
+        const cap = this._cap, el = this._eligible;
+        let live = 0;
+        for (let i = 0; i < cap; i++) {
+            const v = el[i];
+            if (v > 1) {
+                throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] eligible[' + i + '] is ' + v +
+                    ': setEligible() writes only 0 and 1, so it was written directly');
+            }
+            live += v;
+        }
+        if (live !== this._live) {
+            throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] live is ' + this._live + ' but eligible[] has ' +
+                live + ' up: eligible[] was written directly -- flip it only through setEligible()');
+        }
     }
 
     /** Endpoint count (fixed at construction). */
@@ -225,7 +364,7 @@ export class BalancerBase {
      * @returns {number}
      */
     pick() {
-        throw new Error('[lite-pick] BalancerBase.pick() is abstract -- use a strategy (M1+)');
+        throw _err(Error, 'LITE_PICK_ABSTRACT', '[lite-pick] BalancerBase.pick() is abstract -- use a strategy (M1+)');
     }
 }
 
@@ -279,6 +418,14 @@ export class RoundRobinBalancer extends BalancerBase {
         // count guarantees a set bit within one wrap. Fail closed rather than loop.
         return PICK_NONE;
     }
+
+    /** Cold snapshot (1.1.0): the base fields plus the cursor (the last index returned, -1 before any). */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'RoundRobin';
+        d.cursor = this._cursor;
+        return d;
+    }
 }
 
 /**
@@ -314,7 +461,7 @@ export class SmoothWRRBalancer extends BalancerBase {
     constructor(capacity, eligible, weights) {
         super(capacity, eligible);
         if (!(weights instanceof Uint32Array) || weights.length < capacity) {
-            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
         this._weights = weights;
         this._current = new Float64Array(capacity);
@@ -348,7 +495,7 @@ export class SmoothWRRBalancer extends BalancerBase {
     setWeight(i, w) {
         _vIdx(i, this._cap);
         const nw = w >>> 0;
-        if (nw !== w) throw new RangeError('[lite-pick] weight must be a uint32: ' + w);
+        if (nw !== w) throw _err(RangeError, 'LITE_PICK_WEIGHT', '[lite-pick] weight must be a uint32: ' + w);
         const old = this._weights[i];
         if (nw === old) return;
         this._weights[i] = nw;
@@ -376,6 +523,27 @@ export class SmoothWRRBalancer extends BalancerBase {
         // 1.0.1 contract that keeps _totalEligibleWeight in lockstep); a direct eligible[] write desyncs it.
         cur[best] -= total;
         return best;
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus the weights and the cached eligible-weight total. */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'SmoothWRR';
+        d.weights = Array.from(this._weights.subarray(0, this._cap));
+        d.eligibleWeight = this._totalEligibleWeight;
+        return d;
+    }
+
+    /** Cold, opt-in (1.1.0): the base recount plus the eligible-weight total (a direct `weights[i]` write desyncs it). */
+    assertConsistent() {
+        super.assertConsistent();
+        const cap = this._cap, el = this._eligible, wt = this._weights;
+        let t = 0;
+        for (let i = 0; i < cap; i++) if (el[i]) t += wt[i];
+        if (t !== this._totalEligibleWeight) {
+            throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] the eligible-weight total is ' + this._totalEligibleWeight +
+                ' but the weights sum to ' + t + ': weights[] was written directly -- use setWeight()');
+        }
     }
 }
 
@@ -412,7 +580,7 @@ export class P2cBalancer extends BalancerBase {
     constructor(capacity, eligible, inflight, seed = 0x9e3779b9) {
         super(capacity, eligible);
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
-            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
         }
         this._inflight = inflight;
         this._rng = new Prng(seed);
@@ -431,14 +599,7 @@ export class P2cBalancer extends BalancerBase {
             const i = this._rng.nextBelow(cap);
             if (el[i]) return i;
         }
-        // Degenerate (very sparse eligibility): the k-th eligible index, k uniform in [0, live). The
-        // 1.0.x fallback took the first eligible after a random start, which favours a node that follows
-        // a long run of down nodes (nodes {0,1} of 100: 63.5% / 36.5%). Zero-alloc, O(cap).
-        let k = this._rng.nextBelow(this._live);
-        for (let i = 0; i < cap; i++) {
-            if (el[i]) { if (k === 0) return i; k--; }
-        }
-        return PICK_NONE;   // unreachable while _live matches the shared view (a direct write is UB, H2)
+        return _kthEligible(this);   // degenerate sparsity: the cold fallback (L2), counted (D7)
     }
 
     /**
@@ -458,6 +619,14 @@ export class P2cBalancer extends BalancerBase {
         if (b < 0 || b === a) return a;       // astronomically rare: fall back to the first draw
         // Lower in-flight wins; ties go to the first draw (unbiased over many picks).
         return this._inflight[b] < this._inflight[a] ? b : a;
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus the total in flight. */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'P2C';
+        d.inflight = _sum(this._inflight, this._cap);
+        return d;
     }
 }
 
@@ -496,7 +665,7 @@ export class LeastConnBalancer extends BalancerBase {
     constructor(capacity, eligible, inflight) {
         super(capacity, eligible);
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
-            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
         }
         this._inflight = inflight;
         this._cur = 0;   // rotating tie-break cursor (M5, 1.1.0): the next scan's preferred start
@@ -533,6 +702,15 @@ export class LeastConnBalancer extends BalancerBase {
         this._cur = best + 1;                     // best >= 0 guaranteed while _live > 0
         return best;
     }
+
+    /** Cold snapshot (1.1.0): the base fields plus the total in flight and the tie cursor. */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'LeastConn';
+        d.inflight = _sum(this._inflight, this._cap);
+        d.tieCursor = this._cur;
+        return d;
+    }
 }
 
 /**
@@ -565,10 +743,10 @@ export class SedBalancer extends BalancerBase {
     constructor(capacity, eligible, inflight, weights) {
         super(capacity, eligible);
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
-            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
         }
         if (!(weights instanceof Uint32Array) || weights.length < capacity) {
-            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
         this._inflight = inflight;
         this._weights = weights;
@@ -609,6 +787,16 @@ export class SedBalancer extends BalancerBase {
         this._cur = best + 1;
         return best;
     }
+
+    /** Cold snapshot (1.1.0): the base fields plus the total in flight, the weights and the tie cursor. */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'SED';
+        d.inflight = _sum(this._inflight, this._cap);
+        d.weights = Array.from(this._weights.subarray(0, this._cap));
+        d.tieCursor = this._cur;
+        return d;
+    }
 }
 
 /**
@@ -636,10 +824,10 @@ export class NqBalancer extends BalancerBase {
     constructor(capacity, eligible, inflight, weights) {
         super(capacity, eligible);
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
-            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
         }
         if (!(weights instanceof Uint32Array) || weights.length < capacity) {
-            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
         this._inflight = inflight;
         this._weights = weights;
@@ -682,6 +870,16 @@ export class NqBalancer extends BalancerBase {
         if (best < 0) return PICK_NONE;           // every eligible node has weight 0
         this._cur = best + 1;
         return best;
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus the total in flight, the weights and the tie cursor. */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'NQ';
+        d.inflight = _sum(this._inflight, this._cap);
+        d.weights = Array.from(this._weights.subarray(0, this._cap));
+        d.tieCursor = this._cur;
+        return d;
     }
 }
 
@@ -782,13 +980,13 @@ export class PeakEwmaBalancer extends BalancerBase {
         super(capacity, eligible);
         // Validate typeof-first, BEFORE allocating the owned Float64 state (fail closed early).
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
-            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
         }
         if (typeof tauNs !== 'number') {
-            throw new TypeError('[lite-pick] tauNs must be a number');
+            throw _err(TypeError, 'LITE_PICK_OPTION', '[lite-pick] tauNs must be a number');
         }
         if (!Number.isFinite(tauNs) || tauNs <= 0) {
-            throw new RangeError('[lite-pick] tauNs must be a finite number > 0');
+            throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] tauNs must be a finite number > 0');
         }
         this._inflight = inflight;
         this._tau = tauNs;
@@ -851,12 +1049,12 @@ export class PeakEwmaBalancer extends BalancerBase {
     recordRtt(i, sampleNs, now) {
         _vIdx(i, this._cap);
         if (typeof sampleNs !== 'number' || typeof now !== 'number') {
-            throw new TypeError('[lite-pick] recordRtt(i, sampleNs, now) requires numbers');
+            throw _err(TypeError, 'LITE_PICK_ARGUMENT', '[lite-pick] recordRtt(i, sampleNs, now) requires numbers');
         }
         if (!Number.isFinite(sampleNs) || sampleNs < 0) {
-            throw new RangeError('[lite-pick] sampleNs must be a finite number >= 0');
+            throw _err(RangeError, 'LITE_PICK_ARGUMENT', '[lite-pick] sampleNs must be a finite number >= 0');
         }
-        if (!Number.isFinite(now)) throw new RangeError('[lite-pick] now must be a finite number');
+        if (!Number.isFinite(now)) throw _err(RangeError, 'LITE_PICK_ARGUMENT', '[lite-pick] now must be a finite number');
         const v = this._ewma[i];
         if (this._stamp[i] < 0 || sampleNs > v) {
             this._ewma[i] = sampleNs;   // first sample: exact init (clock-independent); else the PEAK: snap up
@@ -934,6 +1132,20 @@ export class PeakEwmaBalancer extends BalancerBase {
             costB = (inf[b] + 1) * baseB;
         }
         return costB < costA ? b : a;         // lower cost wins; tie -> the first draw
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus tau, the total in flight, how many nodes have a sample,
+     *  and the decaying pool mean (null before any sample). */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'PeakEWMA';
+        d.tauNs = this._tau;
+        d.inflight = _sum(this._inflight, this._cap);
+        let sampled = 0;
+        for (let i = 0; i < this._cap; i++) if (this._stamp[i] >= 0) sampled++;
+        d.sampled = sampled;
+        d.poolMeanNs = this._samp[1] > 0 ? this._samp[0] / this._samp[1] : null;
+        return d;
     }
 }
 
@@ -1033,17 +1245,17 @@ export class ConsistentHashBalancer extends BalancerBase {
         super(capacity, eligible);
         // Validate typeof-first, BEFORE allocating the table / owned weights (fail closed early).
         if (typeof m !== 'number') {
-            throw new TypeError('[lite-pick] table size M must be a number');
+            throw _err(TypeError, 'LITE_PICK_OPTION', '[lite-pick] table size M must be a number');
         }
         if (!Number.isInteger(m) || m < 2 || !chIsPrime(m)) {
-            throw new RangeError('[lite-pick] table size M must be a prime integer > 1: ' + m);
+            throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] table size M must be a prime integer > 1: ' + m);
         }
         if (capacity > m) {
-            throw new RangeError('[lite-pick] capacity ' + capacity +
+            throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] capacity ' + capacity +
                 ' exceeds table size M ' + m + ' (would overfill / starve backends)');
         }
         if (weights !== null && (!(weights instanceof Uint32Array) || weights.length < capacity)) {
-            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
         this._m = m;
         this._seed = seed >>> 0;
@@ -1069,6 +1281,7 @@ export class ConsistentHashBalancer extends BalancerBase {
      * scratch that is released after the build; the lookup table itself is reused in place.
      */
     _build() {
+        this._stats[STAT_REBUILDS] += 1;
         const M = this._m, N = this._cap, wt = this._weights, lookup = this._lookup, seed = this._seed;
         // Per-backend Maglev permutation parameters from a deterministic integer mix of the index.
         const offset = new Int32Array(N);
@@ -1141,7 +1354,7 @@ export class ConsistentHashBalancer extends BalancerBase {
     setWeight(i, w) {
         _vIdx(i, this._cap);
         const nw = w >>> 0;
-        if (nw !== w) throw new RangeError('[lite-pick] weight must be a uint32: ' + w);
+        if (nw !== w) throw _err(RangeError, 'LITE_PICK_WEIGHT', '[lite-pick] weight must be a uint32: ' + w);
         if (nw === this._weights[i]) return;
         this._weights[i] = nw;
         this._build();
@@ -1156,7 +1369,7 @@ export class ConsistentHashBalancer extends BalancerBase {
      */
     setWeights(weights) {
         if (!(weights instanceof Uint32Array) || weights.length < this._cap) {
-            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
         const wt = this._weights;
         for (let i = 0; i < this._cap; i++) wt[i] = weights[i];
@@ -1184,6 +1397,7 @@ export class ConsistentHashBalancer extends BalancerBase {
         let slot = (keyHash >>> 0) % M;           // integer key; NaN >>> 0 = 0 (never throws)
         let i = lookup[slot];
         if (el[i]) return i;
+        this._stats[STAT_DISPLACED] += 1;         // D7: the home backend is down (the probe path only)
         // Bounded forward-probe past down slots; past the window, the cold full-table sweep (L3).
         for (let p = 0; p < CH_PROBE_LIMIT; p++) {
             slot++;
@@ -1203,6 +1417,7 @@ export class ConsistentHashBalancer extends BalancerBase {
      * @returns {number}
      */
     _sweep(slot) {
+        this._stats[STAT_FALLBACK_SCANS] += 1;
         const M = this._m, el = this._eligible, lookup = this._lookup;
         for (let p = 0; p < M; p++) {
             slot++;
@@ -1211,6 +1426,15 @@ export class ConsistentHashBalancer extends BalancerBase {
             if (el[i]) return i;
         }
         return PICK_NONE;
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus the table size M and the weights. */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'ConsistentHash';
+        d.tableSize = this._m;
+        d.weights = Array.from(this._weights.subarray(0, this._cap));
+        return d;
     }
 }
 
@@ -1281,19 +1505,19 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
         // table (fail closed early -- the PeakEWMA / ConsistentHash precedent). These read the args
         // only (no `this`), so they may run before super().
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
-            throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
         }
         if (typeof eps !== 'number') {
-            throw new TypeError('[lite-pick] eps must be a number');
+            throw _err(TypeError, 'LITE_PICK_OPTION', '[lite-pick] eps must be a number');
         }
         if (!Number.isFinite(eps) || eps <= 0) {
-            throw new RangeError('[lite-pick] eps must be a finite number > 0');
+            throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] eps must be a finite number > 0');
         }
         if (typeof minCap !== 'number') {
-            throw new TypeError('[lite-pick] minCap must be a number');
+            throw _err(TypeError, 'LITE_PICK_OPTION', '[lite-pick] minCap must be a number');
         }
         if (!Number.isInteger(minCap) || minCap < 0 || minCap > 0xFFFFFFFF) {
-            throw new RangeError('[lite-pick] minCap must be an integer in [0, 2^32 - 1]: ' + minCap);
+            throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] minCap must be an integer in [0, 2^32 - 1]: ' + minCap);
         }
         // super() validates capacity/eligible/weights/m, copies weights, and builds the Maglev table.
         super(capacity, eligible, weights, m, seed);
@@ -1327,8 +1551,8 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
      */
     note(i, delta) {
         _vIdx(i, this._cap);
-        if (typeof delta !== 'number') throw new TypeError('[lite-pick] delta must be a number');
-        if (!Number.isInteger(delta)) throw new RangeError('[lite-pick] delta must be an integer: ' + delta);
+        if (typeof delta !== 'number') throw _err(TypeError, 'LITE_PICK_ARGUMENT', '[lite-pick] delta must be a number');
+        if (!Number.isInteger(delta)) throw _err(RangeError, 'LITE_PICK_ARGUMENT', '[lite-pick] delta must be an integer: ' + delta);
         const t = this._total + delta;
         this._total = t > 0 ? t : 0;   // clamp: over-decrement never drives the mean negative
     }
@@ -1363,6 +1587,7 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
             if (!capActive || inf[i] < cap) return i;   // sticky home, under cap: the common fast path
             firstEligible = i;
         }
+        this._stats[STAT_DISPLACED] += 1;         // D7: home down or over cap (the probe path only)
         // Bounded forward-probe (M8's exact walk): the first eligible AND under-cap backend wins; a hot
         // home OVERFLOWS to its neighbours. Past the window we fall back to the sticky first-eligible.
         for (let p = 0; p < CH_PROBE_LIMIT; p++) {
@@ -1376,6 +1601,35 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
         }
         // Nothing eligible in the window: the cold full-table sweep (L3), cap ignored (never a dead pick).
         return firstEligible >= 0 ? firstEligible : this._sweep(slot);
+    }
+
+    /** Cold snapshot (1.1.0): the ConsistentHash fields plus eps, minCap, the noted total, the total in
+     *  flight and the cap a pick would use now (null while the cap is inactive: total 0 or nothing live). */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'BoundedLoad';
+        d.eps = this._eps;
+        d.minCap = this._minCap;
+        d.total = this._total;
+        d.inflight = _sum(this._inflight, this._cap);
+        let cap = null;
+        if (this._total > 0 && this._live > 0) {
+            cap = (1 + this._eps) * (this._total + 1) / this._live;
+            if (cap < this._minCap) cap = this._minCap;
+        }
+        d.cap = cap;
+        return d;
+    }
+
+    /** Cold, opt-in (1.1.0): the base recount plus the noted total, which must equal the inflight sum -- every
+     *  inflight change mirrored by note(i, delta) (Pool does both). Call it between requests, not mid-dispatch. */
+    assertConsistent() {
+        super.assertConsistent();
+        const t = _sum(this._inflight, this._cap);
+        if (t !== this._total) {
+            throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] the noted total is ' + this._total + ' but inflight[] sums to ' +
+                t + ': mirror every inflight change with note(i, delta)');
+        }
     }
 }
 
@@ -1439,7 +1693,7 @@ export class WeightedRandomBalancer extends BalancerBase {
         // Validate typeof-first, BEFORE allocating the owned table / scratch (fail closed early -- the
         // PeakEWMA / ConsistentHash / BoundedLoad discipline).
         if (!(weights instanceof Uint32Array) || weights.length < capacity) {
-            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
         this._weights = weights;
         this._rng = new Prng(seed);
@@ -1470,6 +1724,7 @@ export class WeightedRandomBalancer extends BalancerBase {
      */
     _build() {
         this._builds++;
+        this._stats[STAT_REBUILDS] += 1;
         const cap = this._cap, wt = this._weights, prob = this._prob, alias = this._alias;
         const scaled = this._scaled, small = this._small, large = this._large;
         let total = 0;
@@ -1510,7 +1765,7 @@ export class WeightedRandomBalancer extends BalancerBase {
     setWeight(i, w) {
         _vIdx(i, this._cap);
         const nw = w >>> 0;
-        if (nw !== w) throw new RangeError('[lite-pick] weight must be a uint32: ' + w);
+        if (nw !== w) throw _err(RangeError, 'LITE_PICK_WEIGHT', '[lite-pick] weight must be a uint32: ' + w);
         if (nw === this._weights[i]) return;
         this._weights[i] = nw;
         this._build();
@@ -1524,7 +1779,7 @@ export class WeightedRandomBalancer extends BalancerBase {
      */
     setWeights(weights) {
         if (!(weights instanceof Uint32Array) || weights.length < this._cap) {
-            throw new RangeError('[lite-pick] weights must be a Uint32Array of length >= capacity');
+            throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
         const wt = this._weights;
         for (let i = 0; i < this._cap; i++) wt[i] = weights[i];
@@ -1566,6 +1821,7 @@ export class WeightedRandomBalancer extends BalancerBase {
      * @returns {number}
      */
     _sparsePick() {
+        this._stats[STAT_FALLBACK_SCANS] += 1;
         const cap = this._cap, el = this._eligible, wt = this._weights;
         let s = 0;
         for (let i = 0; i < cap; i++) if (el[i]) s += wt[i];
@@ -1576,5 +1832,25 @@ export class WeightedRandomBalancer extends BalancerBase {
             if (el[i] && wt[i] > 0) { u -= wt[i]; last = i; if (u < 0) return i; }
         }
         return last;                              // float residue: the last positive-weight eligible node
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus the weights and the weight sum the alias table was built on. */
+    describe() {
+        const d = super.describe();
+        d.strategy = 'WeightedRandom';
+        d.weights = Array.from(this._weights.subarray(0, this._cap));
+        d.weightSum = this._psum;
+        return d;
+    }
+
+    /** Cold, opt-in (1.1.0): the base recount plus the table's weight sum (a direct `weights[i]` write without
+     *  rebuild() leaves the alias table stale). */
+    assertConsistent() {
+        super.assertConsistent();
+        const t = _sum(this._weights, this._cap);
+        if (t !== this._psum) {
+            throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] the alias table was built on a weight sum of ' + this._psum +
+                ' but the weights sum to ' + t + ': weights[] changed without rebuild() -- use setWeight() / setWeights()');
+        }
     }
 }

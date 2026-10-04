@@ -17,6 +17,49 @@ export const VERSION: string;
 export const PICK_NONE: -1;
 
 /**
+ * The stable `code` on every error lite-pick throws or rejects with (1.1.0). Messages may change in any
+ * release; codes are semver API. The error CLASS is unchanged (TypeError for a wrong type, RangeError for a
+ * value out of its domain, Error otherwise). Kernel: CAPACITY, ARRAY (a typed array of the wrong type or too
+ * short, or a bad stats slab), INDEX, WEIGHT, OPTION (a constructor / run option out of its domain), ARGUMENT
+ * (a call argument: recordRtt's sample / clock, note's delta, Pool.run's fn), ABSTRACT, INCONSISTENT
+ * (assertConsistent). Pool adds KEY_REQUIRED, CLOCK_REQUIRED, CLOCK_INVALID, ABORTED, NONE, FEEDBACK.
+ */
+export type LitePickErrorCode =
+    | 'LITE_PICK_CAPACITY' | 'LITE_PICK_ARRAY' | 'LITE_PICK_INDEX' | 'LITE_PICK_WEIGHT' | 'LITE_PICK_OPTION'
+    | 'LITE_PICK_ARGUMENT' | 'LITE_PICK_ABSTRACT' | 'LITE_PICK_INCONSISTENT'
+    | 'LITE_PICK_KEY_REQUIRED' | 'LITE_PICK_CLOCK_REQUIRED' | 'LITE_PICK_CLOCK_INVALID' | 'LITE_PICK_ABORTED'
+    | 'LITE_PICK_NONE' | 'LITE_PICK_FEEDBACK';
+
+/**
+ * Stats slab indices (1.1.0). Attach a caller-owned `Float64Array(STAT_COUNT)` with `attachStats`; the
+ * balancer adds to it, never resets it (read deltas). Only events the caller cannot see are counted, and only
+ * off the healthy pick path. New indices are only ever appended: size slabs with `STAT_COUNT`.
+ */
+/** P2C / PeakEWMA / WeightedRandom very-sparse fallback, or the ConsistentHash / BoundedLoad full-table sweep. */
+export const STAT_FALLBACK_SCANS: 0;
+/** A ConsistentHash / BoundedLoad / WeightedRandom table build (rebuild, setWeight, setWeights; the constructor's too). */
+export const STAT_REBUILDS: 1;
+/** A ConsistentHash / BoundedLoad keyed pick that did not return its home backend (home down, or over cap). */
+export const STAT_DISPLACED: 2;
+/** The number of stats indices in this version. */
+export const STAT_COUNT: number;
+
+/** The counters in a `describe()` snapshot (null when no slab is attached). */
+export interface BalancerStats {
+    fallbackScans: number;
+    rebuilds: number;
+    displaced: number;
+}
+
+/** The fields every `describe()` snapshot has; each strategy adds its own. Plain, JSON-safe data. */
+export interface BalancerDescription {
+    strategy: string;
+    capacity: number;
+    live: number;
+    stats: BalancerStats | null;
+}
+
+/**
  * Instance-local, deterministic xorshift32 PRNG. Zero-alloc per step; seedable and
  * `reset()`-able so the balance benchmark stays reproducible.
  */
@@ -54,6 +97,22 @@ export class BalancerBase {
      *  Throws `RangeError` on a non-integer or out-of-range index (incl. a numeric string like '2'). */
     setEligible(i: number, up: boolean): void;
     /**
+     * Cold (1.1.0): count this balancer's internal events (`STAT_*`) into a caller-owned slab; `null`
+     * detaches. Several balancers may share one slab. Throws RangeError (`LITE_PICK_ARRAY`) on anything but a
+     * `Float64Array` of length >= `STAT_COUNT` or `null`.
+     */
+    attachStats(slab: Float64Array | null): void;
+    /** The attached stats slab, or null. */
+    readonly stats: Float64Array | null;
+    /** Cold (1.1.0): a plain-object snapshot (allocates; never per pick). Node's `util.inspect` prints it too. */
+    describe(): BalancerDescription;
+    /**
+     * Cold, opt-in (1.1.0): recount the cached state (the live count; SmoothWRR's eligible-weight total,
+     * WeightedRandom's table weight sum, BoundedLoad's noted total) and throw `LITE_PICK_INCONSISTENT` on a
+     * mismatch -- the trace of a direct `eligible[i]` / `weights[i]` write or a missing `note()`. O(cap).
+     */
+    assertConsistent(): void;
+    /**
      * Choose an endpoint index, or `PICK_NONE`. Abstract in the base (throws). Declared with a
      * DELIBERATELY LOOSE optional numeric argument so a keyed subclass (`pick(keyHash)`) or a latency
      * subclass (`pick(now)`) that requires it stays assignable to `BalancerBase` (`const b:
@@ -76,6 +135,8 @@ export class RoundRobinBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array);
     /** Next eligible index in round-robin order, or `PICK_NONE` when the pool is down. */
     pick(): number;
+    /** Snapshot: plus the cursor (the last index returned; -1 before any). */
+    describe(): BalancerDescription & { strategy: 'RoundRobin'; cursor: number };
 }
 
 /**
@@ -95,6 +156,8 @@ export class SmoothWRRBalancer extends BalancerBase {
     setWeight(i: number, w: number): void;
     /** Next endpoint by smooth weighting, or `PICK_NONE` when the eligible-weight sum is 0. */
     pick(): number;
+    /** Snapshot: plus the weights (a copy) and the cached eligible-weight total. */
+    describe(): BalancerDescription & { strategy: 'SmoothWRR'; weights: number[]; eligibleWeight: number };
 }
 
 /**
@@ -113,6 +176,8 @@ export class P2cBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, seed?: number);
     /** Pick by power-of-two-choices (lower in-flight of two random eligibles), or `PICK_NONE`. */
     pick(): number;
+    /** Snapshot: plus the total in flight. */
+    describe(): BalancerDescription & { strategy: 'P2C'; inflight: number };
 }
 
 /**
@@ -133,6 +198,8 @@ export class LeastConnBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array);
     /** The eligible node with the fewest in-flight requests, or `PICK_NONE`. O(cap). */
     pick(): number;
+    /** Snapshot: plus the total in flight and the tie cursor. */
+    describe(): BalancerDescription & { strategy: 'LeastConn'; inflight: number; tieCursor: number };
 }
 
 /**
@@ -152,6 +219,8 @@ export class SedBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array);
     /** The eligible node minimizing (inflight+1)/weight, or `PICK_NONE`. O(cap). */
     pick(): number;
+    /** Snapshot: plus the total in flight, the weights (a copy) and the tie cursor. */
+    describe(): BalancerDescription & { strategy: 'SED'; inflight: number; weights: number[]; tieCursor: number };
 }
 
 /**
@@ -170,6 +239,8 @@ export class NqBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array);
     /** The first idle eligible node, else the SED minimum, or `PICK_NONE`. O(cap). */
     pick(): number;
+    /** Snapshot: plus the total in flight, the weights (a copy) and the tie cursor. */
+    describe(): BalancerDescription & { strategy: 'NQ'; inflight: number; weights: number[]; tieCursor: number };
 }
 
 /**
@@ -212,6 +283,10 @@ export class PeakEwmaBalancer extends BalancerBase {
     recordRtt(i: number, sampleNs: number, now: number): void;
     /** Pick by latency-aware power-of-two-choices at time `now` (ns), or `PICK_NONE`. O(d)=O(1). */
     pick(now: number): number;
+    /** Snapshot: plus tau, the total in flight, the sampled-node count and the decaying pool mean (null before any sample). */
+    describe(): BalancerDescription & {
+        strategy: 'PeakEWMA'; tauNs: number; inflight: number; sampled: number; poolMeanNs: number | null;
+    };
 }
 
 /** The default Maglev lookup-table size (a prime, 2^16 + 1). Configurable via the ctor. */
@@ -260,6 +335,8 @@ export class ConsistentHashBalancer extends BalancerBase {
      * sweep -- 1.1.0), or `PICK_NONE` only when no eligible backend owns a table slot.
      */
     pick(keyHash: number): number;
+    /** Snapshot: plus the table size M and the weights (a copy). */
+    describe(): BalancerDescription & { strategy: 'ConsistentHash' | 'BoundedLoad'; tableSize: number; weights: number[] };
 }
 
 /**
@@ -321,6 +398,12 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
     note(i: number, delta: number): void;
     /** Map an integer `keyHash` to a backend, honouring the occupancy cap (overflow past a hot home), or `PICK_NONE`. O(1). */
     pick(keyHash: number): number;
+    /** Snapshot: the ConsistentHash fields plus eps, minCap, the noted total, the total in flight, and the cap a
+     *  pick would use now (null while inactive: nothing noted, or nothing live). */
+    describe(): BalancerDescription & {
+        strategy: 'BoundedLoad'; tableSize: number; weights: number[];
+        eps: number; minCap: number; total: number; inflight: number; cap: number | null;
+    };
 }
 
 /**
@@ -357,4 +440,6 @@ export class WeightedRandomBalancer extends BalancerBase {
     rebuild(): void;
     /** Pick an endpoint index proportional to weight (eligibility by rejection sampling), or `PICK_NONE`. O(1). */
     pick(): number;
+    /** Snapshot: plus the weights (a copy) and the weight sum the alias table was built on. */
+    describe(): BalancerDescription & { strategy: 'WeightedRandom'; weights: number[]; weightSum: number };
 }

@@ -81,6 +81,15 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   shows the integrity status, every issue and every fatal message. Each issue is also printed to stderr
   as `soak:report: ISSUE <text>`. Seven new teeth controls (`RPT S12 ...`) edit genuine streams and must
   be caught; all seven pass against the pre-S12 report, six of them with exit 0.
+- **Benchmark-only: the hot-path clean probe passes on Node 22 for the right reason and is in the teeth
+  battery (S13, audit 2026-09-29).** `_probe.mjs` failed on the clean tree on Node 22 ("latency sampler
+  B/op = 32") with no line saying why, and nothing ran it. The cause is not JIT noise: Node 22's
+  `performance.now()` returns a boxed double (16 B per read; the sampler reads twice), deterministic on
+  every run, while Node 26 reads 0. The probe now measures the two clock reads alone, gates the
+  sampler on the difference (its own work must add <= 0.05 B/op) and bounds the clock at two boxed doubles,
+  printing which runtime boxes. Every failure prints a `probe: FAIL -- <what>` line. New: `npm run
+  soak:probe`, and teeth controls PP (clean probe passes) and PM (`PROBE_MUSTFAIL=sampleralloc`, one small
+  object per sampled pick, must FAIL). The soak's own comment claiming a 0 B/op sampler is corrected.
 - **Repository: LF line endings on every OS.** A new `.gitattributes` (`* text=auto eol=lf`). Windows
   runners check out with `core.autocrlf=true`, which broke `test/RecipesDoc.test.js` (red on
   windows-latest since it was added) and `test/SoakTeeth.test.js`, and would make a Windows checkout of

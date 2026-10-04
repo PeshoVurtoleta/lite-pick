@@ -133,8 +133,9 @@ let lastT = Date.now();   // per-control wall time (the battery's cost is budget
  */
 function matchWant(stderr, spec) {
     const lines = stderr.split('\n');
-    // 'soak: ' (soak NOTE / INCONCLUSIVE) and 'soak:report: ' (report ISSUE / verdict) specs: a line prefix.
-    if (spec.startsWith('soak: ') || spec.startsWith('soak:report: ')) return lines.some((l) => l.startsWith(spec));
+    // 'soak: ' (soak NOTE / INCONCLUSIVE), 'soak:report: ' (report ISSUE / verdict) and 'probe: ' (_probe.mjs
+    // ok / FAIL) specs: a line prefix.
+    if (spec.startsWith('soak: ') || spec.startsWith('soak:report: ') || spec.startsWith('probe: ')) return lines.some((l) => l.startsWith(spec));
     const toks = spec.split(' ').filter(Boolean);
     for (const l of lines) {
         if (!l.startsWith('soak: BREACH ')) continue;
@@ -500,6 +501,18 @@ if (want('RPT overridden pool -> not a release soak')) {
     reportControl('RPT overridden pool -> not a release soak', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_POOL: pp }, 1);
 }
 reportControl('RPT genuine FAIL stream -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 0);
+
+// --- S13 (audit 2026-09-29): the hot-path CLEAN probe (_probe.mjs) is part of the battery. PP: the clean tree
+// passes it (every lane, the EventQueue and the latency sampler 0 B/op beyond the runtime's clock boxing; no
+// major GC; no retention). PM: a sampler that allocates one small object per sampled pick must FAIL it. -----
+function probeControl(name, env, wantStatus, wantSpec) {
+    if (!want(name)) return;
+    if (LIST) return listed(name, 'probe', env, wantStatus, wantSpec);
+    const r = spawnSync(NODE, NODE_FLAGS.concat(['benchmark/soak/_probe.mjs']), { cwd: ROOT, env: Object.assign({}, process.env, env), stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: RUN_TIMEOUT_MS });
+    record(name, { status: r.status === null ? -1 : r.status, stderr: String(r.stderr || '') }, wantStatus, wantSpec);
+}
+probeControl('PP clean probe (pass-control)', {}, 0, 'probe: ok');
+probeControl('PM sampler allocates -> probe FAIL', { PROBE_MUSTFAIL: 'sampleralloc' }, 1, 'probe: FAIL -- latency sampler adds');
 
 // --- S12 (audit 2026-09-29): soak:report fails CLOSED on a tampered stream or baseline. Each control edits
 // a GENUINE stream (generated once per env, cached) and asserts the report exits 1 naming the issue -- the

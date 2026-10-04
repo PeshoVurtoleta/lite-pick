@@ -255,3 +255,16 @@ it false-FAILs a correct kernel. Two decisions change:
   clean baseline, a tampered baseline); each must exit 1 naming its issue. Against the pre-S12 report all
   seven MISS (six exit 0, the string case's HTML path threw a TypeError). Genuine cycle-bound, duration-bound
   and mixed kernel+pool streams still pass integrity.
+
+## Amendment 2026-10-04 -- audit 2026-09-29 (S13)
+
+- **The probe's failure was real allocation, in the clock.** Node 22: latency sampler 32.02 B/op on every
+  run (not a JIT transient, so the S1 isolation the fix plan suggested does not apply); the kernel lanes
+  read <= 0.006. Node 22's `performance.now()` returns a boxed double, 16 B per read, and the sampler reads
+  twice; Node 26 returns it unboxed (0.000). In the soak this is ~3 MB per lane-cycle inside the latency
+  segment (at most ~1 scavenge, one sample of ~96000) and outside every gated B/op window.
+- **Fix.** The probe measures the clock reads alone (the sampler's code minus the kernel step), gates
+  `sampler - clock <= 0.05 B/op`, bounds `clock <= 33 B/op` (two boxed doubles + 1 B), and reports whether
+  the runtime boxes. Clean Node 22: sampler adds 0.011-0.019 over 6 runs. Each failure prints `probe: FAIL --
+  <what>`; a pass prints `probe: ok`. `soak:teeth` runs PP (clean, must pass) and PM
+  (`PROBE_MUSTFAIL=sampleralloc`, must FAIL: +32 B/op on Node 26, +43.5 on Node 22).

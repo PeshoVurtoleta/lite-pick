@@ -91,7 +91,7 @@ const TOKEN_VALUES = {
 /** null when `spec` (one of a control's specs) is well-formed against this manifest, else why not. */
 export function validSpec(spec) {
     if (spec === null) return null;
-    if (spec.startsWith('soak:report: ')) return null;   // a report-tool line (S12 controls; never a soak check)
+    if (spec.startsWith('soak:report: ') || spec.startsWith('probe: ')) return null;   // report / probe tool lines (S12, S13; never a soak check)
     if (spec.startsWith('soak: ')) {
         for (const c of INCONCLUSIVE_CAUSES) if (spec.startsWith('soak: INCONCLUSIVE -- ' + c)) return null;
         for (const g of NOTE_GATES) if (spec.startsWith('soak: NOTE -- ' + g + '[')) return null;

@@ -296,8 +296,10 @@ async function main() {
         const sparseRng = new Prng((seed ^ 0x5A5A5A5A) >>> 0);
         const checkCtx = { b: built.b, cap: CAP, eligible, inflight, weights, keyHash: 0, lastPick: PICK_NONE };
         // T16 latency sampler: time 1 pick in 32, delta ns -> a reused Float64Array slot, clamp [1,1e9),
-        // addFrom(slot,0) into a strict-range DDSketch. 0 B/op per sample (verified by _probe.mjs): the
-        // clock deltas stay in a local/typed slot, never a boxed field.
+        // addFrom(slot,0) into a strict-range DDSketch. The sampler adds 0 B/op beyond its two clock reads
+        // (_probe.mjs, S13): the deltas stay in a local/typed slot, never a boxed field. The clock itself is
+        // runtime-dependent -- Node 22's performance.now() returns a boxed double (2 x 16 B per sampled pick,
+        // ~3 MB per lane-cycle: at most ~1 scavenge inside the latency segment); Node >= 24 reads 0.
         const latSlot = new Float64Array(1);
         const latRing = new Float64Array(LAT_PICKS + 1);   // pre-allocated: 0-alloc hot writes (every pick)
         latSketch.clear(); sparseSketch.clear(); rebuildSketch.clear();   // reuse (no per-cycle alloc)

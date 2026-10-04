@@ -56,6 +56,7 @@
     "bench:verify": "node benchmark/Report.mjs --verify",
     "soak": "node --expose-gc --min-semi-space-size=4 --max-semi-space-size=4 benchmark/soak/main.mjs",
     "soak:teeth": "node benchmark/soak/_mustfail.mjs",
+    "soak:probe": "node --expose-gc --min-semi-space-size=4 --max-semi-space-size=4 benchmark/soak/_probe.mjs",
     "soak:report": "node benchmark/soak/SoakReport.mjs",
     "parity": "node benchmark/soak/parity.mjs",
     "parity:update": "node benchmark/soak/parity.mjs --update",

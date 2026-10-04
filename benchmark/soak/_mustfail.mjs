@@ -364,6 +364,18 @@ poolControl('MP6 pool-retains-self (A6 retention)',
 poolControl('MP7 pool-unhandled (A7)',
     patchPool('        const o = opts != null ? opts : undefined;', '        const o = opts != null ? opts : undefined; if (((this.__ur = (this.__ur | 0) + 1) % 1000) === 0) Promise.reject(new Error("pool unhandled"));'),
     { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A7');
+// A8 (S10): Pool's failover scan ignores eligibility -> an attempt lands on a DOWN node. Keyed lanes re-pick
+// the same home, so every keyed failover goes through _scanUntried; the audit's mutant exited 0 on all four
+// pool lanes before fn checked eligible[i] at dispatch.
+poolControl('MP8 scan ignores isEligible (A8 down-dispatch)',
+    patchPool('        if (b.isEligible(idx) && tried.indexOf(idx) < 0) return idx;', '        if (tried.indexOf(idx) < 0) return idx;'),
+    { ...PA, SOAK_LANES: 'PoolConsistentHash' }, 1, 'pool=A8 lane=PoolConsistentHash');
+// A9 (S9): Pool counts every dispatch TWICE in flight and releases it twice -- nets to zero at quiescence
+// (A2 blind), but the time-integral of inflight is double the attempt time -> Little's-law identity breaks.
+poolControl('MP9 double-counted in-flight (A9 Little)',
+    patch(patchPool('                inflight[j] = inflight[j] > 0 ? inflight[j] - 1 : 0;', '                inflight[j] = inflight[j] > 1 ? inflight[j] - 2 : 0;'),
+        '                inflight[i] = (inflight[i] + 1) >>> 0;', '                inflight[i] = (inflight[i] + 2) >>> 0;'),
+    { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A9 lane=PoolP2C');
 // The three REQUIRED harness modes (also exit 1 through main).
 modeControl('MPm1 poolnote mode (A1)', { ...PA, SOAK_LANES: 'PoolBoundedLoad', SOAK_MUSTFAIL: 'poolnote' }, 1, 'pool=A1 lane=PoolBoundedLoad');
 modeControl('MPm2 poolleak mode (A2)', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolleak' }, 1, 'pool=A2 lane=PoolP2C');
@@ -571,6 +583,9 @@ tamperControl('RPT baseline: heap +5 MB fails', RPT_ENV, null, 'soak:report: REG
     () => editedStream(genuineStream(RPT_ENV), shiftHeap(-5)));
 tamperControl('RPT baseline: other Node major -> heap not compared', RPT_ENV, null, 'soak:report: NOTE * heap not compared',
     () => editedStream(genuineStream(RPT_ENV), (recs) => otherNode(shiftHeap(-5)(recs))), null, 0);
+// A schema bump (S9: 3 -> 4) must not break the nightly: an older-schema baseline is "not compared", exit 0.
+tamperControl('RPT baseline: older schema -> not compared', RPT_ENV, null, 'soak:report: NOTE * baseline not compared: schema',
+    () => editedStream(genuineStream(RPT_ENV), (recs) => recs.map((r) => { if (r.type === 'header') r.schemaVersion = 3; return r; })), null, 0);
 tamperControl('RPT S12 baseline integrity', RPT_ENV, null, 'soak:report: BASELINE INTEGRITY MISMATCH', () => editedStream(genuineStream(RPT_ENV), (recs) => recs.filter((r, i) => i !== 5)));
 
 if (out.length === 0) { allOk = false; out.push('  MISS MUSTFAIL_ONLY=' + process.env.MUSTFAIL_ONLY + ' selected no control'); }

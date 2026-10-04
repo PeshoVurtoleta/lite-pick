@@ -585,7 +585,8 @@ async function main() {
                 const pb = await closeLaneCycle(gc, tracker, null, { extraForcedGc: 0 });
                 const retentionOk = pb.trackerSize === 0;
                 const passed = pcore.assert1_inflightConsistent && pcore.assert2_quiescenceZero &&
-                    pcore.assert3_accounted && pcore.assert4_codesOk && pcore.assert5_outcomeOk && retentionOk;
+                    pcore.assert3_accounted && pcore.assert4_codesOk && pcore.assert5_outcomeOk && retentionOk &&
+                    pcore.assert8_noDownDispatch && pcore.assert9_little;
                 if (!passed) {
                     poolFailures++;
                     const at = ' lane=' + laneId + ' cycle=' + cycle;
@@ -595,6 +596,8 @@ async function main() {
                     if (!pcore.assert4_codesOk) breach('pool=A4' + at, 'unexpected rejection code ' + pcore.badCode);
                     if (!pcore.assert5_outcomeOk) breach('pool=A5' + at, 'outcome oracle: ' + pcore.outcomeMiss);
                     if (!retentionOk) breach('pool=A6' + at, 'tracker.size()=' + pb.trackerSize);
+                    if (!pcore.assert8_noDownDispatch) breach('pool=A8' + at, pcore.downDispatch + ' attempt(s) dispatched to a DOWN node');
+                    if (!pcore.assert9_little) breach('pool=A9' + at, "Little's law: integral of sum(inflight) " + pcore.inflightArea + ' != sum of attempt time ' + pcore.attemptArea);
                 }
                 cyclesRun++;
                 const prollup = {
@@ -604,6 +607,11 @@ async function main() {
                     assert3: pcore.assert3_accounted, lostRun: pcore.lostRun, pendingCount: pcore.pendingCount,
                     assert4: pcore.assert4_codesOk, assert5_outcome: pcore.assert5_outcomeOk,
                     assert6_retention: retentionOk, trackerSize: pb.trackerSize, badCode: pcore.badCode, outcomeMiss: pcore.outcomeMiss,
+                    // S9/S10: down-dispatch (A8), Little's-law identity (A9), simulated RTTs (ns) and the trace hash.
+                    assert8: pcore.assert8_noDownDispatch, downDispatch: pcore.downDispatch,
+                    assert9: pcore.assert9_little, inflightArea: pcore.inflightArea, attemptArea: pcore.attemptArea,
+                    rttP50Ns: pcore.rttP50Ns, rttP99Ns: pcore.rttP99Ns, rttMeanNs: pcore.rttMeanNs, svcMeanNs: pcore.svcMeanNs,
+                    simUs: pcore.simUs, events: pcore.events, traceHash: pcore.traceHash,
                 };
                 rollupCount++;
                 writeRecord(stream, 'cycle', prollup);

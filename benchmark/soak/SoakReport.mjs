@@ -131,6 +131,7 @@ const SUMMARY_COUNTERS = ['rollups', 'cyclesRun', 'qualityViolations', 'invarian
 function poolCycleFailed(c) {
     return c.assert1 === false || c.assert2 === false || c.assert3 === false ||
         c.assert4 === false || c.assert5_outcome === false || c.assert6_retention === false || c.lostRun === true ||
+        c.assert8 === false || c.assert9 === false ||
         (c.trackerSize | 0) !== 0 || c.badCode != null || c.outcomeMiss != null;
 }
 
@@ -361,7 +362,17 @@ for (const pl of gate.perLane) {
 
 // 3. REGRESSION (--baseline) ---------------------------------------------------------------------
 let regressionFail = false;
-if (args.baseline) {
+// A baseline written by an OLDER stream schema is not comparable (fields differ): say so and skip the diff,
+// exactly like having no baseline yet (the nightly's first run after a schema bump) -- never a crash.
+function baselineSchema(path) {
+    try { return JSON.parse(readFileSync(path, 'utf8').split('\n', 1)[0]).schemaVersion; } catch { return undefined; }
+}
+const baseSchema = args.baseline ? baselineSchema(args.baseline) : undefined;
+if (args.baseline && baseSchema !== undefined && baseSchema !== SCHEMA) {
+    process.stdout.write('  vs baseline: not compared -- baseline schema ' + baseSchema + ' != ' + SCHEMA + '\n');
+    process.stderr.write('soak:report: NOTE * baseline not compared: schema ' + baseSchema + ' != ' + SCHEMA + '\n');
+}
+if (args.baseline && (baseSchema === undefined || baseSchema === SCHEMA)) {
     const base = load(args.baseline);
     // S12: the baseline must itself be sound evidence -- integrity OK and not an overridden stream.
     const bd = rederive(base);

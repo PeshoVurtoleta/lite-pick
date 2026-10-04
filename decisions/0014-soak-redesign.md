@@ -279,3 +279,32 @@ it false-FAILs a correct kernel. Two decisions change:
   green run's `soak-baseline` workflow artifact (`actions: read` only), validated by S12 before use.
   Release-time same-runner interleaved A/B (ROADMAP #8b, research note first) is the path to a real timing
   gate; a history window (#8c) only if the report-only notes prove useful.
+
+## Amendment 2026-10-04 -- audit 2026-09-29 (S9 + S10): the pool lanes are a deterministic simulation
+
+- **Design** (researched first: `research/s9-deterministic-simulation.md`, `research/phase3-primer.md`):
+  Poisson arrivals and attempt completions are events in the pool lane's own event heap (`SimQueue`,
+  plain arrays: the lane allocates by design); an attempt parks its promise resolver at `now + service`
+  (exponential, mean 1 ms, x (1 + inflight[node] / 2) processor-sharing slowdown -- the existing des.mjs
+  sampler with conc = per-node concurrency); the driver pops one event, releases that promise, and
+  yields one macrotask (`setImmediate`) so every microtask -- Pool's settle, failover, feedback --
+  finishes before the next event. Ties at equal times pop in push order (sequence number).
+- **The 0-B/op `EventQueue` stays byte-identical.** A first version added ids and a sequence number to
+  it; no single change allocated, but together they shifted V8's inlining on Node 22 so that the clean
+  probe's latency step (PeakEWMA + queue + two clock reads) boxed ~11.5 B/op -- deterministically with
+  `--no-concurrent-recompilation`, in ~50% of runs without. The PP teeth control caught it; the design
+  was changed rather than the gate. Pool/PeakEWMA read nanoseconds. Hung attempts park with no
+  completion and are released (SIM_RESET) only when the queue is empty; queue empty + nothing parked +
+  runs pending = a lost run (deterministic; the real-time batch deadline is removed).
+- **Determinism is tested**, not assumed: `test/SoakPool.test.js` (in `npm test`) runs each pool lane
+  twice per seed and requires an identical trace hash, and a different seed to differ.
+- **New assertions.** A8 (S10): no dispatch to a down node (fn checks `eligible[i]` at dispatch). A9:
+  Little's law as an identity -- integral of sum(inflight) dt == sum over runs of (run end - attempt start)
+  for every attempt (Pool holds a failed attempt's slot until its run settles). Teeth: MP8 (`_scanUntried`
+  ignores eligibility), MP9 (in-flight double-counted and double-released: A2-blind, A9 trips).
+- **Self-check by mean and identity, not median**: the fix plan's "p50 ~ mean service x slowdown" was
+  dropped -- under processor sharing the median is not that (research note); the per-dispatch slowdown is
+  an approximation of processor sharing, documented as such. RTT p50/p99/mean and mean service are
+  recorded per pool cycle (report-only).
+- Stream schema 4. `soak:report --baseline` with an older-schema baseline prints "not compared" and
+  continues (teeth: `RPT baseline: older schema`).

@@ -18,7 +18,9 @@ import * as G from './gates.mjs';
 
 // 3: header.kernel gains poolUrl/poolOverride (the LOADED pool is hashed) + header.parity (S6); cycle
 // records gained gcPauseAvgMs/hotOps*N (S2). soak:report imports this constant (one source of truth).
-export const SCHEMA_VERSION = 3;
+// 4: pool cycle records gain assert8/downDispatch (S10), assert9/inflightArea/attemptArea (Little's law),
+// simulated RTTs (rttP50Ns/rttP99Ns/rttMeanNs/svcMeanNs), simUs/events/traceHash (S9 deterministic simulation).
+export const SCHEMA_VERSION = 4;
 
 const PICK_PATH = fileURLToPath(KERNEL_URL);   // the RESOLVED kernel (SOAK_KERNEL override or in-tree)
 const POOL_PATH = fileURLToPath(POOL_URL);     // the RESOLVED pool (SOAK_POOL override or in-tree) -- S6: it

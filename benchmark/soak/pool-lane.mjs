@@ -1,24 +1,37 @@
 /**
- * @zakkster/lite-pick soak -- POOL LANES (planner T14-15, increment 2a async).
+ * @zakkster/lite-pick soak -- POOL LANES (planner T14-15; deterministic simulation since S9, audit 2026-09-29).
  *
  * The /pool layer is the only async, allocating, stateful surface (dispatch, settle, failover, abort,
- * note, recordRtt). This drives Pool-wrapped P2C / PeakEWMA / BoundedLoad / ConsistentHash with a
- * discrete-event model: a virtual clock in a Float64Array(1); per-run outcomes sampled from a seeded
- * Prng; the des.mjs service sampler for realistic RTTs. Genuine async; a REF'd deadline races every
- * batch so a stuck run is observed, and membership churns between batches so failover routes around
- * real down nodes. NOT a 0-B/op path (Pool.run allocates by design) -- flat-heap == RETENTION (tracker->0).
+ * note, recordRtt). This drives Pool-wrapped P2C / PeakEWMA / BoundedLoad / ConsistentHash inside a
+ * DETERMINISTIC DISCRETE-EVENT SIMULATION (research/s9-deterministic-simulation.md -- the FoundationDB /
+ * TigerBeetle pattern): runs ARRIVE as Poisson events on a virtual clock; every attempt `fn(i)` PARKS its
+ * promise resolver in the EventQueue at `now + service(i)` (processor sharing: the service is inflated by
+ * the node's own in-flight count); the driver pops the earliest event, jumps the clock to it, releases
+ * exactly that promise, and yields ONE macrotask (setImmediate) so every resulting microtask -- Pool's
+ * settle, failover, feedback -- finishes before the next event. Completion order is the queue's, never
+ * Node's promise order; the same seed replays the same trace (`traceHash`, checked by
+ * test/SoakPool.test.js). Pool and PeakEWMA read the clock in NANOSECONDS (`opts.clock`, PeakEWMA tau
+ * 1 ms = the mean service). A HUNG attempt parks with no completion and is released (SIM_RESET) only when
+ * nothing else can happen; a run still pending when the queue is empty and nothing is parked is a LOST run,
+ * detected deterministically (no real-time deadline). Membership churns between batches.
+ * NOT a 0-B/op path (Pool.run allocates by design) -- flat-heap == RETENTION (tracker->0).
  *
  * The assertions are keyed on each run's SEEDED INTENT (a real Pool bug -- not a harness self-injection --
  * is what must trip them; every pool must-fail control is a SOAK_POOL Pool.js mutant):
  *   A1 (BL) b._total === INDEPENDENT sum(inflight) WHILE RUNS ARE IN FLIGHT (checked inside fn), and
  *           each in-flight pick respects cap = ceil((1+eps)(T+1)/live).
  *   A2 every inflight cell === 0 at quiescence.
- *   A3 launched === resolved + rejected AND no lost (never-settling) run (batch deadline + beforeExit).
+ *   A3 launched === resolved + rejected AND no lost (never-settling) run.
  *   A4 rejection codes only SIM_* / abort-reason; NO LITE_PICK_NONE while the pool has eligible nodes.
  *   A5+OUTCOME per-run intent oracle: success->RESOLVE/1 try; failover->RESOLVE/2 distinct; failAll->
  *           REJECT SIM_FAIL/3; hung->REJECT SIM_RESET/3; abort->REJECT err===signal.reason/1.
  *   A6 heap flat: tracker.size() -> 0 (pool + balancer) at the boundary.
  *   A7 zero unhandled rejections over the run.
+ *   A8 (S10) no attempt is dispatched to a node that is DOWN at dispatch time (fn checks eligible[i]).
+ *   A9 Little's law, exactly: the time-integral of sum(inflight) (Pool's own counters) equals the sum over
+ *           runs of (run end - attempt start) for every attempt (Pool holds a failed attempt's slot until
+ *           its run settles). A bookkeeping bug that over/under-counts in flight -- even one that nets to
+ *           zero at quiescence (A2 blind) -- breaks it.
  */
 
 import {
@@ -33,8 +46,61 @@ export const POOL_LANES = ['PoolP2C', 'PoolPeakEWMA', 'PoolBoundedLoad', 'PoolCo
 const noop = () => {};
 const SIM_FAIL = 'SIM_FAIL', SIM_RESET = 'SIM_RESET';
 const ALLOWED = { SIM_FAIL: 1, SIM_RESET: 1 };   // + the abort reason (checked by identity), never LITE_PICK_NONE
-const BATCH_DEADLINE_MS = 4000;
 function mkErr(msg, code) { const e = new Error(msg); e.code = code; return e; }
+
+// Simulation parameters (virtual microseconds; Pool sees nanoseconds = us x 1000).
+const MEAN_SVC_US = 1000;                    // mean attempt service time (exponential)
+const NODE_CONC = 2;                         // processor sharing: service x (1 + inflight[node] / NODE_CONC)
+const ARRIVAL_US = MEAN_SVC_US / 128;        // Poisson arrivals: ~128 runs in flight (Little: L = lambda W)
+const HUNG_RELEASE_US = 20 * MEAN_SVC_US;    // a parked hung attempt is released this long after the drain
+const U_DEN = 16777216;
+const LITTLE_REL_TOL = 1e-9;                 // A9 is an identity; only float rounding is tolerated
+const drain = () => new Promise((r) => setImmediate(r));   // one macrotask: every pending microtask runs first
+
+/**
+ * The pool lane's event heap: earliest virtual time first, equal times in PUSH ORDER (a sequence number --
+ * FIFO, deterministic). Ordinary arrays on purpose: this lane allocates by design (Pool.run does), and the
+ * 0-B/op EventQueue the kernel lanes use stays byte-identical (S9: adding ids/sequence to it shifted V8's
+ * inlining on Node 22 enough that the probe's latency step boxed ~11.5 B/op).
+ */
+class SimQueue {
+    constructor() { this.t = []; this.sq = []; this.id = []; this.node = []; this.size = 0; this.seq = 0; this.now = 0; this.lastId = -1; }
+    _less(a, b) { return this.t[a] < this.t[b] || (this.t[a] === this.t[b] && this.sq[a] < this.sq[b]); }
+    _swap(a, b) {
+        let x = this.t[a]; this.t[a] = this.t[b]; this.t[b] = x;
+        x = this.sq[a]; this.sq[a] = this.sq[b]; this.sq[b] = x;
+        x = this.id[a]; this.id[a] = this.id[b]; this.id[b] = x;
+        x = this.node[a]; this.node[a] = this.node[b]; this.node[b] = x;
+    }
+    /** Schedule handle `id` (for `node`) at absolute virtual time `at` (>= now). */
+    push(at, node, id) {
+        let i = this.size++;
+        this.t[i] = at; this.sq[i] = this.seq++; this.id[i] = id; this.node[i] = node;
+        while (i > 0) { const p = (i - 1) >> 1; if (!this._less(i, p)) break; this._swap(i, p); i = p; }
+    }
+    /** Pop the earliest event: jump the clock to it, leave its handle in lastId, return its node. */
+    pop() {
+        const node = this.node[0];
+        this.now = this.t[0];
+        this.lastId = this.id[0];
+        const last = --this.size;
+        if (last > 0) {
+            this.t[0] = this.t[last]; this.sq[0] = this.sq[last]; this.id[0] = this.id[last]; this.node[0] = this.node[last];
+            let i = 0;
+            for (;;) {
+                const l = 2 * i + 1, r = l + 1;
+                let s = i;
+                if (l < last && this._less(l, s)) s = l;
+                if (r < last && this._less(r, s)) s = r;
+                if (s === i) break;
+                this._swap(s, i); i = s;
+            }
+        }
+        return node;
+    }
+    /** Move the clock forward with no event (the hung-release step). */
+    advance(dt) { if (dt > 0) this.now += dt; }
+}
 
 /** Build the Pool + balancer + caller-owned arrays for a pool lane. */
 function buildPoolLane(laneName, cap, m, seed) {
@@ -54,9 +120,9 @@ function buildPoolLane(laneName, cap, m, seed) {
 }
 
 /**
- * Run one pool lane-cycle. `mode` is a SOAK_MUSTFAIL pool mode (harness-level teeth; the PRIMARY teeth
- * are SOAK_POOL Pool.js mutants). Returns a rollup + the per-outcome counts. AWAITS all launched runs;
- * a stuck run trips the deadline -> lostRun (A3). deps = { keys, keyMask }.
+ * Run one pool lane-cycle inside the deterministic simulation. `mode` is a SOAK_MUSTFAIL pool mode
+ * (harness-level teeth; the PRIMARY teeth are SOAK_POOL Pool.js mutants). Returns a rollup with the
+ * assertion results, RTT telemetry and the trace hash. deps = { keys, keyMask }.
  */
 export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, tracker) {
     const built = buildPoolLane(laneName, cap, m, seed);
@@ -66,31 +132,56 @@ export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, trac
     const eligible = built.eligible, inflight = built.inflight, b = built.b;
     const rng = new Prng((seed ^ 0x9E3779B1) >>> 0);
     const churnRng = new Prng((seed ^ 0x2545F491) >>> 0);
-    const vclock = new Float64Array(1);
-    const q = new EventQueue(1024);
-    q.reset(new Prng((seed ^ 0x51A17ED) >>> 0), inflight, cap, 1000, 0, cap);
+    const arrRng = new Prng((seed ^ 0x6A09E667) >>> 0);
+    const q = new SimQueue();
+    // The des.mjs service sampler, reused as-is: its divisor `conc` applies to the node's OWN inflight, so
+    // conc = NODE_CONC gives per-node processor sharing (the old lane passed cap: slowdown ~1.004).
+    const svcQ = new EventQueue(NODE_CONC);
+    svcQ.reset(new Prng((seed ^ 0x51A17ED) >>> 0), inflight, NODE_CONC, MEAN_SVC_US, 0, 0);
 
     const keyed = laneName === 'PoolBoundedLoad' || laneName === 'PoolConsistentHash';
     const latency = laneName === 'PoolPeakEWMA';
     const isBL = laneName === 'PoolBoundedLoad';
     const eps = isBL ? b._eps : 0;
-    const clock = () => vclock[0];
+    const clock = () => q.now * 1000;      // ns for Pool / PeakEWMA
 
     const RUNS = 2048, C = 128;
     let launched = 0, resolved = 0, rejected = 0;
     let a1_inflightConsistent = true, a2_quiescenceZero = true, a4_codesOk = true;
     let outcomeOk = true, lostRun = false, pendingCount = 0;
     let badCode = null, outcomeMiss = null;
+    let downDispatch = 0;                      // A8
+    let inflightArea = 0, attemptArea = 0;     // A9 (virtual us x requests)
+    let svcSum = 0, svcN = 0, events = 0, settledInBatch = 0;
+    const rttUs = new Float64Array(RUNS);      // last-attempt RTT of each resolved run (what PeakEWMA sees)
+    let rttN = 0;
+    let h = 0x811c9dc5 | 0;                    // FNV-1a trace hash (events, dispatches, outcomes)
+    const mix = (v) => { h = Math.imul(h ^ (v | 0), 0x01000193); };
     const perOutcome = { success: 0, failover: 0, failAll: 0, hung: 0, abort: 0 };
     const perOutcomeMiss = { success: 0, failover: 0, failAll: 0, hung: 0, abort: 0 };
     const retainSink = [];
+    // Event handles: kind 0 = arrival (ref = run index), 1 = completion (ref = parked resolver).
+    const evKind = [], evRef = [];
+    const hungParked = [];                     // reject functions of parked hung attempts (FIFO)
 
     /** Independent sum of inflight over ALL nodes (the kernel _total contract). */
     function sumInflight() { let s = 0; for (let i = 0; i < cap; i++) s += inflight[i]; return s; }
+    function newEvent(kind, ref) { evKind.push(kind); evRef.push(ref); return evKind.length - 1; }
+
+    /** Park an attempt on node i until its simulated completion. */
+    function parkCompletion(i) {
+        return new Promise((resolve) => {
+            const svc = svcQ.sampleServiceUs(i);   // processor-sharing slowdown from inflight[i] (already ++'d by Pool)
+            svcSum += svc; svcN++;
+            q.push(q.now + svc, i, newEvent(1, resolve));
+        });
+    }
+    /** Park a hung attempt: no completion event; released (SIM_RESET) only when nothing else can happen. */
+    function parkHung() { return new Promise((_, reject) => { hungParked.push(reject); }); }
 
     function launch(runIdx) {
         launched++;
-        const rec = { intent: 'success', tried: [], settled: false, ok: false, code: null, err: null, ac: null };
+        const rec = { intent: 'success', tried: [], starts: [], settled: false, ok: false, code: null, err: null, ac: null };
         let attempt = 0;
         const roll = rng.nextBelow(1000);
         if (roll < 150) rec.intent = 'failover';
@@ -101,10 +192,12 @@ export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, trac
         rec.ac = ac;
 
         const fn = async (i, signal) => {
+            // --- synchronous at DISPATCH (Pool called fn right after inflight[i]++) ---------------------
+            if (!eligible[i]) downDispatch++;                 // A8 (S10): Pool must never dispatch to a down node
             rec.tried.push(i);
+            rec.starts.push(q.now);
+            mix(i);
             const a = attempt++;
-            await Promise.resolve();
-            vclock[0] += q.sampleServiceUs(i);
             if (mode === 'poolnote' && isBL) b.note(i, 1);   // harness A1 teeth: desync _total IN FLIGHT
             // A1 (BL): while THIS dispatch is in flight (inflight already ++'d by Pool), the kernel's
             // _total must equal the INDEPENDENT sum(inflight), and the pick must respect the cap.
@@ -118,8 +211,10 @@ export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, trac
                 }
             }
             if (mode === 'poolbadcode' && runIdx === 0) throw mkErr('unexpected', 'WEIRD_CODE');
+            // --- the simulated work -------------------------------------------------------------------
+            if (rec.intent === 'hung') await parkHung();      // rejects with SIM_RESET when released
+            else await parkCompletion(i);
             if (rec.intent === 'abort' && a === 0) { ac.abort(mkErr('sim abort', 'SIM_ABORT')); throw ac.signal.reason; }
-            if (rec.intent === 'hung') throw mkErr('sim reset (hung, phase end)', SIM_RESET);
             if (rec.intent === 'failAll') throw mkErr('sim fail', SIM_FAIL);
             if (rec.intent === 'failover' && a === 0) throw mkErr('sim fail (failover)', SIM_FAIL);
             return i;
@@ -129,10 +224,20 @@ export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, trac
         if (latency) opts.clock = clock;
         if (ac) opts.signal = ac.signal;
 
-        return pool.run(fn, opts).then(
-            (out) => { rec.settled = true; rec.ok = true; resolved++; evalRun(rec); },
-            (err) => { rec.settled = true; rec.ok = false; rec.err = err; rec.code = err && err.code; rejected++; evalRun(rec); },
+        pool.run(fn, opts).then(
+            () => { rec.settled = true; rec.ok = true; resolved++; settle(rec); },
+            (err) => { rec.settled = true; rec.ok = false; rec.err = err; rec.code = err && err.code; rejected++; settle(rec); },
         );
+    }
+
+    /** A run settled (same virtual time as its last event): A9 bookkeeping, RTT, trace, outcome oracle. */
+    function settle(rec) {
+        settledInBatch++;
+        const end = q.now;
+        for (let k = 0; k < rec.starts.length; k++) attemptArea += end - rec.starts[k];
+        if (rec.ok && rec.starts.length) rttUs[rttN++] = end - rec.starts[rec.starts.length - 1];
+        mix(rec.ok ? 1 : 2); mix(rec.tried.length);
+        evalRun(rec);
     }
 
     /** Per-run oracle: did the run settle exactly as its seeded intent requires? */
@@ -164,30 +269,70 @@ export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, trac
         if (live < cap - 16) for (let i = 0; i < cap; i++) b.setEligible(i, true);   // never go sparse
     }
 
+    /** Advance the clock by dt while integrating sum(inflight) (A9 left side). */
+    function integrate(dtUs) { inflightArea += sumInflight() * dtUs; }
+
+    /** Drive the simulation until every run of the batch settled. false = a LOST run (nothing can happen). */
+    async function driveBatch(batchSize) {
+        for (;;) {
+            if (settledInBatch === batchSize) return true;
+            if (q.size > 0) {
+                const prev = q.now;
+                const node = q.pop();
+                integrate(q.now - prev);
+                const id = q.lastId;
+                events++;
+                mix(evKind[id]); mix(node); mix(Math.round(q.now * 1000));
+                if (evKind[id] === 0) launch(evRef[id]);
+                else { const resolve = evRef[id]; evRef[id] = null; resolve(); }
+                await drain();
+            } else if (hungParked.length) {
+                integrate(HUNG_RELEASE_US);
+                q.advance(HUNG_RELEASE_US);
+                const parked = hungParked.splice(0, hungParked.length);
+                events++;
+                mix(9); mix(parked.length);
+                for (let k = 0; k < parked.length; k++) parked[k](mkErr('sim reset (hung, released at phase end)', SIM_RESET));
+                await drain();
+            } else {
+                return false;   // runs pending, no event scheduled, nothing parked: a lost run (A3)
+            }
+        }
+    }
+
     let idx = 0;
     while (idx < RUNS && !lostRun) {
-        const batch = [];
-        for (let k = 0; k < C && idx < RUNS; k++, idx++) batch.push(launch(idx));
-        let timer;
-        const deadline = new Promise((res) => { timer = setTimeout(res, BATCH_DEADLINE_MS, false); });   // REF'd
-        const done = await Promise.race([Promise.allSettled(batch).then(() => true), deadline]);
-        clearTimeout(timer);   // release the timer + its closure so it cannot pin the pool/balancer context
-        if (!done) { lostRun = true; break; }
+        const batchSize = Math.min(C, RUNS - idx);
+        settledInBatch = 0;
+        // Poisson arrivals for this batch, from the current virtual time.
+        let t = q.now;
+        for (let k = 0; k < batchSize; k++, idx++) {
+            t += -ARRIVAL_US * Math.log((arrRng.nextBelow(U_DEN) + 1) / (U_DEN + 1));
+            q.push(t, 0, newEvent(0, idx));
+        }
+        if (!(await driveBatch(batchSize))) { lostRun = true; break; }
         churn();   // membership churn between batches
     }
 
     // Harness-mode teeth (kept for the required poolleak/poolnote/poolunhandled modes; the PRIMARY teeth
     // are the SOAK_POOL Pool.js mutants).
     if (mode === 'poolleak') inflight[0] = (inflight[0] + 1) >>> 0;
-    // (poolnote A1 teeth fire IN FLIGHT at line ~108 -- a post-quiescence note would be unobserved.)
+    // (poolnote A1 teeth fire IN FLIGHT inside fn -- a post-quiescence note would be unobserved.)
     if (mode === 'poolretain') retainSink.push(b);
     if (mode === 'poolunhandled') { Promise.reject(mkErr('unhandled', SIM_FAIL)); }
     if (lostRun) pendingCount = launched - resolved - rejected;
 
-    await new Promise((r) => setTimeout(r, 0));
+    await drain();
 
     if (sumInflight() !== 0) a2_quiescenceZero = false;
     const a3_accounted = !lostRun && (resolved + rejected) === launched;
+    // A9: an identity, so only float rounding is tolerated. A lost run leaves attempts unsettled: A3 owns that.
+    const a9_little = lostRun || Math.abs(inflightArea - attemptArea) <= LITTLE_REL_TOL * Math.max(1, attemptArea);
+
+    // RTT telemetry (cold): nanoseconds, as Pool and PeakEWMA see them.
+    const rs = rttUs.slice(0, rttN).sort();
+    const pctl = (f) => (rttN ? Math.round(rs[Math.min(rttN - 1, Math.floor(f * rttN))] * 1000) : 0);
+    let rttSum = 0; for (let k = 0; k < rttN; k++) rttSum += rs[k];
 
     return {
         laneName, launched, resolved, rejected, perOutcome, perOutcomeMiss,
@@ -196,6 +341,11 @@ export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, trac
         assert3_accounted: a3_accounted, lostRun, pendingCount,
         assert4_codesOk: a4_codesOk, badCode,
         assert5_outcomeOk: outcomeOk, outcomeMiss,
+        assert8_noDownDispatch: downDispatch === 0, downDispatch,
+        assert9_little: a9_little, inflightArea: +inflightArea.toFixed(3), attemptArea: +attemptArea.toFixed(3),
+        rttP50Ns: pctl(0.5), rttP99Ns: pctl(0.99), rttMeanNs: rttN ? Math.round(rttSum / rttN * 1000) : 0,
+        svcMeanNs: svcN ? Math.round(svcSum / svcN * 1000) : 0, simUs: Math.round(q.now), events,
+        traceHash: (h >>> 0).toString(16),
         retainSink: mode === 'poolretain' ? retainSink : null,
     };
 }

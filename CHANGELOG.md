@@ -115,6 +115,27 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   - `tui.mjs`: exits 128 + signal on SIGINT/SIGTERM/SIGHUP (130/143/129) instead of 0.
   - ASCII-only source: the UI glyphs in `tui.mjs` and `web/main.mjs` are `\u` escapes now (the TUI's
     rendered frames are byte-identical).
+- **Benchmark-only: the soak's pool lanes are a deterministic simulation (S9 + S10, audit 2026-09-29;
+  decided in `research/s9-deterministic-simulation.md`).** Before, every run in a batch "completed" at
+  the same virtual time plus the batch's summed service, completion order was Node's promise order, the
+  clock was in microseconds while Pool and PeakEWMA expect nanoseconds, and nothing ever hung (PeakEWMA
+  saw RTT p50 ~142 ms for a 1 ms service). Now runs arrive as Poisson events; each attempt parks its
+  promise in the event queue until its simulated completion (processor sharing per node); the driver
+  pops one event, releases that promise and yields one macrotask so Pool's settle and failover finish
+  before the next event; Pool and PeakEWMA read a nanosecond clock (RTT p50 ~1 ms, p99 ~7 ms). Hung
+  attempts really park and are released only when nothing else can happen; a run still pending when the
+  queue is empty is a lost run, detected deterministically (the 4 s real-time deadline is gone; the
+  lost-run control now takes 0 s instead of 44 s). The pool lane has its own event heap (equal times pop
+  first-in-first-out); the kernel lanes' 0-B/op event queue is unchanged -- adding ids and a sequence
+  number to it shifted V8's inlining on Node 22 enough that the clean probe's latency step boxed ~11.5
+  B/op (caught by the PP control), so that design was dropped. New pool assertions: **A8**
+  (S10) no attempt is dispatched to a node that is down -- the audit's "scan ignores eligibility" Pool
+  mutant exited 0 on every pool lane before; **A9** Little's law as an exact identity (the time-integral
+  of Pool's in-flight counters equals the attempt time), which catches in-flight bookkeeping that nets to
+  zero at quiescence. Pool cycle records carry the RTTs, A8/A9 and a trace hash (stream schema 4; an
+  older-schema baseline is reported as "not compared", not a crash). New `npm test` suite
+  `test/SoakPool.test.js` runs every pool lane twice per seed and requires an identical trace. Teeth:
+  MP8 (A8), MP9 (A9).
 - **Repository: LF line endings on every OS.** A new `.gitattributes` (`* text=auto eol=lf`). Windows
   runners check out with `core.autocrlf=true`, which broke `test/RecipesDoc.test.js` (red on
   windows-latest since it was added) and `test/SoakTeeth.test.js`, and would make a Windows checkout of

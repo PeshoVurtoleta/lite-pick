@@ -1,6 +1,6 @@
 # Research: a deterministic simulated scheduler for the soak's pool lanes (Phase 3, S9)
 
-**Status:** DECIDED 2026-10-04 -- all recommendations accepted (S9 + S10 implementation burst next.) Not implemented yet.
+**Status:** DECIDED and IMPLEMENTED 2026-10-04 (with S10): `benchmark/soak/pool-lane.mjs`, `des.mjs`, pool assertions A8/A9, `test/SoakPool.test.js`.
 **Question:** the audit (S9) found the pool lanes do not use the discrete-event model the ADR claims:
 every run in a batch "completes" at the same virtual time plus the batch's summed service, completion
 ORDER is just Node's promise order, the clock is in microseconds while Pool and PeakEWMA expect

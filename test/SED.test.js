@@ -87,3 +87,12 @@ test('A5 (churn): never returns a down or weight-0 index under flapping', () => 
         inflight[p]++;
     }
 });
+
+test('M5 (1.1.0): equal SED scores rotate', () => {
+    // weights 2 and 4 with in-flight 0 and 1: scores (0+1)/2 = (1+1)/4 = 0.5 -- a tie, so they alternate.
+    const inf = Uint32Array.from([0, 1, 9]), wt = Uint32Array.from([2, 4, 1]);
+    const b = new SedBalancer(3, up(3), inf, wt);
+    const got = [];
+    for (let r = 0; r < 6; r++) got.push(b.pick());
+    assert.deepEqual(got, [0, 1, 0, 1, 0, 1]);
+});

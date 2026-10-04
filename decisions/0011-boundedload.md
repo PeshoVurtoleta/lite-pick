@@ -123,3 +123,14 @@ AWS ALB anomaly-mitigation / NLB flow-hash-with-shedding belongs to, at the in-p
   which does both). A direct `inflight` write without the matching `note` desyncs `_total` (UB).
 - **Index validation (M1).** `note(i, delta)` throws `RangeError` for a non-integer / out-of-range
   index (including a numeric string like `'2'`).
+
+## Amendment 2026-10-04 (1.1.0, audit N4): the opt-in `minCap`
+
+The capacity ceil((1+eps)(T+1)/live) is 1 while the pool is nearly idle, so a second CONCURRENT request for the
+same key always overflows its home (n=10, eps 0.25: five concurrent same-key requests -> five backends). HAProxy
+`hash-balance-factor` behaves exactly the same (strict `<`, floor 1); Envoy's `<=` quietly lets a home keep 2;
+no reference implementation offers a knob (research/1.1.0-kernel-and-api.md section 4). 1.1.0 adds an opt-in
+8th constructor argument `minCap` (default 0 = unchanged): cap = max(minCap, ...). Applied only when the cap
+is active (`_total > 0`), as before. For integer in-flight counts `inf < max(minCap, x)` equals the paper's
+`inf < max(minCap, ceil(x))`, so the kernel still skips the ceil. The soak's BoundedLoad oracle and the pool
+lane's A1 check read `minCap`.

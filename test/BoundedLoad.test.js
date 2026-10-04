@@ -264,3 +264,32 @@ test('L3 (1.1.0): nothing eligible in the probe window -> the full-table sweep, 
     inflight[99] = 50; bl.note(99, 50);
     for (let k = 0; k < 2000; k++) assert.equal(bl.pick(k), 99, 'key ' + k);
 });
+
+test('minCap (1.1.0, N4): opt-in low-load affinity; default 0 is the paper capacity exactly', () => {
+    // n = 10, eps 0.25, five CONCURRENT requests for one key. Paper capacity: the 2nd request sees
+    // cap = ceil(1.25 x 2 / 10) = 1 and leaves home -- five requests land on five backends.
+    const run = (minCap) => {
+        const n = 10, inf = new Uint32Array(n);
+        const bl = minCap === undefined
+            ? new BoundedLoadBalancer(n, new Uint8Array(n).fill(1), inf, 0.25, null, 101)
+            : new BoundedLoadBalancer(n, new Uint8Array(n).fill(1), inf, 0.25, null, 101, 0x9e3779b9, minCap);
+        const got = [];
+        for (let k = 0; k < 5; k++) { const p = bl.pick(12345); got.push(p); inf[p]++; bl.note(p, 1); }
+        return got;
+    };
+    const paper = run(undefined);
+    assert.deepEqual(run(0), paper, 'minCap 0 == the default');
+    assert.equal(new Set(paper).size, 5, 'paper capacity: every concurrent same-key request overflows');
+    const two = run(2), home = paper[0];
+    assert.deepEqual(two.slice(0, 2), [home, home], 'minCap 2: two concurrent requests stay home');
+    assert.notEqual(two[2], home, 'the third overflows');
+    const four = run(4);
+    assert.deepEqual(four.slice(0, 4), [home, home, home, home]);
+    const b = new BoundedLoadBalancer(4, new Uint8Array(4).fill(1), new Uint32Array(4), 0.25, null, 7, 1, 3);
+    assert.equal(b.minCap, 3);
+    assert.equal(new BoundedLoadBalancer(4, new Uint8Array(4).fill(1), new Uint32Array(4), 0.25, null, 7).minCap, 0);
+    for (const bad of [-1, 1.5, NaN, Infinity, 2 ** 32]) {
+        assert.throws(() => new BoundedLoadBalancer(4, new Uint8Array(4).fill(1), new Uint32Array(4), 0.25, null, 7, 1, bad), RangeError, String(bad));
+    }
+    assert.throws(() => new BoundedLoadBalancer(4, new Uint8Array(4).fill(1), new Uint32Array(4), 0.25, null, 7, 1, '2'), TypeError);
+});

@@ -174,26 +174,28 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     (length >= capacity), read LIVE each pick. No `setWeight`, no derived aggregate: the caller may
     mutate inflight directly between picks (that is the shared-counter seam).
   - `pick()` -> number. Full O(cap) scan returning the eligible node with the fewest in-flight
-    requests (tie order UNSPECIFIED in 1.0.1 -- deterministic but do not depend on it; a rotating
-    tie-break is planned for 1.1.0), or `PICK_NONE` when the whole pool is down. 0 B/op. In a
+    requests -- ties ROTATE (1.1.0): it scans [cursor, cap) then [0, cursor) and a cursor moves past
+    each pick, so tied nodes take turns (1.0.x gave every tie to the lowest index: at low load one node
+    took all traffic). Do not depend on WHICH tied node wins. `PICK_NONE` when the whole pool is down. 0 B/op. In a
     feedback loop (increment on dispatch, decrement on settle) it is greedy-optimal: max-minus-min
-    load stays within 1 (balance.mjs). Without feedback it returns the same lowest-load index --
+    load stays within 1 (balance.mjs). Without feedback the tied lowest-load nodes take turns --
     correct by contract; the M5 lite-query adapter provides the increment/decrement.
 - `SedBalancer extends BalancerBase` -- class. Shortest-expected-delay (M4, IPVS `sed`).
   - `new SedBalancer(capacity, eligible, inflight, weights)` -- `inflight` AND `weights` are
     caller-owned Uint32Arrays (length >= capacity), read LIVE (no `setWeight`, no derived total --
     the caller may retune weights directly, UNLIKE SmoothWRR).
   - `pick()` -> number. O(cap) scan returning the eligible, positive-weight node minimizing
-    `(inflight + 1) / weight` (the new request's marginal expected delay), tie order UNSPECIFIED
-    (1.0.1; rotating tie-break planned for 1.1.0),
+    `(inflight + 1) / weight` (the new request's marginal expected delay), equal scores ROTATE (1.1.0,
+    as LeastConn),
     or `PICK_NONE` when no eligible node has a positive weight. A weight-0 eligible node is NOT a
     candidate. Converges to load proportional-to-weight (balance.mjs). 0 B/op.
 - `NqBalancer extends BalancerBase` -- class. Never-queue (M4, IPVS `nq`); the worker-pool fit.
   - `new NqBalancer(capacity, eligible, inflight, weights)` -- same caller-owned, read-live
     inflight + weights contract as SED.
-  - `pick()` -> number. Returns the FIRST idle eligible positive-weight node (in-flight 0) if one
-    exists -- never queueing while a server is free -- else the SED minimum, else `PICK_NONE`.
-    O(cap) worst case, O(1) when an early node is idle. 0 B/op.
+  - `pick()` -> number. Returns an idle eligible positive-weight node (in-flight 0) if one exists --
+    never queueing while a server is free; idle nodes take turns (1.1.0 rotating cursor: the first idle
+    node at or after it) -- else the SED minimum (ties rotate), else `PICK_NONE`. O(cap) worst case,
+    O(distance to the next idle node) when one is idle. 0 B/op.
 - `PeakEwmaBalancer extends BalancerBase` -- class. Latency-aware P2C (M7, Finagle peak-EWMA).
   - `new PeakEwmaBalancer(capacity, eligible, inflight, tauNs, seed?=0x9e3779b9)` -- `inflight` is a
     caller-owned Uint32Array (length >= capacity) read LIVE; `tauNs` is the EWMA TIME CONSTANT in
@@ -257,7 +259,7 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
 - `BoundedLoadBalancer extends ConsistentHashBalancer` -- class. Consistent Hashing with Bounded Loads
   (M9, CHBL: Mirrokni et al. / Google Research; Vimeo eps=0.25). ConsistentHash (the Maglev table) PLUS
   a per-backend occupancy cap that overflows a hot backend to its neighbours.
-  - `new BoundedLoadBalancer(capacity, eligible, inflight, eps?=0.25, weights?=null, m?=65537, seed?=0x9e3779b9)`
+  - `new BoundedLoadBalancer(capacity, eligible, inflight, eps?=0.25, weights?=null, m?=65537, seed?=0x9e3779b9, minCap?=0)`
     -- `inflight` is a caller-owned Uint32Array (length >= capacity) read LIVE as the per-backend
     OCCUPANCY; `eps` is the bounded-load slack (finite, > 0). Validates inflight + eps typeof-first
     BEFORE super() allocates the Maglev table (TypeError non-number eps, RangeError non-finite / <= 0).
@@ -280,6 +282,12 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     `i` is validated in range (RangeError), `delta` typeof-first as an integer; `_total` clamps at 0.
     0 B/op on the success path.
   - `totalInflight` -- readonly number. The owned running occupancy sum (for tests / observability).
+  - `minCap` -- readonly number (1.1.0, OPT-IN, default 0). A floor on the cap: cap = max(minCap,
+    ceil((1+eps)(T+1)/live)). 0 is the paper's (and HAProxy's) capacity, which is 1 at low load -- so a
+    SECOND concurrent request for the same key leaves its home. minCap = k keeps up to k concurrent
+    same-key requests at home (n=10, eps 0.25, 5 concurrent same-key requests: 5 backends at minCap 0,
+    home, home, then overflow at minCap 2), at the price of a looser bound while the pool is nearly idle.
+    lite-pick's own extension (no reference implementation has the knob). Integer in [0, 2^32 - 1].
   - `setWeight(i, w)` / `setWeights(weights)` / `rebuild()` / `tableSize` -- inherited from ConsistentHashBalancer (COLD
     rebuild of the Maglev table; the readonly prime table size).
   - THE PIVOT (decisions/0011): P2C-over-inflight with a `(1+eps) x mean` cap is byte-identical to

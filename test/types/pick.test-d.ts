@@ -193,6 +193,11 @@ bl.note(0, 1);
 bl.note(0, -1);
 bl.setWeight(0, 5);                          // inherited COLD reweight + rebuild
 bl.setWeights(new Uint32Array(8).fill(2));   // inherited 1.1.0 batch reweight
+const blMin: BoundedLoadBalancer = new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4), 0.25, null, 257, 1, 2);
+const blMinCap: number = blMin.minCap;      // 1.1.0 opt-in cap floor, readonly
+void blMinCap;
+// @ts-expect-error -- minCap is readonly.
+blMin.minCap = 3;
 bl.rebuild();                               // inherited COLD rebuild
 
 // @ts-expect-error -- inflight must be a Uint32Array, not a number[].

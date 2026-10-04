@@ -477,9 +477,9 @@ export class P2cBalancer extends BalancerBase {
  * directly between picks; that is the whole point of the shared-counter seam.
  *
  * Bound: O(cap) per pick (one scan). Steady-state pick(): integer compares + one index write,
- * no object/closure/array created -- 0 B/op. Tie order is UNSPECIFIED in 1.0.1 (deterministic,
- * but callers must not depend on which tied node wins; a rotating tie-break is planned for 1.1.0);
- * the feedback loop breaks a startup all-zero tie by raising the picked node's count. Fails
+ * no object/closure/array created -- 0 B/op. Ties ROTATE (1.1.0, M5): a cursor moves past each pick, so
+ * tied nodes take turns instead of the lowest index winning every tie (deterministic, no random draw;
+ * callers still must not depend on WHICH tied node wins). Fails
  * closed (PICK_NONE) when the whole pool is down.
  *
  * NOTE: without a feedback loop (inflight never changes) LeastConn returns the same lowest-load
@@ -499,24 +499,39 @@ export class LeastConnBalancer extends BalancerBase {
             throw new RangeError('[lite-pick] inflight must be a Uint32Array of length >= capacity');
         }
         this._inflight = inflight;
+        this._cur = 0;   // rotating tie-break cursor (M5, 1.1.0): the next scan's preferred start
     }
 
     /**
      * The eligible endpoint with the fewest in-flight requests, or PICK_NONE (fail closed).
-     * O(cap), zero-alloc. Tie order unspecified in 1.0.1 (deterministic; rotating tie-break 1.1.0).
+     * O(cap), zero-alloc. Ties ROTATE (1.1.0): the first least-loaded node at or after a cursor that moves
+     * past each pick -- deterministic, no random draw.
      * @returns {number}
      */
     pick() {
         if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
         const cap = this._cap, el = this._eligible, inf = this._inflight;
+        // Rotating tie-break (M5, 1.1.0): scan [cursor, cap) then [0, cursor) and keep the FIRST least-loaded
+        // node in that order; the cursor moves past the pick. 1.0.x scanned from 0, so the lowest index won
+        // every tie and at low load one node took everything (8 idle nodes, one request at a time: 100% to
+        // node 0; now 12.5% each). NGINX/HAProxy/Envoy spread ties too; IPVS does not. Two loops, not a
+        // wrapped index: the per-node work stays one compare (research/1.1.0-kernel-and-api.md section 3).
+        const cur = this._cur < cap ? this._cur : 0;
         let best = -1, bestLoad = 0;
-        for (let i = 0; i < cap; i++) {
+        for (let i = cur; i < cap; i++) {
             if (el[i]) {
                 const c = inf[i];
                 if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }
             }
         }
-        return best;                              // best >= 0 guaranteed while _live > 0
+        for (let i = 0; i < cur; i++) {
+            if (el[i]) {
+                const c = inf[i];
+                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }
+            }
+        }
+        this._cur = best + 1;                     // best >= 0 guaranteed while _live > 0
+        return best;
     }
 }
 
@@ -536,8 +551,9 @@ export class LeastConnBalancer extends BalancerBase {
  * weight is 0 is NOT a candidate (its expected delay is infinite); if every eligible endpoint
  * has weight 0, `pick()` fails closed.
  *
- * Bound: O(cap) per pick (one scan, one Float64 division per eligible node), 0 B/op. Lowest
- * index on a tie. Fails closed (PICK_NONE) when no eligible endpoint has a positive weight.
+ * Bound: O(cap) per pick (one scan, one Float64 division per eligible node), 0 B/op. Ties among
+ * equal scores rotate (1.1.0, as LeastConn). Fails closed (PICK_NONE) when no eligible endpoint has a
+ * positive weight.
  */
 export class SedBalancer extends BalancerBase {
     /**
@@ -556,19 +572,22 @@ export class SedBalancer extends BalancerBase {
         }
         this._inflight = inflight;
         this._weights = weights;
+        this._cur = 0;   // rotating tie-break cursor (M5, 1.1.0): the next scan's preferred start
     }
 
     /**
      * The eligible endpoint minimizing (inflight + 1) / weight, or PICK_NONE (fail closed).
-     * O(cap), zero-alloc. Tie order unspecified in 1.0.1 (deterministic; rotating tie-break 1.1.0);
-     * weight-0 nodes are not candidates.
+     * O(cap), zero-alloc. Ties rotate (1.1.0); weight-0 nodes are not candidates.
      * @returns {number}
      */
     pick() {
         if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
         const cap = this._cap, el = this._eligible, inf = this._inflight, wt = this._weights;
+        // Rotating tie-break among EQUAL scores (M5, 1.1.0) -- as LeastConnBalancer.pick: [cursor, cap) then
+        // [0, cursor), first minimum in that order. Equal rationals (inf + 1) / w divide to the same double.
+        const cur = this._cur < cap ? this._cur : 0;
         let best = -1, bestScore = Infinity;
-        for (let i = 0; i < cap; i++) {
+        for (let i = cur; i < cap; i++) {
             if (el[i]) {
                 const w = wt[i];
                 if (w > 0) {
@@ -577,7 +596,18 @@ export class SedBalancer extends BalancerBase {
                 }
             }
         }
-        return best;                              // -1 when every eligible node has weight 0
+        for (let i = 0; i < cur; i++) {
+            if (el[i]) {
+                const w = wt[i];
+                if (w > 0) {
+                    const score = (inf[i] + 1) / w;
+                    if (score < bestScore) { bestScore = score; best = i; }
+                }
+            }
+        }
+        if (best < 0) return PICK_NONE;           // every eligible node has weight 0
+        this._cur = best + 1;
+        return best;
     }
 }
 
@@ -590,9 +620,8 @@ export class SedBalancer extends BalancerBase {
  * case: spin up idle capacity first, only weigh expected delay once everyone is busy.
  *
  * Ownership (ADR 0001, ADR 0006): identical to SED -- caller-owned inflight + weights, read
- * live, no derived aggregate. The first idle eligible node found in the scan (in-flight 0, weight
- * > 0) short-circuits it; when several are idle the one returned is unspecified in 1.0.1
- * (deterministic; a rotating tie-break is planned for 1.1.0).
+ * live, no derived aggregate. An idle eligible node (in-flight 0, weight > 0) wins outright; when
+ * several are idle they take turns (1.1.0 rotating cursor -- 1.0.x returned the lowest idle index).
  *
  * Bound: O(cap) worst case (no idle node -> a full SED scan); O(1) when a low-index endpoint is
  * idle. 0 B/op. Fails closed (PICK_NONE) when no eligible endpoint has a positive weight.
@@ -614,28 +643,45 @@ export class NqBalancer extends BalancerBase {
         }
         this._inflight = inflight;
         this._weights = weights;
+        this._cur = 0;   // rotating tie-break cursor (M5, 1.1.0): the next scan's preferred start
     }
 
     /**
-     * The first idle eligible endpoint (in-flight 0, weight > 0), else the SED minimum, else
-     * PICK_NONE (fail closed). O(cap) worst case, O(1) when an early node is idle. Zero-alloc.
+     * An idle eligible endpoint (in-flight 0, weight > 0; idle nodes take turns), else the SED minimum
+     * (ties rotate), else PICK_NONE (fail closed). O(cap) worst case. Zero-alloc.
      * @returns {number}
      */
     pick() {
         if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
         const cap = this._cap, el = this._eligible, inf = this._inflight, wt = this._weights;
+        // Rotating tie-break (M5, 1.1.0): scan [cursor, cap) then [0, cursor). The first IDLE node in that
+        // order wins at once (never queue) -- O(distance) to it, so idle nodes take turns -- else the first
+        // SED minimum in that order.
+        const cur = this._cur < cap ? this._cur : 0;
         let best = -1, bestScore = Infinity;
-        for (let i = 0; i < cap; i++) {
+        for (let i = cur; i < cap; i++) {
             if (el[i]) {
                 const w = wt[i];
                 if (w > 0) {
-                    if (inf[i] === 0) return i;   // idle: never queue -- take it immediately
+                    if (inf[i] === 0) { this._cur = i + 1; return i; }   // idle: never queue -- take it immediately
                     const score = (inf[i] + 1) / w;
                     if (score < bestScore) { bestScore = score; best = i; }
                 }
             }
         }
-        return best;                              // -1 when every eligible node has weight 0
+        for (let i = 0; i < cur; i++) {
+            if (el[i]) {
+                const w = wt[i];
+                if (w > 0) {
+                    if (inf[i] === 0) { this._cur = i + 1; return i; }   // idle: never queue -- take it immediately
+                    const score = (inf[i] + 1) / w;
+                    if (score < bestScore) { bestScore = score; best = i; }
+                }
+            }
+        }
+        if (best < 0) return PICK_NONE;           // every eligible node has weight 0
+        this._cur = best + 1;
+        return best;
     }
 }
 
@@ -1202,8 +1248,13 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
      * @param {Uint32Array|null} [weights=null]  optional per-backend weights (COPIED); null = equal.
      * @param {number} [m=CH_DEFAULT_M]  the Maglev table size: a prime, > 1, and >= capacity.
      * @param {number} [seed=0x9e3779b9]  deterministic salt for the permutation mix (reproducible).
+     * @param {number} [minCap=0]  OPT-IN floor on the per-backend cap (N4, 1.1.0): cap = max(minCap,
+     *   ceil((1+eps)(T+1)/live)). 0 (default) is the paper's / HAProxy's capacity exactly. At low load
+     *   that capacity is 1, so a SECOND concurrent request for the same key always leaves its home;
+     *   minCap = k keeps up to k concurrent same-key requests at home, at the price of a looser bound
+     *   while the pool is nearly idle. Our extension -- no reference implementation offers the knob.
      */
-    constructor(capacity, eligible, inflight, eps = 0.25, weights = null, m = CH_DEFAULT_M, seed = 0x9e3779b9) {
+    constructor(capacity, eligible, inflight, eps = 0.25, weights = null, m = CH_DEFAULT_M, seed = 0x9e3779b9, minCap = 0) {
         // Validate inflight + eps typeof-first, BEFORE super() allocates the (cold, ~256KB) Maglev
         // table (fail closed early -- the PeakEWMA / ConsistentHash precedent). These read the args
         // only (no `this`), so they may run before super().
@@ -1216,10 +1267,17 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
         if (!Number.isFinite(eps) || eps <= 0) {
             throw new RangeError('[lite-pick] eps must be a finite number > 0');
         }
+        if (typeof minCap !== 'number') {
+            throw new TypeError('[lite-pick] minCap must be a number');
+        }
+        if (!Number.isInteger(minCap) || minCap < 0 || minCap > 0xFFFFFFFF) {
+            throw new RangeError('[lite-pick] minCap must be an integer in [0, 2^32 - 1]: ' + minCap);
+        }
         // super() validates capacity/eligible/weights/m, copies weights, and builds the Maglev table.
         super(capacity, eligible, weights, m, seed);
         this._inflight = inflight;
         this._eps = eps;
+        this._minCap = minCap;
         // The running occupancy sum the balancer OWNS. Starts at 0: note() is its sole writer, so a
         // caller must drive dispatch/settle through note() (or /pool) -- inflight seeded non-zero
         // BEFORE construction would desync it (UB, as documented).
@@ -1229,6 +1287,11 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
     /** The balancer-owned running sum of in-flight the mean/cap is computed from. Readonly. */
     get totalInflight() {
         return this._total;
+    }
+
+    /** The opt-in cap floor (N4, 1.1.0); 0 = the paper's capacity. Readonly (set at construction). */
+    get minCap() {
+        return this._minCap;
     }
 
     /**
@@ -1268,7 +1331,9 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
         // CHBL cap (Mirrokni-Thorup-Zadimoghaddam per-bin capacity). The load-bearing part is the +1
         // that counts the INCOMING request. The paper's integer capacity is ceil(x); it is NOT taken here
         // because for an integer inf `inf < ceil(x)` == `inf < x`, and the call cost 15-20% (N3).
-        const cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;   // > 0: total>0, live>0
+        let cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;     // > 0: total>0, live>0
+        // Opt-in floor (N4, 1.1.0): for integer inf and minCap, inf < max(minCap, x) == inf < max(minCap, ceil(x)).
+        if (cap < this._minCap) cap = this._minCap;
         let slot = (keyHash >>> 0) % M;           // integer key; NaN >>> 0 = 0 (never throws)
         let firstEligible = -1;                   // the pure-ConsistentHash sticky fallback answer
         let i = lookup[slot];

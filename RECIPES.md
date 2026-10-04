@@ -486,8 +486,9 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
 - **Eligibility flips go through `setEligible`** -- it is the only supported writer and
   keeps `live` exact; a direct byte write desyncs the cached count (recipe 3). Each
   balancer needs its own eligibility array.
-- **Tie order is unspecified** -- LeastConn/SED/NQ break an exact tie deterministically
-  but on no promised index (1.0.1; a rotating tie-break is planned for 1.1.0).
+- **Ties rotate, but WHICH tied node wins is not a contract** -- since 1.1.0 LeastConn/SED/NQ hand
+  exact ties to the first tied node after a moving cursor, so tied nodes take turns (1.0.x: always the
+  lowest index). Do not depend on a particular index.
 - **lite-pick is not a proxy** -- it returns an index; you own transport, retries/backoff
   (temporal), health checking, and the socket.
 

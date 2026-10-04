@@ -89,3 +89,15 @@ equal-load (LeastConn) / equal-(inflight+1)/weight (SED) / equally-idle (NQ) end
 UNSPECIFIED.** The implementation is still deterministic (it happens to keep the lowest index), but
 callers must not depend on which tied endpoint wins. A rotating-cursor tie-break (0 B/op, still
 deterministic) is planned for 1.1.0. No code change in 1.0.1 -- this is a contract de-commitment only.
+
+## Amendment 2026-10-04 (1.1.0, audit M5): ties rotate
+
+The family took the lowest index on every exact tie, so at low load one endpoint took all traffic (8 idle,
+concurrency 1: 100% to endpoint 0; concurrency 3: three endpoints share it all). 1.1.0 keeps a cursor
+(`_cur`, set past each pick) and scans [cursor, cap) then [0, cursor), keeping the first minimum in that
+order; NQ returns the first idle endpoint in that order. Result: 12.5% each in both cases. Prior art
+(research/1.1.0-kernel-and-api.md section 3): NGINX `least_conn` runs weighted round-robin among tied peers,
+HAProxy `leastconn` serves equal keys first-in-first-out, Envoy samples among ties; Linux IPVS takes the first.
+Rejected shapes, measured at 256 endpoints: one loop with a wrapped index (+55-85%); one forward pass that
+tracks the first tie after the cursor (fine for LeastConn/SED, but NQ then scans every endpoint before the
+cursor on its way to an idle one: 6.8 -> 247 ns). Chosen: two loops, +5-8% LeastConn, +2-7% SED.

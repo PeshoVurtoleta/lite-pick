@@ -142,7 +142,7 @@ export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, trac
     const keyed = laneName === 'PoolBoundedLoad' || laneName === 'PoolConsistentHash';
     const latency = laneName === 'PoolPeakEWMA';
     const isBL = laneName === 'PoolBoundedLoad';
-    const eps = isBL ? b._eps : 0;
+    const eps = isBL ? b._eps : 0, minCap = isBL ? b.minCap | 0 : 0;
     const clock = () => q.now * 1000;      // ns for Pool / PeakEWMA
 
     const RUNS = 2048, C = 128;
@@ -206,7 +206,8 @@ export async function runPoolCycle(laneName, cap, m, seed, cfg, mode, deps, trac
                 if (b._total !== T) a1_inflightConsistent = false;
                 let live = 0; for (let k = 0; k < cap; k++) if (eligible[k]) live++;
                 if (live > 0 && T > 0) {
-                    const capOcc = Math.ceil((1 + eps) * (T + 1) / live);
+                    let capOcc = Math.ceil((1 + eps) * (T + 1) / live);
+                    if (capOcc < minCap) capOcc = minCap;   // the opt-in floor (1.1.0, N4); 0 by default
                     if (inflight[i] > capOcc) a1_inflightConsistent = false;
                 }
             }

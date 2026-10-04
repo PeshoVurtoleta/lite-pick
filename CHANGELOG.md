@@ -6,10 +6,17 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
-Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; burst B1 -- the plain fixes).
+Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; bursts B1 -- the plain fixes --
+and B2 -- rotating ties and the BoundedLoad `minCap`).
 
 ### Added
 
+- **`BoundedLoadBalancer` opt-in `minCap` (8th constructor argument, default 0; readonly `minCap`).**
+  `cap = max(minCap, ceil((1 + eps)(T + 1) / live))`. The paper's capacity (and HAProxy's) is 1 at low load,
+  so a second concurrent request for the same key always leaves its home: with 10 backends and eps 0.25, five
+  concurrent same-key requests land on five backends. `minCap = k` keeps up to k at home, at the price of a
+  looser bound while the pool is nearly idle. Our extension (no reference implementation has the knob);
+  default 0 is bit-identical to 1.0.x. Validated integer in [0, 2^32 - 1] (TypeError / RangeError).
 - **`setWeights(weights)` on `ConsistentHashBalancer`, `BoundedLoadBalancer` (inherited) and
   `WeightedRandomBalancer`.** Replace every weight at once with ONE table rebuild; `setWeight` rebuilds per
   call, so retuning N backends cost N rebuilds. The array is copied (CH/BL into the balancer-owned weights,
@@ -31,6 +38,15 @@ Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`;
 
 ### Changed
 
+- **LeastConn, SED and NQ: ties rotate (audit M5).** Through 1.0.x the lowest index won every exact tie, so at
+  low load one endpoint took everything (8 idle endpoints, one request at a time: 100% to endpoint 0). A
+  cursor now moves past each pick and the scan runs [cursor, cap) then [0, cursor): tied endpoints take turns
+  (12.5% each) and NQ's idle endpoints take turns. NGINX, HAProxy and Envoy spread ties too; Linux IPVS does
+  not. The tie order was documented as unspecified since 1.0.1; which tied endpoint wins is still not a
+  contract. Cost per pick at 256 endpoints: LeastConn +5-8%, SED +2-7% (two scans split at the cursor -- a
+  single wrapped loop cost +55-85% and was rejected); NQ stops at the first idle endpoint after the cursor
+  (~10 ns where 1.0.x returned the always-idle endpoint 0 in ~7 ns). The fuzzer's NQ check now accepts any
+  idle endpoint, and still catches an NQ that ignores idle endpoints.
 - **ConsistentHash / BoundedLoad tables build ~8x faster at the default M (audit L7).** Additive Maglev
   stepping (`c += skip`) instead of `(offset + j * skip) % M`: 10.5 ms -> 1.3 ms per rebuild at M = 65537,
   1.7x at 4099. The tables are IDENTICAL to 1.0.x (golden fingerprints in the tests), so upgrading moves no key.

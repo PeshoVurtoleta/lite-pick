@@ -264,13 +264,13 @@ control('M8c P2C ignores the comparison 80%',
 // M9: LeastConn picks the MOST-loaded eligible node -> the argmin oracle trips. (SED/NQ share the
 // identical oracleArgmin path, differing only in the recomputed score; see report note.)
 control('M9 LeastConn non-argmin',
-    patch(PICK, '                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }', '                if (best < 0 || c > bestLoad) { best = i; bestLoad = c; }'),
+    patchAll(PICK, '                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }', '                if (best < 0 || c > bestLoad) { best = i; bestLoad = c; }', 2),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 1, 'quality lane=LeastConn kind=oracle');
-// M9b (S14, a PASS control): LeastConn breaks ties toward the HIGHEST index instead of the lowest. Tie order
-// is unspecified (a rotating tie-break is planned for 1.1), so the argmin-SET oracle must accept it; the old
-// exact-index oracle failed it (over-eager).
-control('M9b LeastConn ties -> highest index (must PASS)',
-    patch(PICK, '                if (best < 0 || c < bestLoad) { best = i; bestLoad = c; }', '                if (best < 0 || c <= bestLoad) { best = i; bestLoad = c; }'),
+// M9b (S14, a PASS control): LeastConn WITHOUT the 1.1.0 rotation -- every tie goes to the lowest index, the
+// 1.0.x rule. Any member of the argmin set is a correct pick, so the argmin-SET oracle must accept it (the
+// pre-S14 exact-index oracle could not have accepted the rotation itself).
+control('M9b LeastConn ties -> lowest index, no rotation (must PASS)',
+    patchAll(PICK, '        const cur = this._cur < cap ? this._cur : 0;', '        const cur = 0;', 3),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'LeastConn' }, 0, null);
 // M10: ConsistentHash rotates the start slot per call (in ITS OWN fast path) -> a key no longer
 // sticks -> the consecutive-equality stickiness check trips.
@@ -285,7 +285,7 @@ control('M10 CH stickiness break (per-setEligible rotation)',
 // M11: BoundedLoad drops the +1 that counts the incoming request (the H4 bug) -> under-caps -> the
 // reference walk disagrees with the pick.
 control('M11 BoundedLoad H4 under-cap',
-    patch(PICK, 'const cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;   // > 0: total>0, live>0', 'const cap = capActive ? Math.ceil((1 + this._eps) * total / this._live) : 0;'),
+    patch(PICK, 'let cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;     // > 0: total>0, live>0', 'let cap = capActive ? Math.ceil((1 + this._eps) * total / this._live) : 0;'),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, ['quality lane=BoundedLoad kind=oracle', 'quality lane=BoundedLoad kind=property']);
 // MH1 / MH2 (S14): ConsistentHash design errors the stickiness re-walk cannot see, caught by the stated
 // properties. MH1 is MODULO-N HASHING -- the slot depends on the live count, the very thing consistent hashing
@@ -332,12 +332,12 @@ control('M15 BoundedLoad _total desync',
 // recomputes (inflight + 1) / weight independently, disagrees whenever weights differ. The score line is
 // shared verbatim with NQ; the mutant runs on the SED lane only.
 control('M17 SED weight-blind score',
-    patchAll(PICK, '                    const score = (inf[i] + 1) / w;', '                    const score = inf[i] + 1;', 2),
+    patchAll(PICK, '                    const score = (inf[i] + 1) / w;', '                    const score = inf[i] + 1;', 4),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'SED' }, 1, 'quality lane=SED kind=oracle');
 // M18: NQ loses its never-queue shortcut (an idle node no longer wins outright) -> it degenerates to SED and
 // queues on a busy node while an idle one exists -> the NQ oracle (first idle, else SED min) trips.
 control('M18 NQ never-queue removed',
-    patch(PICK, '                    if (inf[i] === 0) return i;   // idle: never queue -- take it immediately', '                    /* mutant: idle shortcut removed */'),
+    patchAll(PICK, '                    if (inf[i] === 0) { this._cur = i + 1; return i; }   // idle: never queue -- take it immediately', '                    /* mutant: idle shortcut removed */', 2),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'NQ' }, 1, 'quality lane=NQ kind=oracle');
 // M19: ~2 KB allocated on EVERY RoundRobin pick (dies young, nothing retained) -> every 8192-pick B/op window
 // scavenges (>= one 4 MB semi-space) -> the hotAlloc GROSS tier FAILs (the hard part of the report-only

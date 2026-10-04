@@ -265,14 +265,15 @@ function pickHome(el, cap, rng, wt) {
  * read from b._total / b._live, so a kernel that miscounts either is CAUGHT, not masked by shared state.
  * The static Maglev table b._lookup is fine to read (it is the built table, not a live decision). */
 function oracleBoundedLoad(b, el, inf, keys, keyCount, cap, rng) {
-    const M = b._m, lookup = b._lookup, eps = b._eps;
+    const M = b._m, lookup = b._lookup, eps = b._eps, minCap = b.minCap | 0;
     let checks = 0, viol = 0, propChecks = 0, propViol = 0;
     for (let t = 0; t < keyCount; t++) {
         const key = keys[t] >>> 0;
         // INDEPENDENT recompute: total = sum inflight over ALL nodes (kernel _total contract); live = eligible.
         let total = 0, live = 0;
         for (let i = 0; i < cap; i++) { total += inf[i]; if (el[i]) live++; }
-        const capOcc = (total > 0 && live > 0) ? Math.ceil((1 + eps) * (total + 1) / live) : 0;
+        let capOcc = (total > 0 && live > 0) ? Math.ceil((1 + eps) * (total + 1) / live) : 0;
+        if (total > 0 && capOcc < minCap) capOcc = minCap;   // the opt-in floor (1.1.0, N4); 0 by default
         let slot = (key >>> 0) % M;
         let firstEligible = -1, ref = -1;
         let i = lookup[slot];

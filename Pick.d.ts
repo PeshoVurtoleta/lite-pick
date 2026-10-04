@@ -117,9 +117,10 @@ export class P2cBalancer extends BalancerBase {
 
 /**
  * LeastConnBalancer -- EXACT fewest-in-flight (M4, IPVS `lc`). A full O(cap) scan of the
- * caller-owned in-flight view returning the eligible node with the lowest count (tie order is
- * UNSPECIFIED in 1.0.1 -- deterministic, but do not depend on it; a rotating tie-break is planned
- * for 1.1.0) -- the deterministic complement to P2C's O(1) approximation. In-flight counts are
+ * caller-owned in-flight view returning the eligible node with the lowest count -- the deterministic
+ * complement to P2C's O(1) approximation. Ties ROTATE (1.1.0): a cursor moves past each pick, so tied
+ * nodes take turns (1.0.x gave every tie to the lowest index -- at low load one node took all traffic);
+ * do not depend on WHICH tied node wins. In-flight counts are
  * caller-owned and read LIVE (no `setWeight`, no derived aggregate). 0 B/op. Fails closed
  * (`PICK_NONE`) when the whole pool is down.
  */
@@ -138,8 +139,8 @@ export class LeastConnBalancer extends BalancerBase {
  * SedBalancer -- shortest-expected-delay (M4, IPVS `sed`). Returns the eligible, positive-weight
  * node minimizing `(inflight + 1) / weight`; converges to load proportional-to-weight. BOTH
  * inflight and weights are caller-owned Uint32Arrays, read LIVE (no `setWeight`, no derived
- * aggregate). A weight-0 eligible node is not a candidate. O(cap), 0 B/op. Fails closed
- * (`PICK_NONE`) when no eligible node has a positive weight.
+ * aggregate). A weight-0 eligible node is not a candidate. Ties among equal scores rotate (1.1.0).
+ * O(cap), 0 B/op. Fails closed (`PICK_NONE`) when no eligible node has a positive weight.
  */
 export class SedBalancer extends BalancerBase {
     /**
@@ -154,10 +155,10 @@ export class SedBalancer extends BalancerBase {
 }
 
 /**
- * NqBalancer -- never-queue (M4, IPVS `nq`). Returns the first idle eligible positive-weight
- * node (in-flight 0) if one exists, else the SED minimum -- the worker-pool fit. BOTH inflight
- * and weights are caller-owned, read LIVE. O(cap) worst case, O(1) when an early node is idle,
- * 0 B/op. Fails closed (`PICK_NONE`) when no eligible node has a positive weight.
+ * NqBalancer -- never-queue (M4, IPVS `nq`). Returns an idle eligible positive-weight node
+ * (in-flight 0) if one exists -- idle nodes take turns (1.1.0 rotating cursor) -- else the SED minimum
+ * (ties rotate) -- the worker-pool fit. BOTH inflight and weights are caller-owned, read LIVE. O(cap)
+ * worst case, 0 B/op. Fails closed (`PICK_NONE`) when no eligible node has a positive weight.
  */
 export class NqBalancer extends BalancerBase {
     /**
@@ -285,6 +286,10 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
      * @param weights optional per-backend weights (length >= capacity), COPIED; null = equal weight.
      * @param m the Maglev table size: a prime, > 1, and >= capacity (default 65537).
      * @param seed deterministic salt for the permutation mix (default 0x9e3779b9); reproducible.
+     * @param minCap OPT-IN floor on the per-backend cap (1.1.0; default 0 = the paper's capacity):
+     *   cap = max(minCap, ceil((1+eps)(T+1)/live)). At low load the paper's cap is 1, so a second
+     *   concurrent request for the same key leaves its home; minCap = k keeps up to k at home, at the
+     *   price of a looser bound while the pool is nearly idle. Integer in [0, 2^32 - 1].
      */
     constructor(
         capacity: number,
@@ -294,9 +299,12 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
         weights?: Uint32Array | null,
         m?: number,
         seed?: number,
+        minCap?: number,
     );
     /** The balancer-owned running sum of in-flight the mean/cap is computed from. */
     readonly totalInflight: number;
+    /** The opt-in cap floor set at construction (1.1.0); 0 = the paper's capacity. */
+    readonly minCap: number;
     /**
      * Warm feedback path: adjust the owned occupancy SUM by `delta` (dispatch +1 / settle -1), in
      * LOCKSTEP with the caller's `inflight[i]` write. Maintains `_total`; does NOT write `inflight`.

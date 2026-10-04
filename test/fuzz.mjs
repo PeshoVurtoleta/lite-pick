@@ -109,13 +109,14 @@ const SPECS = {
         extra: (b, ctx, p) => {
             if (p === PICK_NONE) return null;
             if (ctx.weights[p] === 0) return 'NQ picked a weight-0 node ' + p;
-            // First idle eligible (weight > 0, inflight 0) short-circuits the scan.
+            // An idle eligible node (weight > 0, inflight 0) wins outright. WHICH idle node is the rotating
+            // cursor's business (1.1.0, M5 -- idle nodes take turns), so any idle node is correct.
             let firstIdle = -1;
             for (let i = 0; i < ctx.cap; i++) {
                 if (ctx.el[i] && ctx.weights[i] > 0 && ctx.inflight[i] === 0) { firstIdle = i; break; }
             }
             if (firstIdle >= 0) {
-                return p === firstIdle ? null : 'NQ ignored an idle node: picked ' + p + ', first idle ' + firstIdle;
+                return ctx.el[p] && ctx.inflight[p] === 0 ? null : 'NQ ignored an idle node: picked ' + p + ' (inflight ' + ctx.inflight[p] + '), idle ' + firstIdle + ' exists';
             }
             // No idle node -> NQ reduces to SED.
             const score = (ctx.inflight[p] + 1) / ctx.weights[p];

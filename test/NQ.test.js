@@ -94,3 +94,17 @@ test('A5 (churn): never returns a down or weight-0 index under flapping', () => 
         inflight[p]++;
     }
 });
+
+test('M5 (1.1.0): idle nodes take turns; with none idle, equal scores rotate', () => {
+    const N = 4, inf = new Uint32Array(N), wt = new Uint32Array(N).fill(1);
+    const b = new NqBalancer(N, up(N), inf, wt);
+    const got = [];
+    for (let r = 0; r < 8; r++) got.push(b.pick());
+    assert.deepEqual(got, [0, 1, 2, 3, 0, 1, 2, 3], 'idle nodes in turn (1.0.x: always 0)');
+    inf.set([2, 1, 3, 1]);                        // nobody idle; nodes 1 and 3 tie at score 2
+    const busy = [];
+    for (let r = 0; r < 4; r++) busy.push(b.pick());
+    assert.deepEqual(busy, [1, 3, 1, 3]);
+    inf[2] = 0;                                   // an idle node wins outright over any score
+    assert.equal(b.pick(), 2);
+});

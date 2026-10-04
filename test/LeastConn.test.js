@@ -87,3 +87,34 @@ test('A3 (churn): never returns a down index under adversarial flapping', () => 
         else { assert.equal(el[p], 1, 'down index at step ' + step); inflight[p]++; }
     }
 });
+
+test('M5 (1.1.0): ties ROTATE -- at low load every node takes its turn (1.0.x: 100% to node 0)', () => {
+    const N = 8, inf = new Uint32Array(N), b = new LeastConnBalancer(N, up(N), inf);
+    const c = new Uint32Array(N);
+    for (let r = 0; r < 8000; r++) { const p = b.pick(); c[p]++; }   // one request at a time: all idle
+    for (let i = 0; i < N; i++) assert.equal(c[i], 1000, 'node ' + i);
+    // Rotation is among the TIED-least only: a busier node never wins while a lighter one is up.
+    inf[3] = 5;
+    for (let r = 0; r < 200; r++) assert.notEqual(b.pick(), 3);
+    // Down nodes are skipped and the cursor wraps.
+    b.setEligible(0, false); b.setEligible(1, false);
+    const seen = new Set();
+    for (let r = 0; r < 50; r++) seen.add(b.pick());
+    assert.deepEqual([...seen].sort((x, y) => x - y), [2, 4, 5, 6, 7]);
+});
+
+test('M5 (1.1.0): every pick is in the argmin set, whatever the cursor (randomised)', () => {
+    const N = 32, inf = new Uint32Array(N), el = up(N), b = new LeastConnBalancer(N, el, inf);
+    let x = 12345;
+    const rnd = (n) => { x = (Math.imul(x, 1103515245) + 12345) >>> 0; return x % n; };
+    for (let r = 0; r < 20000; r++) {
+        if (rnd(4) === 0) b.setEligible(rnd(N), rnd(3) !== 0);
+        if (b.live === 0) { b.setEligible(0, true); }
+        let min = Infinity;
+        for (let i = 0; i < N; i++) if (el[i] && inf[i] < min) min = inf[i];
+        const p = b.pick();
+        assert.ok(el[p] && inf[p] === min, 'pick ' + p + ' load ' + inf[p] + ' min ' + min);
+        inf[p]++;
+        const d = rnd(N); if (inf[d] > 0) inf[d]--;
+    }
+});

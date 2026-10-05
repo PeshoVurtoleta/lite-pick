@@ -1,6 +1,7 @@
 # Research: the capstone -- `pickEcosystem/`, a served, FUNCTIONING load-balancing system
 
-**Status:** PROPOSED 2026-10-05 -- decisions C1-C9 below need your call. Nothing is built yet.
+**Status:** DECIDED 2026-10-05 -- all recommendations accepted (C1-C9). P0 (the worker layer) IMPLEMENTED
+2026-10-05 as lite-worker-pool 1.1.0 `createWorkerSet` (LiteWorkerPool research/worker-set.md). Next: P1, the headless kernel.
 **North-star (ROADMAP section 5, your words 2026-09-23):** "to see the whole system built, and not only built --
 but functioning, anyone can see the served system; both operational through a browser and terminal" -- the
 proof that an A+, zero-GC module is still worth building.
@@ -208,6 +209,59 @@ from lite-pick), per-worker failure isolation and `respawn(i)`, and the load it 
    - P3 the browser page (Pool Scope's web renderer) + the import map + its drift test;
    - P4 the hub page + the Pages deploy job;
    - P5 the soak heartbeat, the scenario script, polish.
+
+## 9. Next session: the P1 plan (draft -- opens with a one-page spec, F-decisions, before code)
+
+**Goal of P1:** the whole system running HEADLESS -- no rendering -- booted by `bootKernel(io)`, proven by tests,
+runnable in a terminal with plain periodic stats. P2/P3 then only add renderers.
+
+**Where:** `pickEcosystem/live/` in the lite-pick repo, with ITS OWN `package.json` + lock (the diEcosystem
+sub-app pattern): the di-* bricks, lite-statechart, lite-signal, lite-sketch, lite-worker(-pool) and a PINNED
+published `@zakkster/lite-pick` are the sub-app's dependencies, so lite-pick's own devDependencies and
+`peerDependencies: {}` stay untouched and the demo dogfoods the released package. Never in `files[]`.
+
+**Files:** `kernel.js` (`bootKernel(io)` -- `io = { spawn, now, schedule, rng }`, injectable so tests run on a
+virtual clock), `fleet.js` (one DI child scope per worker: Health + breaker + supervisor child),
+`traffic.js` (open-loop Poisson arrivals, keys for keyed strategies), `driver.js` (the Pool Scope driver
+interface over the live system), `run.mjs` (terminal: boots with `worker_threads`, prints 1 Hz stats, SIGINT ->
+orchestrator), `test/` (node:test + torture).
+
+**Wiring (the decisions C1-C9 made concrete):**
+- Root container: `set` (createWorkerSet, `slots` 2, `queue` 32), `inflight` (Uint32Array), the balancer
+  router (lite-di-strategies over the ten strategies), `pool` (lite-pick `/pool`), the event bus, `now`.
+- Per worker i, a child scope: token `worker` = `singletonFactoryAsync(() => set.respawn(i))`; a Supervisor
+  (one-for-one, budget e.g. 5 restarts / 30 s, escalate -> stays DOWN); a Health with sources `ready`
+  (`set.isReady(i)`), `hung` (`busySince` age < limit) and `watchSupervisor`; a lite-statechart breaker
+  Closed -> Open after k consecutive failures -> HalfOpen after a cool-down -> Closed on a probe success.
+  A death (`LWP_WORKER_DOWN`) is `reportFault`ed to the supervisor.
+- Eligibility writer (a cron job, ~20 Hz): `up(i) = health.readyz() === 0 && breaker allows` -> `setEligible`
+  only on change. HalfOpen allows exactly one probe in flight.
+- Request path: arrival -> `pool.run((i, signal) => set.submit(i, job, { signal }), { tries: 2, key | clock })`
+  -> settle feeds the breaker (failure count) and lite-sketch (latency); every dispatch / settle / failover /
+  breaker flip / restart / eligibility change is an event-bus emit (flight recorder on).
+- Strategy switch: build the new balancer cold, replay eligibility via `setEligible`, new `/pool` over the SAME
+  `inflight` array (in-flight runs of the old pool settle into the same counters).
+- Faults (all real, inside the threads via `set.control`): slow x10, fail-fast rate, hang, crash, kill;
+  scenarios = timed scripts on lite-di-cron.
+- Shutdown: lite-di-orchestrator -- drain (readyz fails, traffic stops admitting), in-flight finish,
+  supervisor.shutdown, `set.dispose`, container teardown, exit code.
+
+**P1 gates (headless, the loopback `setLoopbackSpawn` + a virtual clock = deterministic):**
+- kill a worker -> no request lost (failover), supervisor restarts it within budget, it becomes eligible again;
+- slow worker -> PeakEWMA's share of it falls below a bound, LeastConn's does not (the visible contrast);
+- fail-fast worker -> breaker opens, the worker gets no traffic, HalfOpen probe recovers it;
+- crash loop -> supervisor escalates, the worker stays DOWN and ineligible (fail closed);
+- graceful shutdown -> no new admissions, every in-flight request settles, exit code OK, threads gone;
+- strategy switch under load -> the inflight sum is conserved and returns to 0 at quiescence;
+- zero-alloc: the selection + feedback + eligibility + event-bus path (PerfGate method), with the
+  MessagePort transport cost reported, not gated;
+- retention: 1000 worker kill/respawn cycles through the supervisor, scope count back to 0;
+- a real `worker_threads` smoke run (30 s, every fault once), and break controls for each gate.
+
+**Open questions for the P1 spec (F-decisions):** breaker k and cool-down; hung-job limit; arrival rate and
+worker speeds for the default scene; whether the sub-app pins lite-pick 1.1.0 or follows the repo's
+working tree in its tests (recommend: pinned for the served demo, plus one test run against the working
+tree so a kernel change cannot silently break the capstone).
 
 ## What we would NOT do
 

@@ -152,4 +152,34 @@ test('the nightly teeth jobs partition the battery (every control exactly once)'
     assert.equal(res.length, 2);
     const wrong = CONTROLS.filter((c) => res.filter((re) => re.test(c.name)).length !== 1).map((c) => c.name);
     assert.deepEqual(wrong, []);
+    // The long full-roster PF control is routed to teeth-long (like PL/ML), never teeth.
+    assert.ok(CONTROLS.some((c) => c.name === 'PF full roster default (pass-control)'), 'PF control is built');
+});
+
+// MUST-FAIL (in-memory): the partition only holds because teeth EXCLUDES `PF ` as well. Drop `|PF ` from
+// teeth's negative lookahead and PF matches BOTH teeth (it is not PL/ML) and teeth-long (^(PL|ML|PF) ),
+// so it would run twice -- the partition check must catch exactly that. If this ever passes cleanly, the
+// real partition test above has lost its teeth.
+test("must-fail control: dropping |PF from teeth's exclusion mispartitions PF", () => {
+    const broken = [new RegExp('^(?!PL |ML )'), new RegExp('^(PL|ML|PF) ')];
+    const wrong = CONTROLS.filter((c) => broken.filter((re) => re.test(c.name)).length !== 1).map((c) => c.name);
+    assert.ok(
+        wrong.includes('PF full roster default (pass-control)'),
+        'expected PF to be mispartitioned (run in two jobs); got ' + JSON.stringify(wrong),
+    );
+});
+
+// QA 2026-10-05: the `bop>=` numeric-threshold token. Only a plain non-negative decimal is a threshold; an
+// empty, non-numeric, signed, exponent or non-finite one would make the spec unmatchable (a MISS that looks
+// like a gate without teeth), so validSpec must reject it. Also: `bop>=` only on gate=hotAlloc.
+test('validSpec: bop>= accepts only a plain non-negative decimal, only on gate=hotAlloc', () => {
+    const head = 'gate=hotAlloc lane=RoundRobin ';
+    for (const ok of ['bop>=0.3', 'bop>=0', 'bop>=12', 'bop>=39.904']) assert.equal(validSpec(head + ok), null, ok);
+    for (const bad of ['bop>=', 'bop>=abc', 'bop>=-1', 'bop>=-0', 'bop>=1e3', 'bop>=NaN', 'bop>=Infinity', 'bop>=.5',
+        'bop>=0.', 'bop>=0x1', 'bop>=1_0', 'bop>=0.3x', 'bop>=' + '9'.repeat(400)]) {
+        assert.match(String(validSpec(head + bad)), /bop>= needs a number/, bad);
+    }
+    assert.match(String(validSpec(head + 'bop>= 0.3')), /bop>= needs a number/);   // the space splits off the value
+    assert.match(String(validSpec(head + 'xyz>=1')), /unknown >= key xyz/);
+    assert.match(String(validSpec('gate=gcMajor lane=RoundRobin bop>=0.3')), /bop>= only valid on gate=hotAlloc/);
 });

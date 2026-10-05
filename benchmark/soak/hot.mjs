@@ -210,8 +210,12 @@ export function sampleWindows(ctx, stepFn, ops, windows) {
  * measured at startup during peak JIT tier-up/finalization, so one-off old-space allocations land in a
  * MINORITY of the no-op windows and pull the mean far above the true per-window floor (observed swing
  * 2943..7088 B). Subtracting an inflated bias OVER-subtracts and hides real allocation (a 0.49 B/op
- * mutant read 0). The MIN is the cleanest window = the pure probe floor: it can never exceed the true
- * per-window overhead, so it never over-subtracts and never hides allocation. The workload estimator
+ * mutant read 0). The MIN is the cleanest window IN THIS PROCESS = its pure probe floor. CAVEAT (ADR 0014
+ * amendment 2026-10-05): this is NOT a cross-process guarantee -- a process whose startup JIT inflates the
+ * no-op floor (observed 3016 B vs the usual ~1864 B on Node 22) establishes a higher MIN and over-subtracts
+ * ~0.14 B/op for that whole run, so a clean lane still reads 0 but a 0.62 B/op mutant reads ~0.47 (its margin
+ * above the FAIL tier narrows from ~2.05x to ~1.6x, still a FAIL). A running MIN of the bias is the open
+ * follow-up. The workload estimator
  * keeps the MEAN (measureHotBytesPerOp) so a burst in a MINORITY of windows still shows (BLOCKER 2).
  *
  * Returns { bias, floor, spread, gcFree }: `bias` is the MIN, `spread` = max-min of the no-op windows

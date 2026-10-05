@@ -3,7 +3,9 @@ name: soak-nightly
 # The endurance soak (audit 1.15, reshaped by audit 2026-09-29 S3): a 45-minute Linux burn-in and the
 # must-fail teeth battery, as THREE PARALLEL JOBS on separate runners. The full battery takes ~42 minutes on
 # an Apple M4 (32 of them in the two 1500-cycle heap controls PL/ML), so it is split: `teeth` runs every
-# control except PL/ML, `teeth-long` runs PL/ML -- together the full battery. Running any of it on the
+# control except the long full-roster ones (PL/ML/PF), `teeth-long` runs PL/ML/PF -- together the full
+# battery. The split is partition-checked in test/SoakTeeth.test.js (each control in exactly one job).
+# Running any of it on the
 # burn-in's machine would blow the time budget AND load the CPU under the burn-in's timing gates.
 # Benchmark-only (it never touches the published kernel), so it runs on its own schedule, off the PR path.
 # Each job fails on its own verdict and ALWAYS uploads its evidence (the JSONL stream + HTML report, or the
@@ -12,16 +14,25 @@ name: soak-nightly
 # Exit codes of the burn-in: 0 PASS, 1 FAIL, 2 bad config, 3 INCONCLUSIVE (not enough evidence -- e.g. a
 # runner too slow to reach the 11-cycle active floor in 45 minutes). All but 0 fail the job.
 #
-# BASELINE (research/soak-baseline.md, accepted 2026-10-04): the burn-in diffs tonight against the last fully
-# green nightly's JSONL, kept as the `soak-baseline` workflow artifact (90 days; read with `actions: read`
-# only -- no write access to the repo). It FAILs on heap (same Node major), quality, pool or a missing lane;
-# throughput and p99 are report-only (one run vs one run on another VM is noise). No green run with the
-# artifact yet (bootstrap, or expired) -> the report runs without a baseline and says so.
+# BASELINE (research/soak-baseline.md, accepted 2026-10-04): the burn-in diffs tonight against a prior
+# JSONL kept as the `soak-baseline` workflow artifact (90 days; read with `actions: read` only -- no write
+# access to the repo). The baseline is selected by ARTIFACT -- the newest NON-EXPIRED soak-baseline whose
+# producing run was on this branch -- not by "last green workflow run". It FAILs on heap (same Node major),
+# quality, pool or a missing lane; throughput and p99 are report-only (one run vs one run on another VM is
+# noise). No artifact yet (bootstrap, or expired) -> the report runs without a baseline and says so.
+# SEED PATH: a manual run with workflow_dispatch input seed_baseline=true uploads tonight's stream as the
+# baseline even if the report regressed, bootstrapping a new branch; the stream must still be its own
+# PASS + integrity OK (re-derived with no baseline) or the seed is refused.
 
 on:
   schedule:
     - cron: '0 4 * * *'   # 04:00 UTC nightly
   workflow_dispatch:
+    inputs:
+      seed_baseline:
+        description: 'Seed the soak-baseline artifact from this run even if the report REGRESSES (bootstrap a baseline on a new branch). The stream must still be PASS + integrity OK.'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,7 +44,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      actions: read   # find the last green nightly and download its soak-baseline artifact
+      actions: read   # list and download the newest non-expired soak-baseline ARTIFACT on this branch
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,32 +58,40 @@ jobs:
       - name: parity
         run: npm run parity
       - name: soak (45m burn-in)
+        id: soak
         env:
           SOAK_DURATION: 45m
           SOAK_REQUIRE_PROVENANCE: '1'
         run: npm run soak
-      # The last fully green nightly's JSONL (the whole workflow succeeded, so its burn-in uploaded one).
-      # Kept OUTSIDE benchmark/out so the report's "most recent stream" stays tonight's.
-      - name: fetch baseline (last green nightly)
+      # The baseline is chosen by ARTIFACT, not by "last green workflow run": the newest NON-EXPIRED
+      # soak-baseline artifact whose producing run was on THIS branch. jq reads GITHUB_REF_NAME via $ENV
+      # so nothing is shell-interpolated into the filter. Every gh call fails OPEN (a warning + exit 0):
+      # a missing baseline is bootstrap, never a burn-in failure. Kept OUTSIDE benchmark/out so the
+      # report's "most recent stream" stays tonight's.
+      - name: fetch baseline (newest soak-baseline artifact on this branch)
         id: baseline
         if: always()
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow soak-nightly.yml --branch "$GITHUB_REF_NAME" \
-            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          set -uo pipefail
+          json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=soak-baseline&per_page=100") \
+            || { echo "::warning::baseline fetch failed"; exit 0; }
+          id=$(printf '%s' "$json" | jq -r '
+            [.artifacts[]
+              | select(.expired == false)
+              | select(.workflow_run.head_branch == $ENV.GITHUB_REF_NAME)]
+            | sort_by(.workflow_run.id) | last | .workflow_run.id // empty') \
+            || { echo "::warning::baseline fetch failed"; exit 0; }
           if [ -z "$id" ]; then
-            echo "::notice::no green nightly yet -- soak:report runs without a baseline (bootstrap)"
+            echo "::notice::no soak-baseline artifact for branch $GITHUB_REF_NAME yet -- soak:report runs without a baseline (bootstrap)"
             exit 0
           fi
-          if gh run download "$id" --repo "$GITHUB_REPOSITORY" --name soak-baseline --dir baseline; then
-            echo "file=baseline/soak-baseline.jsonl" >> "$GITHUB_OUTPUT"
-            echo "baseline: soak-baseline from green run $id"
-          else
-            echo "::notice::green run $id has no soak-baseline artifact (expired, or predates it) -- no baseline"
-          fi
+          gh run download "$id" --repo "$GITHUB_REPOSITORY" --name soak-baseline --dir baseline \
+            || { echo "::warning::baseline fetch failed"; exit 0; }
+          echo "file=baseline/soak-baseline.jsonl" >> "$GITHUB_OUTPUT"
+          echo "baseline: soak-baseline from run $id (branch $GITHUB_REF_NAME)"
       # Re-derive the verdict from the stream (integrity), diff against the baseline, render the HTML report --
       # also on a FAIL. The baseline itself must pass integrity (S12) -- a restored file is untrusted input.
       - name: soak:report
@@ -85,19 +104,36 @@ jobs:
           args=(--out benchmark/out/soak-report.html)
           if [ -n "${BASELINE:-}" ]; then args+=(--baseline "$BASELINE"); fi
           node benchmark/soak/SoakReport.mjs "${args[@]}"
-      # Tonight becomes tomorrow's baseline -- only when everything above passed.
+      # Tonight becomes tomorrow's baseline -- when everything above passed, OR on a manual seed run
+      # (inputs.seed_baseline) whose soak step itself succeeded. The seed path bypasses a report
+      # REGRESSION only: the stream must still be its own PASS + integrity OK, re-derived here with no
+      # baseline, before it may be uploaded.
       - name: stage baseline for the next night
-        if: success()
+        id: stage_baseline
+        if: success() || (always() && inputs.seed_baseline && steps.soak.outcome == 'success')
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           shopt -s nullglob
           files=(benchmark/out/*.jsonl)
           if [ "${#files[@]}" -ne 1 ]; then echo "::error::expected exactly one soak JSONL, found ${#files[@]}"; exit 1; fi
-          mkdir -p baseline-out
-          cp "${files[0]}" baseline-out/soak-baseline.jsonl
+          # The report's OWN exit status is authoritative (a parity/integrity failure exits 1); capture it,
+          # then grep the output with herestrings (no pipe -> no SIGPIPE false-negative under pipefail).
+          if ! out=$(node benchmark/soak/SoakReport.mjs "${files[0]}"); then
+            echo "$out"
+            echo "::error::refusing to seed baseline -- soak:report exited non-zero"
+            exit 1
+          fi
+          echo "$out"
+          if grep -q 're-derived=PASS' <<<"$out" && grep -qF '[integrity OK]' <<<"$out"; then
+            mkdir -p baseline-out
+            cp "${files[0]}" baseline-out/soak-baseline.jsonl
+          else
+            echo "::error::refusing to seed baseline -- stream is not PASS + integrity OK"
+            exit 1
+          fi
       - name: upload baseline
-        if: success()
+        if: success() || (always() && inputs.seed_baseline && steps.soak.outcome == 'success' && steps.stage_baseline.outcome == 'success')
         uses: actions/upload-artifact@v4
         with:
           name: soak-baseline
@@ -115,7 +151,7 @@ jobs:
           if-no-files-found: warn
 
   teeth:
-    name: teeth (must-fail battery minus PL/ML, ubuntu / node 22)
+    name: teeth (must-fail battery minus PL/ML/PF, ubuntu / node 22)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -129,10 +165,10 @@ jobs:
       - run: npm ci
       # Every gate/oracle proven to trip through main.mjs, the clean pass-controls, the config fail-closed
       # cases, the S5 INCONCLUSIVE cases and the 1.0.0-kernel revert. pipefail keeps the exit code through tee.
-      - name: soak:teeth (all but PL/ML)
+      - name: soak:teeth (all but PL/ML/PF)
         shell: bash
         env:
-          MUSTFAIL_ONLY: '^(?!PL |ML )'
+          MUSTFAIL_ONLY: '^(?!PL |ML |PF )'
         run: |
           set -o pipefail
           mkdir -p benchmark/out
@@ -146,7 +182,7 @@ jobs:
           if-no-files-found: warn
 
   teeth-long:
-    name: teeth-long (PL/ML 1500-cycle heap controls, ubuntu / node 22)
+    name: teeth-long (PL/ML/PF long full-roster controls, ubuntu / node 22)
     runs-on: ubuntu-latest
     timeout-minutes: 90   # ~32 min on an Apple M4; headroom for a slower shared runner
     steps:
@@ -157,10 +193,11 @@ jobs:
           cache: npm
       - run: npm ci
       # S4: a clean 1500-cycle run keeps the heap flat (PL) and a ~1 KB/lane-cycle leak FAILs it (ML).
-      - name: soak:teeth (PL/ML)
+      # PF: the clean full default roster must exit 0 (the run every nightly makes).
+      - name: soak:teeth (PL/ML/PF)
         shell: bash
         env:
-          MUSTFAIL_ONLY: '^(PL|ML) '
+          MUSTFAIL_ONLY: '^(PL|ML|PF) '
         run: |
           set -o pipefail
           mkdir -p benchmark/out

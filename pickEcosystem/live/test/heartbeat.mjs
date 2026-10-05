@@ -4,7 +4,8 @@
  *
  *   node --expose-gc test/heartbeat.mjs          (npm run heartbeat; the nightly runs HB_DURATION=30m)
  *
- * One CYCLE (~24 s; seconds from the cycle's start):
+ * One CYCLE (~24 s; seconds from the cycle's start; the flaky step waits for w1's breaker -- up to FLAKY_CAP_S --
+ * and everything after it shifts by that wait):
  *   0     traffic resumes          2.2  steady p99 read (the last full second, faults not yet started)
  *   2.2   kill w2                  4.2  flaky w1          7.2  heal w1        8.2  hang w4
  *   11.2  crash w5                 12.2 crash loop w6     15.2 reset w6
@@ -35,7 +36,7 @@
  *                (neither: 11 cycles, the smallest conclusive run)
  *   HB_WORKERS   real (worker_threads, the default) | virtual (virtual workers on a virtual clock: fast, the teeth)
  *   HB_RATE      offered req/s (default 800 real, 2000 virtual)     HB_OUT  the JSONL path
- *   HB_MUSTFAIL  a planted defect for test/heartbeat-teeth.mjs: leak | slowleak | lose | stuck | p99
+ *   HB_MUSTFAIL  a planted defect for test/heartbeat-teeth.mjs: leak | slowleak | lose | stuck | p99 | nobreaker
  */
 
 import { mkdirSync, openSync, writeSync, closeSync, readFileSync } from 'node:fs';
@@ -62,7 +63,7 @@ const RETAIN_SLACK = 16;
 const P99_ADD_MS = 1;
 const MIN_CONCLUSIVE = 2 * GATE_N + WARMUP_CYCLES;
 const KNOWN = ['HB_DURATION', 'HB_CYCLES', 'HB_WORKERS', 'HB_RATE', 'HB_OUT', 'HB_MUSTFAIL'];
-const MUSTFAIL = ['leak', 'slowleak', 'lose', 'stuck', 'p99'];
+const MUSTFAIL = ['leak', 'slowleak', 'lose', 'stuck', 'p99', 'nobreaker'];
 const NOOP = function () {};
 const say = (s) => process.stderr.write('heartbeat: ' + s + '\n');
 
@@ -187,6 +188,9 @@ function breach(family, detail) {
     say(line);
 }
 
+// The flaky step's cap, seconds from the cycle start (see the cycle body).
+const FLAKY_CAP_S = 16.2;
+
 async function at(start, s) {
     const due = start + s * 1000;
     const left = due - now();
@@ -246,24 +250,38 @@ for (;;) {
     const p99 = k.stats.p99;
     if (cfg.mustfail === 'p99' && post >= GATE_N) slowAll(1);
     k.fault(2, 'kill');
-    await at(start, 4.2); k.fault(1, 'flaky');
-    await at(start, 7.2); k.heal(1);
-    await at(start, 8.2); k.fault(4, 'hang');
-    await at(start, 11.2); k.fault(5, 'crash');
-    await at(start, 12.2); k.fault(6, 'crashloop');
-    await at(start, 15.2);
+    await at(start, 4.2); if (cfg.mustfail !== 'nobreaker') k.fault(1, 'flaky');   // nobreaker: the fault never lands
+    // The breaker opens on 5 failures IN A ROW and `flaky` fails half of w1's jobs (by item hash), so a fixed window
+    // is a coin flip at low rates: 3 s at 600 req/s is ~225 jobs on w1, and 2.2% of cycles never see 5 in a row
+    // (the 2026-10-05 nightly failed this way at cycle 11 of ~75). Hold the fault for at least the 3 s window and
+    // until the breaker has moved, at most until FLAKY_CAP_S (~900 jobs at 600 req/s: a miss < 1e-6 per cycle);
+    // the rest of the cycle shifts by the extra wait. Not moving by the cap stays a `faults` breach.
+    // Keyed on w1's OWN breaker (fleet.bState[1]): the breaker event counter counts every worker's transitions.
+    // Sampled from the moment the fault lands: an early trip whose half-open probe already closed it again by 7.2 s
+    // still counts.
+    let w1Moved = false;
+    while (now() - start < 7.2 * 1000 || (!w1Moved && now() - start < FLAKY_CAP_S * 1000)) {
+        await wait(20);
+        if (k.fleet.bState[1] !== B_CLOSED) w1Moved = true;
+    }
+    const shift = Math.max(0, (now() - start) / 1000 - 7.2);
+    k.heal(1);
+    await at(start, 8.2 + shift); k.fault(4, 'hang');
+    await at(start, 11.2 + shift); k.fault(5, 'crash');
+    await at(start, 12.2 + shift); k.fault(6, 'crashloop');
+    await at(start, 15.2 + shift);
     const escalated = k.fleet.escalated[6] === 1;
     const resetDone = k.reset(6);
-    await at(start, 16.2); await resetDone; k.fault(3, 'slow'); k.setStrategy('peakewma');
-    await at(start, 18.2); k.heal(3);
+    await at(start, 16.2 + shift); await resetDone; k.fault(3, 'slow'); k.setStrategy('peakewma');
+    await at(start, 18.2 + shift); k.heal(3);
     for (let s = 0; s < STRATEGIES.length; s++) {
         k.setStrategy(STRATEGIES[s]);
         k.setEngine(s >= 3 && s < 6 ? ENGINE_B : ENGINE_A);
-        await at(start, 18.2 + 0.4 * (s + 1));
+        await at(start, 18.2 + shift + 0.4 * (s + 1));
     }
     k.setStrategy('p2c');
     k.setEngine(ENGINE_A);
-    await at(start, 23.2);
+    await at(start, 23.2 + shift);
     const cp = await checkpoint();
     const after = snapshot();
     if (cfg.mustfail === 'slowleak') { const chunk = []; for (let j = 0; j < 24000; j++) chunk.push({ a: j, b: j * 2, c: null }); ballast.push(chunk); }
@@ -282,7 +300,7 @@ for (;;) {
     }
     if (notUp.length) breach('eligible', notUp.join(',') + ' not back in rotation');
     for (const w of [2, 4, 5]) if (after.restarts[w] - before.restarts[w] < 1) breach('faults', 'w' + w + ' was not restarted');
-    if (d('breaker') <= 0) breach('faults', 'the flaky worker\'s breaker never moved');
+    if (!w1Moved) breach('faults', 'the flaky worker\'s breaker never moved');
     if (!escalated || d('escalate') < 1) breach('faults', 'the crash loop did not escalate');
     if (cp.tracked > 2 * N_WORKERS + RETAIN_SLACK) breach('retention', cp.tracked + ' transports/scopes still alive after GC (limit ' + (2 * N_WORKERS + RETAIN_SLACK) + ')');
     if (!(p99 > 0)) breach('p99', 'no steady p99 (no request completed in the steady window)');
@@ -290,7 +308,7 @@ for (;;) {
     if (post >= 0) { heapEL.push(cp.heapMB); p99EL.push(p99); }
     const rec = {
         type: 'cycle', cycle, post, t: Math.round(now() - t0), heapMB: +cp.heapMB.toFixed(2), rssMB: +cp.rssMB.toFixed(1), tracked: cp.tracked,
-        p99SteadyMs: +p99.toFixed(3), ok: d('ok'), failed: d('failed'), shed: d('shed'), failover: d('failover'),
+        p99SteadyMs: +p99.toFixed(3), flakyWaitS: +shift.toFixed(2), ok: d('ok'), failed: d('failed'), shed: d('shed'), failover: d('failover'),
         restarts: after.restarts.map((r, i) => r - before.restarts[i]), breaches: breaches.filter((b) => b.indexOf(' cycle=' + cycle + ' ') > 0),
     };
     emit(rec);
@@ -318,15 +336,21 @@ if (active) {
 
 const code = await k.shutdown({ deadlineMs: cfg.workers === 'virtual' ? 3000 : 10000 });
 let verdict;
+// There is no run-forever mode: the loop ends on HB_CYCLES or HB_DURATION (default MIN_CONCLUSIVE
+// cycles), both checked BEFORE the signal. So stopReason==='signal' is always an EARLY stop -- the run
+// did not reach its own end, so even a window with enough cycles is not a PASS: it is INCONCLUSIVE.
+const interrupted = stopReason === 'signal';
 if (hardFail || breaches.length) verdict = 'FAIL';
 else if (code !== 0) { breach('shutdown', 'orchestrator exit code ' + code); verdict = 'FAIL'; }
+else if (interrupted) verdict = 'INCONCLUSIVE';
 else if (!active) verdict = 'INCONCLUSIVE';
 else verdict = 'PASS';
 emit({ type: 'summary', verdict, reason: stopReason, cycles: cycle, postCycles, gates, breaches, shutdownCode: code, endedAt: new Date().toISOString() });
 closeSync(fd);
-if (verdict === 'INCONCLUSIVE') {
-    say('INCONCLUSIVE -- ' + postCycles + ' post-warm-up cycles; the drift gates need ' + 2 * GATE_N + ' (run at least ' + MIN_CONCLUSIVE + ' cycles)' +
-        (stopReason === 'signal' ? '; stopped by a signal' : ''));
+if (verdict === 'INCONCLUSIVE' && interrupted) {
+    say('INCONCLUSIVE -- run interrupted before its end (signal) after ' + cycle + ' cycles');
+} else if (verdict === 'INCONCLUSIVE') {
+    say('INCONCLUSIVE -- ' + postCycles + ' post-warm-up cycles; the drift gates need ' + 2 * GATE_N + ' (run at least ' + MIN_CONCLUSIVE + ' cycles)');
 }
 for (const [name, g] of Object.entries(gates)) say('gate ' + name + ' ' + g.verdict + ' ' + JSON.stringify(g));
 say(verdict + ' -- ' + cycle + ' cycles, ' + breaches.length + ' breaches, shutdown exit code ' + code + ' (' + cfg.out + ')');

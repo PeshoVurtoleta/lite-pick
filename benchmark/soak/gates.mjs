@@ -12,12 +12,14 @@
  * non-smoke lane below the 2N active floor, or an interrupted run), else PASS. SMOKE gates never fail
  * a run, and a non-smoke run never PASSes on SMOKE gates.
  *
- * hotAlloc is REPORT-ONLY below the gross tier (S1, audit 2026-09-29): in a long-lived multi-lane
- * process, V8 JIT state (shared step functions + fresh instances per lane-cycle -> deopt windows that
- * box doubles) shows 8-20 B/op on a correct kernel on Node 22. Per-op 0 B/op is owned by PerfGate
- * (test:perf, isolated scavenge counting); retention by torture and the heap drift gate. The soak keeps
- * measuring and reports an over-bound lane as a NOTE; it still FAILs on the gross tier (every window
- * scavenged = >= a 4 MB semi-space per 8192-pick window, ~512 B/op) and on a non-finite measurement.
+ * hotAlloc has three tiers (S1, audit 2026-09-29; FAIL tier added 2026-10-05, ADR 0014): the GROSS tier
+ * FAILs on every window scavenged (>= a 4 MB semi-space per 8192-pick window, ~512 B/op) or a non-finite
+ * measurement; the FAIL tier FAILs when the two-pass MIN B/op reaches HOTALLOC_FAIL (0.3) in >= 2 post-
+ * warm-up cycles of a lane (a real steady-state allocation -- calibrated 2.05x below the lowest mutant MIN
+ * and 2.1x above the worst clean MIN); the NOTE tier below merely REPORTS an over-bound lane (> HOTALLOC_MAX
+ * or a per-pass recurrence). The MIN estimator (hot.mjs:263) is robust to V8 JIT deopt windows that box
+ * doubles on a correct kernel on Node 22; per-op 0 B/op stays owned by PerfGate (test:perf, isolated
+ * scavenge counting), retention by torture and the heap drift gate.
  */
 
 export const VERDICT = Object.freeze({ PASS: 'PASS', FAIL: 'FAIL', INCONCLUSIVE: 'INCONCLUSIVE', SMOKE: 'SMOKE', STUB: 'STUB' });
@@ -65,6 +67,11 @@ export const MW_ALPHA = 0.01;
 export const HOTALLOC_MAX = 0.02;      // per post-warmup cycle: hot B/op MEAN above this is REPORTED
                                        // (a NOTE, not a breach -- S1). 0.02 is a hair above the warm noise
                                        // floor so even a 2-field object every 64th pick (~0.5 B/op) shows.
+export const HOTALLOC_FAIL = 0.3;      // FAIL tier (maintainer decision 2026-10-05, calibrated in ADR 0014):
+                                       // a lane whose two-pass MIN B/op (hot.mjs:263) reaches this in >= 2
+                                       // post-warm-up cycles is a real steady-state allocation, not JIT noise.
+                                       // 0.3 is 2.05x below M4's lowest mutant MIN (0.614) and 2.1x above the
+                                       // audit's worst clean MIN (0.143). HOTALLOC_MAX stays the NOTE floor below.
 
 /** O(1)-memory early/late accumulator: first N samples + a ring of the last N. */
 export class EarlyLate {
@@ -224,7 +231,9 @@ function newLaneState(N) {
         gcMajorMax: 0, hotAllocWorst: 0, hotAllocMeasured: 0, hotAllocScavengedFail: false,
         hotAllocNonFinite: false, pauseMissing: false,
         hotAllocPassMaxOver: 0,   // NIT1: post-warmup cycles where max(pass1,pass2) B/op > bound
-        lanePicks: 0,
+        hotAllocFailCycles: 0,    // post-warmup cycles whose two-pass MIN B/op reached HOTALLOC_FAIL (FAIL tier)
+        hotAllocFailWorst: 0,     // worst (max) MIN B/op among those failing cycles
+        lanePicks: 0, warmPicks: 0,
     };
 }
 
@@ -264,7 +273,15 @@ function pushRow(st, r) {
         // NaN-closed: a non-finite measured value is a FAIL (Infinity), never a silent pass via a
         // `NaN > worst` that evaluates false.
         if (!Number.isFinite(r.hotBytesPerOp)) { st.hotAllocWorst = Infinity; st.hotAllocNonFinite = true; }
-        else if (r.hotBytesPerOp > st.hotAllocWorst) st.hotAllocWorst = r.hotBytesPerOp;
+        else {
+            if (r.hotBytesPerOp > st.hotAllocWorst) st.hotAllocWorst = r.hotBytesPerOp;
+            // FAIL tier (maintainer decision 2026-10-05): a MIN B/op at or above HOTALLOC_FAIL is a real
+            // steady-state allocation; count such post-warm-up cycles and track the worst (>= 2 FAILs).
+            if (r.hotBytesPerOp >= HOTALLOC_FAIL) {
+                st.hotAllocFailCycles++;
+                if (r.hotBytesPerOp > st.hotAllocFailWorst) st.hotAllocFailWorst = r.hotBytesPerOp;
+            }
+        }
     } else if (r.hotBopGcFree === 0) {
         // EVERY window scavenged -> sustained allocation (>= a semi-space per window) -> a heavy
         // leak, NOT "unmeasurable". This is a FAIL, never a silent skip.
@@ -294,7 +311,10 @@ export class GateAccumulator {
     }
     push(r) {
     const st = this.lanes.get(r.lane);
-    if (st === undefined || r.cycle < this.warmup) return;
+    if (st === undefined) return;
+    // A warm-up record is not folded into the drift/alloc state, but its picks ARE work: count them so a
+    // run that completed ONLY the warm-up cycle is INCONCLUSIVE (S5), never "the soak did nothing" (FAIL).
+    if (r.cycle < this.warmup) { st.warmPicks += (r.totalPicks | 0); return; }
     pushRow(st, r);
     }
     /**
@@ -320,8 +340,8 @@ export class GateAccumulator {
         const st = this.lanes.get(laneName) || newLaneState(N);
         const { post, elHeap, elOps, elOpsSparse, elPause, elLatP999, elLatSamples, elRebuildP99,
             elRebuildSamples, gcMajorMax, hotAllocWorst, hotAllocMeasured, hotAllocScavengedFail,
-            hotAllocNonFinite, hotAllocPassMaxOver, lanePicks } = st;
-        totalPicksAll += lanePicks;
+            hotAllocNonFinite, hotAllocPassMaxOver, hotAllocFailCycles, hotAllocFailWorst, lanePicks, warmPicks } = st;
+        totalPicksAll += lanePicks + warmPicks;
 
         // --- always-active per-cycle gates -----------------------------------------------------
         const gcMajorGate = { verdict: post >= 1 ? (gcMajorMax <= GC_MAJOR_MAX ? VERDICT.PASS : VERDICT.FAIL) : VERDICT.SMOKE, observed: gcMajorMax, bound: GC_MAJOR_MAX };
@@ -333,14 +353,22 @@ export class GateAccumulator {
         // which must never PASS with worst=0.
         const hotAllocRecur = hotAllocPassMaxOver >= 2;
         const hotAllocOver = hotAllocWorst > HOTALLOC_MAX || hotAllocRecur;
+        // FAIL tier (maintainer decision 2026-10-05, ADR 0014): >= 2 post-warm-up cycles whose MIN B/op
+        // reached HOTALLOC_FAIL. The gross tier (every window scavenged / non-finite) stays above it; the
+        // over-bound NOTE tier stays below.
+        const hotAllocFail = hotAllocFailCycles >= 2;
         let hotAllocVerdict;
         if (post < 1) hotAllocVerdict = VERDICT.SMOKE;
         else if (hotAllocScavengedFail || hotAllocNonFinite) hotAllocVerdict = VERDICT.FAIL;
+        else if (hotAllocFail) hotAllocVerdict = VERDICT.FAIL;
         else if (hotAllocMeasured === 0) hotAllocVerdict = VERDICT.INCONCLUSIVE;
         else if (hotAllocOver) hotAllocVerdict = VERDICT.STUB;
         else hotAllocVerdict = VERDICT.PASS;
-        const hotAllocGate = { verdict: hotAllocVerdict, reportOnly: hotAllocVerdict === VERDICT.STUB, observedMax: hotAllocWorst, measured: hotAllocMeasured, scavengedFail: hotAllocScavengedFail, nonFinite: hotAllocNonFinite, passMaxOver: hotAllocPassMaxOver, bound: HOTALLOC_MAX };
-        if (hotAllocVerdict === VERDICT.FAIL) breaches.push('hotAlloc[' + laneName + '] ' + (hotAllocScavengedFail ? 'every window scavenged (sustained allocation)' : 'non-finite B/op measurement'));
+        const hotAllocGate = { verdict: hotAllocVerdict, reportOnly: hotAllocVerdict === VERDICT.STUB, observedMax: hotAllocWorst, measured: hotAllocMeasured, scavengedFail: hotAllocScavengedFail, nonFinite: hotAllocNonFinite, passMaxOver: hotAllocPassMaxOver, failCycles: hotAllocFailCycles, failWorst: +hotAllocFailWorst.toFixed(3), bound: HOTALLOC_MAX, failBound: HOTALLOC_FAIL };
+        if (hotAllocVerdict === VERDICT.FAIL) {
+            if (hotAllocScavengedFail || hotAllocNonFinite) breaches.push('hotAlloc[' + laneName + '] ' + (hotAllocScavengedFail ? 'every window scavenged (sustained allocation)' : 'non-finite B/op measurement'));
+            else breaches.push('hotAlloc[' + laneName + '] bop=' + hotAllocFailWorst.toFixed(3) + ' cycles=' + hotAllocFailCycles + ' >= ' + HOTALLOC_FAIL + ' B/op');
+        }
         else if (hotAllocVerdict === VERDICT.INCONCLUSIVE) inconclusive.push('hotAlloc[' + laneName + '] measured no GC-free window');
         else if (hotAllocVerdict === VERDICT.STUB) notes.push('hotAlloc[' + laneName + '] ' + (hotAllocWorst > HOTALLOC_MAX ? 'max=' + hotAllocWorst.toFixed(3) : 'per-pass max over bound in ' + hotAllocPassMaxOver + ' cycles') + ' > ' + HOTALLOC_MAX + ' B/op (report-only; PerfGate owns per-op 0 B/op)');
 
@@ -406,7 +434,7 @@ export class GateAccumulator {
             else if (v === VERDICT.INCONCLUSIVE) sawInconclusive = true;
         }
         // S5: a non-smoke lane below the active floor has SMOKE drift gates -- not enough evidence.
-        if (!opts.smoke && post < activeFloor) inconclusive.push('lane ' + laneName + ' ran ' + post + ' post-warmup cycle(s); drift gates need ' + activeFloor);
+        if (!opts.smoke && post < activeFloor) inconclusive.push('lane ' + laneName + ' ran ' + post + ' post-warmup cycle(s); drift gates need ' + activeFloor + (post === 0 ? ' -- only the warm-up cycle completed' : ''));
         perLane.push({ lane: laneName, postWarmupCycles: post, gates });
     }
     // S5: a bounded run stopped before its end (signal, crash) is never a PASS.

@@ -67,11 +67,12 @@ export function installFatalHandlers(stream, getContext, writeSummary) {
         } catch (e) {
             try { process.stderr.write('soak: fatal-handler write failed -- ' + e + '\n'); } catch (e2) { /* ignore */ }
         }
-        // S11: an unhandled rejection IS pool assertion A7 (zero unhandled rejections over the run) -- a
-        // structured breach; anything else (uncaughtException) is a CRASH, never mistaken for a breach.
+        // S11: an unhandled rejection DURING A POOL LANE IS pool assertion A7 (zero unhandled rejections over
+        // the run) -- a structured breach. An unhandled rejection anywhere else (no pool lane in flight) is
+        // not a pool assertion at all; it is a CRASH, like an uncaughtException, never mislabelled A7.
         const ctx = (getContext && getContext()) || {};
         const msg = (err && err.stack ? err.stack : String(err)).replace(/\n/g, ' ');
-        if (kind === 'unhandledRejection') process.stderr.write('soak: BREACH pool=A7 lane=' + (ctx.lane || '*') + ' cycle=' + ctx.cycle + ' detail=unhandled rejection: ' + msg + '\n');
+        if (kind === 'unhandledRejection' && ctx.tier === 'pool') process.stderr.write('soak: BREACH pool=A7 lane=' + (ctx.lane || '*') + ' cycle=' + ctx.cycle + ' detail=unhandled rejection: ' + msg + '\n');
         else process.stderr.write('soak: CRASH -- ' + kind + ': ' + (err && err.stack ? err.stack : err) + '\n');
         process.exit(1);
     };

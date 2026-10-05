@@ -181,7 +181,7 @@ async function main() {
     let totalPicks = 0;
     let cyclesRun = 0;
     let workloadMajorTotal = 0;
-    const current = { lane: null, cycle: -1, seeds: null };
+    const current = { lane: null, cycle: -1, seeds: null, tier: null };
     let summaryWritten = false;
     // BLOCKER 1a: a lost (never-settling) pool run leaves the event loop with nothing to do; the process
     // would exit 0 with only a header in the JSONL. beforeExit fires first -> if no summary was written,
@@ -581,7 +581,7 @@ async function main() {
             if (tier === 'pool') {
                 const poolName = entries[li].poolName;
                 const pseed = seedFor((cfg.seed ^ 0x504F4F4C) >>> 0, POOL_LANES.indexOf(poolName), cycle);
-                current.lane = laneId; current.cycle = cycle; current.seeds = { seed: pseed };
+                current.lane = laneId; current.cycle = cycle; current.seeds = { seed: pseed }; current.tier = 'pool';
                 const pcore = await runPoolCycle(poolName, CAP, M_CH, pseed, cfg, MF, { keys: KEYS, keyMask: KEY_MASK }, tracker);
                 totalPicks += pcore.launched;   // pool runs count as work (so a pool-only run is not "nothing")
                 poolLaunchedTotal += pcore.launched;
@@ -601,7 +601,7 @@ async function main() {
                     if (!pcore.assert3_accounted) breach('pool=A3' + at, 'accounting' + (pcore.lostRun ? ': lost run, ' + pcore.pendingCount + ' pending' : ''));
                     if (!pcore.assert4_codesOk) breach('pool=A4' + at, 'unexpected rejection code ' + pcore.badCode);
                     if (!pcore.assert5_outcomeOk) breach('pool=A5' + at, 'outcome oracle: ' + pcore.outcomeMiss);
-                    if (!retentionOk) breach('pool=A6' + at, 'tracker.size()=' + pb.trackerSize);
+                    if (!retentionOk) breach('pool=A6' + at, 'tracker.size()=' + pb.trackerSize + ' drainMs=' + pb.drainMs);
                     if (!pcore.assert8_noDownDispatch) breach('pool=A8' + at, pcore.downDispatch + ' attempt(s) dispatched to a DOWN node');
                     if (!pcore.assert9_little) breach('pool=A9' + at, "Little's law: integral of sum(inflight) " + pcore.inflightArea + ' != sum of attempt time ' + pcore.attemptArea);
                 }
@@ -612,7 +612,7 @@ async function main() {
                     assert1: pcore.assert1_inflightConsistent, assert2: pcore.assert2_quiescenceZero,
                     assert3: pcore.assert3_accounted, lostRun: pcore.lostRun, pendingCount: pcore.pendingCount,
                     assert4: pcore.assert4_codesOk, assert5_outcome: pcore.assert5_outcomeOk,
-                    assert6_retention: retentionOk, trackerSize: pb.trackerSize, badCode: pcore.badCode, outcomeMiss: pcore.outcomeMiss,
+                    assert6_retention: retentionOk, trackerSize: pb.trackerSize, forcedGcTries: pb.forcedGcTries, drainMs: pb.drainMs, badCode: pcore.badCode, outcomeMiss: pcore.outcomeMiss,
                     // S9/S10: down-dispatch (A8), Little's-law identity (A9), simulated RTTs (ns) and the trace hash.
                     assert8: pcore.assert8_noDownDispatch, downDispatch: pcore.downDispatch,
                     assert9: pcore.assert9_little, inflightArea: pcore.inflightArea, attemptArea: pcore.attemptArea,
@@ -631,7 +631,7 @@ async function main() {
             // (laneIndex stays within the 4-bit lane mask; the base carries the tier).
             const base = tier === 'tiny' ? (cfg.seed ^ 0x7A7A7A7A) >>> 0 : cfg.seed;
             const seed = seedFor(base, laneIndex, cycle);
-            current.lane = laneId; current.cycle = cycle; current.seeds = { seed };
+            current.lane = laneId; current.cycle = cycle; current.seeds = { seed }; current.tier = tier;
 
             const core = runCycle(lane, seed, cycle, cap, m, laneId);
 
@@ -642,7 +642,7 @@ async function main() {
             workloadMajorTotal += b.workloadMajor;
             if (b.trackerSize !== 0) {
                 sizeFailures++;
-                breach('retention lane=' + laneId + ' cycle=' + cycle, 'tracker.size()=' + b.trackerSize);
+                breach('retention lane=' + laneId + ' cycle=' + cycle, 'tracker.size()=' + b.trackerSize + ' drainMs=' + b.drainMs);
             }
             // A real quality VIOLATION fails any lane (kernel or tiny). But insufficientData -> only a
             // KERNEL lane can be INCONCLUSIVE; a tiny lane (cap in {1,2,3}) is a degenerate regime where
@@ -709,6 +709,7 @@ async function main() {
                 telemetry,
                 trackerSize: b.trackerSize,
                 forcedGcTries: b.forcedGcTries,
+                drainMs: b.drainMs,
                 heapSampledAfterGc: b.heapSampledAfterGc,
                 seed: core.seed,
             };
@@ -744,11 +745,20 @@ async function main() {
                 breach('phases lane=' + pnf.slice(0, dot), 'chaos phase never fired: ' + pnf.slice(dot + 1));
             }
             if ((findings && findings.length) || warns.length) breach('tracker lane=*', 'findings=' + (findings ? findings.length : 0) + ' warnings=' + warns.length);
-            // gates.mjs breach strings are '<gate>[<lane>] <detail>' (totalPicks: no lane).
+            // gates.mjs breach strings are '<gate>[<lane>] <detail>' (totalPicks: no lane). Leading
+            // `key=number` tokens of the detail (e.g. hotAlloc `bop=0.628 cycles=3`) move into the BREACH
+            // head so a spec can match `bop>=0.3`; the remaining free text stays the detail. Existing specs
+            // match only the `gate=`/`lane=` head tokens, so promoting MORE head tokens keeps them matching.
             for (const g of gate.breaches) {
                 const m = /^(\w+)\[([^\]]+)\] ?(.*)$/.exec(g);
-                if (m) breach('gate=' + m[1] + ' lane=' + m[2], m[3]);
-                else breach('gate=' + (/^(\w+)/.exec(g) || ['', 'unknown'])[1] + ' lane=*', g);
+                if (m) {
+                    const toks = m[3].length ? m[3].split(' ') : [];
+                    let j = 0;
+                    while (j < toks.length && /^[A-Za-z]\w*=-?\d+(?:\.\d+)?$/.test(toks[j])) j++;
+                    const head = 'gate=' + m[1] + ' lane=' + m[2] + (j ? ' ' + toks.slice(0, j).join(' ') : '');
+                    const rest = toks.slice(j).join(' ');
+                    breach(head, rest.length ? rest : undefined);
+                } else breach('gate=' + (/^(\w+)/.exec(g) || ['', 'unknown'])[1] + ' lane=*', g);
             }
             process.stderr.write('soak: FAIL -- invariants=' + invariantFailures + ' retention=' + sizeFailures +
                 ' quality=' + qualityViolations + ' pool=' + poolFailures + ' unhandled=' + unhandledCount +

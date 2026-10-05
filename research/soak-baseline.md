@@ -4,7 +4,9 @@
 with evidence"): (1) nightly timing diffs report-only; (2) storage = workflow artifacts; (3) option C on
 the roadmap with its own research note first (ROADMAP Post-1.0 #8b); (4) option B later, conditional (#8c).
 Option A is implemented: `soak:report --baseline` semantics + the `soak-baseline` artifact in
-`.github/workflows/soak-nightly.yml`.
+`.github/workflows/soak-nightly.yml`. Refined 2026-10-05: the baseline is selected by ARTIFACT (newest
+non-expired `soak-baseline` on this branch), not by last green workflow run, and a `seed_baseline`
+workflow_dispatch input can bootstrap the first baseline on a new branch (both detailed in sections 5-6).
 **Question:** the audit's fix plan (2026-09-29) says: keep the last green nightly's JSONL as a
 "baseline artifact" and run `soak:report --baseline` against it every night, "which is what LKP/0-day
 and the Node.js benchmark CI provide for their projects". Before copying that, how do those projects
@@ -148,12 +150,29 @@ one sample versus one sample.
 
 **Where to store the baseline** (GitHub Actions):
 - **Workflow artifacts (recommended):** already uploaded by the nightly; kept 90 days; the next run
-  downloads the last successful run's artifact with `actions: read` only -- no write access to the code.
+  downloads a prior run's artifact with `actions: read` only -- no write access to the code. The
+  artifact is selected by ARTIFACT, not by "last green workflow run": `gh api
+  .../actions/artifacts?name=soak-baseline&per_page=100`, filtered to non-expired artifacts whose
+  `.workflow_run.head_branch` equals this branch (jq `$ENV.GITHUB_REF_NAME`, never shell-interpolated),
+  newest `.workflow_run.id` wins. This decouples "has a baseline" from "the whole workflow went green":
+  a teeth-only failure on an earlier night no longer strands the burn-in without a baseline, and every
+  `gh` call fails OPEN (a `::warning::` + `exit 0`), so a missing baseline is bootstrap, never a burn-in
+  failure.
 - **actions/cache:** silently evicted after 7 days unused; cache poisoning warnings in the docs.
 - **A dedicated branch or release asset:** never expires, but needs `contents: write` -- the job could
   then write to the repository. Not worth it for this.
 - Whatever we pick, the restored file is untrusted input: S12 already makes `--baseline` check the
   baseline's own integrity and refuse an overridden stream.
+
+**Seed path (bootstrap a new branch).** A branch with no prior artifact has no baseline, which is fine
+for the report but means the branch never gets one unless a fully green night happens to produce it. A
+manual `workflow_dispatch` with the boolean input `seed_baseline=true` uploads tonight's stream as the
+baseline even when the report REGRESSED -- but only when the soak step itself succeeded
+(`steps.soak.outcome == 'success'`) and the stream is its OWN evidence: the stage step re-runs
+`node benchmark/soak/SoakReport.mjs <stream>` with no baseline and refuses to upload unless the output
+shows `re-derived=PASS` and `[integrity OK]`. So the seed bypasses a report-vs-baseline regression only,
+never a non-PASS or tampered stream. A scheduled night (`inputs.seed_baseline` null) is unaffected: the
+baseline still uploads only on full `success()`.
 
 ## 7. Recommendation
 1. **Now -- option A.** Upload a baseline, download the last green one, run `--baseline` every night.

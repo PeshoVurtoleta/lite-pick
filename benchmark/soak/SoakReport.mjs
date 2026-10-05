@@ -2,7 +2,7 @@
  * @zakkster/lite-pick soak -- the JSONL analysis tool (audit 1.13).
  *
  *   node benchmark/soak/SoakReport.mjs [file.jsonl] [--baseline other.jsonl] [--out report.html]
- *                                       [--allow-override]
+ *                                       [--allow-override] [--allow-parity-mismatch]
  *
  * Reads a soak stream back and does three jobs:
  *   1. INTEGRITY: re-derive the verdict from the raw CYCLE records (via the SAME pure gates.mjs the run
@@ -31,11 +31,15 @@
  *
  * A stream whose kernel or pool was OVERRIDDEN (SOAK_KERNEL / SOAK_POOL -- a teeth mutant) is not
  * evidence about the shipped code: the report exits 1 on it unless --allow-override is passed (to
- * analyse a mutant run on purpose). The header's parity status (S6) is printed.
+ * analyse a mutant run on purpose). Likewise, a stream whose header parity (S6) is not ok -- the shipped
+ * files did not match their pins when the run was made -- exits 1 unless --allow-parity-mismatch is passed.
+ * A --baseline must be sound, GREEN, same-schema evidence: a foreign schema is BASELINE INCOMPATIBLE, an
+ * integrity failure BASELINE INTEGRITY MISMATCH, and a re-derived non-PASS BASELINE NOT GREEN (all exit 1).
  *
- * Exit codes: 0 report ok (and, with --baseline, no regression); 1 integrity mismatch, a regression, or
- * an overridden kernel/pool without --allow-override; 2 a bad/unsupported stream (missing file, a
- * schemaVersion other than provenance.mjs's SCHEMA_VERSION, no summary).
+ * Exit codes: 0 report ok (and, with --baseline, no regression); 1 integrity mismatch, a parity mismatch
+ * (without --allow-parity-mismatch), a regression, an overridden kernel/pool (without --allow-override),
+ * or a bad baseline (incompatible schema / integrity mismatch / not green); 2 a bad/unsupported stream
+ * (missing file, a schemaVersion other than provenance.mjs's SCHEMA_VERSION, no summary), or an unknown flag.
  */
 
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
@@ -63,14 +67,45 @@ const nodeMajor = (v) => { const m = /^v(\d+)\./.exec(String(v || '')); return m
 
 function die(code, msg) { process.stderr.write('soak:report: ' + msg + '\n'); process.exit(code); }
 
+const KNOWN_FLAGS = ['--baseline', '--out', '--allow-override', '--allow-parity-mismatch'];
+/** Smallest edit-distance known flag (did-you-mean), or null when nothing is close. */
+function didYouMean(flag) {
+    let best = null, bestD = Infinity;
+    for (const k of KNOWN_FLAGS) {
+        const d = editDistance(flag, k);
+        if (d < bestD) { bestD = d; best = k; }
+    }
+    return bestD <= Math.max(2, (flag.length / 3) | 0) ? best : null;
+}
+function editDistance(a, b) {
+    const m = a.length, n = b.length;
+    const row = new Array(n + 1);
+    for (let j = 0; j <= n; j++) row[j] = j;
+    for (let i = 1; i <= m; i++) {
+        let prev = row[0]; row[0] = i;
+        for (let j = 1; j <= n; j++) {
+            const tmp = row[j];
+            row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+            prev = tmp;
+        }
+    }
+    return row[n];
+}
 function parseArgs(argv) {
-    const a = { file: null, baseline: null, out: null, allowOverride: false };
+    const a = { file: null, baseline: null, out: null, allowOverride: false, allowParityMismatch: false };
     for (let i = 0; i < argv.length; i++) {
         const v = argv[i];
-        if (v === '--baseline') a.baseline = argv[++i];
-        else if (v === '--out') a.out = argv[++i];
+        // A flag that takes a value must get one: a trailing `--baseline` used to be dropped silently, so a requested
+        // comparison never ran and the report still exited 0 (QA 2026-10-05). Fail closed instead.
+        if (v === '--baseline' || v === '--out') {
+            const val = argv[i + 1];
+            if (val === undefined || val === '' || val.startsWith('--')) die(2, v + ' needs a path');
+            if (v === '--baseline') a.baseline = val; else a.out = val;
+            i++;
+        }
         else if (v === '--allow-override') a.allowOverride = true;
-        else if (v.startsWith('--')) die(2, 'unknown flag ' + v);
+        else if (v === '--allow-parity-mismatch') a.allowParityMismatch = true;
+        else if (v.startsWith('--')) { const s = didYouMean(v); die(2, 'unknown flag ' + v + (s ? ' -- did you mean ' + s + '?' : '')); }
         else if (a.file === null) a.file = v;
         else die(2, 'unexpected argument ' + v);
     }
@@ -200,7 +235,23 @@ function rederive(doc) {
     for (const id of header.laneRoster) if (!byLane.has(id)) issues.push('lane missing from stream: ' + id);
     for (const id of byLane.keys()) if (header.laneRoster.indexOf(id) === -1) issues.push('lane not in header.laneRoster: ' + id);
     const gridCounts = header.laneRoster.filter((id) => byLane.has(id)).map((id) => byLane.get(id).size);
-    if (gridCounts.length && gridCounts.some((n) => n !== gridCounts[0])) issues.push('ragged lane x cycle grid (lanes have differing cycle counts)');
+    if (gridCounts.length) {
+        if (summary.reason === 'signal') {
+            // A signal arrives MID-cycle: main processes lanes in header.laneRoster order within a cycle, so
+            // the lanes that completed the final cycle k are a PREFIX of the roster. Counts are therefore k
+            // then k-1, non-increasing, differing by at most 1 -- anything else is a genuinely ragged grid.
+            const hi = gridCounts[0];
+            let ok = true, seenLow = false;
+            for (const n of gridCounts) {
+                if (n === hi) { if (seenLow) { ok = false; break; } }
+                else if (n === hi - 1) { seenLow = true; }
+                else { ok = false; break; }
+            }
+            if (!ok) issues.push('ragged lane x cycle grid (signal run: cycle counts must be k or k-1 as a roster prefix)');
+        } else if (gridCounts.some((n) => n !== gridCounts[0])) {
+            issues.push('ragged lane x cycle grid (lanes have differing cycle counts)');
+        }
+    }
     // S12: each lane's cycles are 0..k-1 (no hole), and a cycle-bound run that ENDED ran exactly
     // header.config.cycles of them -- dropping whole cycles AND the summary counters no longer passes.
     for (const [id, set] of byLane) {
@@ -242,7 +293,9 @@ function rederive(doc) {
     // --- failure signals derived from the cycle records themselves ------------------------------------
     const qViol = kt.reduce((s, c) => s + ((c.quality && c.quality.totalViolations) | 0), 0);
     const invFail = cycles.filter((c) => c.invariant && c.invariant !== 'green').length;
-    const trackFail = cycles.filter((c) => (c.trackerSize | 0) !== 0).length;
+    // Non-pool only: pool retention is already counted by poolCycleFailed (assert6 / trackerSize) and
+    // surfaces as summary.poolFailures -- counting a pool cycle's trackerSize here too would double-count it.
+    const trackFail = kt.filter((c) => (c.trackerSize | 0) !== 0).length;
     const poolFail = poolC.filter(poolCycleFailed).length;
 
     // qualityViolations is EXACTLY re-derivable (main sums cycle.quality.totalViolations) -> require it.
@@ -360,19 +413,38 @@ for (const pl of gate.perLane) {
     process.stdout.write('    ' + (pl.lane || pl.laneName || '?').padEnd(20) + parts.join(' ') + '\n');
 }
 
+// 2b. RETENTION DRAIN (report-only; no verdict effect) -------------------------------------------
+// Per-lane max + median drainMs and max forcedGcTries, across every tier (kernel + pool). These are
+// additive cycle fields (no SCHEMA_VERSION bump); an older stream without them prints `?`.
+process.stdout.write('  per-lane retention drain (report-only):\n');
+const drainLaneIds = [];
+{
+    const seen = new Set();
+    for (const c of cycles) { if (!seen.has(c.lane)) { seen.add(c.lane); drainLaneIds.push(c.lane); } }
+}
+for (const id of drainLaneIds) {
+    const drains = seriesByLane(cycles, id, 'drainMs').filter((v) => typeof v === 'number' && Number.isFinite(v));
+    const tries = seriesByLane(cycles, id, 'forcedGcTries').filter((v) => typeof v === 'number' && Number.isFinite(v));
+    const maxDrain = drains.length ? Math.max.apply(null, drains) : null;
+    const medDrain = drains.length ? median(drains) : null;
+    const maxTries = tries.length ? Math.max.apply(null, tries) : null;
+    process.stdout.write('    ' + String(id).padEnd(20) +
+        'drainMs max=' + (maxDrain == null ? '?' : maxDrain.toFixed(1)) +
+        ' median=' + (medDrain == null ? '?' : medDrain.toFixed(1)) +
+        '  forcedGcTries max=' + (maxTries == null ? '?' : maxTries) + '\n');
+}
+
 // 3. REGRESSION (--baseline) ---------------------------------------------------------------------
 let regressionFail = false;
-// A baseline written by an OLDER stream schema is not comparable (fields differ): say so and skip the diff,
-// exactly like having no baseline yet (the nightly's first run after a schema bump) -- never a crash.
+// The baseline must be sound, GREEN, same-schema evidence or the diff is meaningless.
 function baselineSchema(path) {
     try { return JSON.parse(readFileSync(path, 'utf8').split('\n', 1)[0]).schemaVersion; } catch { return undefined; }
 }
-const baseSchema = args.baseline ? baselineSchema(args.baseline) : undefined;
-if (args.baseline && baseSchema !== undefined && baseSchema !== SCHEMA) {
-    process.stdout.write('  vs baseline: not compared -- baseline schema ' + baseSchema + ' != ' + SCHEMA + '\n');
-    process.stderr.write('soak:report: NOTE * baseline not compared: schema ' + baseSchema + ' != ' + SCHEMA + '\n');
-}
-if (args.baseline && (baseSchema === undefined || baseSchema === SCHEMA)) {
+if (args.baseline) {
+    // A foreign-schema baseline is INCOMPATIBLE (its fields differ) -- a hard error (exit 1), checked BEFORE
+    // load() because load() would die(2) on a foreign schema, which is the wrong code for a bad baseline.
+    const baseSchema = baselineSchema(args.baseline);
+    if (baseSchema !== undefined && baseSchema !== SCHEMA) die(1, 'BASELINE INCOMPATIBLE -- baseline schema ' + baseSchema + ' != ' + SCHEMA + ' (regenerate the baseline on this schema)');
     const base = load(args.baseline);
     // S12: the baseline must itself be sound evidence -- integrity OK and not an overridden stream.
     const bd = rederive(base);
@@ -382,6 +454,8 @@ if (args.baseline && (baseSchema === undefined || baseSchema === SCHEMA)) {
         die(1, 'BASELINE INTEGRITY MISMATCH -- ' + (bd.verdict !== base.summary.verdict ? 're-derived ' + bd.verdict + ' != recorded ' + base.summary.verdict : bd.issues.length + ' issue(s)'));
     }
     if ((bkh.kernelOverride === true || bkh.poolOverride === true) && !args.allowOverride) die(1, 'the BASELINE ran an overridden kernel/pool; pass --allow-override to compare against it');
+    // A baseline must be GREEN: a re-derived FAIL or INCONCLUSIVE is not a valid comparison point.
+    if (bd.verdict !== VERDICT.PASS) die(1, 'BASELINE NOT GREEN -- re-derived ' + bd.verdict + ' (a baseline must be a PASS run)');
     const bwarm = base.header.config ? base.header.config.warmupCycles : 0;
     const bN = base.header.config ? base.header.config.gateN : 3;
     const cwarm = header.config ? header.config.warmupCycles : 0;
@@ -444,8 +518,11 @@ if (args.baseline && (baseSchema === undefined || baseSchema === SCHEMA)) {
 // SVG report (--out) -----------------------------------------------------------------------------
 if (args.out) { writeFileSync(args.out, renderHtml(doc, gate, verdict, integrityOk, issues, breachList)); process.stdout.write('  wrote ' + args.out + '\n'); }
 
-// exit: integrity mismatch, a regression, or an overridden kernel/pool is a hard failure.
+// exit: an overridden kernel/pool, a parity mismatch, an integrity mismatch, or a regression is a hard
+// failure. Overridden is checked first (a mutant run is also a parity mismatch, but 'NOT A RELEASE SOAK'
+// is the precise reason); then parity (the shipped files did not match their pins when the run was made).
 if (overridden && !args.allowOverride) die(1, 'NOT A RELEASE SOAK -- the stream ran an overridden ' + (kh.kernelOverride ? 'kernel' : 'pool') + ' (SOAK_KERNEL/SOAK_POOL); pass --allow-override to analyse it anyway');
+if (!(par && par.ok === true) && !args.allowParityMismatch) die(1, 'PARITY MISMATCH -- header.parity.ok is ' + (par === null ? 'absent' : JSON.stringify(par.ok)) + (par && Array.isArray(par.mismatched) && par.mismatched.length ? ' (' + par.mismatched.join(', ') + ')' : '') + '; the shipped files did not match their pins -- pass --allow-parity-mismatch to analyse it anyway');
 if (!integrityOk) die(1, 'INTEGRITY MISMATCH -- ' + (verdict !== summary.verdict ? 're-derived verdict ' + verdict + ' != recorded ' + summary.verdict : issues.length + ' consistency issue(s)'));
 if (regressionFail) die(1, 'REGRESSION vs baseline');
 process.exit(0);
@@ -478,6 +555,7 @@ function renderHtml(doc, gate, verdict, integrityOk, issues, breachList) {
         { key: 'hotOpsDense', label: 'throughput/s', color: '#10b981' },
         { key: 'latency.p99', label: 'p99 ns', color: '#f59e0b' },
         { key: 'hotBytesPerOp', label: 'hot B/op', color: '#ef4444' },
+        { key: 'drainMs', label: 'drain ms', color: '#8b5cf6' },
     ];
     let rows = '';
     for (const lane of lanes) {

@@ -9,13 +9,19 @@
  *   1. yield a tick so async GC entries land in the profiler window
  *   2. gc.summary() -> workload major / minor / maxPause (since the last reset)
  *   3. drop references to the cycle's balancer + arrays
- *   4. forced gc() loop until tracker.size() === 0 (<= 8 tries), plus any injected extra GCs
+ *   4. forced gc() drain until tracker.size() === 0 or DRAIN_BUDGET_MS (2000 ms) is exhausted: each
+ *      try is gc() then a yield -- setTimeout(0) for the first 4 tries, setTimeout(10) after -- to give
+ *      FinalizationRegistry callbacks room to land. A real leak never drains in 2 s. Plus any injected
+ *      extra GCs (teeth). forcedGcTries and drainMs (ms, 0.1) are reported.
  *   5. heap sample -- asserted to run AFTER the last forced GC (heapSampleSeq === forcedGcSeq + 1)
  *   6. return the rollup (caller emits the record)
  *   7. gc({type:'minor'}) to tidy, then gc.reset() so the next cycle's summary is pure workload
  */
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const DRAIN_BUDGET_MS = 2000;
 
 function forceGc(minor) {
     const g = globalThis.gc;
@@ -50,21 +56,22 @@ export async function closeLaneCycle(gc, tracker, dropRefs, opts) {
     // 3) drop references
     if (dropRefs) dropRefs();
 
-    // 4) forced GC loop until the tracker drains. `heapReadOk` starts false and only the heap-sample
-    // step (5) sets it true, AFTER at least one forced GC ran -- a real ordering guard, not a counter
-    // that checks itself: if the heap read is ever moved before the GC loop, forcedGc stays 0 and the
-    // assert fires.
+    // 4) forced GC drain until the tracker reaches zero or DRAIN_BUDGET_MS is exhausted. The loop
+    // always runs at least one forced GC, so the step-5 ordering guard (forcedGc >= 1) still holds:
+    // if the heap read is ever moved before the drain, forcedGc stays 0 and the assert fires. The
+    // first 4 tries yield a bare tick; later tries wait 10 ms so FinalizationRegistry callbacks land.
     let forcedGc = 0;
     let live = tracker.size();
     let tries = 0;
-    for (let i = 0; i < 8; i++) {
+    const drainStart = performance.now();
+    do {
         forceGc(false);
         forcedGc++;
-        await tick();
         tries++;
+        await (tries <= 4 ? tick() : sleep(10));
         live = tracker.size();
-        if (live === 0) break;
-    }
+    } while (live !== 0 && (performance.now() - drainStart) < DRAIN_BUDGET_MS);
+    const drainMs = +((performance.now() - drainStart).toFixed(1));
     // injected extra forced GCs (teeth: prove they do not pollute the workload numbers)
     for (let i = 0; i < extra; i++) { forceGc(false); forcedGc++; }
 
@@ -81,6 +88,6 @@ export async function closeLaneCycle(gc, tracker, dropRefs, opts) {
 
     return {
         workloadMajor, workloadMinor, workloadMaxPauseMs, workloadAvgPauseMs, workloadPauseCount,
-        heapUsedMB, rssMB, trackerSize: live, forcedGcTries: tries, heapSampledAfterGc,
+        heapUsedMB, rssMB, trackerSize: live, forcedGcTries: tries, drainMs, heapSampledAfterGc,
     };
 }

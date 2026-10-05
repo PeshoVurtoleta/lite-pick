@@ -68,8 +68,10 @@ export function checks() {
  * A covered check may not stay here (the meta-test fails), and an entry needs its proof.
  */
 export const UNREACHABLE = Object.freeze({
-    'gate=totalPicks': 'config requires >= 1 lane and SOAK_PICKS >= 20000, and every lane-cycle runs them; ' +
-        'only a stream with zero work (soak:report) or a harness bug reaches it -- proof: unit',
+    'gate=totalPicks': 'config requires >= 1 lane and SOAK_PICKS >= 20000, and EVERY lane-cycle runs them -- ' +
+        'the warm-up cycle now counts its picks too (gates.push -> warmPicks), so even a run that completed ' +
+        'only the warm-up cycle has work and is INCONCLUSIVE, not totalPicks=0; only a stream with zero work ' +
+        '(soak:report) or a harness bug reaches this FAIL -- proof: unit',
     'soak: INCONCLUSIVE -- hotAlloc[': 'measureHotBytesPerOp returns either a B/op or gcFree 0 (the gross ' +
         'FAIL); "measured nothing without a scavenge-FAIL" exists only in a stream -- proof: unit',
     'tracker': 'main.mjs registers no lite-leak kernel, so tracker.audit() and onWarning can never report; ' +
@@ -101,6 +103,19 @@ export function validSpec(spec) {
     const fam = toks[0].split('=')[0];
     if (BREACH_FAMILIES.indexOf(fam) === -1) return 'unknown breach family ' + fam;
     for (const t of toks) {
+        // `key>=number`: a numeric-threshold token (the hotAlloc FAIL breach promotes `bop=<min>` into the
+        // head; a spec matches it with `bop>=0.3`). Only valid on gate=hotAlloc today.
+        const ge = t.indexOf('>=');
+        if (ge !== -1) {
+            const key = t.slice(0, ge);
+            if (key !== 'bop') return 'unknown >= key ' + key;
+            if (toks.indexOf('gate=hotAlloc') === -1) return 'bop>= only valid on gate=hotAlloc';
+            // A finite number with at least one digit: Number('') is 0 (finite), so test the SHAPE too, or an
+            // empty/garbage threshold `bop>=` would pass and the spec could never match a real breach.
+            const num = t.slice(ge + 2);
+            if (!/^\d+(?:\.\d+)?$/.test(num) || !Number.isFinite(Number(num))) return 'bop>= needs a number';
+            continue;
+        }
         const eq = t.indexOf('=');
         if (eq === -1) { if (t !== toks[0]) return 'bare token ' + t + ' after the family'; continue; }
         const key = t.slice(0, eq), val = t.slice(eq + 1);

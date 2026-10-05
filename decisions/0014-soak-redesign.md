@@ -83,9 +83,11 @@ Replace `benchmark/Soak.mjs` with `benchmark/soak/*`:
   balance, stickiness, latency steering, memory, or the `/pool` lifecycle.
 - Deferred (report-only, not gated yet): the rebuild-storm p99 gate (a `rebuild()` is O(M*N), too costly
   to sample 2000x/cycle); a future rebuild micro-bench should gate per-rebuild B/op (FINDINGS L14).
-- Calibration: the hot-alloc bound is 0.02 B/op (clean lanes read 0.000); the heap slack is
-  `1.10x + 2 MB`; the RSS runaway guard is `1.75x band-center + 16 MB`. These are recorded in the header
-  every run so a drift in the calibration itself is visible.
+- Calibration: the hot-alloc NOTE floor is 0.02 B/op (clean lanes read 0.000); since the 2026-10-05
+  amendment the hot-alloc FAIL tier is 0.3 B/op on the two-pass MIN over `>= 2` post-warm-up cycles (that
+  amendment records the margins). The heap slack is `1.10x + 2 MB`; the RSS runaway guard is
+  `1.75x band-center + 16 MB`. These are recorded in the header every run so a drift in the calibration
+  itself is visible.
 - `soak:report` integrity re-derives the verdict from the raw cycle records (gate + quality + invariant +
   tracker + pool asserts + the phase-fired self-check + lane conclusiveness), validates `gateN` /
   `warmupCycles` against the `config.mjs` constants, and requires a complete, non-truncated,
@@ -217,7 +219,8 @@ it false-FAILs a correct kernel. Two decisions change:
   zeroed node), so its control targets WeightedRandom. `pooldrop` was never wired and is removed. Gaps 28 ->
   11; the rest are new kernel mutants (9c2: hotAlloc gross tier, SED, NQ) and checks main.mjs cannot reach
   from a kernel or mode (9c3: gcPause, rebuild, totalPicks, freeze, phases, tracker, two INCONCLUSIVE causes).
-- **Burst 9c2 (2026-10-04).** Kernel mutants M17 (SED weight-blind), M18 (NQ never-queue removed) and M19
+- **Burst 9c2 (2026-10-04).** Kernel mutants M17 (SED weight-blind; renumbered M21, 2026-10-05 -- M17 is now
+  the 2-field-object/pick hotAlloc FAIL control), M18 (NQ never-queue removed) and M19
   (~2 KB per pick). M19 found that the hotAlloc gross tier -- the soak's only HARD allocation gate since S1
   -- was hollow for heavy allocation: snapshot-based GC detection aliases once a window runs several
   scavenges (~90% of windows read "GC-free" at ~54 B/op), so a 2 KB/op allocator produced only a NOTE.
@@ -386,3 +389,92 @@ is 19). Power of the 50%-ignore mutant fell at live 8-11 (38-63% per cycle, was 
 old detection came from the fallback bias amplifying the mutant, not from the oracle; 100% from live 49 as
 before. Evidence: `benchmark/soak/p2c-calibration.json`, `benchmark/soak/p2c-power.json` (the `gitSha` in
 their meta is the parent commit; the kernel was the B1 working tree).
+
+## Amendment 2026-10-05 -- a hotAlloc FAIL tier, a 2 s retention drain, and a stricter report
+
+Benchmark-only (the five parity-pinned files stay byte-identical). Two soak batches landed together.
+
+### hotAlloc now FAILs on a real steady-state allocation
+
+The original design (S1, 2026-09-29) made `hotAlloc` report-only below the gross tier, because V8 JIT
+deopt windows box doubles and read 8-20 B/op on a correct kernel on Node 22, which would false-FAIL a clean
+run. The two-pass MIN estimator (`hot.mjs:263`) is robust to those windows: a clean lane's MIN sits at the
+noise floor while a true steady-state allocator's MIN stays high. So the gate gained a middle tier:
+
+| tier  | condition                                                              | verdict |
+|-------|------------------------------------------------------------------------|---------|
+| gross | every B/op window scavenged (~512+ B/op) or a non-finite measurement    | FAIL    |
+| FAIL  | two-pass MIN B/op `>= HOTALLOC_FAIL` (0.3) in `>= 2` post-warm-up cycles | FAIL    |
+| NOTE  | MIN `> HOTALLOC_MAX` (0.02), or a per-pass recurrence across `>= 2` cycles | report  |
+| pass  | otherwise                                                               | PASS    |
+
+The FAIL breach promotes its leading `key=number` tokens into the `soak: BREACH` head
+(`gate=hotAlloc lane=RoundRobin bop=<min> cycles=<n>`) so a teeth spec matches it as `bop>=0.3`; existing
+specs match only the `gate=`/`lane=` head and keep matching.
+
+Calibration (measured 2026-10-05: 5 clean default soaks plus 6 mutants per Node; this table is the record).
+Clean default soaks, the two-pass MIN taken as the max over post-warm-up lane-cycles:
+
+| build                 | clean MIN (max over lane-cycles)     | per-pass max (NOTE only)            |
+|-----------------------|--------------------------------------|-------------------------------------|
+| Node 22.23.3          | 0.017 B/op (3 runs, 600 lane-cycles) | 0.036                               |
+| Node 26.8.2           | 0.005 B/op (2 runs, 400 lane-cycles) | 0.399 once (1 scavenged window)     |
+| audit worst clean     | 0.143 (Linux 4 vCPU, load 14-19)     | --                                  |
+
+Mutant MIN per cycle (Node 22 / Node 26): M4 (2-field object every 64th pick) 0.628-0.631 / 0.614-0.619;
+M3 3.04-3.21 / 2.98-3.22; M2 4.00 / 4.00; M1 39.07 / 39.06; M17 (2-field object EVERY pick) 40.0 / 40.0;
+M16 (64 KB every 2^20 picks) 0.002-0.036 / 0. Margins: **F = 0.3 is 2.05x below M4's lowest (0.614) and
+2.1x above the audit's worst clean MIN (0.143)** -- the widest gap available between noise and the smallest
+mutant. `HOTALLOC_MAX` 0.02 stays the NOTE floor; `hotBopPassMax` stays NOTE-only (a single noisy pass
+reached 0.399 once on clean Node 26).
+
+**M16 stays a NOTE-only control.** Its allocation lands in only ONE B/op pass per cycle (like a true
+one-off), so its MIN is ~0 (0.002-0.036, below both 0.3 and usually 0.02) and the FAIL tier never trips;
+only the per-pass recurrence NOTE fires. Its control therefore asserts exit 0 EXACTLY plus the NOTE. A rare
+PERIODIC allocation is PerfGate's job (isolated scavenge counting), not the soak's.
+
+**`gcPause` and `rebuild` are report-only by declaration, no teeth.** They compute their drift statistic and
+record a `wouldFail`, but can never FAIL a run and have no must-fail control (the teeth meta-test pins both
+as `REPORT_ONLY_GATES` and proves they stay STUB even on input built to breach them): with the semi-space
+pinned at 4 MB a scavenge copies at most ~4 MB, so the mean pause plateaus near 1 ms and cannot pass
+`early*2+1 ms`; a rebuild-storm yields ~8 timed rebuilds per lane-cycle, far below `LAT_MIN_SAMPLES`. A gate
+that can only fire on noise is flake risk.
+
+**Known limitation (open, not fixed here): the warm bias is measured once per process.**
+`header.bopBias.biasBytes` -- the per-window no-op floor subtracted from every B/op -- is sampled once at
+startup. A process that happens to measure an INFLATED bias (observed 3016 B vs the usual ~1864 B on Node 22,
+during peak JIT tier-up) over-subtracts ~0.14 B/op for the whole run: clean lanes still read 0, but M4 reads
+~0.47 instead of ~0.62, so its margin above F=0.3 narrows to ~1.6x (still a FAIL, but not the nominal 2.05x).
+`hot.mjs`'s claim that the MIN "never over-subtracts" is therefore wrong for the CROSS-process case (a single
+process's MIN is the cleanest window IN THAT PROCESS, but a different process can establish a higher floor);
+that comment is corrected (comment only, no logic change). A follow-up -- a running MIN of the bias across
+cycles, or declaring the run INCONCLUSIVE when `biasBytes` is far above the per-Node floor -- is recorded as
+open, not done here.
+
+### A warm-up-only run is INCONCLUSIVE, not "the soak did nothing"
+
+The warm-up cycle's picks now count toward the `totalPicks` gate (`GateAccumulator.push` folds them into
+`warmPicks`; `compute` adds them to the total). A duration-bound run short enough to complete only the
+warm-up cycle (the deadline is checked at cycle start) therefore re-derives INCONCLUSIVE
+(`lane <X> ran 0 post-warmup cycle(s) ... -- only the warm-up cycle completed`) instead of FAILing
+`totalPicks=0`. The teeth I2 control exercises this (1 s / 2,000,000 picks -> exit 3).
+
+### A 2 s retention drain + drainMs telemetry (batch A)
+
+A pool/kernel lane-cycle drains the lite-leak tracker for up to 2 s (forced GCs with a short settle between)
+before asserting `tracker.size() === 0`, so a trailing settle callback is not mistaken for a leak. The
+per-cycle `drainMs` and `forcedGcTries` are recorded (additive cycle fields, no `SCHEMA_VERSION` bump) and
+`soak:report` prints a per-lane retention-drain section.
+
+### `soak:report` fails closed on more
+
+Non-pool retention only is counted as a retention mismatch (a pool A6 is `poolFailures`, not a non-pool
+retention mismatch, which used to double-count and false-flag INTEGRITY MISMATCH on a genuine A6 FAIL
+stream). A signal-interrupted PARTIAL grid is accepted (cycle counts `k` or `k-1` as a prefix of
+`header.laneRoster`, since a signal lands mid-cycle and lanes are processed in roster order). A `--baseline`
+must be sound, GREEN, same-schema evidence: a foreign schema is `BASELINE INCOMPATIBLE` (exit 1, checked
+before `load()` which would `die(2)`), an integrity failure `BASELINE INTEGRITY MISMATCH`, and a re-derived
+non-PASS `BASELINE NOT GREEN`. A stream whose `header.parity.ok` is not true is `PARITY MISMATCH` (exit 1)
+unless `--allow-parity-mismatch`. Unknown flags fail closed with a did-you-mean hint. An unhandled rejection
+is the structured `pool=A7` breach only while a pool lane is in flight (`current.tier === 'pool'`);
+elsewhere it is a CRASH, like an uncaught exception.

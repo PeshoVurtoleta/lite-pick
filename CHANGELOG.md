@@ -77,6 +77,52 @@ per-run array" cost claim for `Pool.run` was wrong; it is now measured, gated, a
   the perf lane with inlining off). On Node < 20 with no install (the CI Node 18 job) the file skips; anywhere
   else a missing devDependency fails.
 
+### Soak harness (benchmark-only)
+
+The soak harness gained real teeth and a stricter analyser. No library change: `Pick.js`, `Pool.js`,
+`Pick.d.ts`, `Pool.d.ts` and `test/invariants.mjs` are byte-identical (the `npm run parity` pins hold).
+
+- **Retention drain (batch A).** A pool/kernel lane-cycle now drains the lite-leak tracker for up to 2 s
+  (forced GCs with a short settle between) before asserting `tracker.size() === 0`, so a trailing settle
+  callback is not mistaken for a leak; the per-cycle `drainMs` / `forcedGcTries` are recorded and
+  `soak:report` prints a per-lane retention-drain section (additive cycle fields, no `SCHEMA_VERSION` bump).
+- **hotAlloc FAIL tier (batch B).** `hotAlloc` was report-only below the gross tier; it now also FAILs when
+  a lane's two-pass MIN B/op reaches `HOTALLOC_FAIL` (0.3) in `>= 2` post-warm-up cycles -- a real
+  steady-state allocation. The gross tier (every window scavenged / a non-finite measurement) stays above,
+  the over-bound NOTE tier (`HOTALLOC_MAX` 0.02, and the per-pass recurrence) stays below. `gcPause` and
+  `rebuild` remain report-only by declaration. Calibrated 2026-10-05 (ADR 0014 amendment): 0.3 is 2.05x
+  below the lowest mutant MIN (M4's 0.614) and 2.1x above the audit's worst clean MIN (0.143); clean default
+  soaks read MIN <= 0.017 B/op (Node 22) / 0.005 (Node 26). A gate breach now promotes its leading
+  `key=number` tokens (e.g. hotAlloc `bop=0.628 cycles=3`) into the `soak: BREACH` head so a teeth spec can
+  match `bop>=0.3`; existing specs match only the `gate=`/`lane=` head and keep matching.
+- **A warm-up-only run is INCONCLUSIVE, not empty.** The warm-up cycle's picks now count as work, so a
+  duration-bound run that completed only the warm-up cycle re-derives INCONCLUSIVE (`-- only the warm-up
+  cycle completed`) instead of FAILing `totalPicks=0 -- the soak did nothing`.
+- **`soak:report` fails closed on more.** It counts non-pool retention only (a pool A6 is `poolFailures`,
+  not a non-pool retention mismatch); accepts a signal-interrupted PARTIAL grid (cycle counts `k` or `k-1`
+  as a roster prefix) as INCONCLUSIVE; refuses a `--baseline` that is a foreign schema (`BASELINE
+  INCOMPATIBLE`), fails its own integrity (`BASELINE INTEGRITY MISMATCH`), or re-derives non-PASS
+  (`BASELINE NOT GREEN`); and refuses a stream whose `header.parity.ok` is not true (`PARITY MISMATCH`)
+  unless `--allow-parity-mismatch`. Unknown flags fail closed with a did-you-mean hint.
+- **An unhandled rejection is pool A7 only during a pool lane.** Elsewhere (no pool run in flight) it is a
+  CRASH, like an uncaught exception, never mislabelled a structured `pool=A7` breach; `main.mjs` stamps the
+  in-flight tier on the fatal context.
+- **Teeth + tests.** New must-fail controls: the hotAlloc FAIL tier (M1-M4 and a new M17 2-field-object/pick
+  all exit 1 naming `bop>=0.3`; M16 stays a NOTE-only exit-0 control); I2 (a 1 s / 2,000,000-pick run that
+  completes only the warm-up cycle -> exit 3 `lane SED ran 0`); and `soak:report` controls for a genuine A6
+  FAIL (integrity OK), a red baseline, a foreign-schema baseline, and a parity mismatch (refused + allowed).
+  The pre-existing SED weight-blind control was renumbered **M17 -> M21** to free M17 for the new alloc
+  control. New `test/SoakReport.test.js` builds small smoke streams and asserts the six exact report
+  behaviours. One-time revert proof (run against cd060cd's `SoakReport.mjs`, not committed to the test so it
+  cannot go red once this is HEAD): **>= 5 of the 6 cases differed** -- A6 FAIL, signal-partial grid, red
+  baseline, foreign-schema baseline, and parity mismatch all changed exit code; the non-signal partial grid
+  (exit 1 both ways) was the one that did not.
+- **Capstone: the heartbeat and the real-thread smoke held the flaky fault for a fixed 3 s and then required
+  the breaker to have opened -- at 600 req/s that misses 2.2% of the time (5 failures in a row among ~225
+  jobs), failing ~81% of 30-minute nightlies (2026-10-05). Both now hold the fault until the breaker moves
+  (capped at 16 s; a miss < 1e-6) and shift the rest of the timeline; `flakyWaitS` per heartbeat cycle; new
+  teeth control `nobreaker`.**
+
 ### Fixed
 
 - **PerfGate flaked on CI: the B6 1.7e15-clock lanes read 1 scavenge (N:1 8N:1) on GitHub's ubuntu runner.**
@@ -280,8 +326,8 @@ B7 docs. No API is removed. Behaviour changes are listed under Changed, plus the
   FAIL) never fired and the run printed only the report-only NOTE. Each window is now bracketed by
   `v8.GCProfiler`, whose synchronous `stop()` lists every collection in it; a window counts as GC-free only
   if it saw none (and the snapshots agree). Clean kernels still read 0 B/op; cost ~4% of soak runtime.
-  New kernel mutants: M17 (SED weight-blind score), M18 (NQ never-queue shortcut removed), M19 (2 KB per
-  pick -> hotAlloc gross tier). Declared gaps: 11 -> 8.
+  New kernel mutants: M17 (SED weight-blind score; renumbered M21 on 2026-10-05, see [Unreleased]), M18 (NQ
+  never-queue shortcut removed), M19 (2 KB per pick -> hotAlloc gross tier). Declared gaps: 11 -> 8.
 - **Benchmark-only: the teeth battery covers every check that can decide a soak verdict (audit
   2026-09-29).** No declared gaps remain. New controls: M20 (a kernel whose `setEligible(i, true)` is
   ignored -> the freeze self-check) and MM8 (new mode `phaseskip` -> the chaos-phase self-check). Three

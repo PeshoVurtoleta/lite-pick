@@ -25,6 +25,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MIN_ACTIVE_CYCLES } from './config.mjs';
+import { HOTALLOC_FAIL } from './gates.mjs';
 
 // Every control runs exactly the active floor (2N + warm-up cycles), so its drift gates are ACTIVE.
 const CYC = String(MIN_ACTIVE_CYCLES);
@@ -147,9 +148,20 @@ function matchWant(stderr, spec) {
     }
     return false;
 }
-/** `k=v` matches a line token `k=v` or `k=a,v,b` (main joins several quality kinds with commas). */
+/** `k=v` matches a line token `k=v` or `k=a,v,b` (main joins several quality kinds with commas).
+ *  `k>=n` matches a numeric head token `k=m` when m >= n (the hotAlloc FAIL breach promotes `bop=<min>`). */
 function hasToken(have, t) {
     if (have.indexOf(t) !== -1) return true;
+    const ge = t.indexOf('>=');
+    if (ge !== -1) {
+        const key = t.slice(0, ge), bound = parseFloat(t.slice(ge + 2));
+        return have.some((h) => {
+            const eq = h.indexOf('=');
+            if (eq === -1 || h.slice(0, eq) !== key) return false;
+            const v = parseFloat(h.slice(eq + 1));
+            return Number.isFinite(v) && Number.isFinite(bound) && v >= bound;
+        });
+    }
     const eq = t.indexOf('=');
     if (eq === -1) return false;
     const key = t.slice(0, eq + 1), val = t.slice(eq + 1);
@@ -197,22 +209,28 @@ function poolControl(name, poolSrc, env, wantStatus, wantBreach) {
 const A = 20000, Q = 100000;   // alloc mutants can use a short main loop; quality mutants need windows
 
 // --- alloc mutants (RoundRobin.pick), driven through the hotAlloc PROBE -------------------------
-// hotAlloc is REPORT-ONLY (S1, audit 2026-09-29: V8 JIT state false-FAILs a correct kernel on Node 22;
-// PerfGate owns per-op 0 B/op and is proven against these same mutants). The control now asserts the
-// probe still SEES the allocation: a `soak: NOTE -- hotAlloc[RoundRobin]` line. Exit 0, or 1 when a gross
-// allocator (M1 320 KB arrays, M2 a growing retained log) ALSO forces a workload major GC -- the hard
-// gcMajor gate catching it is correct, but whether it happens depends on the run length.
+// hotAlloc has a FAIL tier (maintainer decision 2026-10-05, ADR 0014): a lane whose two-pass MIN B/op
+// reaches HOTALLOC_FAIL (0.3) in >= 2 post-warm-up cycles FAILs. M1-M4 are steady-state allocators whose
+// MIN sits far above 0.3 (M4's 2-field-object/64 is ~0.62, the lowest; M3 ~3, M2 ~4, M1 ~39), so each must
+// FAIL (exit 1) naming `gate=hotAlloc lane=RoundRobin bop>=0.3`. M16 (a rarer-than-one-pass periodic alloc,
+// MIN ~0) stays a NOTE-only control. PerfGate still owns per-op 0 B/op and is proven against these mutants.
 // They need Q picks: with A the RoundRobin quality windows never fill and the run is (correctly)
-// INCONCLUSIVE (S5) -- a FAIL used to mask that.
+// INCONCLUSIVE (S5), which would mask the hotAlloc verdict.
 const NOTE_RR = 'soak: NOTE -- hotAlloc[RoundRobin]';
+const FAIL_RR = 'gate=hotAlloc lane=RoundRobin bop>=' + HOTALLOC_FAIL;
 control('M1 160KB-array/8192', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c & 8191) === 0) { this.__o = new Array(40000); }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 1, FAIL_RR);
 control('M2 retained-log/8th', patch(PICK, RR_ANCHOR, RR_INJECT('if (!this.__log) this.__log = []; if ((this.__c & 7) === 0) this.__log.push({ a: this.__c });')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 1, FAIL_RR);
 control('M3 64KB-burst/24576', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c % 24576) === 0) { this.__o = new Array(8192); }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 1, FAIL_RR);
 control('M4 2-field-object/64', patch(PICK, RR_ANCHOR, RR_INJECT('if ((this.__c & 63) === 0) { this.__o = { a: this.__c, b: 0 }; }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 1, FAIL_RR);
+// M17: a 2-field object on EVERY RoundRobin pick (MIN ~40 B/op) -- the densest steady-state allocator, the
+// top of the FAIL tier. Same FAIL spec as M1-M4. (Against HEAD's report-only gates.mjs it exits 0, so this
+// control MISSES there -- the revert-check the FAIL tier earns.)
+control('M17 2-field-object/pick', patch(PICK, RR_ANCHOR, RR_INJECT('this.__o = { a: this.__c, b: 0 };')),
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 1, FAIL_RR);
 
 // --- quality mutants, driven through the SmoothWRR / WeightedRandom oracles ----------------------
 // M5: SmoothWRR ignores weight in the accumulator -> a PERSISTENT ratio corruption (near-uniform
@@ -332,10 +350,11 @@ control('M15 BoundedLoad _total desync',
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'BoundedLoad' }, 1, 'quality lane=BoundedLoad kind=oracle');
 
 // --- burst 9c2 (audit 2026-09-29): the last oracle lanes and the hotAlloc gross tier, as KERNEL mutants. ---
-// M17: SED goes weight-blind (score = in-flight + 1, the LeastConn rule) -> the SED argmin oracle, which
+// M21: SED goes weight-blind (score = in-flight + 1, the LeastConn rule) -> the SED argmin oracle, which
 // recomputes (inflight + 1) / weight independently, disagrees whenever weights differ. The score line is
-// shared verbatim with NQ; the mutant runs on the SED lane only.
-control('M17 SED weight-blind score',
+// shared verbatim with NQ; the mutant runs on the SED lane only. (Renumbered from M17, which is now the
+// 2-field-object/pick alloc FAIL control above.)
+control('M21 SED weight-blind score',
     patchAll(PICK, '                    const score = (inf[i] + 1) / w;', '                    const score = inf[i] + 1;', 4),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'SED' }, 1, 'quality lane=SED kind=oracle');
 // M18: NQ loses its never-queue shortcut (an idle node no longer wins outright) -> it degenerates to SED and
@@ -362,9 +381,11 @@ control('M20 setEligible up ignored (freeze)',
 // the bound). The MIN estimator misses it (it lands in only one pass per cycle, like a one-off), but it
 // RECURS every cycle -> the cross-cycle recurrence rule (max(pass1,pass2) > bound in >=2 cycles) trips.
 // A genuine one-off (once per process) does NOT recur and correctly does not fire.
+// Exit 0 EXACTLY: its MIN B/op is ~0 (the alloc lands in only one pass per cycle, below HOTALLOC_FAIL AND
+// usually below HOTALLOC_MAX), so the FAIL tier never trips; only the per-pass recurrence NOTE fires.
 control('M16 64KB/2^20 periodic (recurrence)',
     patch(PICK, RR_ANCHOR, RR_INJECT('globalThis.__P20 = (globalThis.__P20 | 0) + 1; if ((globalThis.__P20 & 0xFFFFF) === 0) { this.__o = new Array(8192); }')),
-    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, [0, 1], NOTE_RR);
+    { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin' }, 0, NOTE_RR);
 
 // --- POOL LANE teeth (T14-15): each assertion proven by a REAL Pool.js mutant via the SOAK_POOL seam
 // (Pool.js stays byte-frozen -- the mutant is a scratch copy). These catch REAL Pool bugs, not harness
@@ -496,8 +517,10 @@ if (want('REVERT 1.0.0 kernel (H1/H3/H4)')) {
 }
 
 // --- S5 (audit 2026-09-29): a run without the evidence to judge is INCONCLUSIVE (exit 3), never PASS. --
-// I1: a bounded run interrupted by SIGINT after cycle 1. I2: a duration-bound run too short to reach the
-// 2N active floor. Both run the CLEAN in-tree kernel.
+// I1: a bounded run interrupted by SIGINT after cycle 1. I2: a duration-bound run so short (1s with a huge
+// per-cycle pick count) that ONLY the warm-up cycle completes -- the deadline is checked at cycle start
+// (main.mjs ~:575), so cycle 0 always runs, then cycle 1 trips the deadline -> every lane has 0 post-warm-up
+// cycles -> INCONCLUSIVE. Both run the CLEAN in-tree kernel.
 function runSoakSigint(env) {
     return new Promise((resolve) => {
         const full = Object.assign({}, process.env, { SOAK_OUT: join(TMP, 'sig-' + (idx++) + '.jsonl') }, env);
@@ -510,14 +533,14 @@ function runSoakSigint(env) {
         ch.on('exit', (code) => resolve({ status: sent ? (code === null ? -1 : code) : -2, stderr }));
     });
 }
-const I1_ENV = { SOAK_LANES: 'SED,NQ,SmoothWRR' }, I2_ENV = { SOAK_DURATION: '10s', SOAK_LANES: 'SED,NQ,SmoothWRR' };
+const I1_ENV = { SOAK_LANES: 'SED,NQ,SmoothWRR' }, I2_ENV = { SOAK_DURATION: '1s', SOAK_PICKS: '2000000', SOAK_LANES: 'SED,NQ,SmoothWRR' };
 if (want('I1 SIGINT after cycle 1')) {
     if (LIST) listed('I1 SIGINT after cycle 1', 'main', I1_ENV, 3, 'soak: INCONCLUSIVE -- run interrupted before its end');
     else record('I1 SIGINT after cycle 1', await runSoakSigint(I1_ENV), 3, 'soak: INCONCLUSIVE -- run interrupted before its end');
 }
-if (want('I2 SOAK_DURATION=10s')) {
-    if (LIST) listed('I2 SOAK_DURATION=10s', 'main', I2_ENV, 3, 'soak: INCONCLUSIVE -- lane SED ran');
-    else record('I2 SOAK_DURATION=10s', runSoak(writeMutant(PICK, 'I2'), I2_ENV), 3, 'soak: INCONCLUSIVE -- lane SED ran');
+if (want('I2 SOAK_DURATION=1s')) {
+    if (LIST) listed('I2 SOAK_DURATION=1s', 'main', I2_ENV, 3, 'soak: INCONCLUSIVE -- lane SED ran 0');
+    else record('I2 SOAK_DURATION=1s', runSoak(writeMutant(PICK, 'I2'), I2_ENV), 3, 'soak: INCONCLUSIVE -- lane SED ran 0');
 }
 
 // --- S2 (audit 2026-09-29): the timing gates are noise-aware (time-sized batches, N=5, MAD + exact
@@ -537,6 +560,9 @@ modeControl('ML slowleak 1KB/lane-cycle (heap)', { ...LONG, SOAK_MUSTFAIL: 'slow
 // --- pass-control: the CLEAN kernel through the same path must exit 0 ----------------------------
 control('P clean kernel (pass-control)', PICK,
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' }, 0, null);
+// PF: the CLEAN kernel over the FULL default roster (no SOAK_* overrides) must exit 0 -- the default
+// run every nightly makes, including the pool lanes whose retention drain this batch changed.
+control('PF full roster default (pass-control)', PICK, {}, 0, null);
 poolControl('P2 clean pool (pass-control)', patchPool("from '" + REAL_PICK_URL + "'", "from '" + REAL_PICK_URL + "'"),
     { ...PA, SOAK_LANES: 'PoolP2C' }, 0, null);
 
@@ -563,6 +589,10 @@ if (want('RPT overridden pool -> not a release soak')) {
     reportControl('RPT overridden pool -> not a release soak', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_POOL: pp }, 1);
 }
 reportControl('RPT genuine FAIL stream -> integrity OK', { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin', SOAK_MUSTFAIL: 'imbalance' }, 0);
+// A GENUINE pool A6 FAIL (poolretain): the report must re-derive FAIL (matching the recorded FAIL), i.e.
+// [integrity OK], and therefore exit 0 -- NOT INTEGRITY MISMATCH (exit 1). The report's job is integrity,
+// not to propagate the soak's own FAIL verdict as its exit code.
+reportControl('RPT genuine A6 FAIL -> integrity OK', { ...PA, SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolretain' }, 0);
 
 // --- S13 (audit 2026-09-29): the hot-path CLEAN probe (_probe.mjs) is part of the battery. PP: the clean tree
 // passes it (every lane, the EventQueue and the latency sampler 0 B/op beyond the runtime's clock boxing; no
@@ -609,6 +639,9 @@ function tamperControl(name, env, edit, wantSpec, baselineOf, moreArgs, wantStat
     record(name, runReport(cur, extra), wantStatus, wantSpec);
 }
 const RPT_ENV = { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' };
+// A GREEN (PASS) stream: Q picks so the RoundRobin quality windows fill (RPT_ENV at A=20000 is INCONCLUSIVE,
+// which the report now refuses as a baseline -- BASELINE NOT GREEN). Used for every baseline-diff control.
+const RPT_GREEN = { SOAK_CYCLES: CYC, SOAK_PICKS: String(Q), SOAK_LANES: 'RoundRobin,SmoothWRR,WeightedRandom' };
 // drop 8 of the 11 cycles of every lane AND delete the two counters that used to be the only cycle check.
 tamperControl('RPT S12 dropped cycles + deleted counters', RPT_ENV, (recs) => reseq(recs.filter((r) => !(r.type === 'cycle' && r.cycle >= 3)).map((r) => {
     if (r.type === 'summary') { delete r.rollups; delete r.cyclesRun; } return r;
@@ -627,16 +660,27 @@ tamperControl('RPT S12 baseline: pool regression', { ...PA, SOAK_LANES: 'PoolP2C
 const scaleOps = (k) => (recs) => recs.map((r) => { if (r.type === 'cycle' && typeof r.hotOpsDense === 'number') r.hotOpsDense *= k; return r; });
 const shiftHeap = (mb) => (recs) => recs.map((r) => { if (r.type === 'cycle' && typeof r.heapUsedMB === 'number') r.heapUsedMB += mb; return r; });
 const otherNode = (recs) => recs.map((r) => { if (r.type === 'header') r.node = 'v20.0.0'; return r; });
-tamperControl('RPT baseline: timing is report-only', RPT_ENV, null, 'soak:report: NOTE RoundRobin throughput -50.0% vs baseline (report-only',
-    () => editedStream(genuineStream(RPT_ENV), scaleOps(2)), null, 0);
-tamperControl('RPT baseline: heap +5 MB fails', RPT_ENV, null, 'soak:report: REGRESSION vs baseline',
-    () => editedStream(genuineStream(RPT_ENV), shiftHeap(-5)));
-tamperControl('RPT baseline: other Node major -> heap not compared', RPT_ENV, null, 'soak:report: NOTE * heap not compared',
-    () => editedStream(genuineStream(RPT_ENV), (recs) => otherNode(shiftHeap(-5)(recs))), null, 0);
-// A schema bump (S9: 3 -> 4) must not break the nightly: an older-schema baseline is "not compared", exit 0.
-tamperControl('RPT baseline: older schema -> not compared', RPT_ENV, null, 'soak:report: NOTE * baseline not compared: schema',
-    () => editedStream(genuineStream(RPT_ENV), (recs) => recs.map((r) => { if (r.type === 'header') r.schemaVersion = 3; return r; })), null, 0);
-tamperControl('RPT S12 baseline integrity', RPT_ENV, null, 'soak:report: BASELINE INTEGRITY MISMATCH', () => editedStream(genuineStream(RPT_ENV), (recs) => recs.filter((r, i) => i !== 5)));
+tamperControl('RPT baseline: timing is report-only', RPT_GREEN, null, 'soak:report: NOTE RoundRobin throughput -50.0% vs baseline (report-only',
+    () => editedStream(genuineStream(RPT_GREEN), scaleOps(2)), null, 0);
+tamperControl('RPT baseline: heap +5 MB fails', RPT_GREEN, null, 'soak:report: REGRESSION vs baseline',
+    () => editedStream(genuineStream(RPT_GREEN), shiftHeap(-5)));
+tamperControl('RPT baseline: other Node major -> heap not compared', RPT_GREEN, null, 'soak:report: NOTE * heap not compared',
+    () => editedStream(genuineStream(RPT_GREEN), (recs) => otherNode(shiftHeap(-5)(recs))), null, 0);
+// A schema bump (S9) makes an older-schema baseline INCOMPATIBLE -- a hard error (exit 1), not a silent skip.
+tamperControl('RPT baseline: older schema -> incompatible', RPT_GREEN, null, 'soak:report: BASELINE INCOMPATIBLE',
+    () => editedStream(genuineStream(RPT_GREEN), (recs) => recs.map((r) => { if (r.type === 'header') r.schemaVersion = 3; return r; })));
+tamperControl('RPT S12 baseline integrity', RPT_GREEN, null, 'soak:report: BASELINE INTEGRITY MISMATCH', () => editedStream(genuineStream(RPT_GREEN), (recs) => recs.filter((r, i) => i !== 5)));
+// A baseline that re-derives to a non-PASS verdict (here an INCONCLUSIVE A=20000 run) is refused: it is not
+// a valid comparison point. Integrity still matches (INCONCLUSIVE == recorded), so this is BASELINE NOT GREEN.
+tamperControl('RPT red baseline refused', RPT_GREEN, null, 'soak:report: BASELINE NOT GREEN', () => genuineStream(RPT_ENV));
+// An untampered-except-parity stream (only header.parity.ok flipped, which integrity does not re-derive) is
+// refused: the shipped files did not match their pins when the run was made. --allow-parity-mismatch allows it.
+tamperControl('RPT parity mismatch', RPT_GREEN,
+    (recs) => recs.map((r) => { if (r.type === 'header') r.parity = { ok: false, mismatched: ['Pick.js'], error: null }; return r; }),
+    'soak:report: PARITY MISMATCH');
+tamperControl('RPT parity mismatch allowed', RPT_GREEN,
+    (recs) => recs.map((r) => { if (r.type === 'header') r.parity = { ok: false, mismatched: ['Pick.js'], error: null }; return r; }),
+    null, null, ['--allow-parity-mismatch'], 0);
 
 if (out.length === 0) { allOk = false; out.push('  MISS MUSTFAIL_ONLY=' + process.env.MUSTFAIL_ONLY + ' selected no control'); }
 if (LIST) {

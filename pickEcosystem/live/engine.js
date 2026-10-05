@@ -46,6 +46,7 @@ export class Engine {
         this.n = config.workers;
         this.mode = ENGINE_A;
         this.draining = false;
+        this.lastWorker = -1;     // the worker the last request went to (-1: none) -- the hot-key panel's mapping
 
         // ---- engine A: the request table ------------------------------------------------
         const R = config.maxRequests;
@@ -92,7 +93,7 @@ export class Engine {
         c[S_ARRIVED]++;
         if (this.draining) { c[S_DRAINED]++; return false; }
         if (this.mode === ENGINE_B) return this._requestB(key);
-        if (this.freeTop === 0) { c[S_SHED]++; return false; }
+        if (this.freeTop === 0) { c[S_SHED]++; this.lastWorker = -1; return false; }
         const r = this.free[--this.freeTop];
         this.rKey[r] = key >>> 0;
         this.rArrive[r] = this.now();
@@ -126,7 +127,7 @@ export class Engine {
         this._key[0] = this.rKey[r];
         let i = this._pick();
         if (this.rTries[r] > 0 && i === this.rFirst[r]) i = this._other(i);
-        if (i < 0) { this.stats.c[S_NONE]++; this._finishA(r, false); return; }
+        if (i < 0) { this.stats.c[S_NONE]++; this.lastWorker = -1; this._finishA(r, false); return; }
         this.rTries[r]++;
         if (this.rFirst[r] < 0) this.rFirst[r] = i;
         this.seq = (this.seq + 1) & 0x7fffffff;
@@ -139,8 +140,10 @@ export class Engine {
         const bal = this.bal;
         if (bal.hasNote) bal.lb.note(i, 1);
         this.rSent[r] = this.now();
+        this.lastWorker = i;
         this.fleet.onDispatch(i);
         this.bus.emit('dispatch', i);
+        if (this.rTries[r] > 1) this.bus.emit('reroute', this.rFirst[r] * 256 + i);   // "w1 -> w2", the decision stream
     }
 
     _attemptFailed(r) {
@@ -193,6 +196,7 @@ export class Engine {
         const bal = this.bal;
         const opts = bal.keyed ? { key, tries: this.cfg.tries } : bal.latency ? { clock: this._clockNs, tries: this.cfg.tries } : { tries: this.cfg.tries };
         this.pendingB++;
+        this.lastWorker = -1;     // engine B picks asynchronously
         this.pool.run((i, signal) => {
             self.fleet.onDispatch(i);
             self.bus.emit('dispatch', i);

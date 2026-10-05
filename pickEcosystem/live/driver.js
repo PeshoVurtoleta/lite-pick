@@ -12,6 +12,7 @@
 import { S_OK } from './stats.js';
 
 const SHARE_DECAY = 0.8;     // per frame: the rolling share follows the last ~5 frames
+const KEY_DECAY = 0.9;       // per frame: the hot-key panel's recency weighting
 
 export class LiveDriver {
     constructor(kernel) {
@@ -27,9 +28,41 @@ export class LiveDriver {
         this.shareDecay = new Float64Array(n);
         this._lastPerOk = new Float64Array(n);
         this._lastOk = 0;
+        // The renderer's key panel, by Zipf rank (traffic.js keeps the counts and the last-routed worker).
+        this.weights = kernel.balancers.shared.weights;
+        this.keyFreq = kernel.traffic.rankFreq;
+        this.keyWorker = kernel.traffic.rankWorker;
     }
 
     get strategyName() { return this.k.balancers.name; }
+    get keyed() { return this.k.balancers.keyed; }
+
+    /** Fill `out` with the hottest ranks by recent share, hottest first; returns the count. Cold (render rate). */
+    hotKeys(out) {
+        const f = this.keyFreq;
+        const n = out.length;
+        let m = 0;
+        for (let slot = 0; slot < n; slot++) {
+            let best = -1, bestF = 0;
+            for (let k = 0; k < f.length; k++) {
+                const v = f[k];
+                if (v <= bestF) continue;
+                let taken = false;
+                for (let j = 0; j < m; j++) if (out[j] === k) { taken = true; break; }
+                if (!taken) { best = k; bestF = v; }
+            }
+            if (best < 0) break;
+            out[m++] = best;
+        }
+        return m;
+    }
+
+    keyMass() {
+        const f = this.keyFreq;
+        let s = 0;
+        for (let k = 0; k < f.length; k++) s += f[k];
+        return s;
+    }
 
     isEligible(i) { return this.k.balancers.lb.isEligible(i); }
     weightOf(i) { return this.k.balancers.shared.weights[i]; }
@@ -66,6 +99,8 @@ export class LiveDriver {
             this._lastPerOk[i] = per[i];
         }
         this.nowNs = this.k.engine.now() * 1e6;
+        const f = this.keyFreq;
+        for (let k = 0; k < f.length; k++) f[k] *= KEY_DECAY;
     }
 
     tick() { /* the live system runs itself */ }

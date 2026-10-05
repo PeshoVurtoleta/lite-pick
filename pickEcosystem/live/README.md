@@ -3,14 +3,14 @@
 The lite-pick capstone (`research/capstone-pickEcosystem.md`) is a served, FUNCTIONING load-balancing system.
 This directory is its kernel, headless: real workers doing real CPU work, a supervised fleet with health
 checks and circuit breakers, open-loop traffic, live strategy switching and a graceful shutdown -- built
-only from the suite's bricks. P2/P3 add the terminal and browser renderers (Pool Scope reads it through
-`driver.js`); P4 serves it.
+only from the suite's bricks. P2 (below) is the terminal UI; P3 the browser page; P4 serves it.
 
 It has its own `package.json` (exact versions of the published bricks) and is never part of the lite-pick
 npm package.
 
 ```bash
 npm ci
+npm run tui                                                      # Pool Scope on the LIVE system (real threads)
 npm start -- --seconds 20 --fault 3:kill:2 --fault 6:slow:3     # real worker_threads, 1 line per second
 npm test                                                         # the P1 gates (virtual workers, deterministic)
 npm run smoke                                                    # ~20 s over real threads, every fault once
@@ -19,6 +19,20 @@ npm run smoke                                                    # ~20 s over re
 `run.mjs` flags: `--strategy <name>` (one of the ten), `--rate <req/s>`, `--engine A|B`, `--seconds N`,
 `--fault <sec>:<kind>:<worker>` with kind `kill`, `slow`, `flaky`, `hang`, `crash`, `crashloop`, `heal`,
 `reset`. Ctrl-C runs the orchestrator: drain, settle every in-flight request, retire, exit code.
+
+## The terminal UI (P2)
+
+`tui.mjs` is Pool Scope -- the same renderer (`demo/pool-scope/tui-render.mjs`), snapshot and five pathology
+detectors as the simulated demo -- fed by the running kernel through `driver.js`, plus the live system's own
+panel: every worker's state (`up`, `out`, `BRK` breaker open, `half`, `down`, `ESCAL`) with its restart count, the
+DECISIONS stream (breaker flips, rotation changes, supervisor restarts, escalations -- a lane of its own so a
+restart never scrolls away) and the newest failover REROUTES ("w1 -> w6").
+
+Keys: `1`-`9`,`0` strategy, `n` next, `e` engine A/B, `w` select a worker, then `k` kill, `s` slow x10,
+`f` flaky (50% fail-fast), `h` hang, `c` crash, `l` crash loop, `x` heal, `r` reset (after an escalation),
+`+`/`-` arrival rate, `q` shutdown through the orchestrator (drain, settle every request, retire, exit code).
+`node tui.mjs --frames N --script 2:kill:2,3:slow:3` renders deterministic frames over virtual workers (script
+times are seconds since boot); `--real` uses real threads.
 
 ## What each brick does here
 
@@ -52,5 +66,6 @@ npm run smoke                                                    # ~20 s over re
 
 `test/kernel.test.mjs` (G1-G10, each with a control that must fail), `test/alloc.test.mjs` (allocation rate by
 scavenge count; retention of 1000 supervised respawns and 200 scope rebuilds), `test/driver.test.mjs` (Pool
-Scope's real snapshot over the live system), `test/smoke.mjs` (real threads). G10 runs the gates against the
+Scope's real snapshot over the live system), `test/tui.test.mjs` (the live TUI scripted: fleet, decisions,
+shutdown; two runs byte-identical), `test/smoke.mjs` (real threads). G10 runs the gates against the
 repo's working-tree `Pick.js`, so a lite-pick change cannot silently break the capstone.

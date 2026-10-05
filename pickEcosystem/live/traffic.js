@@ -24,6 +24,10 @@ export class Traffic {
         this.last = -1;
         this.offered = 0;
         const K = config.keys;
+        // The hot-key panel's view, by Zipf RANK (0 = the hottest key): a recency-weighted count (the live
+        // driver decays it per frame) and the worker the rank's last request went to. 0 B per arrival.
+        this.rankFreq = new Float64Array(K);
+        this.rankWorker = new Int16Array(K).fill(-1);
         this.cdf = new Float64Array(K);
         let s = 0;
         for (let k = 0; k < K; k++) { s += 1 / Math.pow(k + 1, config.zipfS); this.cdf[k] = s; }
@@ -43,14 +47,13 @@ export class Traffic {
         return k;
     }
 
-    _key() {
+    /** A Zipf rank in [0, keys): 0 is the hottest key. */
+    _rank() {
         const u = (this.rng.nextBelow(U) + 0.5) / U;
         const cdf = this.cdf;
         let lo = 0, hi = cdf.length - 1;
         while (lo < hi) { const mid = (lo + hi) >>> 1; if (cdf[mid] < u) lo = mid + 1; else hi = mid; }
-        // Spread key ids like a hash, but keep them in [0, 2^30): a small integer on every engine, so the key
-        // never boxes as it crosses _key() -> request() (a uint32 >= 2^31 would, whenever V8 does not inline).
-        return Math.imul(lo + 1, 0x9e3779b1) & 0x3fffffff;
+        return lo;
     }
 
     /** One tick: offer Poisson(rate x dt) requests. */
@@ -60,7 +63,15 @@ export class Traffic {
         this.last = now;
         if (!this.admitting || dt <= 0) return;
         const k = this._poisson(this.rate * dt / 1000);
-        for (let j = 0; j < k; j++) this.engine.request(this._key());
+        const engine = this.engine;
+        for (let j = 0; j < k; j++) {
+            const rank = this._rank();
+            // Spread key ids like a hash, but keep them in [0, 2^30): a small integer on every engine, so the
+            // key never boxes as it crosses into request() (a uint32 >= 2^31 would, when V8 does not inline).
+            engine.request(Math.imul(rank + 1, 0x9e3779b1) & 0x3fffffff);
+            this.rankFreq[rank]++;
+            this.rankWorker[rank] = engine.lastWorker;
+        }
         this.offered += k;
     }
 

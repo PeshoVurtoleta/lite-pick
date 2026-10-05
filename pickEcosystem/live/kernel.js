@@ -68,11 +68,49 @@ class TrafficJob { constructor(t) { this.t = t; } run(ctx) { this.t.tick(ctx.now
 class FleetJob { constructor(f) { this.f = f; } run(ctx) { this.f.tick(ctx.now); } }
 class StatsJob { constructor(s) { this.s = s; } run(ctx) { this.s.roll(ctx.now); } }
 
-/** Event counters, one listener class per event (the bus dispatches by index, 0 B/emit). */
-export const EV_DISPATCH = 0, EV_FAILOVER = 1, EV_BREAKER = 2, EV_ELIGIBLE = 3, EV_RESTART = 4, EV_ESCALATE = 5, EV_COUNT = 6;
-const EVENTS = ['dispatch', 'failover', 'breaker', 'eligible', 'restart', 'escalate'];
+/** Event counters + the decision stream, one listener class per event (the bus dispatches by index, 0 B/emit). */
+export const EV_DISPATCH = 0, EV_FAILOVER = 1, EV_BREAKER = 2, EV_ELIGIBLE = 3, EV_RESTART = 4, EV_ESCALATE = 5,
+    EV_REROUTE = 6, EV_COUNT = 7;
+const EVENTS = ['dispatch', 'failover', 'breaker', 'eligible', 'restart', 'escalate', 'reroute'];
+
+/**
+ * The DECISION STREAM, in two lanes of preallocated rings -- what Pool Scope's live panel narrates:
+ *   STRUCTURAL  breaker flips, eligibility changes, restarts, escalations (rare, and each one matters);
+ *   REROUTE     failover reroutes "w1 -> w2" (per request: under a flaky worker, dozens per second).
+ * Two lanes so a restart never scrolls out behind request-level noise. Dispatches are only counted.
+ * Payloads are the bus's packed integers.
+ */
+export const STREAM_CAP = 64;
+export class StreamLane {
+    constructor(now) {
+        this.now = now;
+        this.type = new Uint8Array(STREAM_CAP);
+        this.payload = new Int32Array(STREAM_CAP);
+        this.time = new Float64Array(STREAM_CAP);
+        this.head = 0;            // next write
+        this.count = 0;           // total pushed (the newest is at head - 1)
+    }
+    push(type, payload) {
+        const h = this.head;
+        this.type[h] = type;
+        this.payload[h] = payload;
+        this.time[h] = this.now();
+        this.head = (h + 1) % STREAM_CAP;
+        this.count++;
+    }
+}
+export class EventStream {
+    constructor(now) {
+        this.structural = new StreamLane(now);
+        this.reroute = new StreamLane(now);
+    }
+    push(type, payload) { (type === EV_REROUTE ? this.reroute : this.structural).push(type, payload); }
+}
 function counterFor(slot) {
-    return class { constructor(ev) { this.ev = ev; } handle() { this.ev[slot]++; } };
+    return class {
+        constructor(ev, stream) { this.ev = ev; this.stream = stream; }
+        handle(p) { this.ev[slot]++; if (slot !== EV_DISPATCH && slot !== EV_FAILOVER) this.stream.push(slot, p); }
+    };
 }
 
 /**
@@ -99,6 +137,8 @@ export async function bootKernel(io) {
     c.value('poolMod', io.poolMod);
     c.value('shared', shared);
     c.value('events', events);
+    const stream = new EventStream(now);
+    c.value('stream', stream);
     registerBalancers(c, io.lp, cfg, shared);
 
     let sink = null;   // set -> engine (the set is built before the engine that consumes its replies)
@@ -115,7 +155,7 @@ export async function bootKernel(io) {
 
     const bus = new EventBus(c);
     c.value('bus', bus);
-    for (let k = 0; k < EVENTS.length; k++) bus.on(EVENTS[k], counterFor(k), ['events']);
+    for (let k = 0; k < EVENTS.length; k++) bus.on(EVENTS[k], counterFor(k), ['events', 'stream']);
 
     const cron = new Cron(c, { tickMs: cfg.trafficMs, now });
     cron.job('traffic', TrafficJob, interval(cfg.trafficMs), { deps: ['traffic'] });
@@ -155,7 +195,7 @@ export async function bootKernel(io) {
     orch.step('stop-cron', () => { cron.stop(); });
 
     return {
-        cfg, container: c, set, engine, fleet, traffic, stats, balancers, bus, cron, events, orchestrator: orch,
+        cfg, container: c, set, engine, fleet, traffic, stats, balancers, bus, cron, events, stream, orchestrator: orch,
         /** Drive every due cron job at `t` (tests / a virtual clock). */
         tick(t) { cron.tick(t); },
         setStrategy(name) { balancers.set(name); engine.rebindPool(); },

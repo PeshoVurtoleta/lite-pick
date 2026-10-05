@@ -24,7 +24,7 @@ import { StrategyRouter } from '@zakkster/lite-di-strategies';
 import { EventBus } from '@zakkster/lite-di-event-bus';
 import { Cron, interval } from '@zakkster/lite-di-cron';
 import { Orchestrator } from '@zakkster/lite-di-orchestrator';
-import { jobFn } from './job.js';
+import { jobFn, UNITS_PER_MS } from './job.js';
 import { STRATEGIES, registerBalancers, Balancers } from './balancers.js';
 import { Stats } from './stats.js';
 import { Fleet } from './fleet.js';
@@ -39,6 +39,7 @@ export const DEFAULTS = Object.freeze({
     speeds: [1, 1, 1, 1, 1, 1, 2, 3],      // slowdown per worker: 6 and 7 are 2x and 3x slower
     weights: [3, 3, 3, 3, 3, 3, 2, 1],     // capacity weights for the weighted strategies
     jobMs: 1,                              // ~1 ms of real CPU per job
+    unitsPerMs: UNITS_PER_MS,              // busy-loop units per ms on THIS machine (the browser page calibrates)
     slots: 2,
     queue: 32,
     rate: 2000,                            // open-loop arrivals, req/s
@@ -62,6 +63,15 @@ export const DEFAULTS = Object.freeze({
     fleetMs: 50,
     statsMs: 1000,
     recorder: 4096,                        // flight-recorder entries
+});
+
+// The host's timers as plain functions. lite-di-orchestrator 1.0.0's default `timers` is a frozen object holding
+// the global setTimeout and calls it as `timers.setTimeout(...)`: a browser rejects that receiver ("Illegal
+// invocation"), the deadline cannot be armed, and shutdown() fails closed at once with DEADLINE (2) -- found by
+// this page's real-browser smoke run; Node does not mind. Always injecting these keeps the shutdown portable.
+const HOST_TIMERS = Object.freeze({
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (t) => clearTimeout(t),
 });
 
 class TrafficJob { constructor(t) { this.t = t; } run(ctx) { this.t.tick(ctx.now); } }
@@ -211,7 +221,7 @@ export async function bootKernel(io) {
             return orch.shutdown({
                 exit: (x) => { code = x; if (o.exit) o.exit(x); },
                 deadlineMs: o.deadlineMs || 10000,
-                timers: o.timers,
+                timers: o.timers || HOST_TIMERS,
             }).then(() => code);
         },
     };

@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <link rel="icon" href="data:,"/>
+    <title>Pool Scope LIVE</title>
+    <meta name="description" content="A working load balancer running in your browser tab: lite-pick chooses, eight real Web Workers serve, the lite-di-* kernel heals."/>
+    <link rel="preconnect" href="https://fonts.googleapis.com"/>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap"
+          rel="stylesheet"/>
+    <script>
+        // ?nosketch / ?noadaptive force Pool Scope's inline fallbacks (siblings.mjs reads these at eval time).
+        const poolScopeQuery = new URLSearchParams(location.search);
+        if (poolScopeQuery.has('nosketch')) globalThis.POOL_SCOPE_NO_SKETCH = 1;
+        if (poolScopeQuery.has('noadaptive')) globalThis.POOL_SCOPE_NO_ADAPTIVE = 1;
+    </script>
+    <!--
+      Import map: every brick at the EXACT version pickEcosystem/live/package.json pins (test/web.test.mjs keeps
+      the two equal, both ways). The kernel files (./kernel.js ...) and Pool Scope's renderer
+      (../../demo/pool-scope/) load as relative modules from this site. ?external= keeps a brick's own import of
+      another brick BARE, so it resolves through this map to the one pinned instance (lite-worker-pool ->
+      lite-worker, lite-statechart / lite-charts -> lite-signal). No SRI: esm.sh rebuilds behind a version URL
+      (see demo/pool-scope/web/index.html, L25).
+    -->
+    <script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-pick": "https://esm.sh/@zakkster/lite-pick@1.1.0",
+    "@zakkster/lite-pick/pool": "https://esm.sh/@zakkster/lite-pick@1.1.0/pool",
+    "@zakkster/lite-worker": "https://esm.sh/@zakkster/lite-worker@1.4.0",
+    "@zakkster/lite-worker-pool": "https://esm.sh/@zakkster/lite-worker-pool@1.1.0?external=@zakkster/lite-worker",
+    "@zakkster/lite-di-container": "https://esm.sh/@zakkster/lite-di-container@2.2.1",
+    "@zakkster/lite-di-health": "https://esm.sh/@zakkster/lite-di-health@1.0.0",
+    "@zakkster/lite-di-supervisor": "https://esm.sh/@zakkster/lite-di-supervisor@1.0.0",
+    "@zakkster/lite-di-orchestrator": "https://esm.sh/@zakkster/lite-di-orchestrator@1.0.0",
+    "@zakkster/lite-di-strategies": "https://esm.sh/@zakkster/lite-di-strategies@1.0.0",
+    "@zakkster/lite-di-event-bus": "https://esm.sh/@zakkster/lite-di-event-bus@1.1.0",
+    "@zakkster/lite-di-cron": "https://esm.sh/@zakkster/lite-di-cron@1.0.0",
+    "@zakkster/lite-di-graph": "https://esm.sh/@zakkster/lite-di-graph@1.0.0",
+    "@zakkster/lite-statechart": "https://esm.sh/@zakkster/lite-statechart@1.1.0?external=@zakkster/lite-signal",
+    "@zakkster/lite-signal": "https://esm.sh/@zakkster/lite-signal@1.5.2",
+    "@zakkster/lite-sketch": "https://esm.sh/@zakkster/lite-sketch@1.1.2",
+    "@zakkster/lite-adaptive": "https://esm.sh/@zakkster/lite-adaptive@1.11.0",
+    "@zakkster/lite-charts": "https://esm.sh/@zakkster/lite-charts@1.24.0?external=@zakkster/lite-signal"
+  }
+}
+    </script>
+    <script>
+        // A module that fails to load shows a banner instead of a blank page (the simulated page's watchdog, L25).
+        let $poolScopeCdnBanner = null;
+        function poolScopeCdnError() {
+            if ($poolScopeCdnBanner === null) $poolScopeCdnBanner = document.getElementById('cdn-error');
+            if ($poolScopeCdnBanner) $poolScopeCdnBanner.hidden = false;
+        }
+
+        addEventListener('error', (e) => {
+            const t = e && e.target;
+            if (t && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) {
+                poolScopeCdnError();
+                return;
+            }
+            const f = '' + (e && (e.filename || e.message || ''));
+            if (f.indexOf('esm.sh') >= 0 || f.indexOf('dynamically imported module') >= 0) poolScopeCdnError();
+        }, true);
+        setTimeout(() => {
+            if (!globalThis.__poolScopeReady) poolScopeCdnError();
+        }, 10000);
+    </script>
+    <link rel="stylesheet" href="../../demo/pool-scope/web/scope.css"/>
+    <link rel="stylesheet" href="./live.css"/>
+</head>
+<body>
+<div class="cdn-error" id="cdn-error" role="alert" hidden>
+    A module failed to load (esm.sh may be blocked, rate-limited, or offline). This page loads the lite-* bricks
+    from esm.sh at pinned versions; check your network or content-security policy and reload. The same system
+    runs in a terminal: <code>cd pickEcosystem/live &amp;&amp; npm ci &amp;&amp; npm run tui</code>.
+</div>
+<header class="scope-head">
+    <h1>POOL SCOPE <span class="live-tag">LIVE</span></h1>
+    <span class="subtitle"><span id="head-workers">8</span> real Web Workers &mdash; a load balancer running in this tab</span>
+    <div class="head-stats">
+        <span><span class="k">strategy</span> <span class="v cyan" id="head-strategy">-</span></span>
+        <span><span class="k">live</span> <span class="v" id="head-live">-</span></span>
+        <span><span class="k">inflight</span> <span class="v" id="head-inflight">-</span></span>
+        <span><span class="k">thr</span> <span class="v" id="head-thr">-</span>/s</span>
+        <span><span class="k">p50/p95/p99</span> <span class="v" id="head-lat">-</span></span>
+        <span class="badge-alloc" id="head-alloc"></span>
+    </div>
+</header>
+
+<div class="backing">
+    <span class="lbl">backing</span>
+    <span><span class="lbl">workers</span> <span class="b live">Web Workers (lite-worker-pool)</span></span>
+    <span><span class="lbl">cpu</span> <span class="b live" id="back-cpu">-</span></span>
+    <span><span class="lbl">detectors</span> <span class="b" id="back-det">-</span></span>
+    <span><span class="lbl">latency</span> <span class="b" id="back-lat">-</span></span>
+    <span><span class="lbl">hot-keys</span> <span class="b" id="back-hk">-</span></span>
+    <span><span class="lbl">render</span> <span class="b" id="back-render">-</span></span>
+</div>
+
+<p class="boot-status warn" id="boot-status" role="status">loading modules...</p>
+
+<nav class="tabs" id="tabs">
+    <button data-scene="all" aria-selected="true">overview</button>
+    <button data-scene="fingerprint" aria-selected="false">fingerprint</button>
+    <button data-scene="heat" aria-selected="false">heat</button>
+    <button data-scene="fairness" aria-selected="false">fairness</button>
+    <button data-scene="latency" aria-selected="false">killer graph</button>
+</nav>
+
+<div class="layout">
+    <section class="stage" id="stage" data-scene="all">
+        <div class="panel" data-panel="fingerprint">
+            <h2>Fingerprint <span class="hint">per-worker load &mdash; mean line + weight-ghost</span></h2>
+            <div class="chart-host" id="host-fingerprint" style="--h: 220px;"></div>
+        </div>
+        <div class="panel" data-panel="heat">
+            <h2>Heat <span class="hint">worker &times; time &mdash; green&rarr;amber&rarr;red load ramp</span></h2>
+            <div class="chart-host" id="host-heat" style="--h: 200px;"></div>
+        </div>
+        <div class="panel" data-panel="fairness">
+            <h2>Fairness <span class="hint">Lorenz curve + weight-aware Gini gauge</span></h2>
+            <div class="chart-host" id="host-fairness" style="--h: 240px;"></div>
+            <div id="gini-gauge" class="gini"></div>
+        </div>
+        <div class="panel" data-panel="latency">
+            <h2>The killer graph <span class="hint">throughput vs latency &mdash; completions/sec over p50</span></h2>
+            <div class="chart-host" id="host-latency" style="--h: 240px;"></div>
+        </div>
+    </section>
+
+    <aside class="side">
+        <div class="alarm nominal" id="alarm">
+            <div class="status"><span class="dot"></span><span id="alarm-text">SYSTEM NOMINAL</span></div>
+            <div class="sub" id="alarm-sub">no pathology detected</div>
+            <div class="badges" id="badges"></div>
+        </div>
+
+        <div class="panel controls">
+            <h2>Controls <span class="hint">same keys as the terminal UI</span></h2>
+            <div class="grp">
+                <div class="eyebrow grp-label">strategy</div>
+                <div class="ctl-row"><select class="ctl" id="strategy-select" aria-label="strategy"></select>
+                    <button class="ctl" id="btn-next">next <span class="key">[n]</span></button>
+                </div>
+            </div>
+            <div class="grp">
+                <div class="eyebrow grp-label">engine &amp; traffic</div>
+                <div class="ctl-row">
+                    <button class="ctl" id="btn-engine">A  zero-alloc</button><span class="key-hint">[e]</span>
+                </div>
+                <div class="ctl-row ctl-row-gap">
+                    <button class="ctl" id="btn-rate-down" aria-label="less traffic">&minus; <span class="key">[-]</span></button>
+                    <span class="rate"><span id="rate">-</span>/s</span>
+                    <button class="ctl" id="btn-rate-up" aria-label="more traffic">+ <span class="key">[+]</span></button>
+                </div>
+            </div>
+            <div class="grp">
+                <div class="eyebrow grp-label">fault on <span id="sel-label" class="sel">w0</span> <span class="key">[w] next worker</span></div>
+                <div class="ctl-row">
+                    <button class="ctl inject" data-fault="kill">kill <span class="key">[k]</span></button>
+                    <button class="ctl inject" data-fault="slow">slow x10 <span class="key">[s]</span></button>
+                    <button class="ctl inject" data-fault="flaky">flaky <span class="key">[f]</span></button>
+                    <button class="ctl inject" data-fault="hang">hang <span class="key">[h]</span></button>
+                    <button class="ctl inject" data-fault="crash">crash <span class="key">[c]</span></button>
+                    <button class="ctl inject" data-fault="crashloop">crash loop <span class="key">[l]</span></button>
+                    <button class="ctl" data-fault="heal">heal <span class="key">[x]</span></button>
+                    <button class="ctl" data-fault="reset">reset <span class="key">[r]</span></button>
+                </div>
+            </div>
+            <div class="grp">
+                <div class="eyebrow grp-label">system</div>
+                <div class="ctl-row">
+                    <button class="ctl danger" id="btn-shutdown" hidden>graceful shutdown <span class="key">[q]</span></button>
+                    <button class="ctl" id="btn-reboot" hidden>boot a fresh system</button>
+                </div>
+            </div>
+            <p class="note" id="note" aria-live="polite"></p>
+        </div>
+
+        <div class="panel">
+            <h2>Fleet <span class="hint">click a worker to select it</span></h2>
+            <div class="fleet" id="fleet"></div>
+            <div class="fleet-stats" id="fleet-stats"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Decisions <span class="hint">newest first</span></h2>
+            <ol class="stream" id="decisions"></ol>
+            <h2 class="sub-h">Reroutes <span class="hint" id="reroute-count"></span></h2>
+            <ol class="stream" id="reroutes"></ol>
+        </div>
+
+        <div class="panel hotkeys" id="hotkeys-panel" hidden>
+            <h2>Hot keys <span class="hint" id="hk-backing"></span></h2>
+            <div id="hotkeys-list">
+                <div class="empty">warming up&hellip;</div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Workers <span class="hint">p95 = time on the worker (queue + job)</span></h2>
+            <table class="wtable" id="wtable">
+                <thead>
+                <tr>
+                    <th data-sort="w">w</th>
+                    <th data-sort="share">share</th>
+                    <th data-sort="load">load</th>
+                    <th data-sort="lat">p95</th>
+                </tr>
+                </thead>
+                <tbody id="wtable-body"></tbody>
+            </table>
+        </div>
+
+        <div class="panel inspector" id="inspector">
+            <h2>Inspector</h2>
+            <div class="empty">select a worker to inspect</div>
+        </div>
+    </aside>
+</div>
+
+<footer class="foot">
+    Nothing here is simulated. Each request is a ~1 ms job (measured on this device) sent to one of eight Web
+    Workers that <code>@zakkster/lite-pick</code> chooses; <code>lite-worker-pool</code> runs them; per worker a
+    <code>lite-di-container</code> scope holds a <code>lite-di-supervisor</code> (restarts),
+    <code>lite-di-health</code> (readiness) and a <code>lite-statechart</code> circuit breaker;
+    <code>lite-di-orchestrator</code> runs the graceful shutdown. The same kernel runs in a terminal
+    (<code>npm run tui</code> in <code>pickEcosystem/live</code>, over <code>worker_threads</code>), and the
+    <a href="../../demo/pool-scope/web/">simulated Pool Scope</a> shows ten strategies at a scale no tab could serve.
+</footer>
+
+<script type="module" src="./page.js"></script>
+</body>
+</html>

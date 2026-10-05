@@ -20,7 +20,7 @@
 import { Supervisor, STATES as SUP } from '@zakkster/lite-di-supervisor';
 import { Health, LANES } from '@zakkster/lite-di-health';
 import { createStatechart } from '@zakkster/lite-statechart';
-import { CTL_LEN, CTL_UNITS, CTL_SLOW, CTL_FAIL, CTL_HANG, CTL_CRASH, UNITS_PER_MS } from './job.js';
+import { CTL_LEN, CTL_UNITS, CTL_SLOW, CTL_FAIL, CTL_HANG, CTL_CRASH } from './job.js';
 
 export const B_CLOSED = 0;
 export const B_OPEN = 1;
@@ -44,7 +44,7 @@ function breakerConfig() {
 
 export class Fleet {
     /**
-     * @param {object} config     scene config (workers, breakerFailures, breakerCoolMs, hungMs, hungKillMs,
+     * @param {object} config     scene config (workers, jobMs, unitsPerMs, breakerFailures, breakerCoolMs, hungMs, hungKillMs,
      *                            maxRestarts, restartWindowMs, speeds)
      * @param {object} set        lite-worker-pool WorkerSet
      * @param {object} balancers  the live balancer slot (setEligible)
@@ -76,7 +76,7 @@ export class Fleet {
         this._initialReady = null;
         for (let i = 0; i < n; i++) {
             const b = i * CTL_LEN;
-            this.ctl[b + CTL_UNITS] = config.jobMs * UNITS_PER_MS;
+            this.ctl[b + CTL_UNITS] = config.jobMs * config.unitsPerMs;
             this.ctl[b + CTL_SLOW] = config.speeds[i];
         }
     }

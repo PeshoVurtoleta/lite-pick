@@ -76,4 +76,8 @@ export class Traffic {
     }
 
     stop() { this.admitting = false; }
+
+    /** Forget the last tick: the next one starts a fresh interval (a browser tab back from the background,
+     *  where timers were throttled to once a second or slower, must not offer the whole gap at once). */
+    resync() { this.last = -1; }
 }

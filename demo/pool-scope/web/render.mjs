@@ -1,0 +1,770 @@
+/**
+ * Pool Scope -- web/render.mjs : the BROWSER renderer, shared by every page that shows Pool Scope.
+ *
+ * Split out of web/main.mjs (capstone P3, the same move P2 made for the TUI with tui-render.mjs): the
+ * simulated page (web/main.mjs, over driver.mjs) and the LIVE page (pickEcosystem/live/, over the running
+ * kernel's LiveDriver) paint the same panels with the same code; each page keeps only its own data source
+ * and controls. Behaviour of the simulated page is unchanged.
+ *
+ *     const scope = createWebScope({ driver, snapshot, detectors, cap, allocHtml });
+ *     await scope.initCharts();
+ *     // per frame: driver.beginFrame(..) / snapshot.build(driver) / detectors.evaluate(snapshot), then
+ *     scope.render();
+ *
+ * Options (besides the bricks): `allocHtml` (the header's allocation badge), `keyPrefix` (hot-key label,
+ * default 'key '), and two optional hooks the simulated page does not use -- `stateLabel(i)` (the inspector's
+ * state row) and `onPaint()` (called in the same reactive redraw as the shared panels, for a page's own panels).
+ *
+ * DOM contract -- the page provides these ids: stage tabs head-workers head-strategy head-live head-inflight
+ * head-thr head-lat head-alloc back-det back-lat back-hk back-render alarm alarm-text alarm-sub badges
+ * hotkeys-panel hotkeys-list hk-backing wtable wtable-body inspector gini-gauge host-fingerprint host-heat
+ * host-fairness host-latency (test: pickEcosystem/live/test/web.test.mjs).
+ *
+ * The "richer pitch" render target for the SAME live decision-monitor as the TUI. It REUSES the
+ * renderer-agnostic bricks unchanged -- driver.mjs (the traffic engine over the real ten lite-pick
+ * balancers), snapshot.mjs (the SoA ring scene model), detectors.mjs (the five pathology detectors),
+ * siblings.mjs (the optional lite-sketch / lite-adaptive peer layer) -- and swaps ONLY the renderer:
+ * the TUI paints ANSI to a terminal, this paints a served browser page with @zakkster/lite-charts.
+ *
+ * Same DATA PATH as the TUI: on a throttled ~12 Hz tick the page steps its driver, snapshot.build(),
+ * detectors.evaluate() -- all pre-allocated, zero-alloc (the bricks' discipline). Only the RENDER layer
+ * (chart data arrays, DOM textContent, canvas paints) allocates, which is fine. State is lite-signal
+ * signals; a single effect() keyed on a render-version signal redraws the DOM panels + the charts read
+ * the same version in their data thunks (one shared reactive registry -- lite-charts loads via esm.sh
+ * with ?external=@zakkster/lite-signal so it shares THIS module's lite-signal instance).
+ *
+ * Lego thesis: the fingerprint HERO is a hand-rolled canvas (it needs the bar + mean/sigma band +
+ * weight-ghost OVERLAY at pixel fidelity lite-charts bars do not compose); heat / fairness / killer-graph
+ * ride lite-charts kernels (heatmap / area+line / scatter). Every chart is created behind a try/catch and
+ * degrades to a small canvas fallback so the page ALWAYS loads live with no uncaught console error.
+ */
+
+import {UNFAIR_GINI} from '../detectors.mjs';
+import {LATENCY_BACKING, DETECTOR_BACKING, HOTKEY_BACKING} from '../siblings.mjs';
+import {signal, effect} from '@zakkster/lite-signal';
+
+/* --------------------------------------------------------------------- constants + palette ---- */
+
+const HEAT_COLS = 48;                      // worker x time columns (newest at the right)
+const KILLER_MAX = 96;                     // killer-graph trailing scatter depth
+const SCALE_FLOOR = 20;                    // heat colour scale floor so an overloaded cell reads red
+const FP_MEAN_MULT = 2.3;                  // fingerprint full-scale = live-mean load x this
+const FP_SCALE_FLOOR = 4;
+const TAU = Math.PI * 2;
+
+export const COL = {
+    bg1: '#0d1117', bg2: '#131922', bg3: '#1a2230', line: '#232b38',
+    text: '#eae8e4', dim: '#c6c9d0', faint: '#9ca2ae',
+    green: '#5fe39f', amber: '#f5b942', red: '#f87171', magenta: '#e879a8', cyan: '#7dd3fc',
+};
+
+const G0 = [0x5f, 0xe3, 0x9f], G1 = [0xf5, 0xb9, 0x42], G2 = [0xf8, 0x71, 0x71];
+
+/** green -> amber -> red colour at t in [0,1] (init-time only: it builds a string). */
+function rampRgb(t) {
+    let a, b, u;
+    if (t < 0.5) {
+        a = G0;
+        b = G1;
+        u = t * 2;
+    } else {
+        a = G1;
+        b = G2;
+        u = (t - 0.5) * 2;
+    }
+    const r = (a[0] + (b[0] - a[0]) * u) | 0;
+    const g = (a[1] + (b[1] - a[1]) * u) | 0;
+    const bl = (a[2] + (b[2] - a[2]) * u) | 0;
+    return 'rgb(' + r + ',' + g + ',' + bl + ')';
+}
+
+// The ramp as a 256-entry lookup table of colour strings built ONCE: ramp() is then integer math + an
+// array read -- no string is built per cell / per bar / per frame (lite-law: zero alloc in a frame loop).
+const RAMP_N = 256;
+const RAMP_LUT = new Array(RAMP_N);
+for (let k = 0; k < RAMP_N; k++) RAMP_LUT[k] = rampRgb(k / (RAMP_N - 1));
+
+/** green -> amber -> red ramp along t in [0,1]; the reading IS the hue (btop idiom). 0 B per call. */
+function ramp(t) {
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    return RAMP_LUT[(t * (RAMP_N - 1) + 0.5) | 0];
+}
+
+// Init-time label / dash constants, reused every frame (no per-frame String() / array literal).
+const W_LABEL = [], T_LABEL = [], DIGIT = [];
+for (let c = 0; c < HEAT_COLS; c++) T_LABEL.push('t' + c);
+for (let d = 0; d < 10; d++) DIGIT.push(String(d));
+const DASH_GHOST = [2, 2], DASH_MEAN = [5, 4], DASH_DIAG = [4, 4], DASH_NONE = [];
+
+/** The DOM ids a page must provide (the renderer looks each up once). */
+export const WEB_SCOPE_IDS = ['stage', 'tabs', 'head-workers', 'head-strategy', 'head-live', 'head-inflight', 'head-thr',
+    'head-lat', 'head-alloc', 'back-det', 'back-lat', 'back-hk', 'back-render', 'alarm', 'alarm-text', 'alarm-sub',
+    'badges', 'hotkeys-panel', 'hotkeys-list', 'hk-backing', 'wtable', 'wtable-body', 'inspector', 'gini-gauge',
+    'host-fingerprint', 'host-heat', 'host-fairness', 'host-latency'];
+
+/**
+ * Build the renderer over a driver + snapshot + detectors of `cap` workers.
+ * @returns {{ initCharts: () => Promise<void>, render: () => void, repaint: () => void,
+ *            setDriver: (d: object) => void, selected: () => number, select: (i: number) => void }}
+ */
+export function createWebScope(o) {
+    const CAP = o.cap;
+    let drv = o.driver;
+    const snap = o.snapshot;
+    const det = o.detectors;
+    const keyPrefix = o.keyPrefix || 'key ';
+    const stateLabel = typeof o.stateLabel === 'function' ? o.stateLabel : null;
+    const onPaint = typeof o.onPaint === 'function' ? o.onPaint : null;
+    for (let i = W_LABEL.length; i < CAP; i++) W_LABEL.push('w' + i);
+
+    /* ------------------------------------------------------------------------- cached DOM refs ---- */
+
+    const $ = (id) => document.getElementById(id);
+    const $stage = $('stage');
+    const $tabs = $('tabs');
+    const $headWorkers = $('head-workers');
+    const $headStrategy = $('head-strategy');
+    const $headLive = $('head-live');
+    const $headInflight = $('head-inflight');
+    const $headThr = $('head-thr');
+    const $headLat = $('head-lat');
+    const $headAlloc = $('head-alloc');
+    const $backDet = $('back-det');
+    const $backLat = $('back-lat');
+    const $backHk = $('back-hk');
+    const $backRender = $('back-render');
+    const $alarm = $('alarm');
+    const $alarmText = $('alarm-text');
+    const $alarmSub = $('alarm-sub');
+    const $badges = $('badges');
+    const $hotkeysPanel = $('hotkeys-panel');
+    const $hotkeysList = $('hotkeys-list');
+    const $hkBacking = $('hk-backing');
+    const $wtableBody = $('wtable-body');
+    const $wtable = $('wtable');
+    const $inspector = $('inspector');
+    const $giniGauge = $('gini-gauge');
+    // The scene tab buttons and the table head, looked up ONCE.
+    const $tabButtons = Array.from($tabs.querySelectorAll('button'));
+    const $wtableHead = $wtable.querySelector('thead');
+
+    // Pre-allocated scratch reused across frames (kept off the alloc path).
+    const hotKeyBuf = new Int32Array(6);
+
+    /* ---------------------------------------------------------------------------- state signals --- */
+
+    const sSelected = signal(-1);              // selected worker index for the inspector, -1 = none
+    const sSort = signal('load');              // worker table sort key
+    const sTick = signal(0);                   // render-version: bumped each data frame -> redraws everything
+
+    /* ------------------------------------------------------- backing indicators (lego thesis) ----- */
+
+    function paintBacking(el, label, live) {
+        el.textContent = label;
+        el.className = 'b ' + (live ? 'live' : 'fallback');
+    }
+
+    paintBacking($backDet, DETECTOR_BACKING, DETECTOR_BACKING === 'lite-adaptive');
+    paintBacking($backLat, LATENCY_BACKING, LATENCY_BACKING === 'lite-sketch');
+    paintBacking($backHk, HOTKEY_BACKING, HOTKEY_BACKING === 'lite-adaptive');
+    $hkBacking.textContent = '(' + HOTKEY_BACKING + ')';
+    $headWorkers.textContent = String(CAP);
+    // The browser has no reliable per-op heap probe: each page states (allocHtml) where its 0 is proven.
+    $headAlloc.innerHTML = o.allocHtml || '';
+
+    /* =============================================================================================
+     * CHART LAYER -- lite-charts kernels with per-panel canvas fallbacks (all guarded).
+     * Each panel object exposes update(): it either drives its lite-charts data (via the shared render
+     * signal read in the data thunk) or paints its fallback canvas.
+     * ============================================================================================= */
+
+    let charts = null;                          // the lite-charts module, or null if it failed to load
+
+    // ---- reusable chart data arrays (render layer; rebuilt each frame) --------------------------
+    const heatData = [];                        // {x:'t0'..t47, y:'w0'..w11, v} -- CAP x HEAT_COLS cells, built ONCE below
+    // Lorenz points {x, y} (cumulative population vs cumulative share): CAP+1 point objects and one array VIEW
+    // per live count n (0..CAP), all built ONCE; a frame fills the points in place and selects the view.
+    const lorenzPts = [];
+    for (let i = 0; i <= CAP; i++) lorenzPts.push({x: 0, y: 0});
+    const lorenzViews = [];
+    for (let n = 0; n <= CAP; n++) lorenzViews.push(lorenzPts.slice(0, n === 0 ? 2 : n + 1));
+    const lorenzShares = new Float64Array(CAP);
+    let lorenzData = lorenzViews[0];
+    const killerData = [];                      // {x:p50, y:picks/sec} trailing window; point objects RECYCLED
+
+    // ---- fallback canvases (created lazily when a chart cannot mount) ---------------------------
+    // Each canvas is wrapped ONCE in a reused state object { canvas, ctx, w, h, dirty }: the 2d context is
+    // cached (not re-fetched per frame), and the CSS size is read only when a ResizeObserver says it changed
+    // (no per-frame layout read, no per-frame { ctx, w, h } allocation).
+    const fitRO = typeof ResizeObserver === 'function'
+        ? new ResizeObserver((entries) => { for (const e of entries) if (e.target.__fit) e.target.__fit.dirty = true; })
+        : null;
+
+    function makeCanvas(host) {
+        const c = document.createElement('canvas');
+        c.className = 'fallback';
+        host.textContent = '';
+        host.appendChild(c);
+        const fit = {canvas: c, ctx: c.getContext('2d'), w: 0, h: 0, dirty: true};
+        c.__fit = fit;
+        if (fitRO) fitRO.observe(c);
+        return fit;
+    }
+
+    function fitCanvas(fit) {
+        if (fit.dirty || !fitRO) {
+            const c = fit.canvas;
+            const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
+            const w = c.clientWidth || c.parentElement.clientWidth || 600;
+            const h = c.clientHeight || c.parentElement.clientHeight || 220;
+            const pw = (w * dpr) | 0, ph = (h * dpr) | 0;
+            if (c.width !== pw || c.height !== ph) {
+                c.width = pw;
+                c.height = ph;
+            }
+            fit.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            fit.w = w;
+            fit.h = h;
+            fit.dirty = false;
+        }
+        return fit;
+    }
+
+    /* -------- FINGERPRINT: hand-rolled canvas hero (bar + mean/sigma band + weight-ghost) -------- */
+
+    const fpCanvas = makeCanvas($('host-fingerprint'));
+    let fpBase = 0, fpPlotH = 1, fpScaleNow = 1;   // per-frame scale state (no per-frame closure)
+    const fpY = (v) => fpBase - Math.min(1, v / fpScaleNow) * fpPlotH;
+
+    function drawFingerprint() {
+        const {ctx, w, h} = fitCanvas(fpCanvas);
+        ctx.clearRect(0, 0, w, h);
+        const pad = 8, base = h - 16;
+        fpBase = base;
+        fpPlotH = base - pad;
+        // live weight sum + mean/std of live inflight (mean-relative scale, TUI-parity).
+        let sumW = 0, meanLoad = 0, liveN = 0;
+        for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) {
+            sumW += drv.weights[i];
+            meanLoad += snap.wInflight[i];
+            liveN++;
+        }
+        meanLoad = liveN > 0 ? meanLoad / liveN : 0;
+        let sig = 0;
+        for (let i = 0; i < CAP; i++) if (snap.wEligible[i]) {
+            const d = snap.wInflight[i] - meanLoad;
+            sig += d * d;
+        }
+        sig = liveN > 0 ? Math.sqrt(sig / liveN) : 0;
+        let fpScale = meanLoad * FP_MEAN_MULT;
+        if (fpScale < FP_SCALE_FLOOR) fpScale = FP_SCALE_FLOOR;
+        fpScaleNow = fpScale;
+        const yOf = fpY;
+        const colW = (w - pad * 2) / CAP;
+        const barW = colW * 0.62;
+        // +-1 sigma band
+        if (liveN > 0) {
+            ctx.fillStyle = 'rgba(125,211,252,0.08)';
+            const yHi = yOf(meanLoad + sig), yLo = yOf(meanLoad - sig);
+            ctx.fillRect(pad, yHi, w - pad * 2, Math.max(1, yLo - yHi));
+        }
+        // bars + weight-ghost outline
+        for (let i = 0; i < CAP; i++) {
+            const x = pad + i * colW + (colW - barW) / 2;
+            if (!snap.wEligible[i]) {
+                ctx.fillStyle = COL.faint;
+                ctx.fillRect(x, base - 1, barW, 1);
+                continue;
+            }
+            const v = snap.wInflight[i];
+            const yb = yOf(v);
+            ctx.fillStyle = ramp(v / fpScale);
+            ctx.fillRect(x, yb, barW, base - yb);
+            // weight-ghost: where a weight-proportional load would sit (dotted outline).
+            const ghost = sumW > 0 ? (drv.weights[i] / sumW) * (meanLoad * liveN) : 0;
+            const yg = yOf(ghost);
+            ctx.strokeStyle = 'rgba(156,162,174,0.55)';
+            ctx.setLineDash(DASH_GHOST);
+            ctx.strokeRect(x, yg, barW, Math.max(0.5, base - yg));
+            ctx.setLineDash(DASH_NONE);
+        }
+        // mean line
+        ctx.strokeStyle = COL.dim;
+        ctx.setLineDash(DASH_MEAN);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pad, yOf(meanLoad));
+        ctx.lineTo(w - pad, yOf(meanLoad));
+        ctx.stroke();
+        ctx.setLineDash(DASH_NONE);
+        // worker index axis
+        ctx.fillStyle = COL.faint;
+        ctx.font = '10px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        for (let i = 0; i < CAP; i++) ctx.fillText(DIGIT[i % 10], pad + i * colW + colW / 2, h - 3);
+    }
+
+    /* -------- HEAT: lite-charts heatmap (worker x time), canvas fallback -------- */
+
+    const heatHost = $('host-heat');
+    let heatChart = null, heatFallback = null;
+
+    for (let wI = 0; wI < CAP; wI++) for (let c = 0; c < HEAT_COLS; c++) heatData.push({x: T_LABEL[c], y: W_LABEL[wI], v: 0});
+
+    /** Refresh the heat cells IN PLACE (only `v` changes per frame; no object or label string per cell). */
+    function buildHeatData() {
+        const scale = snap.maxLoad > SCALE_FLOOR ? snap.maxLoad : SCALE_FLOOR;
+        for (let wI = 0; wI < CAP; wI++) {
+            for (let c = 0; c < HEAT_COLS; c++) {
+                const k = HEAT_COLS - 1 - c;               // newest at the right
+                let v = 0;
+                if (k < snap.frames && snap.eligAt(wI, k)) v = snap.loadAt(wI, k);
+                heatData[wI * HEAT_COLS + c].v = v / scale;
+            }
+        }
+    }
+
+    function drawHeatFallback() {
+        const {ctx, w, h} = fitCanvas(heatFallback);
+        ctx.clearRect(0, 0, w, h);
+        const labW = 26, pad = 4;
+        const cellW = (w - labW - pad) / HEAT_COLS;
+        const cellH = (h - pad) / CAP;
+        const scale = snap.maxLoad > SCALE_FLOOR ? snap.maxLoad : SCALE_FLOOR;
+        ctx.font = '9px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        for (let wI = 0; wI < CAP; wI++) {
+            const y = pad + wI * cellH;
+            ctx.fillStyle = COL.faint;
+            ctx.fillText(W_LABEL[wI], 0, y + cellH / 2);
+            for (let c = 0; c < HEAT_COLS; c++) {
+                const k = HEAT_COLS - 1 - c;
+                const x = labW + c * cellW;
+                if (k >= snap.frames || !snap.eligAt(wI, k)) {
+                    ctx.fillStyle = COL.bg3;
+                    ctx.fillRect(x, y, cellW - 0.5, cellH - 0.5);
+                    continue;
+                }
+                const v = snap.loadAt(wI, k) / scale;
+                ctx.fillStyle = v <= 0 ? COL.bg3 : ramp(v);
+                ctx.fillRect(x, y, cellW - 0.5, cellH - 0.5);
+            }
+        }
+    }
+
+    /* -------- FAIRNESS: lite-charts Lorenz curve + DOM Gini gauge -------- */
+
+    const fairHost = $('host-fairness');
+    let fairChart = null, fairFallback = null;
+
+    function buildLorenz() {
+        // Lorenz: sort live workers' share ascending (insertion sort over <= CAP in a preallocated typed array),
+        // plot cumulative population vs cumulative share into the preallocated points.
+        let n = 0, total = 0;
+        for (let i = 0; i < CAP; i++) {
+            if (!snap.wEligible[i]) continue;
+            const v = snap.wShare[i];
+            let j = n++;
+            while (j > 0 && lorenzShares[j - 1] > v) { lorenzShares[j] = lorenzShares[j - 1]; j--; }
+            lorenzShares[j] = v;
+            total += v;
+        }
+        lorenzPts[0].x = 0;
+        lorenzPts[0].y = 0;
+        if (n > 0) {
+            if (!(total > 0)) total = 1;
+            let acc = 0;
+            for (let i = 0; i < n; i++) {
+                acc += lorenzShares[i];
+                lorenzPts[i + 1].x = (i + 1) / n;
+                lorenzPts[i + 1].y = acc / total;
+            }
+        } else {
+            lorenzPts[1].x = 1;
+            lorenzPts[1].y = 1;
+        }
+        lorenzData = lorenzViews[n];
+    }
+
+    function drawFairFallback() {
+        const {ctx, w, h} = fitCanvas(fairFallback);
+        ctx.clearRect(0, 0, w, h);
+        const pad = 22;
+        const px = pad, py = pad, pw = w - pad * 2, ph = h - pad * 2;
+        // equality diagonal
+        ctx.strokeStyle = COL.faint;
+        ctx.setLineDash(DASH_DIAG);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(px, py + ph);
+        ctx.lineTo(px + pw, py);
+        ctx.stroke();
+        ctx.setLineDash(DASH_NONE);
+        // Lorenz curve
+        const g = snap.curGini;
+        ctx.strokeStyle = g >= UNFAIR_GINI ? COL.red : COL.green;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i = 0; i < lorenzData.length; i++) {
+            const p = lorenzData[i];
+            const xx = px + p.x * pw, yy = py + ph - p.y * ph;
+            if (i === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+        }
+        ctx.stroke();
+        ctx.fillStyle = COL.faint;
+        ctx.font = '10px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('population', px, h - 6);
+        ctx.save();
+        ctx.translate(10, py + ph);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText('cumulative share', 0, 0);
+        ctx.restore();
+    }
+
+    function drawGiniGauge() {
+        const g = snap.curGini;
+        const col = g >= UNFAIR_GINI ? COL.red : (g >= UNFAIR_GINI * 0.6 ? COL.amber : COL.green);
+        const press = g >= UNFAIR_GINI ? 'MONOPOLY' : (g >= UNFAIR_GINI * 0.6 ? 'SKEWED' : 'BALANCED');
+        const pct = Math.max(0, Math.min(100, g * 100));
+        $giniGauge.innerHTML =
+            '<div style="display:flex;align-items:center;gap:0.6rem;font-size:0.82rem;">' +
+            '<span style="color:' + COL.faint + '">gini</span>' +
+            '<span style="color:' + col + ';font-weight:700;">' + g.toFixed(3) + '</span>' +
+            '<span style="flex:1;height:0.6rem;background:' + COL.bg3 + ';border-radius:2px;overflow:hidden;">' +
+            '<span style="display:block;height:100%;width:' + pct + '%;background:' + col + ';"></span></span>' +
+            '<span style="color:' + col + ';font-weight:700;letter-spacing:0.05em;">' + press + '</span></div>';
+    }
+
+    /* -------- KILLER GRAPH: lite-charts scatter (throughput vs latency), canvas fallback -------- */
+
+    const killerHost = $('host-latency');
+    let killerChart = null, killerFallback = null;
+
+    function pushKiller() {
+        const x = snap.p50, y = snap.curThroughput;
+        if (x === x && y === y) {                 // both finite
+            // Recycle the oldest point once the window is full (no per-frame object).
+            const p = killerData.length >= KILLER_MAX ? killerData.shift() : {x: 0, y: 0};
+            p.x = x;
+            p.y = y;
+            killerData.push(p);
+        }
+    }
+
+    function drawKillerFallback() {
+        const {ctx, w, h} = fitCanvas(killerFallback);
+        ctx.clearRect(0, 0, w, h);
+        const pad = 30;
+        const px = pad, py = 12, pw = w - pad - 12, ph = h - py - pad;
+        let maxX = 1, maxY = 1;
+        for (let i = 0; i < killerData.length; i++) {
+            if (killerData[i].x > maxX) maxX = killerData[i].x;
+            if (killerData[i].y > maxY) maxY = killerData[i].y;
+        }
+        maxX *= 1.1;
+        maxY *= 1.1;
+        ctx.strokeStyle = COL.line;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(px, py, pw, ph);
+        for (let i = 0; i < killerData.length; i++) {
+            const p = killerData[i];
+            const xx = px + (p.x / maxX) * pw;
+            const yy = py + ph - (p.y / maxY) * ph;
+            const age = i / Math.max(1, killerData.length - 1);   // fade the trail (recency = brighter)
+            const newest = i === killerData.length - 1;
+            // A numeric globalAlpha over a constant colour -- not an 'rgba(..., a.toFixed(2))' string per point.
+            ctx.fillStyle = COL.cyan;
+            ctx.globalAlpha = newest ? 1 : 0.15 + age * 0.5;
+            ctx.beginPath();
+            ctx.arc(xx, yy, newest ? 4 : 2.5, 0, TAU);
+            ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = COL.faint;
+        ctx.font = '10px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('service latency (p50) ->', px, h - 8);
+        ctx.save();
+        ctx.translate(12, py + ph);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText('picks/sec ->', 0, 0);
+        ctx.restore();
+    }
+
+    /* ------------------------------------------------------------ lite-charts creation (guarded) --- */
+
+    async function initCharts() {
+        try {
+            charts = await import('@zakkster/lite-charts');
+        } catch (e) {
+            charts = null;
+        }
+        const axis = {
+            axisColor: COL.line,
+            labelColor: COL.faint,
+            font: '11px "JetBrains Mono", monospace',
+            background: null
+        };
+
+        // HEAT -- heatmap kernel
+        try {
+            if (!charts || typeof charts.createHeatmap !== 'function') throw 0;
+            heatChart = charts.createHeatmap({
+                data: () => {
+                    sTick();
+                    return heatData;
+                },
+                x: 'x', y: 'y', value: 'v',
+                colorFn: (v) => (v <= 0 ? COL.bg3 : ramp(v)),
+                cellGap: 0.08, rowHighlight: true, columnHighlight: true,
+                labelColor: COL.faint, labelFont: '9px "JetBrains Mono", monospace', background: COL.bg1,
+                margin: {top: 6, right: 6, bottom: 6, left: 30},
+            }).mount(heatHost);
+        } catch (e) {
+            heatChart = null;
+            heatFallback = makeCanvas(heatHost);
+        }
+
+        // FAIRNESS -- Lorenz via area chart + an equality-diagonal annotation
+        try {
+            if (!charts || typeof charts.createAreaChart !== 'function') throw 0;
+            fairChart = charts.createAreaChart({
+                data: () => {
+                    sTick();
+                    return lorenzData;
+                },
+                x: 'x', y: 'y', color: COL.green, lineWidth: 2,
+                xScale: {domain: [0, 1]}, yScale: {domain: [0, 1]},
+                grid: {x: false, y: false}, crosshair: false, tooltip: false, legend: false,
+                xTitle: 'population', yTitle: 'cumulative share',
+                annotations: () => [
+                    {type: 'line', axis: 'y', value: 0, color: COL.line},
+                    {type: 'point', x: 0, y: 0, color: COL.faint, radius: 1},
+                    {type: 'point', x: 1, y: 1, color: COL.faint, radius: 1},
+                ],
+                margin: {top: 10, right: 14, bottom: 34, left: 44}, ...axis,
+            }).mount(fairHost);
+        } catch (e) {
+            fairChart = null;
+            fairFallback = makeCanvas(fairHost);
+        }
+
+        // KILLER GRAPH -- scatter kernel
+        try {
+            if (!charts || typeof charts.createScatterChart !== 'function') throw 0;
+            killerChart = charts.createScatterChart({
+                data: () => {
+                    sTick();
+                    return killerData;
+                },
+                x: 'x', y: 'y', color: COL.cyan, markerSize: 3, fillOpacity: 0.7,
+                grid: {x: true, y: true, color: COL.line}, crosshair: false, tooltip: false,
+                xTitle: 'service latency (p50)', yTitle: 'picks/sec',
+                yScale: {zero: true},
+                margin: {top: 10, right: 14, bottom: 34, left: 48}, ...axis,
+            }).mount(killerHost);
+        } catch (e) {
+            killerChart = null;
+            killerFallback = makeCanvas(killerHost);
+        }
+
+        const anyChart = !!(heatChart || fairChart || killerChart);
+        paintBacking($backRender, anyChart ? 'lite-charts' : 'canvas (fallback)', anyChart);
+    }
+
+    /* -------------------------------------------------------------- per-frame chart data refresh --- */
+
+    function refreshCharts() {
+        buildHeatData();
+        buildLorenz();
+        pushKiller();
+        // Fallback canvases redraw imperatively; lite-charts panels re-extract from sTick() in their thunk.
+        if (heatFallback) drawHeatFallback();
+        if (fairFallback) drawFairFallback();
+        if (killerFallback) drawKillerFallback();
+        drawFingerprint();
+        drawGiniGauge();
+    }
+
+    /* ================================================================================ DOM panels === */
+
+    const BADGE_DEFS = [
+        ['osc', 'osc', '\u223f', (d) => 'OSCILLATION w' + d.oscWorker],
+        ['ping', 'ping', '\u21c4', (d) => 'PING-PONG w' + d.pingA + '/w' + d.pingB],
+        ['starv', 'starv', '\u2205', (d) => 'STARVATION w' + d.starvWorker],
+        ['unfair', 'unfair', '\u2696', () => 'UNFAIR'],
+        ['over', 'over', '\u25b2', (d) => 'OVERLOAD w' + d.overWorker + '=' + d.overLoad],
+    ];
+
+    function paintAlarm() {
+        if (det.activeCount === 0) {
+            $alarm.className = 'alarm nominal';
+            $alarmText.textContent = 'SYSTEM NOMINAL';
+            $alarmSub.textContent = 'no pathology detected';
+            $badges.textContent = '';
+            return;
+        }
+        $alarm.className = 'alarm alert';
+        $alarmText.textContent = 'PATHOLOGY DETECTED / ' + det.activeCount;
+        $alarmSub.textContent = det.activeCount === 1 ? '1 fault' : det.activeCount + ' faults';
+        let html = '';
+        for (let i = 0; i < BADGE_DEFS.length; i++) {
+            const [flag, cls, glyph, txt] = BADGE_DEFS[i];
+            if (det[flag]) html += '<span class="badge ' + cls + '">' + glyph + ' ' + txt(det) + '</span>';
+        }
+        $badges.innerHTML = html;
+    }
+
+    function paintHeader() {
+        $headStrategy.textContent = drv.strategyName;
+        $headLive.textContent = snap.live + '/' + CAP;
+        $headInflight.textContent = String(snap.totalInflight);
+        $headThr.textContent = String(snap.curThroughput | 0);
+        const suffix = drv.hasLatSketch ? ' (\u00b11%)' : '';
+        $headLat.textContent = snap.p50.toFixed(0) + '/' + snap.p95.toFixed(0) + '/' + snap.p99.toFixed(0) + 'ms' + suffix;
+    }
+
+    // worker row order buffer (reused, avoids per-frame alloc growth beyond the CAP-length array)
+    const order = new Int32Array(CAP);
+
+    function paintTable() {
+        const key = sSort.peek();
+        for (let i = 0; i < CAP; i++) order[i] = i;
+        // small insertion sort over CAP (12) by the chosen key, descending (w ascending).
+        const val = (i) => key === 'share' ? snap.wShare[i] : key === 'lat' ? p95Of(i) : key === 'w' ? -i : snap.wInflight[i];
+        for (let a = 1; a < CAP; a++) {
+            const cur = order[a];
+            const cv = val(cur);
+            let b = a - 1;
+            while (b >= 0 && val(order[b]) < cv) {
+                order[b + 1] = order[b];
+                b--;
+            }
+            order[b + 1] = cur;
+        }
+        const sel = sSelected.peek();
+        let maxLoad = 1;
+        for (let i = 0; i < CAP; i++) if (snap.wInflight[i] > maxLoad) maxLoad = snap.wInflight[i];
+        let html = '';
+        for (let r = 0; r < CAP; r++) {
+            const i = order[r];
+            const share = (snap.wShare[i] * 100);
+            const load = snap.wInflight[i];
+            const p95 = p95Of(i);
+            const barW = Math.max(1, (load / maxLoad) * 46) | 0;
+            const barCol = ramp(load / (maxLoad || 1));
+            html += '<tr data-w="' + i + '" data-down="' + (snap.wEligible[i] ? 0 : 1) + '"' +
+                (i === sel ? ' aria-selected="true"' : '') + '>' +
+                '<td>w' + i + '</td>' +
+                '<td>' + share.toFixed(1) + '%</td>' +
+                '<td><span class="minibar" style="width:' + barW + 'px;background:' + barCol + '"></span> ' + load + '</td>' +
+                '<td>' + (p95 === p95 ? p95.toFixed(0) : '-') + '</td></tr>';
+        }
+        $wtableBody.innerHTML = html;
+    }
+
+    function p95Of(i) {
+        const q = drv.latWorkerQuantile(i, 0.95);
+        return q === q ? q : NaN;
+    }
+
+    function paintInspector() {
+        const i = sSelected.peek();
+        if (i < 0) {
+            $inspector.innerHTML = '<h2>Inspector</h2><div class="empty">select a worker to inspect</div>';
+            return;
+        }
+        const rows = [
+            ['worker', 'w' + i],
+            ['state', stateLabel !== null ? stateLabel(i) : (snap.wEligible[i] ? 'up' : 'DOWN')],
+            ['weight', String(drv.weights[i])],
+            ['inflight', String(snap.wInflight[i])],
+            ['share', (snap.wShare[i] * 100).toFixed(1) + '%'],
+            ['ewma cost', fmt(drv.ewmaOf(i))],
+            ['occupancy cap', fmt(drv.capOf(i))],
+            ['p50', fmt(drv.latWorkerQuantile(i, 0.5))],
+            ['p95', fmt(drv.latWorkerQuantile(i, 0.95))],
+            ['p99', fmt(drv.latWorkerQuantile(i, 0.99))],
+        ];
+        let html = '<h2>Inspector <span class="hint">w' + i + '</span></h2>';
+        for (let r = 0; r < rows.length; r++) html += '<div class="kv"><span class="k">' + rows[r][0] + '</span><span>' + rows[r][1] + '</span></div>';
+        $inspector.innerHTML = html;
+    }
+
+    function fmt(v) {
+        return v === v ? (v).toFixed(1) : '-';
+    }
+
+    function paintHotKeys() {
+        if (!drv.keyed) {
+            $hotkeysPanel.hidden = true;
+            return;
+        }
+        $hotkeysPanel.hidden = false;
+        const n = drv.hotKeys(hotKeyBuf);
+        const mass = drv.keyMass();
+        if (n === 0 || mass <= 0) {
+            $hotkeysList.innerHTML = '<div class="empty">warming up&hellip;</div>';
+            return;
+        }
+        let html = '';
+        for (let e = 0; e < n; e++) {
+            const key = hotKeyBuf[e];
+            const share = drv.keyFreq[key] / mass;
+            const wk = drv.keyWorker[key];
+            html += '<div class="hk"><span style="color:' + COL.cyan + '">' + keyPrefix + key + '</span>' +
+                '<span class="track"><span class="fill" style="width:' + (share * 100).toFixed(1) + '%"></span></span>' +
+                '<span style="color:' + COL.faint + '">' + (share * 100).toFixed(1) + '% \u2192 w' + (wk >= 0 ? wk : '?') + '</span></div>';
+        }
+        $hotkeysList.innerHTML = html;
+    }
+
+    /* ---------------------------------------------------------------- the reactive redraw effect --- */
+
+    // One effect keyed on the render-version + the control-state signals: redraws every DOM panel.
+    // The lite-charts panels re-extract independently off sTick() in their own data thunks.
+    effect(() => {
+        sTick();
+        sSelected();
+        sSort();
+        paintHeader();
+        paintAlarm();
+        paintTable();
+        paintInspector();
+        paintHotKeys();
+        if (onPaint !== null) onPaint();
+    });
+
+    // scene tabs
+    $tabs.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('button[data-scene]');
+        if (!btn) return;
+        for (const t of $tabButtons) t.setAttribute('aria-selected', String(t === btn));
+        $stage.setAttribute('data-scene', btn.getAttribute('data-scene'));
+    });
+
+    // worker table: sort + row select
+    $wtableHead.addEventListener('click', (ev) => {
+        const th = ev.target.closest('th[data-sort]');
+        if (th) sSort.set(th.getAttribute('data-sort'));
+    });
+    $wtableBody.addEventListener('click', (ev) => {
+        const tr = ev.target.closest('tr[data-w]');
+        if (!tr) return;
+        const w = tr.getAttribute('data-w') | 0;
+        sSelected.set(sSelected.peek() === w ? -1 : w);
+    });
+
+    return {
+        initCharts,
+        /** After the page's data step: refresh the chart arrays + canvases and redraw every panel. */
+        render() { refreshCharts(); sTick.set(sTick.peek() + 1); },
+        /** Redraw the DOM panels now (a control changed between frames). */
+        repaint() { sTick.set(sTick.peek() + 1); },
+        setDriver(d) { drv = d; },
+        selected() { return sSelected.peek(); },
+        select(i) { sSelected.set(i); },
+    };
+}

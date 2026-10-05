@@ -1,0 +1,155 @@
+/*
+ * pickEcosystem/live -- the live page's own panels, on top of Pool Scope's house style
+ * (../../demo/pool-scope/web/scope.css: the palette variables, panels, controls, table).
+ */
+
+.live-tag {
+    font-size: 0.8rem;
+    letter-spacing: 0.12em;
+    padding: 0.1rem 0.4rem;
+    margin-left: 0.4rem;
+    border: 1px solid var(--red);
+    border-radius: 0.3rem;
+    color: var(--red);
+    vertical-align: middle;
+}
+
+.boot-status {
+    margin: 0 0 0.8rem;
+    font-size: 0.82rem;
+    color: var(--dim);
+}
+
+.boot-status.ok { color: var(--green); }
+.boot-status.warn { color: var(--amber); }
+.boot-status.bad { color: var(--red); }
+
+.grp-label {
+    margin-bottom: 0.35rem;
+}
+
+.grp-label .sel {
+    color: var(--cyan);
+    letter-spacing: 0.04em;
+}
+
+.ctl-row-gap {
+    margin-top: 0.35rem;
+}
+
+.ctl-row .rate {
+    align-self: center;
+    font-size: 0.8rem;
+    color: var(--text);
+    min-width: 4.5rem;
+    text-align: center;
+}
+
+.key-hint {
+    align-self: center;
+    color: var(--faint);
+    font-size: 0.7rem;
+    margin-right: 0.4rem;
+}
+
+button.ctl.danger {
+    color: var(--red);
+}
+
+.note {
+    margin: 0.6rem 0 0;
+    min-height: 1.1em;
+    font-size: 0.78rem;
+    color: var(--cyan);
+}
+
+/* fleet chips: one per worker; the tone is the state's severity */
+.fleet {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.35rem;
+}
+
+.wchip {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    grid-template-rows: auto auto;
+    column-gap: 0.3rem;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    text-align: left;
+    background: var(--bg2);
+    color: var(--dim);
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    padding: 0.3rem 0.4rem;
+    cursor: pointer;
+}
+
+.wchip .name { color: var(--text); }
+.wchip .dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--faint); }
+.wchip .state { text-transform: uppercase; letter-spacing: 0.04em; }
+.wchip .restarts { grid-column: 1 / -1; color: var(--faint); font-size: 0.68rem; }
+
+.wchip[data-tone="ok"] .dot { background: var(--green); }
+.wchip[data-tone="ok"] .state { color: var(--green); }
+.wchip[data-tone="warn"] .dot { background: var(--amber); }
+.wchip[data-tone="warn"] .state { color: var(--amber); }
+.wchip[data-tone="bad"] .dot { background: var(--red); }
+.wchip[data-tone="bad"] .state { color: var(--red); }
+
+.wchip[aria-pressed="true"] {
+    border-color: var(--cyan);
+    background: #16222c;
+    background: color-mix(in oklab, var(--cyan) 10%, var(--bg2));
+}
+
+@media (hover: hover) {
+    .wchip:hover {
+        border-color: var(--faint);
+    }
+}
+
+.fleet-stats {
+    margin-top: 0.55rem;
+    font-size: 0.74rem;
+    color: var(--faint);
+    white-space: pre-wrap;
+}
+
+.fleet-stats.bad { color: var(--red); }
+
+/* the decision streams */
+.stream {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 0.76rem;
+}
+
+.stream li {
+    min-height: 1.25em;
+    padding: 0.05rem 0;
+    white-space: pre;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.stream li.ok { color: var(--green); }
+.stream li.warn { color: var(--amber); }
+.stream li.bad { color: var(--red); }
+.stream li.info { color: var(--cyan); }
+.stream li.quiet { color: var(--faint); }
+
+.panel h2.sub-h {
+    margin-top: 0.8rem;
+}
+
+.gini {
+    margin-top: 0.6rem;
+}
+
+footer.foot a {
+    color: var(--cyan);
+}

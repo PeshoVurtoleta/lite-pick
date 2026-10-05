@@ -172,6 +172,7 @@ export class Engine {
         this.fleet.onResult(i, ok, code);
         if (ok) {
             this.stats.perOk[i]++;
+            this.stats.service(i, now - this.rSent[r]);
             this.stats.latency(now - this.rArrive[r]);
             this._finishA(r, true);
         } else {
@@ -200,8 +201,9 @@ export class Engine {
         this.pool.run((i, signal) => {
             self.fleet.onDispatch(i);
             self.bus.emit('dispatch', i);
+            const sent = self.now();
             return self.set.submit(i, seq, { signal }).then(
-                (v) => { self.fleet.onResult(i, true, null); self.stats.perOk[i]++; return v; },
+                (v) => { self.fleet.onResult(i, true, null); self.stats.perOk[i]++; self.stats.service(i, self.now() - sent); return v; },
                 (e) => { self.fleet.onResult(i, false, e && e.code); self.stats.perFail[i]++; throw e; });
         }, opts).then(
             () => { self.pendingB--; self.stats.c[S_OK]++; self.stats.latency(self.now() - arrive); },

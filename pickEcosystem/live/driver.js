@@ -3,6 +3,7 @@
  *
  * Pool Scope's `LitePickSnapshot.build(driver)` (demo/pool-scope/snapshot.mjs) reads: `inflight`,
  * `isEligible(i)`, `shareOf(i)`, `weightOf(i)`, `capOf(i)`, `ewmaOf(i)`, `hasLatSketch`, `latQuantile(q)`,
+ * `latWorkerQuantile(i, q)` (the web renderer's worker table),
  * `latRing`, `frameSettles`, `frameSeconds`, `nowNs`. The simulated driver computes them from its model; this
  * one reads them off the running kernel. `tick()` is a no-op -- the live system advances on its own clock; a
  * renderer calls `beginFrame(seconds)` once per frame. Every read is cold (render rate), never on the request
@@ -84,6 +85,12 @@ export class LiveDriver {
     /** Latency quantile (ms) over the last full second, NaN while that window is empty. */
     latQuantile(q) {
         const s = this.k.stats.latLast;
+        return s.count > 0 ? s.quantile(q) : NaN;
+    }
+
+    /** Worker i's time-on-worker quantile (ms: its queue + the job) over the last full second, NaN while empty. */
+    latWorkerQuantile(i, q) {
+        const s = this.k.stats.svcLast[i];
         return s.count > 0 ? s.quantile(q) : NaN;
     }
 

@@ -85,7 +85,8 @@ jobs:
   # pins the published bricks (lite-pick 1.1.0, lite-worker-pool 1.1.0, the di-* line); `npm test` runs the
   # gates over virtual workers (deterministic) plus one suite against THIS working tree's Pick.js / Pool.js, so a
   # kernel change cannot silently break the capstone; `npm run smoke` is ~20 s over real worker_threads with
-  # every fault once (a lower rate for the 2-core runner).
+  # every fault once (a lower rate for the 2-core runner); `npm run browser-smoke` serves the P3 page and drives
+  # it in the runner's Chrome (headless, over the DevTools protocol) against the pinned esm.sh modules.
   capstone:
     name: capstone (pickEcosystem/live, node 22)
     runs-on: ubuntu-latest
@@ -104,6 +105,7 @@ jobs:
       - run: npm run smoke
         env:
           SMOKE_RATE: '600'
+      - run: npm run browser-smoke
 
   # Compile a real consumer against the PACKED tarball (not the working tree) so the exports
   # map and the typesVersions /pool mapping are exercised. ubuntu is deliberate: its filesystem

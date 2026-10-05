@@ -25,19 +25,17 @@ import {
     Renderer, RESET, BOLD, SHOW, HIDE, ALT_ON, ALT_OFF, CLR_SCREEN,
     C_GREEN, C_AMBER, C_RED, C_CYAN, C_TEXT, C_DIM, C_FAINT,
 } from '../../demo/pool-scope/tui-render.mjs';
-import {
-    bootKernel, STRATEGIES, ENGINE_A, ENGINE_B, STREAM_CAP,
-    EV_BREAKER, EV_ELIGIBLE, EV_RESTART, EV_ESCALATE, EV_REROUTE,
-} from './kernel.js';
+import { bootKernel, STRATEGIES, ENGINE_A, ENGINE_B, STREAM_CAP } from './kernel.js';
 import { nodeSetSpawn } from './nodeworker.js';
 import { bootVirtual } from './virtual.js';
 import { LiveDriver } from './driver.js';
-import { B_OPEN, B_HALF } from './fleet.js';
+import { workerState, WS_TAG, WS_TONE, eventText, eventTone } from './narrate.js';
+import { FAULT_KEYS, rateUp, rateDown, applyFault } from './surface.js';
 
 const FRAME_MS = 84;            // ~12 Hz
 const STREAM_LINES = 5;       // structural events shown
 const REROUTE_LINES = 2;      // newest failover reroutes shown
-const BREAKER_NAME = ['CLOSED', 'OPEN', 'HALF-OPEN'];
+const TONE_ANSI = [C_GREEN, C_AMBER, C_RED, C_CYAN];   // narrate.js TONE_OK / WARN / BAD / INFO
 
 /** LiveDriver + the terminal-only panel and footer the shared renderer asks for. */
 class TuiDriver extends LiveDriver {
@@ -51,34 +49,16 @@ class TuiDriver extends LiveDriver {
     }
 
     _cell(i) {
-        const k = this.k, fl = k.fleet;
-        const st = k.set.state(i);
-        let tag, col;
-        if (fl.escalated[i]) { tag = 'ESCAL'; col = C_RED; }
-        else if (st === 2) { tag = 'down '; col = C_RED; }
-        else if (st === 0) { tag = 'start'; col = C_AMBER; }
-        else if (fl.bState[i] === B_OPEN) { tag = 'BRK  '; col = C_AMBER; }
-        else if (fl.bState[i] === B_HALF) { tag = 'half '; col = C_AMBER; }
-        else if (!k.balancers.shared.up[i]) { tag = 'out  '; col = C_AMBER; }
-        else { tag = 'up   '; col = C_GREEN; }
+        const ws = workerState(this.k, i);
         const mark = i === this.sel ? C_CYAN + '>' : ' ';
-        return mark + C_DIM + 'w' + i + ' ' + col + '\u25cf ' + tag + C_FAINT + 'r' + fl.restarts[i] + RESET + ' ';
+        return mark + C_DIM + 'w' + i + ' ' + TONE_ANSI[WS_TONE[ws]] + '\u25cf ' + WS_TAG[ws].padEnd(5) + C_FAINT + 'r' +
+            this.k.fleet.restarts[i] + RESET + ' ';
     }
 
     _event(lane, idx) {
         const t = ((lane.time[idx] - this.t0) / 1000).toFixed(2).padStart(7) + 's  ';
-        const p = lane.payload[idx];
-        switch (lane.type[idx]) {
-            case EV_REROUTE: return C_FAINT + t + C_CYAN + 'w' + (p >> 8) + ' -> w' + (p & 255) + C_DIM + '  failover' + RESET;
-            case EV_BREAKER: {
-                const code = p & 3;
-                return C_FAINT + t + (code === 1 ? C_AMBER : C_GREEN) + 'w' + (p >> 2) + ' breaker ' + BREAKER_NAME[code] + RESET;
-            }
-            case EV_ELIGIBLE: return C_FAINT + t + ((p & 1) ? C_GREEN + 'w' + (p >> 1) + ' back in rotation' : C_AMBER + 'w' + (p >> 1) + ' out of rotation') + RESET;
-            case EV_RESTART: return C_FAINT + t + C_GREEN + 'w' + p + ' restarted by its supervisor' + RESET;
-            case EV_ESCALATE: return C_FAINT + t + C_RED + 'w' + p + ' ESCALATED (restart budget spent; kept out until reset)' + RESET;
-            default: return C_FAINT + t + '?' + RESET;
-        }
+        const type = lane.type[idx], p = lane.payload[idx];
+        return C_FAINT + t + TONE_ANSI[eventTone(type, p)] + eventText(type, p) + RESET;
     }
 
     _lane(lane, lines, NL) {
@@ -130,12 +110,6 @@ function measureDataPath(kernel) {
 }
 
 function argVal(argv, name, def) { const i = argv.indexOf(name); return i >= 0 && argv[i + 1] != null ? argv[i + 1] : def; }
-
-function applyFault(kernel, kind, w) {
-    if (kind === 'reset') return kernel.reset(w);
-    if (kind === 'heal') return kernel.heal(w);
-    return kernel.fault(w, kind);
-}
 
 /* -------------------------------------------------------------------------------- scripted ---- */
 
@@ -236,10 +210,10 @@ async function runInteractive(argv) {
             else if (ch === 'n') switchTo((STRATEGIES.indexOf(kernel.balancers.name) + 1) % STRATEGIES.length);
             else if (ch === 'e') kernel.setEngine(kernel.engine.mode === ENGINE_A ? ENGINE_B : ENGINE_A);
             else if (ch === 'w') drv.sel = (drv.sel + 1) % kernel.cfg.workers;
-            else if (ch === '+') kernel.setRate(Math.round(kernel.traffic.rate * 1.25));
-            else if (ch === '-') kernel.setRate(Math.max(100, Math.round(kernel.traffic.rate / 1.25)));
+            else if (ch === '+') kernel.setRate(rateUp(kernel.traffic.rate));
+            else if (ch === '-') kernel.setRate(rateDown(kernel.traffic.rate));
             else {
-                const kind = { k: 'kill', s: 'slow', f: 'flaky', h: 'hang', c: 'crash', l: 'crashloop', x: 'heal', r: 'reset' }[ch];
+                const kind = FAULT_KEYS[ch];
                 if (kind) { applyFault(kernel, kind, drv.sel); drv.note = kind + ' -> w' + drv.sel; }
             }
         }

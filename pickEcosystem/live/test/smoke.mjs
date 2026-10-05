@@ -3,10 +3,13 @@
  * real clock for ~20 s, every fault once, then the orchestrator shutdown. Prints "ok" and exits 0, or names
  * the failed check and exits 1. Run by `npm run smoke` (and lite-pick's CI).
  *
- * Timeline (s), faults under P2C first: 2 kill w2 | 4 flaky w1 | 6 hang w4 | 9 crash w5 | 11 heal w1 |
+ * Timeline (s), faults under P2C first: 2 kill w2 | 4 flaky w1 | 7 heal w1 | 8 hang w4 | 11 crash w5 |
  *   12 crash loop w6 | 15 reset w6 | 16 slow w3 + switch to PeakEWMA | 18 switch to BoundedLoad | 20 shutdown.
  * (Order matters: under PeakEWMA a failing worker is avoided by its failure penalty before its breaker can trip
- * and before a crash loop gets the jobs that make it crash -- the strategy doing its job, seen in an earlier run.)
+ * and before a crash loop gets the jobs that make it crash -- the strategy doing its job, seen in an earlier run.
+ * And the failing faults never overlap: the claim is that ONE fault loses no request. With `tries: 2`, two at
+ * once can -- seen (P3, ~1 run in 4 under load): w5 crashed at 9 s, a request failed over to w1, still flaky
+ * and back in rotation after a lucky half-open probe, and failed again. Flaky w1 is healed before the hang.)
  * Checks: exit code 0; every arrival accounted for (ok + failed + shed + drained === arrived); no failed
  * request; nothing in flight at exit; kill / hang / crash each restarted their worker; w1's breaker opened;
  * w6 escalated and came back after reset.
@@ -28,10 +31,10 @@ const check = (ok, what) => { checks.push([ok, what]); log((ok ? '  ok   ' : '  
 
 await at(2); k.fault(2, 'kill');
 await at(4); k.fault(1, 'flaky');
-await at(6); k.fault(4, 'hang');
-await at(9); k.fault(5, 'crash');
-await at(11); k.heal(1);
+await at(7); k.heal(1);
 const breakerOpened = k.events[2] > 0;
+await at(8); k.fault(4, 'hang');
+await at(11); k.fault(5, 'crash');
 await at(12); k.fault(6, 'crashloop');
 await at(15);
 const escalated6 = k.fleet.escalated[6] === 1;

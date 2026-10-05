@@ -4,7 +4,9 @@
 2026-10-05 as lite-worker-pool 1.1.0 `createWorkerSet` (LiteWorkerPool research/worker-set.md). P1 (the headless kernel, `pickEcosystem/live/`)
 IMPLEMENTED 2026-10-05 (research/capstone-P1-spec.md). P2 (the terminal UI on the live
 system, `pickEcosystem/live/tui.mjs`; Pool Scope's renderer split into `demo/pool-scope/tui-render.mjs`, its
-simulated frames byte-identical) IMPLEMENTED 2026-10-05. Next: P3, the browser page.
+simulated frames byte-identical) IMPLEMENTED 2026-10-05. P3 (the browser page, `pickEcosystem/live/index.html`;
+Pool Scope's web renderer split into `demo/pool-scope/web/render.mjs`; section 10) IMPLEMENTED 2026-10-05.
+Next: P4, the hub page + the Pages deploy job.
 **North-star (ROADMAP section 5, your words 2026-09-23):** "to see the whole system built, and not only built --
 but functioning, anyone can see the served system; both operational through a browser and terminal" -- the
 proof that an A+, zero-GC module is still worth building.
@@ -265,6 +267,45 @@ orchestrator), `test/` (node:test + torture).
 worker speeds for the default scene; whether the sub-app pins lite-pick 1.1.0 or follows the repo's
 working tree in its tests (recommend: pinned for the served demo, plus one test run against the working
 tree so a kernel change cannot silently break the capstone).
+
+## 10. P3 as built (2026-10-05)
+
+The browser page runs the same `bootKernel` in the visitor's tab over lite-worker-pool's DEFAULT transport (real
+Web Workers from Blob URLs via lite-worker) -- no browser-specific worker code. What P3 decided while building:
+
+- **Renderer split, like P2's.** `demo/pool-scope/web/main.mjs` became `web/render.mjs` (`createWebScope`: charts,
+  panels, table, inspector; hooks `stateLabel` and `onPaint` the simulated page does not use) + `web/scope.css` +
+  a thin `main.mjs`. The live page (`page.js`) adds the fleet, DECISIONS and REROUTES panels and the controls.
+  The words and keys moved out of the TUI so both surfaces share them: `narrate.js` (worker states, one sentence
+  per event), `surface.js` (keys, rate steps, faults, the device scene).
+- **One instance per brick.** The import map pins every brick at package.json's exact version (W1, both ways);
+  `?external=` wherever one brick imports another AT RUNTIME (lite-worker-pool -> lite-worker, lite-statechart /
+  lite-charts -> lite-signal) -- read from each package's entry file, not its peer list (the di-* peers on
+  lite-di-container are type-only imports).
+- **The device is measured, not assumed.** A cold 60 ms calibration read 57k loop units/ms in Chrome against
+  ~200k warm (V8 tiers): jobs ran at 0.3 ms. Now: half the budget warms the loop, the best of four windows
+  counts, a frozen clock yields the reference (and cannot hang the page). Traffic by cores: 2000/1500/1000 req/s.
+- **A hidden tab pauses traffic.** A background tab's timers fire once a second or slower, so a tick offered a
+  second's arrivals at once and overflowed the queues (seen: the preview pane loads the page hidden). Rate 0 while
+  hidden (also at boot), `Traffic.resync()` on return.
+- **A browser crash is loud.** `close()` in a Web Worker sends no event (the page would see a hang, 1 s later);
+  `job.js` fails the job and raises an uncaught error: the Worker's `error` event takes it down at once (W4).
+- **Per-worker latency** for the worker table: time on the worker (queue + job), a DDSketch per worker rolled
+  each second; engine A still 0 scavenges / 960k requests.
+- **Real-browser gate.** `test/browser-smoke.mjs`: headless Chrome over the DevTools protocol (Node's built-in
+  WebSocket, zero dependencies), the page driven through its own keys, against the live esm.sh modules; in CI.
+
+Found on the way:
+- **lite-di-orchestrator 1.0.0 cannot shut down in a browser.** Its default `timers` object holds the global
+  `setTimeout` and calls `timers.setTimeout(...)`; a browser rejects that receiver ("Illegal invocation"), the
+  deadline cannot be armed, and `shutdown()` fails closed at once with DEADLINE (2) -- drain never runs. Node does
+  not mind, so every Node test passed. The kernel now always injects plain-function timers; the upstream fix
+  (bind the defaults) belongs in lite-di-orchestrator 1.0.1.
+- **The real-thread smoke run overlapped faults** (flaky w1 4-11 s with the hang at 6 s and the crash at 9 s):
+  with `tries: 2`, a failover that lands on the second failing worker loses the request -- ~1 run in 4 under
+  load, on P2's code too. The timeline now heals w1 before the hang; 10/10 clean.
+- **lite-charts canvases do not shrink** when the window narrows after mount (a fresh load at 390 px fits). Seen
+  on both pages; not fixed here.
 
 ## What we would NOT do
 

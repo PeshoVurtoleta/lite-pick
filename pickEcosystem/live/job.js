@@ -10,7 +10,11 @@
  *   ctl[CTL_SLOW]  slowdown factor (1 = normal, 10 = the "slow x10" fault)
  *   ctl[CTL_FAIL]  fail-fast rate in [0, 1] (a deterministic hash of the item decides)
  *   ctl[CTL_HANG]  ms to busy-wait before the job (0 = none): the "hang" fault
- *   ctl[CTL_CRASH] > 0: the thread exits on its next job (the "crash" fault)
+ *   ctl[CTL_CRASH] > 0: the worker dies on its next job (the "crash" fault). In Node the thread exits
+ *                  (process.exit: the transport sees the exit). A Web Worker that calls close() would die
+ *                  SILENTLY -- the page gets no event, so it would look hung until the hang limit -- so in a
+ *                  browser the job fails and an uncaught error is raised right after: the page's Worker gets
+ *                  an `error` event, lite-worker reports it, and the set takes the worker down at once.
  */
 
 export const CTL_UNITS = 0;
@@ -36,7 +40,8 @@ export function jobFn(item, ctl) {
     var slow = ctl.length > 1 ? ctl[1] : 1;
     if (ctl.length > 4 && ctl[4] > 0) {
         if (typeof process !== "undefined" && process && typeof process.exit === "function") process.exit(3);
-        else close();
+        setTimeout(function () { throw new Error("worker crashed"); }, 0);
+        throw new Error("worker crashed");
     }
     if (ctl.length > 3 && ctl[3] > 0) { var t0 = Date.now(); while (Date.now() - t0 < ctl[3]) { /* hang */ } }
     if (ctl.length > 2 && ctl[2] > 0) {

@@ -1,9 +1,9 @@
-# pickEcosystem / live -- the headless capstone kernel (P1)
+# pickEcosystem / live -- the capstone system: kernel (P1), terminal UI (P2), browser page (P3)
 
 The lite-pick capstone (`research/capstone-pickEcosystem.md`) is a served, FUNCTIONING load-balancing system.
 This directory is its kernel, headless: real workers doing real CPU work, a supervised fleet with health
 checks and circuit breakers, open-loop traffic, live strategy switching and a graceful shutdown -- built
-only from the suite's bricks. P2 (below) is the terminal UI; P3 the browser page; P4 serves it.
+only from the suite's bricks. P2 (below) is the terminal UI; P3 the browser page; P4 deploys it to Pages.
 
 It has its own `package.json` (exact versions of the published bricks) and is never part of the lite-pick
 npm package.
@@ -14,6 +14,8 @@ npm run tui                                                      # Pool Scope on
 npm start -- --seconds 20 --fault 3:kill:2 --fault 6:slow:3     # real worker_threads, 1 line per second
 npm test                                                         # the P1 gates (virtual workers, deterministic)
 npm run smoke                                                    # ~20 s over real threads, every fault once
+npm run web                                                      # the browser page on http://127.0.0.1:8137/
+npm run browser-smoke                                            # that page in headless Chrome, every check
 ```
 
 `run.mjs` flags: `--strategy <name>` (one of the ten), `--rate <req/s>`, `--engine A|B`, `--seconds N`,
@@ -33,6 +35,28 @@ Keys: `1`-`9`,`0` strategy, `n` next, `e` engine A/B, `w` select a worker, then 
 `+`/`-` arrival rate, `q` shutdown through the orchestrator (drain, settle every request, retire, exit code).
 `node tui.mjs --frames N --script 2:kill:2,3:slow:3` renders deterministic frames over virtual workers (script
 times are seconds since boot); `--real` uses real threads.
+
+## The browser page (P3)
+
+`index.html` + `page.js` run the SAME `bootKernel` in the visitor's tab: eight real Web Workers (lite-worker-pool's
+default transport, Blob URLs via lite-worker), `performance.now`, real timers. Pool Scope's browser renderer
+(`demo/pool-scope/web/render.mjs`, shared with the simulated page) paints it through `driver.js`; the page adds the
+fleet, DECISIONS and REROUTES panels (the terminal's words, `narrate.js`) and the terminal's keys and rate steps
+(`surface.js`), plus buttons for each. Click a worker (or press `w`) to choose where a fault lands; `q` / the
+shutdown button runs the orchestrator and reports its exit code; "boot a fresh system" starts again.
+
+- **Every module is pinned.** The import map names each brick at the exact version `package.json` pins;
+  `test/web.test.mjs` W1 keeps the two equal both ways, and requires `?external=` wherever one brick imports
+  another at runtime (lite-worker-pool -> lite-worker, lite-statechart / lite-charts -> lite-signal), so each
+  loads once.
+- **The device is measured.** Before booting, the page times the job's own loop on this machine (warm-up, then
+  the best of four windows): "~1 ms of CPU per job" holds on a phone too. Fewer cores, less traffic
+  (2000 / 1500 / 1000 req/s for 8+ / 6+ / fewer).
+- **A hidden tab pauses its traffic.** Browsers throttle a background tab's timers to once a second or slower,
+  which would offer a whole second at once; the page offers nothing while hidden and resyncs on return.
+- **A crash is loud in a browser too.** A Web Worker that calls `close()` dies silently (no event: it would look
+  hung for a second); `job.js` fails the job and raises an uncaught error, so the set takes the worker down at once.
+- **The worker table's p95** is time on the worker (its queue + the job), per worker, over the last second.
 
 ## What each brick does here
 
@@ -59,7 +83,9 @@ times are seconds since boot); `--real` uses real threads.
 - **One 10x-slow worker, 2000 req/s, p99:** PeakEWMA 10.1 ms, LeastConn 30.3 ms, P2C 40.0 ms, RoundRobin 340 ms.
 - **Faults, no failed request:** kill (failover + restart), 50% fail-fast (breaker opens, HalfOpen probe closes
   it), hang (out at 500 ms, respawned at ~1 s), crash loop (escalated after 5 restarts), shutdown (every
-  in-flight request settles, exit 0). The real-thread smoke run: ~16,000 requests, 0 failed.
+  in-flight request settles, exit 0). The real-thread smoke run: ~16,000 requests, 0 failed. One fault at a
+  time: with `tries: 2`, two overlapping faults can lose a request (a failover that lands on a second failing
+  worker), so the smoke timeline never overlaps them.
 - **Real threads:** 8 workers up in ~25 ms; ~1500 req/s at p50 ~1.95 ms on the reference machine.
 
 ## Gates
@@ -67,5 +93,9 @@ times are seconds since boot); `--real` uses real threads.
 `test/kernel.test.mjs` (G1-G10, each with a control that must fail), `test/alloc.test.mjs` (allocation rate by
 scavenge count; retention of 1000 supervised respawns and 200 scope rebuilds), `test/driver.test.mjs` (Pool
 Scope's real snapshot over the live system), `test/tui.test.mjs` (the live TUI scripted: fleet, decisions,
-shutdown; two runs byte-identical), `test/smoke.mjs` (real threads). G10 runs the gates against the
-repo's working-tree `Pick.js`, so a lite-pick change cannot silently break the capstone.
+shutdown; two runs byte-identical), `test/web.test.mjs` (W1-W6: import-map drift both ways, the browser's module
+graph, the DOM contract, the browser crash path, the device scene, the static server's allowlist),
+`test/smoke.mjs` (real threads), `test/browser-smoke.mjs` (the served page in headless Chrome over the DevTools
+protocol, zero dependencies: boot, kill / crash / flaky through the page's own keys, engine B, a strategy switch,
+graceful shutdown with exit code 0, no failed request, no console error; and the simulated page). G10 runs the
+gates against the repo's working-tree `Pick.js`, so a lite-pick change cannot silently break the capstone.

@@ -2,7 +2,10 @@
  * Pool Scope -- web/serve.mjs : a zero-dependency static file server for the BROWSER target (PS3).
  *
  *     npm run scope:web           # -> serves demo/pool-scope/web on http://127.0.0.1:8137
- *     node demo/pool-scope/web/serve.mjs [--port N] [--root DIR]   (or PORT=N ...)
+ *     node demo/pool-scope/web/serve.mjs [--port N] [--root DIR] [--page live]   (or PORT=N ...)
+ *
+ * `--page live` opens the capstone's LIVE page instead (pickEcosystem/live/: the running system over Web
+ * Workers; `npm run web` there). It shares this page's renderer and stylesheet, so both trees are served.
  *
  * Node built-in http only (no bundler, no `serve` dependency): the page is pure static -- an import
  * map + relative brick imports + esm.sh for the siblings -- so this just streams files with correct
@@ -11,8 +14,9 @@
  * DIRECTLY (they import Pick.js as a relative path -- zero CDN needed for lite-pick itself).
  *
  * FAIL CLOSED (audit M-D1 / M-D2 / L26): binds to loopback ONLY; serves GET/HEAD only (else 405);
- * an ALLOWLIST limits reachable paths to the demo tree + the two kernel files the page imports
- * (everything else -- /.git, /package.json, /node_modules -- is 404, never touched on disk);
+ * an ALLOWLIST limits reachable paths to the demo tree + the two kernel files the page imports + the live
+ * page's own files (everything else -- /.git, /package.json, any node_modules or test directory -- is 404,
+ * never touched on disk);
  * traversal is rejected with path.relative + a realpath symlink-escape check; a foreign Host header
  * is refused (DNS-rebinding defence); every response carries X-Content-Type-Options: nosniff.
  */
@@ -75,7 +79,8 @@ const MIME = {
 // The web page lives here. A bare "/" REDIRECTS to the page's real directory (with a trailing
 // slash) so the browser's base URL is the web dir and the page's relative module imports
 // (main.mjs, ../driver.mjs, ../../Pick.js) resolve correctly.
-const WEB_DIR = '/demo/pool-scope/web/';
+const LIVE_DIR = '/pickEcosystem/live/';
+const WEB_DIR = argVal('--page', '') === 'live' ? LIVE_DIR : '/demo/pool-scope/web/';
 
 // ALLOWLIST: the ONLY paths this server will serve, matched against the path AFTER normalisation
 // (so a traversal like /demo/pool-scope/../../package.json is judged as /package.json -> denied).
@@ -83,6 +88,11 @@ const WEB_DIR = '/demo/pool-scope/web/';
 function isAllowed(p) {
     if (p === '/Pick.js' || p === '/Pool.js') return true;
     if (p === '/demo/pool-scope' || p.startsWith('/demo/pool-scope/')) return true;
+    // The live page: its top-level files only -- never its node_modules, tests, package files or dotfiles.
+    if (p.startsWith(LIVE_DIR)) {
+        const rest = p.slice(LIVE_DIR.length);
+        return rest.indexOf('/') < 0 && !rest.startsWith('.') && !rest.startsWith('package');
+    }
     return false;
 }
 
@@ -120,13 +130,13 @@ const server = createServer(async (req, res) => {
             res.end();
             return;
         }
-        // The web dir WITHOUT a trailing slash -> redirect (so relative imports resolve), not 404.
-        if (urlPath === '/demo/pool-scope/web') {
-            res.writeHead(302, { location: WEB_DIR, 'x-content-type-options': 'nosniff' });
+        // A page dir WITHOUT a trailing slash -> redirect (so relative imports resolve), not 404.
+        if (urlPath === '/demo/pool-scope/web' || urlPath + '/' === LIVE_DIR) {
+            res.writeHead(302, { location: urlPath + '/', 'x-content-type-options': 'nosniff' });
             res.end();
             return;
         }
-        if (urlPath === WEB_DIR) urlPath = WEB_DIR + 'index.html';
+        if (urlPath === '/demo/pool-scope/web/' || urlPath === LIVE_DIR) urlPath = urlPath + 'index.html';
 
         // Resolve inside ROOT, then reject any traversal escape via path.relative (not a prefix match).
         const abs = join(ROOT, urlPath);

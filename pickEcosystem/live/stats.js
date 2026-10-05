@@ -23,6 +23,11 @@ export class Stats {
         this.perFail = new Float64Array(this.n);       // failed attempts per worker
         this.lat = new DDSketch(0.01);                 // end-to-end latency (ms), rolled every second
         this.latLast = new DDSketch(0.01);             // the previous full second (what stats report)
+        // Per-worker time ON the worker (ms): a successful attempt, sent -> settled (the worker's queue + the job;
+        // failover excluded), rolled with the end-to-end window. Pool Scope's worker table and inspector read these.
+        this.svc = [];
+        this.svcLast = [];
+        for (let i = 0; i < this.n; i++) { this.svc.push(new DDSketch(0.01)); this.svcLast.push(new DDSketch(0.01)); }
         this._x = new Float64Array(1);                 // addFrom slot (0-box)
         this.ring = new Float32Array(512);             // the most recent latencies (Pool Scope fallback)
         this.ringHead = 0;
@@ -40,6 +45,12 @@ export class Stats {
         this.ringHead = (this.ringHead + 1) & 511;
     }
 
+    /** A successful attempt on worker i took `ms` (sent -> settled). */
+    service(i, ms) {
+        this._x[0] = ms;
+        this.svc[i].addFrom(this._x, 0);
+    }
+
     /** 1 Hz: freeze the last second's percentiles and rate, start a new window. */
     roll(now) {
         const s = this.lat;
@@ -52,6 +63,8 @@ export class Stats {
         this.lat = this.latLast;
         this.latLast = s;
         this.lat.clear();
+        const a = this.svc, b = this.svcLast;
+        for (let i = 0; i < this.n; i++) { const t = a[i]; a[i] = b[i]; b[i] = t; a[i].clear(); }
     }
 
     snapshot() {

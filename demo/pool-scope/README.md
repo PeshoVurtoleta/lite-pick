@@ -45,7 +45,8 @@ Strategies (the ten): `roundrobin`, `smoothwrr`, `p2c`, `leastconn`, `sed`, `nq`
 The **"richer pitch"** render target: the same live decision-monitor, served as a static browser page. It
 reuses the **same renderer-agnostic bricks and detectors as the TUI** (`snapshot.mjs`, `detectors.mjs`,
 `driver.mjs`, `siblings.mjs`) over the real `Pick.js` kernel -- **only the renderer differs** (the TUI's
-`tui.mjs` is Node/ANSI; PS3 is `web/main.mjs`, a browser renderer that paints with `@zakkster/lite-charts`).
+`tui.mjs` is Node/ANSI; PS3 is `web/render.mjs`, a browser renderer that paints with `@zakkster/lite-charts`,
+wired to the simulation by `web/main.mjs` -- and to the LIVE system by `pickEcosystem/live/page.js`).
 The driver runs in-browser on a throttled ~12 Hz tick appending to the snapshot ring and running the
 detectors each tick -- the identical zero-alloc data path.
 
@@ -238,6 +239,9 @@ and both stay nominal.
   DDSketch / ForwardDecay / HeavyKeeper sibling instances (with inline fallbacks).
 - `siblings.mjs` -- the OPTIONAL PEER layer: dynamic fail-open `import()` of lite-sketch + lite-adaptive,
   the backing indicators, and the `POOL_SCOPE_NO_*` fallback overrides.
-- `tui.mjs` -- the renderer + the dual-mode main loop + the HOT KEYS panel + the backing indicator.
+- `tui-render.mjs` -- the terminal renderer (shared with the capstone's live TUI); `tui.mjs` -- the simulated
+  TUI's driver wiring + the dual-mode main loop.
+- `web/render.mjs` + `web/scope.css` -- the browser renderer and house style (shared with the capstone's live
+  page, `pickEcosystem/live/`); `web/main.mjs` -- the simulated page's driver, injectors, controls and loop.
 
 Reads state only; never calls `pick()`; kernel unchanged; `peerDependencies` `{}`.

@@ -280,7 +280,10 @@ control('M9b LeastConn ties -> lowest index, no rotation (must PASS)',
 control('M10 CH stickiness break (per-setEligible rotation)',
     patchAll(
         patch(PICK, '    setEligible(i, up) {\n        _vIdx(i, this._cap);', '    setEligible(i, up) {\n        this.__ROT = (this.__ROT | 0) + 1;\n        _vIdx(i, this._cap);'),
-        '        let slot = (keyHash >>> 0) % M;', '        let slot = ((keyHash >>> 0) + (this.__ROT | 0)) % M;', 2),
+        // 1.1.0 B6: the pick doors compute the slot and CH / BL share _pickSlot(slot), so shift it there
+        // (((k % M) + r) % M == (k + r) % M: the same mutant as before B6).
+        '    _pickSlot(slot) {\n        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed\n',
+        '    _pickSlot(slot) {\n        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed\n' + "        slot = (slot + (this.__ROT | 0)) % this._m;\n", 2),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash kind=oracle');
 // M11: BoundedLoad drops the +1 that counts the incoming request (the H4 bug) -> under-caps -> the
 // reference walk disagrees with the pick.
@@ -293,7 +296,8 @@ control('M11 BoundedLoad H4 under-cap',
 // node down moves every other key (property 3). MH2 makes the Maglev permutation depend on the total weight, so any
 // rebuild reshuffles the whole table (property 4: moved share >> CH_REBUILD_MOVED_MAX).
 control('MH1 CH modulo-N hashing (slot depends on live)',
-    patchAll(PICK, '        let slot = (keyHash >>> 0) % M;', '        let slot = ((keyHash >>> 0) + this._live) % M;', 2),
+    patchAll(PICK, '    _pickSlot(slot) {\n        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed\n',
+        '    _pickSlot(slot) {\n        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed\n' + "        slot = (slot + this._live) % this._m;\n", 2),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'ConsistentHash' }, 1, 'quality lane=ConsistentHash kind=property');
 control('MH2 CH rebuild reshuffles (permutation depends on total weight)',
     patch(patch(PICK, '        const offset = new Int32Array(N);', '        const offset = new Int32Array(N); let __t = 0; for (let q = 0; q < N; q++) __t += wt[q];'),

@@ -319,14 +319,21 @@ Notes:
 - Pick `tauNs` around your p50-p90 rtt: smaller = reacts faster to a slowdown, larger =
   steadier. `tauNs` is the EWMA TIME CONSTANT (half-life = `tauNs x ln2`); it IS the
   anti-flap smoothing, no extra dwell needed.
-- **KNOWN LIMITATION (1.0.1, buffer-based API planned for 1.1.0).** `pick(now)` /
-  `recordRtt(..., now)` take a nanosecond `now` as a plain number argument. When the call
-  is not inlined, V8 boxes a non-small-integer number into a ~16 B HeapNumber -- so with a
-  realistic nanosecond clock these calls allocate ~16 B/op (transient, dies young; it does
-  not RETAIN and does not force a major GC). Small-integer arguments are 0 B/op; the
-  small-integer range is build-dependent (below 2^31 on stock 64-bit Node, below 2^30 on
-  pointer-compressed builds such as Chrome/Electron). A buffer-based `recordRttFrom`/clock
-  API that keeps `now` in a `Float64Array` slot is planned for 1.1.0.
+- **Zero-box clock (1.1.0).** `pick(now)` / `recordRtt(..., now)` take plain numbers; V8
+  boxes a nanosecond clock or a fractional rtt into a ~16 B HeapNumber whenever the call
+  is not inlined (transient; never retained, never a major GC). For a strictly 0 B/op loop,
+  write the numbers into your own `Float64Array` slots and use the `From` siblings -- same
+  selection, same errors, 0 B/op even with V8 inlining off:
+
+  ```js
+  const t = new Float64Array(1), fb = new Float64Array(2);
+  t[0] = nowNs();
+  const i = lb.pickFrom(t, 0);                 // == lb.pick(t[0])
+  // ... on settle:
+  const done = nowNs();
+  fb[0] = done - t[0]; fb[1] = done;           // [sampleNs, now] -- recordRtt's argument order
+  lb.recordRttFrom(i, fb, 0);                  // == lb.recordRtt(i, fb[0], fb[1])
+  ```
 - Measured effect: with one node at 10x latency, PeakEWMA sends it a tiny fraction of
   the traffic P2C-over-inflight would, and cuts service p99 sharply.
 
@@ -386,12 +393,16 @@ Notes:
     { key: fnv1a(sessionId), tries: 2 }              // same key -> same backend; failover overflows to a neighbour
   );
   ```
-- **KNOWN LIMITATION (1.0.1).** `pick(keyHash)` takes the key as a plain number argument.
-  A key `>= 2^31` (about half of a 32-bit FNV-1a output) boxes into a ~16 B HeapNumber
-  when the call is not inlined (transient, does not retain; keys below the build's
-  small-integer range -- 2^31 on stock 64-bit Node, 2^30 on pointer-compressed builds --
-  are 0 B/op). A value produced by `%` or division can box even when it is a small
-  integer. A buffer-based key API is planned for 1.1.0.
+- **Zero-box keys (1.1.0).** A key `>= 2^31` (about half of a 32-bit FNV-1a output) boxes
+  into a ~16 B HeapNumber when `pick(keyHash)` is not inlined (transient, does not retain).
+  Keep the key in a `Uint32Array` slot and call `pickFrom` -- the same backend, 0 B/op even
+  with V8 inlining off (BoundedLoad inherits it):
+
+  ```js
+  const keys = new Uint32Array(1);
+  keys[0] = fnv1a(sessionId);
+  const i = ch.pickFrom(keys, 0);              // == ch.pick(keys[0])
+  ```
 
 ---
 
@@ -474,8 +485,8 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
   `pick(keyHash)` take a number argument; V8 boxes a non-small-integer value into a
   ~16 B transient HeapNumber when the call is not inlined -- so a realistic nanosecond
   clock or a key `>= 2^31` allocates ~16 B/op (transient, does not retain, does not force
-  a major GC). Small-integer arguments are 0 B/op; buffer-based variants are planned for
-  1.1.0. See section 8/9.
+  a major GC). The 1.1.0 `pickFrom` / `recordRttFrom` siblings read those numbers from your
+  typed-array slots and are 0 B/op even when V8 does not inline them. See section 8/9.
 - The only async allocation is the promise your own `fn` already creates (disclosed;
   `Pool.run` adds O(1) integer ops plus one small per-run array).
 - Fixed capacity: the pool size is set at construction and the backing arrays never

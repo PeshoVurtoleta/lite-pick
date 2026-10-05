@@ -265,6 +265,16 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     index (incl. a numeric string like '2' -- which used to work; a string index now throws
     RangeError, not TypeError) or a non-finite/negative `sampleNs`; 0 B/op on the success path.
     Anti-flap = the time constant, no extra dwell (ADR 0002, ADR 0009).
+  - `pickFrom(buf, i)` -> number (1.1.0, ZERO-BOX). `now = buf[i]` read INSIDE from a caller-owned
+    `Float64Array`, so a nanosecond clock (~1.7e18, never a small integer) never crosses a call boxed --
+    `pick(now)` boxes it (~16 B) whenever V8 does not inline the call. Identical selection to
+    `pick(buf[i])`. NEVER throws for any value or index (past the end reads undefined -> like a non-finite
+    `now`: P2C-random); no per-pick type check -- a null / undefined `buf` is a programming error the engine
+    reports as TypeError. 0 B/op even with V8 inlining OFF (gated: `npm run test:perf:noinline`).
+  - `recordRttFrom(i, buf, j)` -> void (1.1.0, ZERO-BOX). `sampleNs = buf[j]`, `now = buf[j + 1]` (recordRtt's
+    argument order) read INSIDE a caller-owned `Float64Array`. Same semantics / errors as recordRtt, plus
+    RangeError `LITE_PICK_ARRAY` unless `buf` is a Float64Array with slots j and j + 1 -- all before any write.
+    0 B/op. (Idiom: `fb[0] = done - start; fb[1] = done; lb.recordRttFrom(i, fb, 0)`.)
   - CONTRACT: `now` and `sampleNs` MUST be FINITE numbers. `recordRtt` THROWS on a non-finite
     argument (warm path); `pick(now)` NEVER throws (fail-closed contract), so a non-finite `now`
     yields P2C-random selection, not an error.
@@ -282,6 +292,13 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     COLD full-table sweep finds a far eligible backend (1.1.0, L3; 1.0.x returned PICK_NONE there), so
     `PICK_NONE` ONLY when no eligible backend owns a table slot. KEY IS A CALLER INTEGER -- no per-pick string
     hashing (the one zero-GC hazard); hash string keys yourself, cold. No hashing dependency added.
+  - `pickFrom(buf, i)` -> number (1.1.0, ZERO-BOX). The key is `buf[i]`, read INSIDE and reduced to its
+    slot at once, so a 32-bit hash >= 2^31 (not a small integer on Node; >= 2^30 on Chrome / Electron)
+    never crosses a call boxed -- `pick(keyHash)` boxes it whenever V8 does not inline the call.
+    Identical selection to `pick(buf[i])`: any typed array, normalized by `>>> 0` (a Uint32Array is the
+    natural home of a 32-bit hash). NEVER throws for any value or index (past the end -> key 0, like
+    pick(NaN)); a null / undefined `buf` is a programming error (engine TypeError). 0 B/op, gated with
+    V8 inlining on and off. BoundedLoad inherits it (cap-aware).
   - `setWeight(i, w)` -> void. COLD. Set backend i's weight (uint32) and REBUILD the table.
   - `setWeights(weights)` -> void. COLD (1.1.0). Replace ALL weights (a Uint32Array, length >= capacity,
     COPIED) and rebuild ONCE -- the batch form of setWeight. Validated before any write (RangeError).
@@ -317,6 +334,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     ConsistentHash. O(1), 0 B/op, NEVER throws. Nothing eligible in the window -> the cold full-table
     sweep (1.1.0, L3), cap ignored. `PICK_NONE` ONLY when no eligible backend owns a table slot -- NEVER
     merely because backends are over cap (fail OPEN on overload).
+  - `pickFrom(buf, i)` -> number (1.1.0, ZERO-BOX). Inherited from ConsistentHash: the key is `buf[i]`,
+    read inside; identical to `pick(buf[i])` WITH the cap. 0 B/op even with V8 inlining off.
   - `note(i, delta)` -> void. WARM feedback path (not the hot pick path): the SOLE writer of `_total`
     (dispatch note(i,+1) / settle note(i,-1)), so the cap's mean stays O(1)-current without a scan.
     `i` is validated in range (RangeError), `delta` typeof-first as an integer; `_total` clamps at 0.

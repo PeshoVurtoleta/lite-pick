@@ -32,9 +32,9 @@ import {
 // setting, no coarser than V8's default starting size, so the gate detects the smallest per-op
 // allocation. Pinning MIN as well as MAX stops the young generation from growing mid-run, which
 // would otherwise raise the scavenge threshold and let a small allocation slip. Assert both flags so
-// the gate can never silently run un-pinned. (At this sharp pin the isolated recordRtt lane shows a
-// small window-scaling allocation for some integer sample patterns; root cause NOT established -- see
-// the recordRtt FINDINGS note and the report-only lane. The gating sample avoids it.)
+// the gate can never silently run un-pinned. (At this sharp pin the 1.0.x recordRtt showed a small
+// allocation for some integer sample patterns when its lane ran alone -- a Maglev merge of a tagged argument
+// with a double, removed in 1.1.0 B3; research/1.1.0-buffer-apis.md section 6. The lane is gated below.)
 function semiSpaceMB(flag) {
     const av = process.execArgv;
     for (let i = 0; i < av.length; i++) {
@@ -49,7 +49,7 @@ test('perf-gate: semi-space pinned to 1MB (min AND max) -- fail closed', () => {
     const min = semiSpaceMB('--min-semi-space-size');
     assert.equal(max, 1, 'run with --max-semi-space-size=1 (got ' + max + ') -- use: npm run test:perf');
     assert.equal(min, 1, 'run with --min-semi-space-size=1 so new space does not grow mid-run ' +
-        '(got ' + min + '); see the recordRtt FINDINGS note -- use: npm run test:perf');
+        '(got ' + min + ') -- use: npm run test:perf');
 });
 
 const CAP = 1 << 14;      // pool capacity 16384 (O(1)/O(d) scenarios: size is irrelevant)
@@ -79,9 +79,8 @@ const FB_CAP = 2048;
 // is a Smi on both builds, keeping the gate portable. (A plain monotonic `now += 1000` reaches ~1.6e9
 // over an 8N window -- still a Smi HERE, but a HeapNumber on a pointer-compressed build, where a large
 // clock passed to non-inlined pick()/recordRtt would box.) The wrap makes the clock non-monotonic;
-// pick()/recordRtt clamp the resulting negative dt to 0 (L6), so it is harmless. NOTE: masking is NOT
-// what keeps the recordRtt lane 0 B/op alone (a bitwise-typed `(now % 500000)|0` still tripped it) --
-// see the recordRtt FINDINGS note and the report-only lane.
+// pick()/recordRtt clamp the resulting negative dt to 0 (L6), so it is harmless. The REALISTIC-magnitude
+// lanes (a 1.7e15 clock, fractional samples, keys >= 2^31) gate the 1.1.0 `From` methods below.
 const CLK_MASK = 0x3fffffff;   // 2^30 - 1: the LOWER (pointer-compressed) Smi ceiling -- portable
 
 // M-T3: buffer IDENTITY, not byteLength. A typed array's `.buffer.byteLength` can NEVER change
@@ -330,7 +329,7 @@ const peakEwmaPick = {
         s.acc = acc | 0; s.now = now | 0;
     },
     statsOf(s) {
-        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer) };
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
     },
 };
 
@@ -339,20 +338,12 @@ const peakEwmaPick = {
  * writes over the owned EWMA state; the typeof/range guards only construct an Error on the
  * (untaken) failure branch, so the success path allocates nothing.
  *
- * FINDINGS "recordRtt lane" -- MEASURED FACTS ONLY (this machine, darwin arm64, Node v26.8.2,
- * --min/--max-semi-space-size=1). ROOT CAUSE NOT ESTABLISHED; tracked for 1.1.0 (where recordRtt
- * gets a buffer-based variant). What is measured:
- *   - Run ALONE, with some INTEGER sample patterns (e.g. `now % 500000`, step 1000), the lane shows a
- *     small allocation that SCALES with window length: 8N:2, 16N:4, 32N:9 scavenges at the 1MB pin
- *     (N:0). The recordRtt arguments are all Smis by VALUE (%IsSmi true).
- *   - It DISAPPEARS with --no-maglev, with --no-concurrent-recompilation, and when the PeakEWMA pick
- *     lane (or any preceding lane) runs first. It does not reproduce in a standalone script.
- *   - --max-opt=1 (lower tiers only) boxes heavily for ANY sample pattern (~294-302 scavenges/8N,
- *     mask and mod-500000 alike).
- *   - recordRtt shows 0 B/op in torture (retained) and in the full suite. `now & 0x7ffff` (the gating
- *     sample below) is 0 alone and in any order; `now % 500000` is not (see the report-only lane).
- * No single mechanism (tier-install timing, argument boxing, a specific deopt, an unfed branch) has
- * been PROVEN to account for all of the above, so none is asserted here.
+ * The 1.0.x "recordRtt in isolation" FINDINGS (a small window-scaling allocation for the `now % 500000`
+ * sample pattern when this lane ran ALONE, gone with --no-maglev or a prior lane) has an established root
+ * cause: the 1.0.x blend `sampleNs > e ? sampleNs : e + ...` merged the tagged argument with a double, and
+ * Maglev boxed the merge whenever the blend branch ran (5 of 30 windows alone; 0 of 30 with only that line
+ * changed to if / else). 1.1.0 B3 removed the merge; research/1.1.0-buffer-apis.md section 6. The
+ * mod-500000 pattern is now a GATED lane (peakEwmaRecordMod).
  */
 const peakEwmaRecord = {
     name: 'PeakEwmaBalancer.recordRtt()',
@@ -371,7 +362,7 @@ const peakEwmaRecord = {
         s.now = now | 0;
     },
     statsOf(s) {
-        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer) };
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
     },
 };
 
@@ -396,7 +387,7 @@ const consistentHashPick = {
         const ch = s.ch;
         // Stride 97 (coprime to M=257) walks every slot; `& 0x3fffffff` keeps `key` a Smi VALUE
         // (< 2^30), which crosses the non-inlined pick() boundary UNBOXED, proving pick() is 0 B/op on
-        // the Smi-key path. HONEST DISCLOSURE (matching the KNOWN LIMITATION note above): a REALISTIC
+        // the Smi-key path. HONEST DISCLOSURE (the report-only lanes below): a REALISTIC
         // key >= 2^31 is a genuine NON-Smi double -- and about half of fnv1a's `x >>> 0` output is
         // >= 2^31 -- so it is boxed as a HeapNumber at that boundary (measured ~16 B/op, steady-state).
         // The report-only lanes below print it every run; the buffer-based key API (pick keys from a
@@ -434,7 +425,7 @@ const boundedLoadPick = {
         const bl = s.bl;
         // Stride 97 (coprime to M=257) walks every slot; `& 0x3fffffff` keeps `key` a Smi VALUE
         // (< 2^30), which crosses the non-inlined pick() boundary UNBOXED, proving pick() is 0 B/op on
-        // the Smi-key path. HONEST DISCLOSURE (matching the KNOWN LIMITATION note above): a REALISTIC
+        // the Smi-key path. HONEST DISCLOSURE (the report-only lanes below): a REALISTIC
         // key >= 2^31 is a genuine NON-Smi double -- about half of fnv1a's `x >>> 0` output -- so it is
         // boxed as a HeapNumber at that boundary (measured ~16 B/op, steady-state). The report-only
         // lanes below print it every run; the buffer-based key API (Uint32Array) lands in 1.1.0.
@@ -528,10 +519,118 @@ const weightedRandomPickFallback = {
     },
 };
 
+// ---------------------------------------------------------------------------
+// 1.1.0 B6: the zero-box `From` methods, GATED at REALISTIC magnitudes (research/1.1.0-buffer-apis.md).
+// The plain-argument methods box these values at a non-inlined call (the report-only lanes print it); the
+// `From` siblings read them from a caller-owned typed-array slot, so they must be 0 B/op here.
+// ---------------------------------------------------------------------------
+const REAL_NOW = 1.7e15;           // an hrtime-scale ns clock: a large double, never a Smi
+const peakEwmaPickFrom = {
+    name: 'PeakEwmaBalancer.pickFrom(clock~1.7e15 in a Float64Array)',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        for (let i = 0; i < CAP; i++) inflight[i] = i & 15;
+        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xABCDEF);
+        for (let i = 0; i < CAP; i += 8) pe.recordRtt(i, (i & 31) * 1000 + 0.5, REAL_NOW);
+        return { el, inflight, pe, clk: new Float64Array([REAL_NOW]), acc: 0 };
+    },
+    hot(s, n) {
+        const pe = s.pe, clk = s.clk;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) { clk[0] += 1000; acc = (acc + pe.pickFrom(clk, 0)) | 0; }
+        s.acc = acc | 0;
+    },
+    statsOf(s) {
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.clk.buffer) };
+    },
+};
+const peakEwmaRecordFrom = {
+    name: 'PeakEwmaBalancer.recordRttFrom([fractional sample, clock~1.7e15])',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xFEEDBEEF);
+        return { el, inflight, pe, fb: new Float64Array([0, REAL_NOW]) };
+    },
+    hot(s, n) {
+        const pe = s.pe, fb = s.fb;
+        for (let i = 0; i < n; i++) { fb[1] += 1000; fb[0] = (i & 4095) * 250.5; pe.recordRttFrom(i & MASK, fb, 0); }
+    },
+    statsOf(s) {
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.fb.buffer) };
+    },
+};
+function realKeys() {
+    const keys = new Uint32Array(4096);
+    for (let i = 0; i < keys.length; i++) keys[i] = (0x80000000 + i * 97) >>> 0;   // all >= 2^31
+    return keys;
+}
+const consistentHashPickFrom = {
+    name: 'ConsistentHashBalancer.pickFrom(keys >= 2^31 in a Uint32Array)',
+    setup() {
+        const el = new Uint8Array(CH_CAP);
+        for (let i = 0; i < CH_CAP; i += 2) el[i] = 1;
+        const ch = new ConsistentHashBalancer(CH_CAP, el, null, CH_M, 0xABCDEF);
+        return { el, ch, keys: realKeys(), ki: 0, acc: 0 };
+    },
+    hot(s, n) {
+        const ch = s.ch, keys = s.keys, m = keys.length - 1;
+        let acc = s.acc | 0, ki = s.ki | 0;
+        for (let i = 0; i < n; i++) { acc = (acc + ch.pickFrom(keys, ki & m)) | 0; ki++; }
+        s.acc = acc | 0; s.ki = ki | 0;
+    },
+    statsOf(s) {
+        return { grows: bufIds(s.el.buffer, s.ch._weights.buffer, s.ch._lookup.buffer, s.keys.buffer) };
+    },
+};
+const boundedLoadPickFrom = {
+    name: 'BoundedLoadBalancer.pickFrom(keys >= 2^31 in a Uint32Array)',
+    setup() {
+        const el = new Uint8Array(CH_CAP);
+        for (let i = 0; i < CH_CAP; i += 2) el[i] = 1;
+        const inflight = new Uint32Array(CH_CAP);
+        let total = 0;
+        for (let i = 0; i < CH_CAP; i++) { inflight[i] = i & 15; total += inflight[i]; }
+        const bl = new BoundedLoadBalancer(CH_CAP, el, inflight, 0.25, null, CH_M, 0xABCDEF);
+        bl.note(0, total);
+        return { el, inflight, bl, keys: realKeys(), ki: 0, acc: 0 };
+    },
+    hot(s, n) {
+        const bl = s.bl, keys = s.keys, m = keys.length - 1;
+        let acc = s.acc | 0, ki = s.ki | 0;
+        for (let i = 0; i < n; i++) { acc = (acc + bl.pickFrom(keys, ki & m)) | 0; ki++; }
+        s.acc = acc | 0; s.ki = ki | 0;
+    },
+    statsOf(s) {
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.bl._weights.buffer, s.bl._lookup.buffer, s.keys.buffer) };
+    },
+};
+// The 1.0.x isolation pattern (`now % 500000`, step 1000), gated since 1.1.0 B6 (root cause above).
+const peakEwmaRecordMod = {
+    name: 'PeakEwmaBalancer.recordRtt(now % 500000, step 1000)',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xFEEDBEEF);
+        return { el, inflight, pe, now: 0 };
+    },
+    hot(s, n) {
+        const pe = s.pe;
+        let now = s.now | 0;
+        for (let i = 0; i < n; i++) { now = (now + 1000) & CLK_MASK; pe.recordRtt(now & MASK, now % 500000, now); }
+        s.now = now | 0;
+    },
+    statsOf(s) {
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
+    },
+};
+
 const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
     leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord, consistentHashPick,
     boundedLoadPick, boundedLoadNote, weightedRandomPick, weightedRandomPickFallback,
+    peakEwmaPickFrom, peakEwmaRecordFrom, peakEwmaRecordMod, consistentHashPickFrom, boundedLoadPickFrom,
 ];
 
 /**
@@ -824,17 +923,17 @@ zgcSuite({
 });
 
 // ---------------------------------------------------------------------------
-// REPORT-ONLY (NON-GATING) -- KNOWN LIMITATION until 1.1.0
+// REPORT-ONLY (NON-GATING) -- what the PLAIN-argument methods still cost (use the 1.1.0 `From` siblings)
 // ---------------------------------------------------------------------------
 // The gated lanes above prove 0 B/op on the Smi-ARGUMENT / Smi-KEY path. In REALISTIC use the hot
 // double-taking / key-taking methods take an argument whose VALUE is a genuine NON-Smi double (a large
 // or fractional clock, or a hash key >= 2^31 -- and about half of fnv1a's `x >>> 0` output is >= 2^31),
 // which is boxed into a ~16 B HeapNumber at the NON-INLINED call boundary (measured, scales with op
 // count). These lanes REPRODUCE that path and PRINT its 8N scavenge count every run so the limitation
-// is visible; they do NOT assert and can NEVER fail the gate (report-only). The remedy is a
-// buffer-based `xxxFrom(buf, i)` API (clock / keys read from a caller-owned Float64Array / Uint32Array),
-// an API + docs change that lands in 1.1.0. The final report lane below tracks a SEPARATE open item:
-// a small value-dependent recordRtt allocation seen only in isolation (root cause NOT established).
+// is visible; they do NOT assert and can NEVER fail the gate (report-only). Whether they read 0 or not
+// depends on whether V8 inlines the call into this loop, run to run. The remedy shipped in 1.1.0: the
+// `pickFrom` / `recordRttFrom` siblings (gated above at the same magnitudes) read the value from a
+// caller-owned typed-array slot, so nothing crosses a call boxed.
 const BIG_NOW = 1.7e15;            // a realistic hrtime-scale (ns) clock: a large double, not a Smi
 const peakEwmaPickReal = {
     name: 'PeakEwmaBalancer.pick(now~1.7e15) REALISTIC large-double clock',
@@ -906,48 +1005,19 @@ const consistentHashPickReal = {
         s.acc = acc | 0; s.ki = ki | 0;
     },
 };
-// The mod-500000 (step 1000) integer-sample recordRtt lane: 0 B/op in-suite / after a warm-up, but a
-// small window-scaling allocation ALONE (8N:2, 16N:4, 32N:9 at the 1MB pin). Root cause NOT established
-// (see the recordRtt FINDINGS note). Report-only, printed every run, never asserts.
-const peakEwmaRecordMod = {
-    name: 'PeakEwmaBalancer.recordRtt(now % 500000, step 1000)',
-    setup() {
-        const el = makePool();
-        const inflight = new Uint32Array(CAP);
-        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xFEEDBEEF);
-        return { el, inflight, pe, now: 0 };
-    },
-    hot(s, n) {
-        const pe = s.pe;
-        let now = s.now | 0;
-        for (let i = 0; i < n; i++) { now = (now + 1000) & CLK_MASK; pe.recordRtt(now & MASK, now % 500000, now); }
-        s.now = now | 0;
-    },
-};
 const reportOnlyLanes = [peakEwmaPickReal, peakEwmaRecordReal, boundedLoadPickReal, consistentHashPickReal];
-test('perf-gate REPORT-ONLY: realistic-argument boxing + open recordRtt item (non-gating)', async () => {
+test('perf-gate REPORT-ONLY: realistic-argument boxing of the plain methods (non-gating)', async () => {
     // Prints scavenge counts for each report lane. It asserts NOTHING: a nonzero count here is a
     // documented item, not a gate failure.
     for (const sc of reportOnlyLanes) {
         try {
             const r = await measure(sc, { N: 200000, k: 8 });
-            console.log('  KNOWN LIMITATION until 1.1.0 (report-only) | ' + sc.name +
+            console.log('  REPORT-ONLY (plain argument; use the From sibling) | ' + sc.name +
                 ' -- scavenges N: ' + r.minorLo + '  8N: ' + r.minorHi +
                 ' (realistic double/large argument boxed at the non-inlined call boundary)');
         } catch (e) {
-            console.log('  KNOWN LIMITATION until 1.1.0 (report-only) | ' + sc.name +
+            console.log('  REPORT-ONLY (plain argument; use the From sibling) | ' + sc.name +
                 ' -- measurement skipped: ' + (e && e.message ? e.message : String(e)));
         }
-    }
-    try {
-        const r = await measure(peakEwmaRecordMod, { N: 200000, k: 8 });
-        console.log('  OPEN (1.1.0): small value-dependent recordRtt allocation in isolation, root ' +
-            'cause not established | ' + peakEwmaRecordMod.name +
-            ' -- scavenges N: ' + r.minorLo + '  8N: ' + r.minorHi +
-            ' (scales with window ALONE: 8N:2/16N:4/32N:9; vanishes with --no-maglev or a prior lane)');
-    } catch (e) {
-        console.log('  OPEN (1.1.0): small value-dependent recordRtt allocation in isolation, root ' +
-            'cause not established | ' + peakEwmaRecordMod.name +
-            ' -- measurement skipped: ' + (e && e.message ? e.message : String(e)));
     }
 });

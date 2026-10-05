@@ -123,7 +123,7 @@ becomes the CHEAPEST pick -- a black hole that doubled failure rates. Refinement
 - **Accepted caveats (1.1.0 items):** an idle-then-busy node is priced by time-since-last-response
   until that response completes (no exact per-dispatch "busy since" stamp yet -- 1.1.0); the lifetime
   mean never forgets a latency-regime change (a decaying mean is a 1.1.0 item). The buffer-based
-  clock API that avoids boxing `now` is also 1.1.0 (see the boxing limitation in README/GUIDE).
+  clock API that avoids boxing `now` is also 1.1.0 (shipped: `pickFrom` / `recordRttFrom`, ADR 0016).
 
 ## Amendment 2026-10-04 (1.1.0, audit L4, research D3-D5): Finagle's update, a decaying mean, no busy-since stamp
 

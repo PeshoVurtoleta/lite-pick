@@ -281,8 +281,20 @@ export class PeakEwmaBalancer extends BalancerBase {
      * `ewma x w + sample x (1 - w)` (Finagle, 1.1.0). Also feeds the decaying pool mean. 0 B/op.
      */
     recordRtt(i: number, sampleNs: number, now: number): void;
+    /**
+     * The ZERO-BOX sibling of `recordRtt` (1.1.0): `sampleNs = buf[j]`, `now = buf[j + 1]`, read inside, so a
+     * fractional sample or a large clock never crosses a call boxed. Same semantics and errors as `recordRtt`,
+     * plus RangeError `LITE_PICK_ARRAY` unless `buf` is a `Float64Array` with slots `j` and `j + 1`. 0 B/op.
+     */
+    recordRttFrom(i: number, buf: Float64Array, j: number): void;
     /** Pick by latency-aware power-of-two-choices at time `now` (ns), or `PICK_NONE`. O(d)=O(1). */
     pick(now: number): number;
+    /**
+     * The ZERO-BOX sibling of `pick(now)` (1.1.0): `now = buf[i]`, read inside, so a nanosecond clock (never a
+     * small integer) never crosses a call boxed. Identical selection to `pick(buf[i])`. Never throws for any
+     * value or index (past the end behaves like a non-finite `now`). 0 B/op, even when V8 does not inline it.
+     */
+    pickFrom(buf: Float64Array, i: number): number;
     /** Snapshot: plus tau, the total in flight, the sampled-node count and the decaying pool mean (null before any sample). */
     describe(): BalancerDescription & {
         strategy: 'PeakEWMA'; tauNs: number; inflight: number; sampled: number; poolMeanNs: number | null;
@@ -335,6 +347,13 @@ export class ConsistentHashBalancer extends BalancerBase {
      * sweep -- 1.1.0), or `PICK_NONE` only when no eligible backend owns a table slot.
      */
     pick(keyHash: number): number;
+    /**
+     * The ZERO-BOX sibling of `pick(keyHash)` (1.1.0): the key is `buf[i]`, read inside and reduced to its table
+     * slot at once, so a 32-bit hash >= 2^31 never crosses a call boxed. Identical selection to
+     * `pick(buf[i])` (any typed array, normalized by `>>> 0`). Never throws for any value or index (past the
+     * end is key 0). BoundedLoad inherits it, with its cap. 0 B/op, even when V8 does not inline it.
+     */
+    pickFrom(buf: Uint32Array | Int32Array | Float64Array, i: number): number;
     /** Snapshot: plus the table size M and the weights (a copy). */
     describe(): BalancerDescription & { strategy: 'ConsistentHash' | 'BoundedLoad'; tableSize: number; weights: number[] };
 }

@@ -292,3 +292,20 @@ const obsBase: BalancerBase = obsPe;
 obsBase.assertConsistent();
 const obsName: string = new WeightedRandomBalancer(2, new Uint8Array(2), new Uint32Array(2)).describe().strategy;
 void obsName;
+
+// 1.1.0 B6 zero-box siblings.
+const zbClk = new Float64Array(2);
+const zbPe = new PeakEwmaBalancer(4, new Uint8Array(4), new Uint32Array(4), 1e6);
+const zbP: number = zbPe.pickFrom(zbClk, 0);
+zbPe.recordRttFrom(zbP, zbClk, 0);
+// @ts-expect-error -- the clock slot is a Float64Array (an integer array would truncate it)
+zbPe.pickFrom(new Uint32Array(1), 0);
+// @ts-expect-error -- recordRttFrom needs the [sampleNs, now] Float64Array
+zbPe.recordRttFrom(0, [1, 2], 0);
+const zbKeys = new Uint32Array(1);
+const zbCh = new ConsistentHashBalancer(4, new Uint8Array(4), null, 257);
+const zbK: number = zbCh.pickFrom(zbKeys, 0) + zbCh.pickFrom(new Int32Array(1), 0) + zbCh.pickFrom(new Float64Array(1), 0);
+void zbK;
+const zbBl = new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4), 0.25);
+const zbB: number = zbBl.pickFrom(zbKeys, 0);
+void zbB;

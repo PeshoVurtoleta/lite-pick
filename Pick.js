@@ -194,9 +194,18 @@ export class Prng {
      * not a multiply-shift). r / 2^32 is exact in a double, and so is the product while n < 2^21; the 2^32
      * values of r fall into n buckets whose sizes differ by at most one, a relative bias <= n / 2^32
      * (~6e-8 at n = 256) -- no modulo bias.
+     * Zero-box (1.1.0, B6): the xorshift step runs HERE rather than through next(), so the uint32 -- >= 2^31
+     * half the time, i.e. not a small integer -- never crosses a call; when V8 did not inline next() it was
+     * boxed (16 B per draw). Bit-identical to `floor(next() / 2^32 x n)`.
      */
     nextBelow(n) {
-        return Math.floor((this.next() / 4294967296) * n);
+        let x = this._s;
+        x ^= x << 13;
+        x ^= x >>> 17;
+        x ^= x << 5;
+        x = x >>> 0;
+        this._s = x;
+        return Math.floor((x / 4294967296) * n);
     }
 
     /** Restore the original seed, so a benchmark run is byte-for-byte repeatable. */
@@ -955,9 +964,14 @@ export class NqBalancer extends BalancerBase {
  * @zakkster/lite-sketch `DDSketch` (optional peer, 0 B/op `add`). EWMA-mean is the shipped,
  * zero-peer default; `peerDependencies` stays empty until a shipped path imports the sketch.
  *
+ * Zero-box siblings (1.1.0, B6; ADR 0016): `pickFrom(buf, i)` / `recordRttFrom(i, buf, j)` read the clock and
+ * `[sampleNs, now]` from a caller-owned Float64Array, so a realistic ns clock or a fractional rtt never crosses a
+ * call boxed; the plain methods box such a value (~16 B) whenever V8 does not inline them.
+ *
  * Bound: O(d) = O(1) per pick (two expected-O(1) rejection draws + two exp() + a compare),
- * 0 B/op on BOTH `pick()` and `recordRtt()` (torture + PerfGate). Fails closed (PICK_NONE) when
- * the whole pool is down.
+ * 0 B/op on BOTH `pick()` and `recordRtt()` with small-integer arguments, and on `pickFrom` / `recordRttFrom`
+ * at ANY magnitude, with V8 inlining on or off (torture + PerfGate + test:perf:noinline). Fails closed
+ * (PICK_NONE) when the whole pool is down.
  */
 export class PeakEwmaBalancer extends BalancerBase {
     /**
@@ -1000,6 +1014,9 @@ export class PeakEwmaBalancer extends BalancerBase {
         // sample yet) -> 1.0. Held in a pre-allocated Float64Array (the hot-path law: pre-allocate
         // typed-array scalars, never a per-op object). Never NaN: the count is >= 1 after any sample.
         this._samp = new Float64Array(3);
+        // B6 (1.1.0): the slots pick(now) / recordRtt(i, sampleNs, now) write their numbers into, so the shared
+        // bodies (_pickAt / _recordAt) read every double from a typed array and none crosses a call boxed.
+        this._arg = new Float64Array(2);
         // Cold start: _ewma seeds to 1.0 and _stamp to a NEGATIVE "unsampled" sentinel (-1). The
         // sentinel makes ewmaAt read the baseline UNDECAYED (graceful LeastConn) regardless of the
         // caller's clock magnitude -- a plain _stamp=0 would decay as exp(-now/tau) -> 0 under a
@@ -1051,6 +1068,40 @@ export class PeakEwmaBalancer extends BalancerBase {
         if (typeof sampleNs !== 'number' || typeof now !== 'number') {
             throw _err(TypeError, 'LITE_PICK_ARGUMENT', '[lite-pick] recordRtt(i, sampleNs, now) requires numbers');
         }
+        const a = this._arg;
+        a[0] = sampleNs;
+        a[1] = now;
+        this._recordAt(i, a, 0);
+    }
+
+    /**
+     * The ZERO-BOX sibling of recordRtt (1.1.0, B6; research/1.1.0-buffer-apis.md): `sampleNs = buf[j]`,
+     * `now = buf[j + 1]`, read inside, so a fractional sample or a large clock never crosses a call boxed
+     * (recordRtt boxes them, ~16 B each, when V8 does not inline it). Same semantics and errors as recordRtt,
+     * plus RangeError LITE_PICK_ARRAY unless `buf` is a Float64Array with slots j and j + 1 -- all checked
+     * before any write. 0 B/op.
+     * @param {number} i  endpoint index
+     * @param {Float64Array} buf  caller-owned: [sampleNs, now] at j, j + 1
+     * @param {number} j  slot index
+     */
+    recordRttFrom(i, buf, j) {
+        _vIdx(i, this._cap);
+        if (!(buf instanceof Float64Array) || (j >>> 0) !== j || j + 1 >= buf.length) {
+            throw _err(RangeError, 'LITE_PICK_ARRAY',
+                '[lite-pick] recordRttFrom(i, buf, j) needs a Float64Array with slots j and j + 1');
+        }
+        this._recordAt(i, buf, j);
+    }
+
+    /**
+     * The shared recordRtt body: reads [sampleNs, now] from `buf[j], buf[j + 1]` (validated finite here),
+     * then updates the EWMA and the pool mean. Every double it touches comes from a typed array. Internal.
+     * @param {number} i
+     * @param {Float64Array} buf
+     * @param {number} j
+     */
+    _recordAt(i, buf, j) {
+        const sampleNs = buf[j], now = buf[j + 1];
         if (!Number.isFinite(sampleNs) || sampleNs < 0) {
             throw _err(RangeError, 'LITE_PICK_ARGUMENT', '[lite-pick] sampleNs must be a finite number >= 0');
         }
@@ -1094,6 +1145,35 @@ export class PeakEwmaBalancer extends BalancerBase {
      * @returns {number}
      */
     pick(now) {
+        const s = this._arg;
+        s[0] = now;
+        return this._pickAt(s, 0);
+    }
+
+    /**
+     * The ZERO-BOX sibling of pick(now) (1.1.0, B6; research/1.1.0-buffer-apis.md): `now = buf[i]`, read
+     * inside, so a nanosecond clock (~1.7e18, never a small integer) never crosses a call boxed. Identical
+     * selection to `pick(buf[i])`. NEVER throws for any value or index: an index past the end reads undefined,
+     * which behaves like a non-finite `now` (P2C-random). `buf` must be indexable (a Float64Array; an integer
+     * typed array would truncate the clock) -- null / undefined is a programming error the engine reports as a
+     * TypeError; there is no per-pick type check. 0 B/op.
+     * @param {Float64Array} buf  caller-owned clock slot(s)
+     * @param {number} i  slot index
+     * @returns {number}
+     */
+    pickFrom(buf, i) {
+        return this._pickAt(buf, i);
+    }
+
+    /**
+     * The shared pick body: `now` is read from `buf[at]`, so it lives in a register and is never boxed.
+     * Internal; pick(now) and pickFrom(buf, i) are its two doors.
+     * @param {Float64Array} buf
+     * @param {number} at
+     * @returns {number}
+     */
+    _pickAt(buf, at) {
+        const now = buf[at];
         const a = this._draw();
         if (a < 0) return PICK_NONE;          // whole pool down: fail closed
         if (this._live === 1) return a;       // only one eligible: it is both choices
@@ -1190,7 +1270,9 @@ function chIsPrime(n) {
  * the next eligible backend. That is a few integer ops over a prebuilt Uint32Array table -- O(1)
  * per pick, 0 B/op. The KEY MUST BE AN INTEGER (`keyHash >>> 0`, so NaN -> 0 deterministically):
  * per-pick STRING hashing is the one zero-GC hazard, so the caller hashes string keys themselves
- * (cold) and passes the integer -- lite-pick adds NO hashing dependency (RESEARCH section 5).
+ * (cold) and passes the integer -- lite-pick adds NO hashing dependency (RESEARCH section 5). A 32-bit hash is
+ * >= 2^31 half the time, which V8 boxes (~16 B) when `pick(keyHash)` is not inlined; the zero-box sibling
+ * `pickFrom(buf, i)` (1.1.0, ADR 0016) reads the key from a caller-owned typed array instead.
  *
  * MINIMAL DISRUPTION is the selling point: on a scale event only ~1/N of keys move. Removing a
  * backend is just marking it down (`setEligible(i, false)`) -- the table is UNCHANGED, so every
@@ -1392,9 +1474,33 @@ export class ConsistentHashBalancer extends BalancerBase {
      * @returns {number}
      */
     pick(keyHash) {
+        return this._pickSlot((keyHash >>> 0) % this._m);   // integer key; NaN >>> 0 = 0 (never throws)
+    }
+
+    /**
+     * The ZERO-BOX sibling of pick(keyHash) (1.1.0, B6; research/1.1.0-buffer-apis.md): the key is `buf[i]`,
+     * read inside and reduced to its slot at once, so a 32-bit hash >= 2^31 (not a small integer) never crosses
+     * a call boxed. Identical selection to `pick(buf[i])` -- any typed array, normalized by `>>> 0` as pick
+     * does; a Uint32Array is the natural home of a 32-bit hash. NEVER throws for any value or index (past the
+     * end reads undefined -> key 0, like pick(NaN)); null / undefined `buf` is a programming error the engine
+     * reports as a TypeError (no per-pick type check). BoundedLoad inherits it. 0 B/op.
+     * @param {Uint32Array} buf  caller-owned key slot(s)
+     * @param {number} i  slot index
+     * @returns {number}
+     */
+    pickFrom(buf, i) {
+        return this._pickSlot((buf[i] >>> 0) % this._m);
+    }
+
+    /**
+     * The shared pick body, from a table slot in [0, M) -- always a small integer, so it crosses any call
+     * unboxed. BoundedLoad overrides it with its cap-aware walk. Internal.
+     * @param {number} slot
+     * @returns {number}
+     */
+    _pickSlot(slot) {
         if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
         const M = this._m, el = this._eligible, lookup = this._lookup;
-        let slot = (keyHash >>> 0) % M;           // integer key; NaN >>> 0 = 0 (never throws)
         let i = lookup[slot];
         if (el[i]) return i;
         this._stats[STAT_DISPLACED] += 1;         // D7: the home backend is down (the probe path only)
@@ -1558,17 +1664,18 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
     }
 
     /**
-     * Map an INTEGER key to a backend, honouring the occupancy cap, or PICK_NONE (fail closed). O(1),
-     * 0 B/op, never throws. slot = (keyHash >>> 0) % M; walk the M8 probe window (home + CH_PROBE_LIMIT
-     * slots) and return the FIRST backend that is ELIGIBLE AND under cap = ceil((1+eps) x (_total+1) /
-     * live). If none in the window is under cap, fall back to the FIRST eligible seen (sticky wins -- the cap is
-     * a soft preference, never a dead pick). `_total === 0` skips the cap test -> pure ConsistentHash.
-     * Nothing eligible in the window: the cold full-table sweep (L3). PICK_NONE ONLY when no eligible
-     * backend owns a table slot.
-     * @param {number} keyHash  a caller-supplied integer key hash (coerced to uint32)
+     * The cap-aware pick body behind the inherited `pick(keyHash)` / `pickFrom(buf, i)` (both reduce the key
+     * to slot = (key >>> 0) % M first, 1.1.0 B6): map the key's slot to a backend, honouring the occupancy
+     * cap, or PICK_NONE (fail closed). O(1), 0 B/op, never throws. Walk the M8 probe window (home +
+     * CH_PROBE_LIMIT slots) and return the FIRST backend that is ELIGIBLE AND under cap = ceil((1+eps) x
+     * (_total+1) / live). If none in the window is under cap, fall back to the FIRST eligible seen (sticky wins
+     * -- the cap is a soft preference, never a dead pick). `_total === 0` skips the cap test -> pure
+     * ConsistentHash. Nothing eligible in the window: the cold full-table sweep (L3). PICK_NONE ONLY when no
+     * eligible backend owns a table slot.
+     * @param {number} slot  the key's home slot in [0, M)
      * @returns {number}
      */
-    pick(keyHash) {
+    _pickSlot(slot) {
         if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
         const M = this._m, el = this._eligible, lookup = this._lookup, inf = this._inflight;
         const total = this._total;
@@ -1580,7 +1687,6 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
         let cap = capActive ? (1 + this._eps) * (total + 1) / this._live : 0;     // > 0: total>0, live>0
         // Opt-in floor (N4, 1.1.0): for integer inf and minCap, inf < max(minCap, x) == inf < max(minCap, ceil(x)).
         if (cap < this._minCap) cap = this._minCap;
-        let slot = (keyHash >>> 0) % M;           // integer key; NaN >>> 0 = 0 (never throws)
         let firstEligible = -1;                   // the pure-ConsistentHash sticky fallback answer
         let i = lookup[slot];
         if (el[i]) {
@@ -1806,7 +1912,13 @@ export class WeightedRandomBalancer extends BalancerBase {
         // rejecting the ineligible ones renormalizes weight-proportionality over the surviving mass.
         for (let t = 0; t < 64; t++) {
             const col = rng.nextBelow(cap);
-            const u = rng.next() / 4294967296;    // fresh uniform in [0, 1)
+            let x = rng._s;                       // rng.next(), inline (zero-box, B6): the uint32 never crosses a call
+            x ^= x << 13;
+            x ^= x >>> 17;
+            x ^= x << 5;
+            x = x >>> 0;
+            rng._s = x;
+            const u = x / 4294967296;             // fresh uniform in [0, 1)
             const cand = u < prob[col] ? col : alias[col];
             if (el[cand]) return cand;
         }
@@ -1826,7 +1938,14 @@ export class WeightedRandomBalancer extends BalancerBase {
         let s = 0;
         for (let i = 0; i < cap; i++) if (el[i]) s += wt[i];
         if (s === 0) return PICK_NONE;            // no eligible positive-weight node
-        let u = (this._rng.next() / 4294967296) * s;
+        const rng = this._rng;
+        let x = rng._s;                           // rng.next(), inline (zero-box, B6)
+        x ^= x << 13;
+        x ^= x >>> 17;
+        x ^= x << 5;
+        x = x >>> 0;
+        rng._s = x;
+        let u = (x / 4294967296) * s;
         let last = PICK_NONE;
         for (let i = 0; i < cap; i++) {
             if (el[i] && wt[i] > 0) { u -= wt[i]; last = i; if (u < 0) return i; }

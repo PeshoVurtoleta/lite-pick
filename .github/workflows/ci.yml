@@ -65,6 +65,9 @@ jobs:
       - run: npm run parity
       - run: npm run torture
       - run: npm run test:perf
+      # 1.1.0 B6: the same gate with V8 inlining OFF -- the worst case, a caller V8 will not inline into. Every
+      # lane must still be 0 B/op (research/1.1.0-buffer-apis.md: the From methods + the self-contained PRNG).
+      - run: npm run test:perf:noinline
       - run: npm run bench:verify
       - name: tarball is exactly the 11 whitelisted files
         run: |

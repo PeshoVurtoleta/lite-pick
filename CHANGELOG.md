@@ -8,10 +8,21 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; bursts B1 -- the plain fixes --,
 B2 -- rotating ties and the BoundedLoad `minCap` --, B3 -- PeakEWMA's update rule and pool mean --, B4 --
-observability, decisions/0015 -- and B5 -- Pool's diagnostics_channel events).
+observability, decisions/0015 --, B5 -- Pool's diagnostics_channel events -- and B6 -- zero-box buffer APIs,
+decisions/0016).
 
 ### Added
 
+- **Zero-box siblings: `pickFrom(buf, i)` (PeakEWMA, ConsistentHash, BoundedLoad) and `recordRttFrom(i, buf, j)`
+  (PeakEWMA) (D8, research/1.1.0-buffer-apis.md).** The number is read from a caller-owned typed-array slot --
+  the clock / `[sampleNs, now]` from a `Float64Array`, the key from a `Uint32Array` -- so a nanosecond clock, a
+  fractional rtt or a hash >= 2^31 never crosses a call boxed. Identical selection and errors to the plain
+  methods (`pickFrom` never throws; `recordRttFrom` adds `LITE_PICK_ARRAY` for a bad buffer). Measured 0 B/op
+  even with V8 inlining switched off, where the plain methods cost 16-32 B/op; this closes the 1.0.1 KNOWN
+  LIMITATION. `pickFrom` costs what `pick` costs; `recordRttFrom` ~1 ns more than `recordRtt`.
+- **`npm run test:perf:noinline`** -- the whole perf gate again with `--max-inlined-bytecode-size=0` (in `verify`
+  and CI), plus five gated realistic-magnitude lanes for the `From` methods. The pre-1.1.0 kernel fails 12 lanes
+  of the no-inline run.
 - **Error codes on every throw (D7).** Each error keeps its class (TypeError / RangeError / Error) and carries a
   stable `code`, which is semver API (messages are not): `LITE_PICK_CAPACITY`, `LITE_PICK_ARRAY`,
   `LITE_PICK_INDEX`, `LITE_PICK_WEIGHT`, `LITE_PICK_OPTION`, `LITE_PICK_ARGUMENT`, `LITE_PICK_ABSTRACT`,
@@ -50,6 +61,15 @@ observability, decisions/0015 -- and B5 -- Pool's diagnostics_channel events).
 
 ### Fixed
 
+- **The PRNG boxed whenever V8 did not inline it.** `Prng.next()` returns a uint32, >= 2^31 half the time;
+  `nextBelow` called it, so each draw crossed a call boxed (~16 B) in a caller V8 would not inline -- P2C,
+  PeakEWMA and WeightedRandom paid ~16 B/op there. `nextBelow` now runs the xorshift step itself and
+  WeightedRandom's uniform draws run it inline. Bit-identical streams (golden fingerprints), so no seeded result
+  changes.
+- **Closed: the 1.0.1 "recordRtt in isolation" FINDINGS.** Root cause established: the 1.0.x blend
+  `sampleNs > e ? sampleNs : e + ...` merged the tagged argument with a double, and Maglev boxed the merge
+  whenever the blend branch ran (5 of 30 windows when the lane ran alone; 0 of 30 with only that line changed).
+  B3's rewrite had already removed it; the lane is now gated.
 - **P2C, PeakEWMA and WeightedRandom: the very-sparse fallback was biased (audit L2).** After 64 rejected
   draws the 1.0.x fallback took the first eligible node after a random start, so a node that follows a long
   run of down nodes won more often: nodes {0, 1} of 100 up gave 63.5% / 36.5%. P2C/PeakEWMA now draw a

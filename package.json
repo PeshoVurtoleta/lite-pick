@@ -41,13 +41,14 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/Base.test.js test/BoundedLoad.test.js test/ConsistentHash.test.js test/LeastConn.test.js test/NQ.test.js test/Observability.test.js test/P2C.test.js test/PeakEWMA.test.js test/Pool.test.js test/PoolChannels.test.js test/RecipesDoc.test.js test/RoundRobin.test.js test/SED.test.js test/SmoothWRR.test.js test/SoakOracles.test.js test/SoakP2C.test.js test/SoakPool.test.js test/SoakTeeth.test.js test/WeightedRandom.test.js test/suite-list.test.js",
+    "test": "node --test test/Base.test.js test/BoundedLoad.test.js test/BufferApis.test.js test/ConsistentHash.test.js test/LeastConn.test.js test/NQ.test.js test/Observability.test.js test/P2C.test.js test/PeakEWMA.test.js test/Pool.test.js test/PoolChannels.test.js test/RecipesDoc.test.js test/RoundRobin.test.js test/SED.test.js test/SmoothWRR.test.js test/SoakOracles.test.js test/SoakP2C.test.js test/SoakPool.test.js test/SoakTeeth.test.js test/WeightedRandom.test.js test/suite-list.test.js",
     "test:types": "tsc -p test/types/tsconfig.json && tsc -p test/types/tsconfig.es2022.json",
     "torture": "node --expose-gc test/torture.mjs",
     "witness": "node test/witness.mjs",
     "balance": "node test/balance.mjs",
     "fuzz": "node test/fuzz.mjs",
     "test:perf": "node --expose-gc --min-semi-space-size=1 --max-semi-space-size=1 --test test/perf/PerfGate.test.mjs",
+    "test:perf:noinline": "node --expose-gc --min-semi-space-size=1 --max-semi-space-size=1 --max-inlined-bytecode-size=0 --test test/perf/PerfGate.test.mjs",
     "bench": "node benchmark/Matrix.mjs",
     "bench:gc": "node --expose-gc benchmark/GcBlastRadius.mjs",
     "bench:fairness": "node benchmark/Fairness.mjs",
@@ -64,7 +65,7 @@
     "scope": "node --expose-gc demo/pool-scope/tui.mjs",
     "scope:frames": "node --expose-gc demo/pool-scope/tui.mjs --frames 40 --scenario flapstorm",
     "scope:web": "node demo/pool-scope/web/serve.mjs",
-    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run balance && npm run fuzz && npm run test:perf"
+    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run balance && npm run fuzz && npm run test:perf && npm run test:perf:noinline"
   },
   "keywords": [
     "load-balancer",

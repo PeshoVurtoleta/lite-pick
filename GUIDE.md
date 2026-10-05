@@ -11,14 +11,14 @@ supported writer, which keeps the cached `live` exact; a direct byte write desyn
 balancer has its own eligibility array.
 
 `pick()` **allocates 0 B/op** (PerfGate scavenge counting) and **retains 0 B/op** (torture) in the
-steady state. KNOWN LIMITATION (1.0.1): the strategies that take a **number argument** on the hot
-path -- `PeakEWMA.pick(now)` / `recordRtt(..., now)` with a realistic nanosecond clock, and
+steady state. The strategies that take a **number argument** on the hot path --
+`PeakEWMA.pick(now)` / `recordRtt(..., now)` with a realistic nanosecond clock, and
 `ConsistentHash`/`BoundedLoad.pick(keyHash)` with a key `>= 2^31` -- box that argument into a ~16 B
 transient `HeapNumber` when the call is not inlined (transient, does not retain, does not force a
-major GC). Arguments within V8's small-integer range are 0 B/op; that range is build-dependent (below
-2^31 on stock 64-bit Node, below 2^30 on pointer-compressed builds such as Chrome/Electron), and a
-value produced by `%` or division can box even when its value is a small integer. Buffer-based
-variants are planned for 1.1.0.
+major GC); V8's small-integer range is below 2^31 on stock 64-bit Node and below 2^30 on
+pointer-compressed builds such as Chrome/Electron. Since 1.1.0 each has a ZERO-BOX sibling that reads
+the number from a caller-owned typed-array slot -- `pickFrom(buf, i)` and `recordRttFrom(i, buf, j)`
+-- gated at 0 B/op even with V8 inlining switched off.
 
 ## The one question that splits everything: what fixes the primary choice?
 

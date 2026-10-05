@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <link rel="icon" href="data:,"/>
+    <title>lite-pick capstone</title>
+    <meta name="description" content="A load balancer you can watch work: lite-pick chooses, real workers serve, the lite-di-* kernel heals -- in your browser tab or your terminal, built only from @zakkster/lite-* bricks."/>
+    <link rel="preconnect" href="https://fonts.googleapis.com"/>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap"
+          rel="stylesheet"/>
+    <link rel="stylesheet" href="./hub.css"/>
+</head>
+<body>
+<main>
+
+<header class="hero">
+    <p class="eyebrow">@zakkster/lite-pick &mdash; the capstone</p>
+    <h1>A load balancer you can <em>watch work</em>.</h1>
+    <p class="lede">Eight real workers doing real CPU work. <code>lite-pick</code> chooses who gets each request; per
+        worker a supervisor, a health check and a circuit breaker decide who is up; a supervisor heals what you break.
+        Every part is a published <code>@zakkster/lite-*</code> package, zero-allocation on the request path, and
+        gated in CI like a library.</p>
+    <div class="cta">
+        <a class="btn primary" href="./live/">Open the live system <span class="arrow">&rarr;</span></a>
+        <a class="btn" href="../demo/pool-scope/web/">Simulated Pool Scope</a>
+    </div>
+    <p class="cta-note">The live system runs in this browser tab: eight Web Workers, about 2,000 requests a second.
+        Kill one, slow one, make one flaky &mdash; and watch the decisions.</p>
+</header>
+
+<section>
+    <h2>Or in a terminal</h2>
+    <p>The same kernel over <code>worker_threads</code>, drawn by the same Pool Scope, with the same keys.</p>
+    <pre class="term"><code>git clone https://github.com/PeshoVurtoleta/lite-pick
+cd lite-pick/pickEcosystem/live
+npm ci
+npm run tui</code></pre>
+</section>
+
+<section>
+    <h2>What happens to one request</h2>
+    <ol class="flow">
+        <li><span class="step">arrive</span> <span class="desc">Open-loop traffic: Poisson arrivals at the offered rate, each with a
+            Zipf-distributed key. Arrivals never wait for completions, so overload shows honestly.</span></li>
+        <li><span class="step">choose</span> <span class="desc"><code>lite-pick</code> picks a worker with the live strategy &mdash; one
+            of ten, switchable under load &mdash; reading only who is eligible, who is busy and how fast each has been.</span></li>
+        <li><span class="step">run</span> <span class="desc"><code>lite-worker-pool</code> posts a ~1 ms job to that one worker: two slots
+            and a capped queue each, results in order, one dead worker never takes the others down.</span></li>
+        <li><span class="step">settle</span> <span class="desc">The result feeds the strategy (latency, occupancy), the worker's circuit
+            breaker and the percentiles. A failure fails over once, to a different worker.</span></li>
+        <li><span class="step">heal</span> <span class="desc">Twenty times a second the fleet asks each worker's health check and breaker
+            whether it may serve, and writes that &mdash; only that &mdash; into the balancer. A dead worker is
+            restarted by its supervisor; a crash loop is escalated and kept out until reset.</span></li>
+        <li><span class="step">narrate</span> <span class="desc">Every breaker flip, rotation change, restart and failover is an event:
+            the DECISIONS and REROUTES panels are that stream.</span></li>
+    </ol>
+</section>
+
+<section>
+    <h2>Try this in the live system</h2>
+    <div class="tries">
+        <div class="try"><span class="key">k</span><b>Kill a worker.</b> Its in-flight requests fail over; its
+            supervisor restarts it; health lets it back in. Nothing is lost.</div>
+        <div class="try"><span class="key">s</span><b>Slow one ten times.</b> Under PeakEWMA (<span class="key">7</span>)
+            its share collapses; under LeastConn (<span class="key">4</span>) or RoundRobin (<span class="key">1</span>)
+            the tail latency climbs.</div>
+        <div class="try"><span class="key">f</span><b>Make one flaky.</b> Five failures in a row open its breaker; after
+            two seconds one probe decides whether it comes back. Failover hides it from every caller.</div>
+        <div class="try"><span class="key">l</span><b>Crash-loop one.</b> Five restarts in thirty seconds and the
+            supervisor gives up: escalated, kept out, until <span class="key">r</span> resets it.</div>
+        <div class="try"><span class="key">8</span><b>Route by key.</b> ConsistentHash keeps every key on its worker
+            &mdash; and melts the one with the hot keys; BoundedLoad (<span class="key">9</span>) spills the overflow.</div>
+        <div class="try"><span class="key">q</span><b>Shut it down.</b> The orchestrator drains, waits for every
+            in-flight request, retires each worker and reports its exit code.</div>
+    </div>
+</section>
+
+<section>
+    <h2>The composition, from the running container</h2>
+    <p>Not a diagram someone drew: <code>lite-di-graph</code> exports the root container that <code>bootKernel</code>
+        builds, and one worker's child scope. CI regenerates it and fails if this picture is stale.</p>
+    <figure class="graph">
+        <a href="./graph.svg"><img src="./graph.svg" alt="The kernel's composition graph: values and factories on the left; stats, balancers and the event listeners; then fleet, engine, traffic and the cron jobs; plus each worker's child scope." width="1110" height="488"/></a>
+        <figcaption>34 tokens, 35 edges. <a href="./graph.json">graph.json</a> is the raw snapshot.</figcaption>
+    </figure>
+</section>
+
+<section>
+    <h2>Every brick earns its place</h2>
+    <p>Each package has one job here, and a test in <code>pickEcosystem/live/test/</code> that fails if it stops
+        doing it.</p>
+    <div class="cards">
+        <div class="card core">
+            <div class="card-head"><b>lite-pick</b><span class="ver" data-pkg="@zakkster/lite-pick">1.1.0</span></div>
+            <p>Chooses the worker. Ten strategies over typed arrays, allocation-free per pick.</p>
+            <p class="proof">G3: one 10x-slow worker, p99 10 ms under PeakEWMA vs 340 ms under RoundRobin.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-worker-pool</b><span class="ver" data-pkg="@zakkster/lite-worker-pool">1.1.0</span></div>
+            <p>The workers: a job to a chosen worker, per-worker isolation, respawn, control values.</p>
+            <p class="proof">G2: kill a worker under load, no request lost. R1: 1000 respawns, all collected.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-worker</b><span class="ver" data-pkg="@zakkster/lite-worker">1.4.0</span></div>
+            <p>A Web Worker from a function (a Blob URL), transfer-only messages.</p>
+            <p class="proof">The browser smoke run boots eight of them in headless Chrome.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-di-container</b><span class="ver" data-pkg="@zakkster/lite-di-container">2.2.1</span></div>
+            <p>The composition root, and one child scope per worker.</p>
+            <p class="proof">R2: 200 scope rebuilds, every old scope collected. The graph above is its own.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-di-supervisor</b><span class="ver" data-pkg="@zakkster/lite-di-supervisor">1.0.0</span></div>
+            <p>Restarts a dead or hung worker; escalates a crash loop and keeps it out.</p>
+            <p class="proof">G6: escalated after five restarts, back after a reset.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-di-health</b><span class="ver" data-pkg="@zakkster/lite-di-health">1.0.0</span></div>
+            <p>Per-worker readiness: the READY handshake, no hung job, a healthy supervisor.</p>
+            <p class="proof">G5: a hung worker is out of rotation within 600 ms, then respawned.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-statechart</b><span class="ver" data-pkg="@zakkster/lite-statechart">1.1.0</span></div>
+            <p>Each worker's circuit breaker: closed, open, half-open with one probe.</p>
+            <p class="proof">G4: the breaker opens with no failed request and closes after healing.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-di-strategies</b><span class="ver" data-pkg="@zakkster/lite-di-strategies">1.0.0</span></div>
+            <p>The live strategy switch: a new balancer built cold, eligibility replayed.</p>
+            <p class="proof">G8: all ten switched under load, in-flight counts conserved.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-di-event-bus</b><span class="ver" data-pkg="@zakkster/lite-di-event-bus">1.1.0</span></div>
+            <p>Every decision as a numeric event, 0 B per emit; the decision stream.</p>
+            <p class="proof">A1: inside the zero-allocation steady state.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-di-cron</b><span class="ver" data-pkg="@zakkster/lite-di-cron">1.0.0</span></div>
+            <p>Traffic at 100 Hz, the fleet at 20 Hz, stats at 1 Hz &mdash; on an injected clock.</p>
+            <p class="proof">Every gate runs on a virtual clock, deterministically.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-di-orchestrator</b><span class="ver" data-pkg="@zakkster/lite-di-orchestrator">1.0.0</span></div>
+            <p>Graceful shutdown: drain, stop supervising, settle in-flight work, retire, exit code.</p>
+            <p class="proof">G7: exit code 0, every in-flight request settled, workers gone.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-di-graph</b><span class="ver" data-pkg="@zakkster/lite-di-graph">1.0.0</span></div>
+            <p>Exports the container's real wiring.</p>
+            <p class="proof">S2: the picture above is regenerated and compared in CI.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>lite-sketch</b><span class="ver" data-pkg="@zakkster/lite-sketch">1.1.2</span></div>
+            <p>Latency percentiles (DDSketch, &plusmn;1%), end to end and per worker.</p>
+            <p class="proof">D3: a slow worker's p95 reads several times a normal one's.</p>
+        </div>
+        <div class="card">
+            <div class="card-head"><b>Pool Scope</b><span class="ver" data-pkg="@zakkster/lite-charts">1.24.0</span></div>
+            <p>The decision monitor, with <code>lite-charts</code>, <code>lite-signal</code> and
+                <code>lite-adaptive</code>'s detectors. One renderer per surface, shared by the simulated and live
+                systems.</p>
+            <p class="proof">T1 / T2: the live TUI narrates every fault, byte-identically twice.</p>
+        </div>
+    </div>
+</section>
+
+<section>
+    <h2>Measured</h2>
+    <dl class="numbers">
+        <div><dt>0</dt><dd>scavenges over 960,000 requests on the request path (engine A, Node 26; two one-off on Node 22)</dd></div>
+        <div><dt>~2.9 KB</dt><dd>per request on the ergonomic path (<code>/pool</code> + a promise each) &mdash; shown side by side, key <code>e</code></dd></div>
+        <div><dt>10 ms</dt><dd>p99 with one worker 10x slow at 2,000 requests/s under PeakEWMA &mdash; LeastConn 30, P2C 40, RoundRobin 340</dd></div>
+        <div><dt>0 failed</dt><dd>of ~16,000 requests over real threads with every fault injected once, one at a time</dd></div>
+    </dl>
+</section>
+
+<section>
+    <h2>Gated like a library</h2>
+    <p>This site is deployed only after every job passes:</p>
+    <ul class="gates">
+        <li><b>lite-pick itself</b> &mdash; unit tests on Node 20/22/24 &times; three OSes, allocation gates (with V8
+            inlining on and off), torture, benchmarks, the packed tarball's types.</li>
+        <li><b>the kernel</b> &mdash; ten scenario gates, each with a control that must fail; allocation rate by
+            scavenge count; retention after 1000 respawns; the same gates against lite-pick's working tree.</li>
+        <li><b>the surfaces</b> &mdash; the TUI scripted and compared byte for byte; the import map pinned to
+            <code>package.json</code> both ways; a 20-second run over real threads; this site, built exactly as
+            deployed, driven in headless Chrome through its own keys.</li>
+    </ul>
+</section>
+
+</main>
+<footer class="foot">
+    <a href="https://github.com/PeshoVurtoleta/lite-pick">github.com/PeshoVurtoleta/lite-pick</a> &middot;
+    <a href="https://www.npmjs.com/package/@zakkster/lite-pick">npm @zakkster/lite-pick</a> &middot;
+    MIT &copy; Zahary Shinikchiev
+</footer>
+</body>
+</html>

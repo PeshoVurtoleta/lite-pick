@@ -138,3 +138,39 @@ jobs:
       - name: compile consumer under lib ES2022 only (no DOM, no @types/node)
         working-directory: test/types/consumer
         run: npx -y -p typescript@5 tsc -p tsconfig.es2022.json
+
+  # Capstone P4: publish the site -- the hub (pickEcosystem/), the live system and the simulated Pool Scope -- to
+  # GitHub Pages, only from main and only after EVERY gate above is green (lite-pick's own matrix and Node 18 floor, its allocation
+  # gates, the types against the packed tarball, and the capstone, whose browser smoke run already drove this exact
+  # site build in headless Chrome). The site is built by pickEcosystem/live/site.mjs: exactly what the pages reach
+  # (no node_modules, tests or research), with the root redirecting to the hub. Needs Settings -> Pages ->
+  # Source: GitHub Actions.
+  deploy:
+    name: deploy (GitHub Pages)
+    needs: [test, test-node18, gates, capstone, types-compat]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # Only the deploy serializes; the gates never cancel each other.
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}pickEcosystem/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: build the site
+        run: node pickEcosystem/live/site.mjs _site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

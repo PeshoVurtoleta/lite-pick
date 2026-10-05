@@ -1,0 +1,458 @@
+{
+ "root": {
+  "format": "lite-di-graph",
+  "version": "1.0.0",
+  "nodes": [
+   {
+    "token": "config",
+    "kind": 0,
+    "kindName": "VALUE",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "now",
+    "kind": 0,
+    "kindName": "VALUE",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lp",
+    "kind": 0,
+    "kindName": "VALUE",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "poolMod",
+    "kind": 0,
+    "kindName": "VALUE",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "shared",
+    "kind": 0,
+    "kindName": "VALUE",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "events",
+    "kind": 0,
+    "kindName": "VALUE",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "stream",
+    "kind": 0,
+    "kindName": "VALUE",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:roundrobin",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:smoothwrr",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:p2c",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:leastconn",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:sed",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:nq",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:peakewma",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:consistenthash",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:boundedload",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "lb:weightedrandom",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "set",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "stats",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "config"
+    ]
+   },
+   {
+    "token": "balancers",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "shared"
+    ]
+   },
+   {
+    "token": "fleet",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "config",
+     "set",
+     "balancers",
+     "bus",
+     "now"
+    ]
+   },
+   {
+    "token": "engine",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "config",
+     "set",
+     "balancers",
+     "fleet",
+     "stats",
+     "bus",
+     "now",
+     "poolMod"
+    ]
+   },
+   {
+    "token": "traffic",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "config",
+     "engine",
+     "lp"
+    ]
+   },
+   {
+    "token": "bus",
+    "kind": 0,
+    "kindName": "VALUE",
+    "deps": [],
+    "opaqueDeps": true
+   },
+   {
+    "token": "cron:job:traffic",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "traffic"
+    ]
+   },
+   {
+    "token": "cron:job:fleet",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "fleet"
+    ]
+   },
+   {
+    "token": "cron:job:stats",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "stats"
+    ]
+   },
+   {
+    "token": "dispatch",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "events",
+     "stream"
+    ]
+   },
+   {
+    "token": "failover",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "events",
+     "stream"
+    ]
+   },
+   {
+    "token": "breaker",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "events",
+     "stream"
+    ]
+   },
+   {
+    "token": "eligible",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "events",
+     "stream"
+    ]
+   },
+   {
+    "token": "restart",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "events",
+     "stream"
+    ]
+   },
+   {
+    "token": "escalate",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "events",
+     "stream"
+    ]
+   },
+   {
+    "token": "reroute",
+    "kind": 1,
+    "kindName": "SINGLETON",
+    "deps": [
+     "events",
+     "stream"
+    ]
+   }
+  ],
+  "edges": [
+   {
+    "from": "stats",
+    "to": "config"
+   },
+   {
+    "from": "balancers",
+    "to": "shared"
+   },
+   {
+    "from": "fleet",
+    "to": "config"
+   },
+   {
+    "from": "fleet",
+    "to": "set"
+   },
+   {
+    "from": "fleet",
+    "to": "balancers"
+   },
+   {
+    "from": "fleet",
+    "to": "bus"
+   },
+   {
+    "from": "fleet",
+    "to": "now"
+   },
+   {
+    "from": "engine",
+    "to": "config"
+   },
+   {
+    "from": "engine",
+    "to": "set"
+   },
+   {
+    "from": "engine",
+    "to": "balancers"
+   },
+   {
+    "from": "engine",
+    "to": "fleet"
+   },
+   {
+    "from": "engine",
+    "to": "stats"
+   },
+   {
+    "from": "engine",
+    "to": "bus"
+   },
+   {
+    "from": "engine",
+    "to": "now"
+   },
+   {
+    "from": "engine",
+    "to": "poolMod"
+   },
+   {
+    "from": "traffic",
+    "to": "config"
+   },
+   {
+    "from": "traffic",
+    "to": "engine"
+   },
+   {
+    "from": "traffic",
+    "to": "lp"
+   },
+   {
+    "from": "cron:job:traffic",
+    "to": "traffic"
+   },
+   {
+    "from": "cron:job:fleet",
+    "to": "fleet"
+   },
+   {
+    "from": "cron:job:stats",
+    "to": "stats"
+   },
+   {
+    "from": "dispatch",
+    "to": "events"
+   },
+   {
+    "from": "dispatch",
+    "to": "stream"
+   },
+   {
+    "from": "failover",
+    "to": "events"
+   },
+   {
+    "from": "failover",
+    "to": "stream"
+   },
+   {
+    "from": "breaker",
+    "to": "events"
+   },
+   {
+    "from": "breaker",
+    "to": "stream"
+   },
+   {
+    "from": "eligible",
+    "to": "events"
+   },
+   {
+    "from": "eligible",
+    "to": "stream"
+   },
+   {
+    "from": "restart",
+    "to": "events"
+   },
+   {
+    "from": "restart",
+    "to": "stream"
+   },
+   {
+    "from": "escalate",
+    "to": "events"
+   },
+   {
+    "from": "escalate",
+    "to": "stream"
+   },
+   {
+    "from": "reroute",
+    "to": "events"
+   },
+   {
+    "from": "reroute",
+    "to": "stream"
+   }
+  ],
+  "order": [
+   "set",
+   "stats",
+   "balancers",
+   "fleet",
+   "engine",
+   "traffic",
+   "cron:job:traffic",
+   "cron:job:fleet",
+   "cron:job:stats",
+   "dispatch",
+   "failover",
+   "breaker",
+   "eligible",
+   "restart",
+   "escalate",
+   "reroute"
+  ]
+ },
+ "scope": {
+  "format": "lite-di-graph",
+  "version": "1.0.0",
+  "nodes": [
+   {
+    "token": "worker",
+    "kind": 3,
+    "kindName": "FACTORY",
+    "deps": [],
+    "opaqueDeps": true
+   }
+  ],
+  "edges": [],
+  "order": [
+   "worker"
+  ]
+ }
+}

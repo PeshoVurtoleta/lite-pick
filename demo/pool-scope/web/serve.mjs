@@ -5,7 +5,9 @@
  *     node demo/pool-scope/web/serve.mjs [--port N] [--root DIR] [--page live]   (or PORT=N ...)
  *
  * `--page live` opens the capstone's LIVE page instead (pickEcosystem/live/: the running system over Web
- * Workers; `npm run web` there). It shares this page's renderer and stylesheet, so both trees are served.
+ * Workers; `npm run web` there), `--page hub` the capstone's hub (pickEcosystem/). They share this page's renderer
+ * and stylesheet, so all three trees are served. `--root DIR` serves a built site (pickEcosystem/live/site.mjs)
+ * the same way -- how the browser smoke run tests exactly what deploys.
  *
  * Node built-in http only (no bundler, no `serve` dependency): the page is pure static -- an import
  * map + relative brick imports + esm.sh for the siblings -- so this just streams files with correct
@@ -79,8 +81,10 @@ const MIME = {
 // The web page lives here. A bare "/" REDIRECTS to the page's real directory (with a trailing
 // slash) so the browser's base URL is the web dir and the page's relative module imports
 // (main.mjs, ../driver.mjs, ../../Pick.js) resolve correctly.
+const HUB_DIR = '/pickEcosystem/';
 const LIVE_DIR = '/pickEcosystem/live/';
-const WEB_DIR = argVal('--page', '') === 'live' ? LIVE_DIR : '/demo/pool-scope/web/';
+const PAGE = argVal('--page', '');
+const WEB_DIR = PAGE === 'live' ? LIVE_DIR : PAGE === 'hub' ? HUB_DIR : '/demo/pool-scope/web/';
 
 // ALLOWLIST: the ONLY paths this server will serve, matched against the path AFTER normalisation
 // (so a traversal like /demo/pool-scope/../../package.json is judged as /package.json -> denied).
@@ -88,10 +92,13 @@ const WEB_DIR = argVal('--page', '') === 'live' ? LIVE_DIR : '/demo/pool-scope/w
 function isAllowed(p) {
     if (p === '/Pick.js' || p === '/Pool.js') return true;
     if (p === '/demo/pool-scope' || p.startsWith('/demo/pool-scope/')) return true;
-    // The live page: its top-level files only -- never its node_modules, tests, package files or dotfiles.
-    if (p.startsWith(LIVE_DIR)) {
-        const rest = p.slice(LIVE_DIR.length);
-        return rest.indexOf('/') < 0 && !rest.startsWith('.') && !rest.startsWith('package');
+    // The hub and the live page: their top-level files only -- never node_modules, tests, package files or
+    // dotfiles.
+    for (const dir of [HUB_DIR, LIVE_DIR]) {
+        if (p.startsWith(dir)) {
+            const rest = p.slice(dir.length);
+            if (rest.indexOf('/') < 0 && !rest.startsWith('.') && !rest.startsWith('package')) return true;
+        }
     }
     return false;
 }
@@ -131,12 +138,12 @@ const server = createServer(async (req, res) => {
             return;
         }
         // A page dir WITHOUT a trailing slash -> redirect (so relative imports resolve), not 404.
-        if (urlPath === '/demo/pool-scope/web' || urlPath + '/' === LIVE_DIR) {
+        if (urlPath === '/demo/pool-scope/web' || urlPath + '/' === LIVE_DIR || urlPath + '/' === HUB_DIR) {
             res.writeHead(302, { location: urlPath + '/', 'x-content-type-options': 'nosniff' });
             res.end();
             return;
         }
-        if (urlPath === '/demo/pool-scope/web/' || urlPath === LIVE_DIR) urlPath = urlPath + 'index.html';
+        if (urlPath === '/demo/pool-scope/web/' || urlPath === LIVE_DIR || urlPath === HUB_DIR) urlPath = urlPath + 'index.html';
 
         // Resolve inside ROOT, then reject any traversal escape via path.relative (not a prefix match).
         const abs = join(ROOT, urlPath);

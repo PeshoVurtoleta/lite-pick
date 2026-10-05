@@ -2,7 +2,7 @@
   "name": "pick-ecosystem-live",
   "private": true,
   "version": "0.0.0",
-  "description": "The lite-pick capstone: a served, functioning load-balancing system (headless kernel P1, terminal UI P2, browser page P3).",
+  "description": "The lite-pick capstone: a served, functioning load-balancing system (headless kernel P1, terminal UI P2, browser page P3, hub + Pages deploy P4).",
   "type": "module",
   "license": "MIT",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
@@ -15,7 +15,9 @@
     "start": "node run.mjs",
     "tui": "node --expose-gc tui.mjs",
     "web": "node ../../demo/pool-scope/web/serve.mjs --page live",
-    "browser-smoke": "node test/browser-smoke.mjs"
+    "browser-smoke": "node test/browser-smoke.mjs",
+    "graph": "node graph.mjs",
+    "site": "node site.mjs"
   },
   "dependencies": {
     "@zakkster/lite-adaptive": "1.11.0",

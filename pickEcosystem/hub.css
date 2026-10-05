@@ -1,0 +1,360 @@
+/*
+ * pickEcosystem -- the hub page. Pool Scope's oscilloscope palette (demo/pool-scope/web/scope.css), so the hub,
+ * the live page and the simulated page read as one site.
+ */
+
+:root {
+    --bg0: #07090d;
+    --bg1: #0d1117;
+    --bg2: #131922;
+    --bg3: #1a2230;
+    --bg1-k: oklch(0.2 0.015 260);
+    --text: #eae8e4;
+    --dim: #c6c9d0;
+    --faint: #9ca2ae;
+    --line: #232b38;
+    --green: #5fe39f;
+    --amber: #f5b942;
+    --red: #f87171;
+    --cyan: #7dd3fc;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+    --eyebrow: 'Space Mono', ui-monospace, monospace;
+    --r: 0.5rem;
+    --maxw: 68rem;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html, body {
+    margin: 0;
+    background: var(--bg0);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+}
+
+body {
+    min-height: 100dvh;
+    background: radial-gradient(120% 60% at 50% -10%, #131922 0%, #0d1117 45%, #07090d 100%);
+}
+
+main, footer.foot {
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 0 1rem;
+}
+
+a {
+    color: var(--cyan);
+}
+
+code {
+    color: var(--green);
+    font-size: 0.92em;
+}
+
+section {
+    margin: 3rem 0;
+}
+
+h2 {
+    font-family: var(--eyebrow);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 0.86rem;
+    color: var(--dim);
+    margin: 0 0 0.8rem;
+}
+
+p {
+    max-width: 52rem;
+    color: var(--dim);
+}
+
+/* ---- hero ---- */
+.hero {
+    padding: 4rem 0 1rem;
+}
+
+.eyebrow {
+    font-family: var(--eyebrow);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 0.74rem;
+    color: var(--faint);
+    margin: 0 0 1rem;
+}
+
+.hero h1 {
+    font-size: 2.6rem;
+    line-height: 1.15;
+    margin: 0 0 1.2rem;
+    color: var(--text);
+    letter-spacing: -0.01em;
+}
+
+.hero h1 em {
+    font-style: normal;
+    color: var(--green);
+}
+
+.lede {
+    font-size: 1.05rem;
+    color: var(--dim);
+}
+
+.cta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem;
+    margin: 1.8rem 0 0.8rem;
+}
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.7rem 1.1rem;
+    border-radius: var(--r);
+    border: 1px solid var(--line);
+    background: var(--bg2);
+    color: var(--text);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.btn.primary {
+    border-color: var(--green);
+    color: var(--green);
+}
+
+@media (hover: hover) {
+    .btn:hover {
+        border-color: var(--faint);
+    }
+
+    .btn.primary:hover {
+        background: #132a20;
+        background: color-mix(in oklab, var(--green) 12%, var(--bg2));
+    }
+}
+
+.cta-note {
+    font-size: 0.85rem;
+    color: var(--faint);
+}
+
+/* ---- terminal block ---- */
+.term {
+    margin: 0;
+    padding: 1rem 1.1rem;
+    background: var(--bg1);
+    background: var(--bg1-k);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    overflow-x: auto;
+}
+
+.term code {
+    color: var(--text);
+}
+
+/* ---- the request flow ---- */
+.flow {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.6rem;
+}
+
+.flow li {
+    display: grid;
+    grid-template-columns: 6rem 1fr;
+    gap: 1rem;
+    align-items: baseline;
+    color: var(--dim);
+    padding: 0.7rem 0.9rem;
+    background: var(--bg1);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+}
+
+.flow .step {
+    font-family: var(--eyebrow);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-size: 0.74rem;
+    color: var(--cyan);
+}
+
+/* ---- try this ---- */
+.tries {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr));
+    gap: 0.7rem;
+}
+
+.try {
+    padding: 0.8rem 0.9rem;
+    background: var(--bg1);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    color: var(--dim);
+    font-size: 0.9rem;
+}
+
+.try b {
+    color: var(--text);
+    margin-right: 0.3rem;
+}
+
+.key {
+    display: inline-block;
+    min-width: 1.4rem;
+    padding: 0 0.35rem;
+    margin-right: 0.45rem;
+    text-align: center;
+    border: 1px solid var(--faint);
+    border-radius: 0.3rem;
+    font-size: 0.8rem;
+    color: var(--amber);
+}
+
+/* ---- the graph ---- */
+.graph {
+    margin: 0;
+    padding: 0.6rem;
+    background: var(--bg1);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    overflow-x: auto;
+}
+
+.graph img {
+    display: block;
+    width: 100%;
+    min-width: 44rem;
+    height: auto;
+}
+
+.graph figcaption {
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--faint);
+}
+
+/* ---- brick cards ---- */
+.cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr));
+    gap: 0.7rem;
+}
+
+.card {
+    padding: 0.9rem 1rem;
+    background: var(--bg1);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+}
+
+.card.core {
+    border-color: var(--green);
+}
+
+.card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 0.4rem;
+}
+
+.card-head b {
+    color: var(--text);
+}
+
+.card .ver {
+    font-size: 0.78rem;
+    color: var(--faint);
+}
+
+.card p {
+    margin: 0 0 0.5rem;
+    font-size: 0.88rem;
+}
+
+.card .proof {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--green);
+}
+
+/* ---- numbers ---- */
+.numbers {
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+    gap: 0.7rem;
+}
+
+.numbers div {
+    padding: 0.9rem 1rem;
+    background: var(--bg1);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+}
+
+.numbers dt {
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--green);
+}
+
+.numbers dd {
+    margin: 0.3rem 0 0;
+    font-size: 0.85rem;
+    color: var(--dim);
+}
+
+/* ---- gates ---- */
+.gates {
+    margin: 0;
+    padding-left: 1.2rem;
+    color: var(--dim);
+}
+
+.gates li {
+    margin-bottom: 0.5rem;
+    max-width: 52rem;
+}
+
+.gates b {
+    color: var(--text);
+}
+
+footer.foot {
+    padding-top: 1.2rem;
+    padding-bottom: 2.5rem;
+    border-top: 1px solid var(--line);
+    font-size: 0.8rem;
+    color: var(--faint);
+}
+
+@media (max-width: 40rem) {
+    .hero {
+        padding-top: 2.5rem;
+    }
+
+    .hero h1 {
+        font-size: 1.9rem;
+    }
+
+    .flow li {
+        grid-template-columns: 1fr;
+        gap: 0.3rem;
+    }
+}

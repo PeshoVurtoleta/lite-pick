@@ -6,7 +6,8 @@ IMPLEMENTED 2026-10-05 (research/capstone-P1-spec.md). P2 (the terminal UI on th
 system, `pickEcosystem/live/tui.mjs`; Pool Scope's renderer split into `demo/pool-scope/tui-render.mjs`, its
 simulated frames byte-identical) IMPLEMENTED 2026-10-05. P3 (the browser page, `pickEcosystem/live/index.html`;
 Pool Scope's web renderer split into `demo/pool-scope/web/render.mjs`; section 10) IMPLEMENTED 2026-10-05.
-Next: P4, the hub page + the Pages deploy job.
+P4 (the hub `pickEcosystem/index.html`, the composition graph from the running container, the site builder and
+the Pages deploy job; section 11) IMPLEMENTED 2026-10-05. Next: P5, the soak heartbeat, the scenario script, polish.
 **North-star (ROADMAP section 5, your words 2026-09-23):** "to see the whole system built, and not only built --
 but functioning, anyone can see the served system; both operational through a browser and terminal" -- the
 proof that an A+, zero-GC module is still worth building.
@@ -306,6 +307,26 @@ Found on the way:
   load, on P2's code too. The timeline now heals w1 before the hang; 10/10 clean.
 - **lite-charts canvases do not shrink** when the window narrows after mount (a fresh load at 390 px fits). Seen
   on both pages; not fixed here.
+
+## 11. P4 as built (2026-10-05)
+
+- **The hub** (`pickEcosystem/index.html` + `hub.css`, no script): what the system is, the two ways in (the live
+  page; the terminal), one request's path, six things to try, the composition graph, one card per brick with the
+  gate that proves it, the measured numbers, and what CI checks before it deploys. Pool Scope's palette, so the three
+  pages read as one site. Versions on the cards are tagged and compared with package.json (S3).
+- **The graph is exported, not drawn** (the section 3 table's lite-di-graph line): `live/graph.mjs` boots the
+  kernel over virtual workers and writes lite-di-graph's snapshot of the root container (34 tokens, 35 edges) and
+  one worker scope, as JSON and as a layered SVG (columns by dependency depth; same-kind, same-deps, same-prefix
+  tokens drawn as one box -- `lb:* x10`). S2 regenerates both byte for byte and checks the hub states the real size.
+- **The site is derived, not listed.** `live/site.mjs` follows every relative src/href of the three pages and every
+  module in their import graphs: 26 files, never node_modules, tests, research or the package files; `Pool.js`
+  stays out because no page reaches it. A reference that does not resolve fails the build. The builder refuses to
+  empty the repo or a directory that is not a previous build.
+- **The browser smoke run tests what deploys**: it builds the site into a temporary directory and serves THAT
+  (`serve.mjs --root`), adding the hub (redirect from the site root, the graph renders, every relative link 200).
+- **Deploy** (`ci.yml`): from `main` pushes only, after `test`, `test-node18`, `gates`, `capstone` and
+  `types-compat`; builds `_site` with site.mjs, uploads it, deploys with actions/deploy-pages. Requires the repo's
+  Pages source set to GitHub Actions.
 
 ## What we would NOT do
 

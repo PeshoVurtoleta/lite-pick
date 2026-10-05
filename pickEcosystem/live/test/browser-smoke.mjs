@@ -1,11 +1,14 @@
 /**
- * pickEcosystem/live -- the REAL-BROWSER smoke run (capstone P3): the served page in headless Chrome, driven
- * through its own keys and buttons, against the pinned esm.sh modules the deployed page loads.
+ * pickEcosystem/live -- the REAL-BROWSER smoke run (capstone P3, P4): the SITE AS DEPLOYED -- built by site.mjs
+ * into a temporary directory, exactly what the Pages job uploads -- in headless Chrome, driven through its own keys
+ * and buttons, against the pinned esm.sh modules.
  *
  *   npm run browser-smoke      (CHROME_PATH=... to choose the browser; CI uses the runner's Chrome)
  *
  * Zero dependencies: the page is served by demo/pool-scope/web/serve.mjs, Chrome is driven over the DevTools
  * protocol with Node's built-in WebSocket. Checks, in order:
+ *   HUB         the site root redirects to the hub; it loads, the composition graph renders, and every relative
+ *               link on it resolves inside the built site
  *   LIVE page   every module loads (no banner) and the system boots: 8 Web Workers up, requests served;
  *               kill w2 (key k)        -> "w2 restarted by its supervisor" in DECISIONS
  *               crash w5 (key c)       -> "w5 restarted by its supervisor" (the browser crash path: an uncaught
@@ -24,6 +27,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildSite } from '../site.mjs';
 
 const SERVE = fileURLToPath(new URL('../../../demo/pool-scope/web/serve.mjs', import.meta.url));
 const PORT = Number(process.env.SMOKE_PORT || 8790);
@@ -112,7 +116,9 @@ if (chromePath === null) {
     process.exit(1);
 }
 
-const server = spawn(process.execPath, [SERVE, '--port', String(PORT), '--page', 'live'], { stdio: ['ignore', 'pipe', 'pipe'] });
+const site = mkdtempSync(join(tmpdir(), 'pick-site-'));
+log('  site: ' + buildSite(site).length + ' files built into a temporary directory');
+const server = spawn(process.execPath, [SERVE, '--port', String(PORT), '--page', 'hub', '--root', site], { stdio: ['ignore', 'pipe', 'pipe'] });
 const profile = mkdtempSync(join(tmpdir(), 'pick-smoke-'));
 let chrome = null;
 let code = 1;
@@ -147,6 +153,25 @@ try {
     await cdp.send('Runtime.enable');
     await cdp.send('Log.enable');
     await cdp.send('Page.enable');
+
+    // ---- the HUB --------------------------------------------------------------------------------------
+    await cdp.send('Page.navigate', { url: BASE + '/' });
+    const hub = await cdp.until("document.readyState === 'complete' && location.pathname === '/pickEcosystem/' && document.title", 15000);
+    check(hub === 'lite-pick capstone', 'hub: the site root redirects to it and it loads (' + hub + ')');
+    check(await cdp.until("(() => { const i = document.querySelector('.graph img'); return i && i.complete && i.naturalWidth > 0; })()", 10000) === true,
+        'hub: the composition graph renders');
+    const links = await cdp.eval(`(async () => {
+        const out = [];
+        for (const a of document.querySelectorAll('a[href]')) {
+            const h = a.getAttribute('href');
+            if (h.startsWith('#') || h.startsWith('//') || h.indexOf(':') >= 0) continue;
+            const r = await fetch(new URL(h, location.href));
+            out.push(h + ' ' + r.status);
+        }
+        return out;
+    })()`);
+    const broken = links.filter((l) => !/ 200$/.test(l));
+    check(links.length >= 4 && broken.length === 0, 'hub: ' + links.length + ' relative links resolve in the built site' + (broken.length ? ': ' + broken.join(', ') : ''));
 
     // ---- the LIVE page ----------------------------------------------------------------------------
     await cdp.send('Page.navigate', { url: BASE + '/pickEcosystem/live/' });
@@ -210,6 +235,7 @@ try {
     if (chrome !== null) chrome.kill();
     server.kill();
     try { rmSync(profile, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { rmSync(site, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 if (code === 0) process.stdout.write('ok\n', () => process.exit(0));
 else process.stderr.write('', () => process.exit(1));

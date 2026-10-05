@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1110 488" width="1110" height="488" role="img" aria-label="The composition graph of the running pickEcosystem kernel: 34 tokens, 35 edges, exported by lite-di-graph">
+<style>text{font-family:ui-monospace,"JetBrains Mono",Menlo,monospace;font-size:11px;fill:#eae8e4}.h{fill:#9ca2ae;font-size:10px;letter-spacing:.08em}.k{fill:#9ca2ae;font-size:9px}.e{fill:none;stroke:#3a4558;stroke-width:1}</style>
+<rect width="1110" height="488" fill="#0d1117"/>
+<text class="h" x="20" y="24">ROOT CONTAINER -- 34 TOKENS, 35 EDGES (a token depends on the boxes to its left)</text>
+<path class="e" d="M204 78 C187 78 187 62 170 62"/>
+<path class="e" d="M204 110 C187 110 187 190 170 190"/>
+<path class="e" d="M388 190 C279 190 279 62 170 62"/>
+<path class="e" d="M388 190 C279 190 279 318 170 318"/>
+<path class="e" d="M388 190 C371 190 371 110 354 110"/>
+<path class="e" d="M388 190 C279 190 279 350 170 350"/>
+<path class="e" d="M388 190 C279 190 279 94 170 94"/>
+<path class="e" d="M572 190 C371 190 371 62 170 62"/>
+<path class="e" d="M572 190 C371 190 371 318 170 318"/>
+<path class="e" d="M572 190 C463 190 463 110 354 110"/>
+<path class="e" d="M572 190 C555 190 555 190 538 190"/>
+<path class="e" d="M572 190 C463 190 463 78 354 78"/>
+<path class="e" d="M572 190 C371 190 371 350 170 350"/>
+<path class="e" d="M572 190 C371 190 371 94 170 94"/>
+<path class="e" d="M572 190 C371 190 371 158 170 158"/>
+<path class="e" d="M756 206 C463 206 463 62 170 62"/>
+<path class="e" d="M756 206 C739 206 739 190 722 190"/>
+<path class="e" d="M756 206 C463 206 463 126 170 126"/>
+<path class="e" d="M940 206 C923 206 923 206 906 206"/>
+<path class="e" d="M572 222 C555 222 555 190 538 190"/>
+<path class="e" d="M388 222 C371 222 371 78 354 78"/>
+<path class="e" d="M204 142 C187 142 187 222 170 222"/>
+<path class="e" d="M204 142 C187 142 187 254 170 254"/>
+<path class="e" d="M204 174 C187 174 187 222 170 222"/>
+<path class="e" d="M204 174 C187 174 187 254 170 254"/>
+<path class="e" d="M204 206 C187 206 187 222 170 222"/>
+<path class="e" d="M204 206 C187 206 187 254 170 254"/>
+<path class="e" d="M204 238 C187 238 187 222 170 222"/>
+<path class="e" d="M204 238 C187 238 187 254 170 254"/>
+<path class="e" d="M204 270 C187 270 187 222 170 222"/>
+<path class="e" d="M204 270 C187 270 187 254 170 254"/>
+<path class="e" d="M204 302 C187 302 187 222 170 222"/>
+<path class="e" d="M204 302 C187 302 187 254 170 254"/>
+<path class="e" d="M204 334 C187 334 187 222 170 222"/>
+<path class="e" d="M204 334 C187 334 187 254 170 254"/>
+<g><title>config -- VALUE (deps opaque)</title><rect x="20" y="50" width="150" height="24" rx="4" fill="#131922" stroke="#7dd3fc"/><text x="28" y="66">config</text></g>
+<g><title>now -- VALUE (deps opaque)</title><rect x="20" y="82" width="150" height="24" rx="4" fill="#131922" stroke="#7dd3fc"/><text x="28" y="98">now</text></g>
+<g><title>lp -- VALUE (deps opaque)</title><rect x="20" y="114" width="150" height="24" rx="4" fill="#131922" stroke="#7dd3fc"/><text x="28" y="130">lp</text></g>
+<g><title>poolMod -- VALUE (deps opaque)</title><rect x="20" y="146" width="150" height="24" rx="4" fill="#131922" stroke="#7dd3fc"/><text x="28" y="162">poolMod</text></g>
+<g><title>shared -- VALUE (deps opaque)</title><rect x="20" y="178" width="150" height="24" rx="4" fill="#131922" stroke="#7dd3fc"/><text x="28" y="194">shared</text></g>
+<g><title>events -- VALUE (deps opaque)</title><rect x="20" y="210" width="150" height="24" rx="4" fill="#131922" stroke="#7dd3fc"/><text x="28" y="226">events</text></g>
+<g><title>stream -- VALUE (deps opaque)</title><rect x="20" y="242" width="150" height="24" rx="4" fill="#131922" stroke="#7dd3fc"/><text x="28" y="258">stream</text></g>
+<g><title>lb:roundrobin, lb:smoothwrr, lb:p2c, lb:leastconn, lb:sed, lb:nq, lb:peakewma, lb:consistenthash, lb:boundedload, lb:weightedrandom -- FACTORY (deps opaque)</title><rect x="20" y="274" width="150" height="24" rx="4" fill="#131922" stroke="#f5b942"/><text x="28" y="290">lb:* x10</text></g>
+<g><title>set -- FACTORY (deps opaque)</title><rect x="20" y="306" width="150" height="24" rx="4" fill="#131922" stroke="#f5b942"/><text x="28" y="322">set</text></g>
+<g><title>stats -- SINGLETON &lt;- config</title><rect x="204" y="66" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="82">stats</text></g>
+<g><title>balancers -- SINGLETON &lt;- shared</title><rect x="204" y="98" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="114">balancers</text></g>
+<g><title>fleet -- SINGLETON &lt;- config, set, balancers, bus, now</title><rect x="388" y="178" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="396" y="194">fleet</text></g>
+<g><title>engine -- SINGLETON &lt;- config, set, balancers, fleet, stats, bus, now, poolMod</title><rect x="572" y="178" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="580" y="194">engine</text></g>
+<g><title>traffic -- SINGLETON &lt;- config, engine, lp</title><rect x="756" y="194" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="764" y="210">traffic</text></g>
+<g><title>bus -- VALUE (deps opaque)</title><rect x="20" y="338" width="150" height="24" rx="4" fill="#131922" stroke="#7dd3fc"/><text x="28" y="354">bus</text></g>
+<g><title>cron:job:traffic -- SINGLETON &lt;- traffic</title><rect x="940" y="194" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="948" y="210">cron:job:traffic</text></g>
+<g><title>cron:job:fleet -- SINGLETON &lt;- fleet</title><rect x="572" y="210" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="580" y="226">cron:job:fleet</text></g>
+<g><title>cron:job:stats -- SINGLETON &lt;- stats</title><rect x="388" y="210" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="396" y="226">cron:job:stats</text></g>
+<g><title>dispatch -- SINGLETON &lt;- events, stream</title><rect x="204" y="130" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="146">dispatch</text></g>
+<g><title>failover -- SINGLETON &lt;- events, stream</title><rect x="204" y="162" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="178">failover</text></g>
+<g><title>breaker -- SINGLETON &lt;- events, stream</title><rect x="204" y="194" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="210">breaker</text></g>
+<g><title>eligible -- SINGLETON &lt;- events, stream</title><rect x="204" y="226" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="242">eligible</text></g>
+<g><title>restart -- SINGLETON &lt;- events, stream</title><rect x="204" y="258" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="274">restart</text></g>
+<g><title>escalate -- SINGLETON &lt;- events, stream</title><rect x="204" y="290" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="306">escalate</text></g>
+<g><title>reroute -- SINGLETON &lt;- events, stream</title><rect x="204" y="322" width="150" height="24" rx="4" fill="#131922" stroke="#5fe39f"/><text x="212" y="338">reroute</text></g>
+<rect x="20" y="402" width="702" height="72" rx="6" fill="none" stroke="#3a4558" stroke-dasharray="4 4"/>
+<text class="h" x="30" y="420">EACH WORKER'S CHILD SCOPE (x8)</text>
+<rect x="30" y="430" width="150" height="24" rx="4" fill="#131922" stroke="#f5b942"/><text x="38" y="446">worker</text><text class="k" x="190" y="445">factory: brings worker i up (set.respawn); a supervisor, a health check and a breaker watch it</text>
+<text class="k" x="1090" y="24" text-anchor="end">factory</text><rect x="1034.8" y="15" width="10" height="10" rx="2" fill="#131922" stroke="#f5b942"/><text class="k" x="1022.8" y="24" text-anchor="end">singleton</text><rect x="956.4" y="15" width="10" height="10" rx="2" fill="#131922" stroke="#5fe39f"/><text class="k" x="944.4" y="24" text-anchor="end">value</text><rect x="900.4" y="15" width="10" height="10" rx="2" fill="#131922" stroke="#7dd3fc"/>
+</svg>

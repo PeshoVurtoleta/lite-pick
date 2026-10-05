@@ -1,9 +1,10 @@
-# pickEcosystem / live -- the capstone system: kernel (P1), terminal UI (P2), browser page (P3)
+# pickEcosystem / live -- the capstone system: kernel (P1), terminal UI (P2), browser page (P3), site (P4)
 
 The lite-pick capstone (`research/capstone-pickEcosystem.md`) is a served, FUNCTIONING load-balancing system.
 This directory is its kernel, headless: real workers doing real CPU work, a supervised fleet with health
 checks and circuit breakers, open-loop traffic, live strategy switching and a graceful shutdown -- built
-only from the suite's bricks. P2 (below) is the terminal UI; P3 the browser page; P4 deploys it to Pages.
+only from the suite's bricks. P2 (below) is the terminal UI, P3 the browser page, P4 the hub and the Pages site:
+**https://peshovurtoleta.github.io/lite-pick/pickEcosystem/**.
 
 It has its own `package.json` (exact versions of the published bricks) and is never part of the lite-pick
 npm package.
@@ -15,7 +16,9 @@ npm start -- --seconds 20 --fault 3:kill:2 --fault 6:slow:3     # real worker_th
 npm test                                                         # the P1 gates (virtual workers, deterministic)
 npm run smoke                                                    # ~20 s over real threads, every fault once
 npm run web                                                      # the browser page on http://127.0.0.1:8137/
-npm run browser-smoke                                            # that page in headless Chrome, every check
+npm run browser-smoke                                            # the built site in headless Chrome, every check
+npm run graph                                                    # regenerate the hub's composition graph
+npm run site -- ../../_site                                      # build the Pages site (what CI deploys)
 ```
 
 `run.mjs` flags: `--strategy <name>` (one of the ten), `--rate <req/s>`, `--engine A|B`, `--seconds N`,
@@ -58,6 +61,16 @@ shutdown button runs the orchestrator and reports its exit code; "boot a fresh s
   hung for a second); `job.js` fails the job and raises an uncaught error, so the set takes the worker down at once.
 - **The worker table's p95** is time on the worker (its queue + the job), per worker, over the last second.
 
+## The site (P4)
+
+The hub (`pickEcosystem/index.html`) introduces the system and links the live page and the simulated Pool Scope.
+Its composition graph is not drawn by hand: `graph.mjs` boots the kernel and exports the root container and one
+worker scope with lite-di-graph (`graph.json`, `graph.svg`); `test/site.test.mjs` S2 regenerates both and fails if
+the committed picture is stale. `site.mjs` builds the Pages site from exactly what the three pages reach -- every
+relative link, every module in their import graphs -- so it never carries node_modules, tests or research, and the
+site root redirects to the hub. The browser smoke run drives that built site; the CI `deploy` job publishes it from
+`main` only after every other job is green (Settings -> Pages -> Source must be "GitHub Actions").
+
 ## What each brick does here
 
 | Brick | Job |
@@ -95,7 +108,9 @@ scavenge count; retention of 1000 supervised respawns and 200 scope rebuilds), `
 Scope's real snapshot over the live system), `test/tui.test.mjs` (the live TUI scripted: fleet, decisions,
 shutdown; two runs byte-identical), `test/web.test.mjs` (W1-W6: import-map drift both ways, the browser's module
 graph, the DOM contract, the browser crash path, the device scene, the static server's allowlist),
-`test/smoke.mjs` (real threads), `test/browser-smoke.mjs` (the served page in headless Chrome over the DevTools
-protocol, zero dependencies: boot, kill / crash / flaky through the page's own keys, engine B, a strategy switch,
-graceful shutdown with exit code 0, no failed request, no console error; and the simulated page). G10 runs the
+`test/site.test.mjs` (S1-S3: the site is exactly what the pages reach, the hub graph is the running kernel's, the
+hub's versions are package.json's), `test/smoke.mjs` (real threads), `test/browser-smoke.mjs` (the BUILT site in
+headless Chrome over the DevTools protocol, zero dependencies: the hub and its links; the live page booted, kill /
+crash / flaky through its own keys, engine B, a strategy switch, graceful shutdown with exit code 0, no failed
+request; the simulated page; no console error). G10 runs the
 gates against the repo's working-tree `Pick.js`, so a lite-pick change cannot silently break the capstone.

@@ -15,7 +15,7 @@
  *      page's Worker gets an error event and the set takes the worker down (a silent close() would not).
  *   W5 the device scene: calibration measures this machine (and clamps a frozen clock); the offered rate
  *      follows the core count; resync() makes the next traffic tick offer nothing for the gap.
- *   W6 the static server serves the live page's files but never its node_modules, tests or package files.
+ *   W6 the static server serves the hub's and the live page's files but never node_modules, tests or package files.
  */
 
 import { test } from 'node:test';
@@ -29,6 +29,7 @@ import { WEB_SCOPE_IDS } from '../../../demo/pool-scope/web/render.mjs';
 import { jobFn, CTL_LEN, CTL_CRASH, CTL_UNITS, CTL_SLOW, UNITS_PER_MS } from '../job.js';
 import { calibrateUnitsPerMs, browserScene, FAULT_KEYS } from '../surface.js';
 import { Traffic } from '../traffic.js';
+import { walk } from '../site.mjs';
 import * as lp from '@zakkster/lite-pick';
 
 const LIVE = fileURLToPath(new URL('..', import.meta.url));
@@ -103,29 +104,6 @@ test('W1 the import map and package.json pin the same versions, both ways; share
     const unshared = { ...map, '@zakkster/lite-worker-pool': 'https://esm.sh/@zakkster/lite-worker-pool@1.1.0' };
     assert.ok(driftErrors(unshared, pkg.dependencies).some((e) => /second instance/.test(e)), 'a missing ?external= is caught');
 });
-
-/** Walk every import reachable from `entry`: { files, bare, node, missing }. */
-function walk(entry) {
-    const files = new Set(), bare = new Set(), node = new Set(), missing = [];
-    const todo = [entry];
-    while (todo.length) {
-        const f = todo.pop();
-        if (files.has(f)) continue;
-        files.add(f);
-        const src = read(f);
-        const specs = [];
-        for (const m of src.matchAll(/^\s*(?:import|export)\s[^;]*?from\s*['"]([^'"]+)['"]/gm)) specs.push(m[1]);
-        for (const m of src.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g)) specs.push(m[1]);
-        for (const s of specs) {
-            if (s.startsWith('node:')) node.add(s);
-            else if (s.startsWith('.')) {
-                const p = resolve(dirname(f), s);
-                if (existsSync(p)) todo.push(p); else missing.push(f + ' -> ' + s);
-            } else bare.add(s);
-        }
-    }
-    return { files, bare, node, missing };
-}
 
 test('W2 the browser module graph: no node: module, every bare import mapped, every file present', () => {
     const map = importMap(html);
@@ -205,7 +183,7 @@ function get(port, path) {
     return fetch('http://127.0.0.1:' + port + path, { redirect: 'manual' }).then((r) => r.status);
 }
 
-test('W6 the static server: the live page is served, its node_modules / tests / package files never', async () => {
+test('W6 the static server: the hub and the live page are served, node_modules / tests / package files never', async () => {
     const port = 8791;
     const srv = spawn(process.execPath, [join(SIM, 'serve.mjs'), '--port', String(port), '--page', 'live'], { stdio: ['ignore', 'pipe', 'pipe'] });
     try {
@@ -218,6 +196,9 @@ test('W6 the static server: the live page is served, its node_modules / tests / 
         assert.equal(await get(port, '/pickEcosystem/live/page.js'), 200);
         assert.equal(await get(port, '/pickEcosystem/live/kernel.js'), 200);
         assert.equal(await get(port, '/demo/pool-scope/web/render.mjs'), 200);
+        assert.equal(await get(port, '/pickEcosystem'), 302);
+        assert.equal(await get(port, '/pickEcosystem/'), 200);
+        assert.equal(await get(port, '/pickEcosystem/graph.svg'), 200);
         assert.equal(await get(port, '/pickEcosystem/live/node_modules/@zakkster/lite-pick/package.json'), 404);
         assert.equal(await get(port, '/pickEcosystem/live/test/web.test.mjs'), 404);
         assert.equal(await get(port, '/pickEcosystem/live/package.json'), 404);

@@ -13,6 +13,8 @@
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
 
+> **See it running: [the live system](https://peshovurtoleta.github.io/lite-pick/pickEcosystem/)** -- eight real Web Workers balanced by `lite-pick` and healed by the `lite-di-*` kernel, in your browser tab: kill one, slow one, make one flaky, switch strategy, and watch the decisions. Source and the terminal version: [pickEcosystem/](./pickEcosystem/live/README.md).
+
 ## The load balancer the ecosystem was missing
 
 The npm landscape has old algorithm libraries (`load-balancers`, `loadbalance`, `wrr`) and heavy full proxies -- but **no package that ships a provably zero-GC `pick()` path with a measured balance-quality anchor.** Most algorithm libraries use ordinary objects and arrays and quietly allocate under sustained high call rates (millions of picks/sec in worker fan-out, high-QPS internal services, client-side routing). `lite-pick` fills that gap: a small, dependency-free, ESM-first selection **kernel** you drop into an HTTP client, a worker pool, or a custom proxy -- and it proves its two claims instead of asserting them.

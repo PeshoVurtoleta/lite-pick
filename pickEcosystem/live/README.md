@@ -1,4 +1,4 @@
-# pickEcosystem / live -- the capstone system: kernel (P1), terminal UI (P2), browser page (P3), site (P4)
+# pickEcosystem / live -- the capstone system: kernel (P1), terminal UI (P2), browser page (P3), site (P4), heartbeat + tour (P5)
 
 The lite-pick capstone (`research/capstone-pickEcosystem.md`) is a served, FUNCTIONING load-balancing system.
 This directory is its kernel, headless: real workers doing real CPU work, a supervised fleet with health
@@ -19,6 +19,8 @@ npm run web                                                      # the browser p
 npm run browser-smoke                                            # the built site in headless Chrome, every check
 npm run graph                                                    # regenerate the hub's composition graph
 npm run site -- ../../_site                                      # build the Pages site (what CI deploys)
+npm run heartbeat                                                # the soak heartbeat (HB_DURATION=30m, ...)
+npm run heartbeat:teeth                                          # every heartbeat gate tripped by a planted defect
 ```
 
 `run.mjs` flags: `--strategy <name>` (one of the ten), `--rate <req/s>`, `--engine A|B`, `--seconds N`,
@@ -35,7 +37,8 @@ restart never scrolls away) and the newest failover REROUTES ("w1 -> w6").
 
 Keys: `1`-`9`,`0` strategy, `n` next, `e` engine A/B, `w` select a worker, then `k` kill, `s` slow x10,
 `f` flaky (50% fail-fast), `h` hang, `c` crash, `l` crash loop, `x` heal, `r` reset (after an escalation),
-`+`/`-` arrival rate, `q` shutdown through the orchestrator (drain, settle every request, retire, exit code).
+`+`/`-` arrival rate, `t` the guided tour, `q` shutdown through the orchestrator (drain, settle every request,
+retire, exit code).
 `node tui.mjs --frames N --script 2:kill:2,3:slow:3` renders deterministic frames over virtual workers (script
 times are seconds since boot); `--real` uses real threads.
 
@@ -70,6 +73,38 @@ the committed picture is stale. `site.mjs` builds the Pages site from exactly wh
 relative link, every module in their import graphs -- so it never carries node_modules, tests or research, and the
 site root redirects to the hub. The browser smoke run drives that built site; the CI `deploy` job publishes it from
 `main` only after every other job is green (Settings -> Pages -> Source must be "GitHub Actions").
+
+## The guided tour and the heartbeat (P5)
+
+**The tour** (`tour.js`; key `t` on both surfaces, a button on the page, `--tour` in scripted TUI mode): about 80
+seconds, one step at a time -- a kill and its restart; a 10x-slow worker under P2C, then PeakEWMA steering around
+it; a flaky worker opening its breaker (under P2C: PeakEWMA's failure penalty would avoid it before the breaker
+trips); ConsistentHash's hot worker (one takes ~2.6x its share) and BoundedLoad's cap (~1.3x); a crash loop
+escalated and reset. It drives the same kernel calls as the keys. Each step names the DECISIONS line it must
+produce, and `test/tour.test.mjs` plays it on the kernel and fails a caption that promises something the system
+does not do (it caught exactly that: the flaky step first ran under PeakEWMA).
+
+**The heartbeat** (`test/heartbeat.mjs`): the system run for as long as you like, every fault once per ~24 s cycle
+(one at a time), then a checkpoint -- no traffic, every request settled, GC until retention drains -- and judged
+the way lite-pick's own soak is judged (decisions/0014-soak-redesign.md; the same `EarlyLate`, Mann-Whitney test
+and constants, imported from `benchmark/soak/gates.mjs`):
+- hard, every cycle: no failed request; everything accounted, nothing in flight; all 8 workers back in rotation;
+  each fault had its effect (restarts, the breaker, the escalation); every replaced transport and worker scope
+  collected (lite-leak; at most 8 + 8 live + 16 slack);
+- drift, first 5 vs last 5 post-warm-up cycles: post-GC heap (<= x1.10 + 2 MB) and steady p99 (<= x1.5 + 1 ms AND a
+  significant Mann-Whitney shift);
+- verdict PASS / FAIL / INCONCLUSIVE (fewer than 11 cycles: no evidence, no PASS) / bad config (an unknown `HB_*`
+  exits 2); one `heartbeat: BREACH` line per failure; a JSONL stream with provenance in `out/heartbeat.jsonl`.
+
+`test/heartbeat-teeth.mjs` proves every gate bites through the real harness, over virtual workers (~20 s): a clean
+run PASSes; 4 cycles are INCONCLUSIVE; a typo'd setting exits 2; `lose` (one try) breaches `failed`, `leak` (replaced
+transports pinned) `retention`, `stuck` (a restart that never completes) `eligible`, `slowleak` (~1.5 MB per cycle)
+the heap gate, `p99` (every worker 3x slower in the late window) the p99 gate. CI runs the teeth on every push and a
+30-minute real-thread heartbeat nightly (`soak-nightly.yml`).
+
+Measured: 11 real-thread cycles (~205,000 requests): PASS, 0 failed, heap 8.27 -> 8.49 MB. 400 virtual cycles (~18.5M
+requests): PASS, heap 7.95 -> 8.55 MB, the growth slowing to ~0.4 KB per cycle -- and a heap-snapshot diff between
+cycles 50 and 350 puts 75 KB of its 79 KB in compiled code (V8 optimizing more functions), not data.
 
 ## What each brick does here
 
@@ -109,8 +144,10 @@ Scope's real snapshot over the live system), `test/tui.test.mjs` (the live TUI s
 shutdown; two runs byte-identical), `test/web.test.mjs` (W1-W6: import-map drift both ways, the browser's module
 graph, the DOM contract, the browser crash path, the device scene, the static server's allowlist),
 `test/site.test.mjs` (S1-S3: the site is exactly what the pages reach, the hub graph is the running kernel's, the
-hub's versions are package.json's), `test/smoke.mjs` (real threads), `test/browser-smoke.mjs` (the BUILT site in
-headless Chrome over the DevTools protocol, zero dependencies: the hub and its links; the live page booted, kill /
-crash / flaky through its own keys, engine B, a strategy switch, graceful shutdown with exit code 0, no failed
-request; the simulated page; no console error). G10 runs the
+hub's versions are package.json's), `test/tour.test.mjs` (U1-U2: the tour does what its captions say), `test/smoke.mjs` (real threads),
+`test/heartbeat-teeth.mjs` + `test/heartbeat.mjs` (above), `test/browser-smoke.mjs` (the BUILT site in
+headless Chrome over the DevTools protocol, zero dependencies: the hub and its links; the live page booted, the tour,
+kill / crash / flaky through its own keys -- one fault at a time, each worker back in rotation before the next --
+engine B, a strategy switch, a window narrowed after mount, graceful shutdown with exit code 0, no failed request;
+the simulated page; no console error). G10 runs the
 gates against the repo's working-tree `Pick.js`, so a lite-pick change cannot silently break the capstone.

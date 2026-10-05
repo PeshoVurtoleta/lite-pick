@@ -34,7 +34,7 @@
     "@zakkster/lite-di-container": "https://esm.sh/@zakkster/lite-di-container@2.2.1",
     "@zakkster/lite-di-health": "https://esm.sh/@zakkster/lite-di-health@1.0.0",
     "@zakkster/lite-di-supervisor": "https://esm.sh/@zakkster/lite-di-supervisor@1.0.0",
-    "@zakkster/lite-di-orchestrator": "https://esm.sh/@zakkster/lite-di-orchestrator@1.0.0",
+    "@zakkster/lite-di-orchestrator": "https://esm.sh/@zakkster/lite-di-orchestrator@1.0.1",
     "@zakkster/lite-di-strategies": "https://esm.sh/@zakkster/lite-di-strategies@1.0.0",
     "@zakkster/lite-di-event-bus": "https://esm.sh/@zakkster/lite-di-event-bus@1.1.0",
     "@zakkster/lite-di-cron": "https://esm.sh/@zakkster/lite-di-cron@1.0.0",
@@ -101,6 +101,12 @@
 </div>
 
 <p class="boot-status warn" id="boot-status" role="status">loading modules...</p>
+
+<div class="tour" id="tour" hidden>
+    <span class="tour-step" id="tour-step"></span>
+    <span class="tour-caption" id="tour-caption" aria-live="polite"></span>
+    <button class="ctl" id="btn-tour-stop">stop the tour</button>
+</div>
 
 <nav class="tabs" id="tabs">
     <button data-scene="all" aria-selected="true">overview</button>
@@ -173,6 +179,7 @@
             <div class="grp">
                 <div class="eyebrow grp-label">system</div>
                 <div class="ctl-row">
+                    <button class="ctl tour-btn" id="btn-tour">take the tour <span class="key">[t]</span></button>
                     <button class="ctl danger" id="btn-shutdown" hidden>graceful shutdown <span class="key">[q]</span></button>
                     <button class="ctl" id="btn-reboot" hidden>boot a fresh system</button>
                 </div>

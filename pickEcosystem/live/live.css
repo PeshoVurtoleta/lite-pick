@@ -153,3 +153,38 @@ button.ctl.danger {
 footer.foot a {
     color: var(--cyan);
 }
+
+/* the guided tour (tour.js) */
+.tour {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 0.9rem;
+    margin: 0 0 0.9rem;
+    padding: 0.7rem 0.9rem;
+    border: 1px solid var(--cyan);
+    border-radius: var(--r);
+    background: #111c24;
+    background: color-mix(in oklab, var(--cyan) 8%, var(--bg1));
+}
+
+.tour[hidden] {
+    display: none;
+}
+
+.tour-step {
+    font-family: var(--eyebrow);
+    letter-spacing: 0.1em;
+    font-size: 0.74rem;
+    color: var(--cyan);
+}
+
+.tour-caption {
+    flex: 1 1 20rem;
+    font-size: 0.88rem;
+    color: var(--text);
+}
+
+button.ctl.tour-btn {
+    color: var(--cyan);
+}

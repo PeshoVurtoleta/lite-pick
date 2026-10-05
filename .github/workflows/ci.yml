@@ -106,6 +106,9 @@ jobs:
         env:
           SMOKE_RATE: '600'
       - run: npm run browser-smoke
+      # P5: every heartbeat gate and invariant tripped by a planted defect through the real harness (~20 s, virtual
+      # workers); the long real-thread heartbeat itself runs in soak-nightly.yml.
+      - run: npm run heartbeat:teeth
 
   # Compile a real consumer against the PACKED tarball (not the working tree) so the exports
   # map and the typesVersions /pool mapping are exercised. ubuntu is deliberate: its filesystem

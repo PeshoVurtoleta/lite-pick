@@ -172,3 +172,35 @@ jobs:
           name: soak-teeth-long-${{ github.run_id }}
           path: benchmark/out/teeth-long.log
           if-no-files-found: warn
+
+  # The capstone's SOAK HEARTBEAT (pickEcosystem/live/test/heartbeat.mjs, capstone P5): the live system over real
+  # worker_threads for 30 minutes, every fault once per ~24 s cycle, judged by this soak's own drift gates (heap,
+  # steady p99) plus hard per-cycle invariants (no failed request, everything accounted and back in rotation,
+  # replaced workers and scopes collected). Its teeth run on every push (ci.yml, capstone job).
+  capstone-heartbeat:
+    name: capstone heartbeat (30m, ubuntu / node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: pickEcosystem/live
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: pickEcosystem/live/package-lock.json
+      - run: npm ci
+      - name: heartbeat (30m, real threads)
+        env:
+          HB_DURATION: 30m
+          HB_RATE: '600'
+        run: npm run heartbeat
+      - name: upload heartbeat stream
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capstone-heartbeat
+          path: pickEcosystem/live/out/heartbeat.jsonl
+          if-no-files-found: warn

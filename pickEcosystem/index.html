@@ -27,7 +27,8 @@
         <a class="btn" href="../demo/pool-scope/web/">Simulated Pool Scope</a>
     </div>
     <p class="cta-note">The live system runs in this browser tab: eight Web Workers, about 2,000 requests a second.
-        Kill one, slow one, make one flaky &mdash; and watch the decisions.</p>
+        Kill one, slow one, make one flaky &mdash; and watch the decisions. New here? Press <span class="key">t</span>
+        there for an 80-second guided tour.</p>
 </header>
 
 <section>
@@ -143,7 +144,7 @@ npm run tui</code></pre>
             <p class="proof">Every gate runs on a virtual clock, deterministically.</p>
         </div>
         <div class="card">
-            <div class="card-head"><b>lite-di-orchestrator</b><span class="ver" data-pkg="@zakkster/lite-di-orchestrator">1.0.0</span></div>
+            <div class="card-head"><b>lite-di-orchestrator</b><span class="ver" data-pkg="@zakkster/lite-di-orchestrator">1.0.1</span></div>
             <p>Graceful shutdown: drain, stop supervising, settle in-flight work, retire, exit code.</p>
             <p class="proof">G7: exit code 0, every in-flight request settled, workers gone.</p>
         </div>
@@ -168,6 +169,18 @@ npm run tui</code></pre>
 </section>
 
 <section>
+    <h2>The kernel's own evidence</h2>
+    <p>The system above runs on a kernel that proves its claims in its own repo, before any of this was built
+        (<a href="https://github.com/PeshoVurtoleta/lite-pick#readme">lite-pick's README</a>):</p>
+    <dl class="numbers">
+        <div><dt>0 B/op</dt><dd>allocated by every strategy's <code>pick()</code>, counted by scavenges &mdash; with V8 inlining on and off</dd></div>
+        <div><dt>~2 vs ~21</dt><dd>P2C's peak-to-mean load gap against a random pick at 1,024 workers: the <code>ln ln n</code> ceiling, measured</dd></div>
+        <div><dt>~1.6% vs ~98%</dt><dd>keys ConsistentHash moves when a worker joins or leaves, against naive modulo</dd></div>
+        <div><dt>~13x &rarr; ~1x</dt><dd>a hot backend's occupancy under a skewed key stream: plain consistent hashing vs BoundedLoad's cap</dd></div>
+    </dl>
+</section>
+
+<section>
     <h2>Measured</h2>
     <dl class="numbers">
         <div><dt>0</dt><dd>scavenges over 960,000 requests on the request path (engine A, Node 26; two one-off on Node 22)</dd></div>
@@ -187,7 +200,11 @@ npm run tui</code></pre>
             scavenge count; retention after 1000 respawns; the same gates against lite-pick's working tree.</li>
         <li><b>the surfaces</b> &mdash; the TUI scripted and compared byte for byte; the import map pinned to
             <code>package.json</code> both ways; a 20-second run over real threads; this site, built exactly as
-            deployed, driven in headless Chrome through its own keys.</li>
+            deployed, driven in headless Chrome through its own keys; the guided tour held to its captions.</li>
+        <li><b>the heartbeat</b> &mdash; nightly, the system runs for 30 minutes over real threads, every fault once per
+            cycle, judged by lite-pick's own soak gates (heap and tail-latency drift) and hard invariants (no lost
+            request, every worker back, every replaced worker collected). Each gate is proven to trip by a planted
+            defect on every push.</li>
     </ul>
 </section>
 

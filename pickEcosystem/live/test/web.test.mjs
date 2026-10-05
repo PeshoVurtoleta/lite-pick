@@ -25,7 +25,6 @@ import { spawn } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
-import { WEB_SCOPE_IDS } from '../../../demo/pool-scope/web/render.mjs';
 import { jobFn, CTL_LEN, CTL_CRASH, CTL_UNITS, CTL_SLOW, UNITS_PER_MS } from '../job.js';
 import { calibrateUnitsPerMs, browserScene, FAULT_KEYS } from '../surface.js';
 import { Traffic } from '../traffic.js';
@@ -37,6 +36,10 @@ const REPO = resolve(LIVE, '..', '..');
 const SIM = join(REPO, 'demo', 'pool-scope', 'web');
 const read = (p) => readFileSync(p, 'utf8');
 const pkg = JSON.parse(read(join(LIVE, 'package.json')));
+// The renderer's DOM contract, read from its SOURCE: importing render.mjs would load @zakkster/lite-signal from
+// lite-pick's ROOT node_modules (it lives under demo/), which this sub-app's CI job never installs -- every test here
+// must run on `npm ci` in pickEcosystem/live alone.
+const WEB_SCOPE_IDS = JSON.parse(/export const WEB_SCOPE_IDS = (\[[^\]]*\]);/.exec(read(join(SIM, 'render.mjs')))[1].replace(/'/g, '"'));
 const html = read(join(LIVE, 'index.html'));
 
 function importMap(src) {

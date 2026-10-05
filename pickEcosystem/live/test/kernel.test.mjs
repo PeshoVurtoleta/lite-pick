@@ -21,6 +21,8 @@
  *   G9 engine B  the /pool engine serves the same scene and survives a kill.
  *   G10 F2       the repo's WORKING-TREE lite-pick passes G1 + G2 (a kernel change cannot silently break the
  *                capstone).
+ *   G11 deadline a shutdown step that hangs still ends: shutdown() resolves with DEADLINE (2) at the deadline
+ *                (the orchestrator calls exit(2) while its own promise waits for the hung step).
  */
 
 import { test } from 'node:test';
@@ -204,4 +206,14 @@ test('G10 (F2): the working-tree lite-pick passes G1 + G2', async () => {
     await run(2000);
     assert.equal(k.stats.c[2], 0);
     assert.equal(k.stats.snapshot().ok + k.engine.pending(), k.stats.c[0]);
+});
+
+test('G11 a hung shutdown step still ends: shutdown() resolves with DEADLINE (2) at the deadline', async () => {
+    const { kernel: k, run } = await bootVirtual();
+    await run(200);
+    k.fleet.shutdownSupervisors = () => new Promise(() => {});      // a step that never completes
+    const t = performance.now();
+    const code = await k.shutdown({ deadlineMs: 150 });
+    assert.equal(code, 2, 'DEADLINE');
+    assert.ok(performance.now() - t < 2000, 'resolved at the deadline, not never');
 });

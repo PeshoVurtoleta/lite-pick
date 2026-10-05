@@ -7,7 +7,8 @@ system, `pickEcosystem/live/tui.mjs`; Pool Scope's renderer split into `demo/poo
 simulated frames byte-identical) IMPLEMENTED 2026-10-05. P3 (the browser page, `pickEcosystem/live/index.html`;
 Pool Scope's web renderer split into `demo/pool-scope/web/render.mjs`; section 10) IMPLEMENTED 2026-10-05.
 P4 (the hub `pickEcosystem/index.html`, the composition graph from the running container, the site builder and
-the Pages deploy job; section 11) IMPLEMENTED 2026-10-05. Next: P5, the soak heartbeat, the scenario script, polish.
+the Pages deploy job; section 11) IMPLEMENTED 2026-10-05. P5 (the soak heartbeat, the guided tour, polish; section 12)
+IMPLEMENTED 2026-10-05 -- the capstone's build order (C9) is complete.
 **North-star (ROADMAP section 5, your words 2026-09-23):** "to see the whole system built, and not only built --
 but functioning, anyone can see the served system; both operational through a browser and terminal" -- the
 proof that an A+, zero-GC module is still worth building.
@@ -327,6 +328,47 @@ Found on the way:
 - **Deploy** (`ci.yml`): from `main` pushes only, after `test`, `test-node18`, `gates`, `capstone` and
   `types-compat`; builds `_site` with site.mjs, uploads it, deploys with actions/deploy-pages. Requires the repo's
   Pages source set to GitHub Actions.
+
+## 12. P5 as built (2026-10-05)
+
+- **The soak heartbeat** (`live/test/heartbeat.mjs`): the system for as long as asked, cycles of ~24 s with every
+  fault once (one at a time), a checkpoint per cycle (no traffic, everything settled, GC until retention drains).
+  Judged with lite-pick's own soak machinery, IMPORTED, not copied (`benchmark/soak/gates.mjs`: `EarlyLate`, the exact
+  Mann-Whitney test, HEAP_MULT / HEAP_SLACK_MB / LAT_P99_MULT / MW_ALPHA; `config.mjs`: GATE_N, WARMUP_CYCLES): hard
+  per-cycle invariants (failed, accounted, eligible, faults, retention via lite-leak) + drift gates (post-GC heap,
+  steady p99); PASS / FAIL / INCONCLUSIVE (exit 3 below 11 cycles) / bad config (exit 2, did-you-mean); BREACH lines;
+  a JSONL stream with provenance. Real threads by default; virtual workers for the teeth.
+- **Teeth** (`heartbeat-teeth.mjs`, ADR 0014's discipline: through the real harness): clean PASS, INCONCLUSIVE, two
+  config errors, and five planted defects -- lose (one try), leak (replaced transports pinned), stuck (a restart that
+  never completes), slowleak (~1.5 MB/cycle), p99 (3x slower late) -- each tripping its own family. ~20 s; CI runs it
+  on every push; `soak-nightly.yml` runs a 30-minute real-thread heartbeat.
+- **Measured:** 11 real-thread cycles PASS (0 failed of ~205k; heap 8.27 -> 8.49 MB). 400 virtual cycles PASS (18.5M
+  requests; heap 7.95 -> 8.55 MB, the growth slowing to ~0.4 KB/cycle). A heap-snapshot diff, cycle 50 vs 350:
+  75 KB of the 79 KB is compiled code (V8 tiering more functions), the data types flat -- no leak.
+- **Found by the heartbeat:** `kernel.shutdown()` never resolved when a shutdown step hung -- the orchestrator calls
+  exit(2) at the deadline while its own promise waits for the step (a terminal's process.exit hid it; the page would
+  have waited forever). It now resolves with the exit code as soon as it is decided (G11).
+- **The guided tour** (`live/tour.js`; key t / a button / `--tour`): 12 steps, ~80 s, the same kernel calls as the keys;
+  each step names the DECISIONS line it must produce and `test/tour.test.mjs` plays it on the kernel (control: no
+  kill, the restart is missed). It caught a caption the system did not honour: the flaky step ran under PeakEWMA,
+  whose failure penalty avoids the worker before its breaker can open -- the step now switches back to P2C first.
+  Measured for the hot-key steps: ConsistentHash puts ~2.6x its share on one worker, BoundedLoad ~1.3x.
+- **The browser smoke run is one fault at a time** too: it waits for "back in rotation", not "restarted" (a restart
+  begins before the worker is READY; a crash while another worker was still restarting lost requests -- both
+  attempts refused). The page exposes `__pickLive.decisions(since)` so a check cannot match an older line.
+- **Polish:** lite-di-orchestrator 1.0.1 (the browser timers fix, released from the P3 finding) pinned and the kernel's
+  workaround removed -- the browser smoke run now proves the upstream fix; charts follow a window narrowed after
+  mount (grid items kept their content's min-width, so lite-charts' ResizeObserver never saw the host shrink;
+  `min-width: 0` in scope.css, checked by the browser smoke run); the simulated page's lite-adaptive aligned to 1.11.0;
+  the hub gained the kernel's own evidence (0 B/op, the ln ln n anchor, ~1.6% vs ~98% remap, the BoundedLoad cap)
+  and the heartbeat; a strategy change from anywhere (key, select, tour) resets the detectors on both surfaces.
+- **CI found:** `test/web.test.mjs` imported Pool Scope's renderer, which resolves `@zakkster/lite-signal` from
+  lite-pick's ROOT node_modules -- present locally, never installed by the capstone job. It now reads the DOM id
+  list from the source; the suite was re-run in a copy with no root node_modules (CI's shape): 31/31.
+
+Not built (recorded, not forgotten): "replay the last 10 seconds" (the flight recorder records; nothing plays it
+back yet), "drain vs remove" (needs a membership change in the kernel, not just eligibility), and the optional
+lite-query read path (C7).
 
 ## What we would NOT do
 

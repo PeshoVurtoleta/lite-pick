@@ -9,8 +9,8 @@
  *
  *   interactive  node tui.mjs [--strategy p2c] [--rate 2000]          real worker_threads, ~12 Hz
  *     keys: 1-9,0 strategy  n next  e engine A/B  w select worker  k kill  s slow  f flaky  h hang  c crash
- *           l crash loop  x heal  r reset  +/- rate  q shutdown (the orchestrator: drain, settle, retire)
- *   scripted     node tui.mjs --frames N [--script 2:kill:2,3:slow:3] [--strategy s] [--rate r] [--real]
+ *           l crash loop  x heal  r reset  +/- rate  t the guided tour (tour.js)  q shutdown (the orchestrator)
+ *   scripted     node tui.mjs --frames N [--script 2:kill:2,3:slow:3] [--tour] [--strategy s] [--rate r] [--real]
  *                (script times are seconds since boot; frames start after ~1.6 s of warm-up)
  *                renders N frames to stdout and exits; VIRTUAL workers on a virtual clock by default, so the
  *                frames are deterministic (how it is tested); --real uses worker_threads.
@@ -31,6 +31,7 @@ import { bootVirtual } from './virtual.js';
 import { LiveDriver } from './driver.js';
 import { workerState, WS_TAG, WS_TONE, eventText, eventTone } from './narrate.js';
 import { FAULT_KEYS, rateUp, rateDown, applyFault } from './surface.js';
+import { TourPlayer } from './tour.js';
 
 const FRAME_MS = 84;            // ~12 Hz
 const STREAM_LINES = 5;       // structural events shown
@@ -45,7 +46,8 @@ class TuiDriver extends LiveDriver {
         this.sel = 0;
         this.note = '';
         this.controlsHelp = '  [1-9,0] strategy [n] next [e] engine  [w] worker  [k]ill [s]low [f]laky [h]ang ' +
-            '[c]rash crash[l]oop  [x] heal [r]eset  [+/-] rate  [q] shutdown';
+            '[c]rash crash[l]oop  [x] heal [r]eset  [+/-] rate  [t] tour  [q] shutdown';
+        this.tour = new TourPlayer(kernel);
     }
 
     _cell(i) {
@@ -83,6 +85,9 @@ class TuiDriver extends LiveDriver {
             if (i % 4 === 3) { out += row + NL; row = '  '; }
         }
         if (row !== '  ') out += row + NL;
+        if (this.tour.active && this.tour.caption) {
+            out += BOLD + C_CYAN + 'TOUR ' + this.tour.progress + ' ' + RESET + C_TEXT + this.tour.caption + RESET + NL;
+        }
         out += BOLD + C_DIM + 'DECISIONS ' + RESET + C_FAINT + '(newest first)' + (this.note ? '   ' + C_CYAN + this.note : '') + RESET + NL;
         const st = k.stream.structural;
         if (st.count === 0) out += C_FAINT + '  (quiet -- inject a fault)' + RESET + NL;
@@ -139,10 +144,14 @@ async function runScripted(argv) {
     for (let f = 0; f < 6; f++) { await step(FRAME_MS); drv.beginFrame(FRAME_MS / 1000); snap.build(drv); det.evaluate(snap); }
     process.stdout.write('pool-scope LIVE scripted -- ' + (argv.indexOf('--real') >= 0 ? 'real threads' : 'virtual workers') +
         ' strategy=' + config.strategy + ' rate=' + config.rate + ' frames=' + frames + '  data-path=' + dataBpo.toFixed(2) + ' B/op\n');
+    if (argv.indexOf('--tour') >= 0) drv.tour.start(kernel.engine.now());
+    let shownStrategy = kernel.balancers.name;
     for (let f = 0; f < frames; f++) {
         await step(FRAME_MS);
         const el = kernel.engine.now() - t0;
         while (script.length && script[0].at <= el) { const s = script.shift(); await applyFault(kernel, s.kind, s.w); }
+        drv.tour.tick(kernel.engine.now());
+        if (kernel.balancers.name !== shownStrategy) { shownStrategy = kernel.balancers.name; rend.beginMorph(); det.reset(); }
         drv.beginFrame(FRAME_MS / 1000);
         snap.build(drv);
         det.evaluate(snap);
@@ -193,9 +202,7 @@ async function runInteractive(argv) {
     }
 
     function switchTo(idx) {
-        rend.beginMorph();
-        kernel.setStrategy(STRATEGIES[idx]);
-        det.reset();
+        kernel.setStrategy(STRATEGIES[idx]);          // the frame loop sees the change: morph + detector reset
     }
 
     function onKey(chunk) {
@@ -210,6 +217,7 @@ async function runInteractive(argv) {
             else if (ch === 'n') switchTo((STRATEGIES.indexOf(kernel.balancers.name) + 1) % STRATEGIES.length);
             else if (ch === 'e') kernel.setEngine(kernel.engine.mode === ENGINE_A ? ENGINE_B : ENGINE_A);
             else if (ch === 'w') drv.sel = (drv.sel + 1) % kernel.cfg.workers;
+            else if (ch === 't') { if (drv.tour.active) { drv.tour.stop(); drv.note = 'tour stopped'; } else { drv.tour.start(kernel.engine.now()); drv.note = ''; } }
             else if (ch === '+') kernel.setRate(rateUp(kernel.traffic.rate));
             else if (ch === '-') kernel.setRate(rateDown(kernel.traffic.rate));
             else {
@@ -226,7 +234,10 @@ async function runInteractive(argv) {
     if (stdin.isTTY && stdin.setRawMode) stdin.setRawMode(true);
     stdin.resume();
     stdin.on('data', onKey);
+    let shownStrategy = kernel.balancers.name;
     timer = setInterval(() => {
+        if (!stopping) drv.tour.tick(kernel.engine.now());
+        if (kernel.balancers.name !== shownStrategy) { shownStrategy = kernel.balancers.name; rend.beginMorph(); det.reset(); }
         drv.beginFrame(FRAME_MS / 1000);
         snap.build(drv);
         det.evaluate(snap);

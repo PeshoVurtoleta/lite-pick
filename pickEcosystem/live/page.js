@@ -23,6 +23,7 @@ import { LiveDriver } from './driver.js';
 import { S_OK, S_FAILED, S_FAILOVER, S_SHED } from './stats.js';
 import { workerState, WS_TAG, WS_LONG, WS_TONE, eventText, eventTone } from './narrate.js';
 import { calibrateUnitsPerMs, browserScene, FAULT_KEYS, rateUp, rateDown, applyFault } from './surface.js';
+import { TourPlayer } from './tour.js';
 
 const N = DEFAULTS.workers;
 const FRAME_MS = 80;                       // ~12 Hz, the TUI's cadence
@@ -55,6 +56,11 @@ const $decisions = $('decisions');
 const $rerouteCount = $('reroute-count');
 const $reroutes = $('reroutes');
 const $faultButtons = Array.from(document.querySelectorAll('button[data-fault]'));
+const $tour = $('tour');
+const $tourStep = $('tour-step');
+const $tourCaption = $('tour-caption');
+const $btnTour = $('btn-tour');
+const $btnTourStop = $('btn-tour-stop');
 
 /* ------------------------------------------------------------------------------ the system ---- */
 
@@ -71,6 +77,9 @@ const snap = new LitePickSnapshot(N);
 const det = new Detectors(N);
 let drv = null;
 let scope = null;
+let tour = null;               // the guided tour (tour.js), over the running kernel
+let shownCaption = null;
+let shownStrategy = null;
 
 function status(text, tone) {
     $status.textContent = text;
@@ -89,6 +98,7 @@ async function start() {
     cfg.unitsPerMs = unitsPerMs;
     k = await bootKernel({ lp, poolMod, wp, now, timers: 'real', config: cfg });
     t0 = now();
+    tour = new TourPlayer(k);
     shownStructural = -1;
     shownReroutes = -1;
     if (drv === null) drv = new LiveDriver(k);
@@ -198,9 +208,34 @@ function paintLive() {
 
 /* ------------------------------------------------------------------------------ the loop ---- */
 
+function paintTour() {
+    const caption = tour !== null && tour.active ? tour.caption : null;
+    if (caption === shownCaption) return;
+    shownCaption = caption;
+    $tour.hidden = caption === null;
+    $btnTour.textContent = '';
+    $btnTour.append(caption === null ? 'take the tour ' : 'stop the tour ');
+    const key = document.createElement('span');
+    key.className = 'key';
+    key.textContent = '[t]';
+    $btnTour.append(key);
+    if (caption !== null) {
+        $tourStep.textContent = 'TOUR ' + tour.progress;
+        $tourCaption.textContent = caption;
+    }
+}
+
 function frame() {
     if (drv === null) return;
     const t = now();
+    if (tour !== null && !stopping) tour.tick(t);
+    paintTour();
+    // A strategy change from anywhere (a key, the select, the tour): the detectors restart, the select follows.
+    if (k !== null && k.balancers.name !== shownStrategy) {
+        if (shownStrategy !== null) det.reset();
+        shownStrategy = k.balancers.name;
+        $strategySelect.value = shownStrategy;
+    }
     drv.beginFrame(lastFrame > 0 ? (t - lastFrame) / 1000 : FRAME_MS / 1000);
     lastFrame = t;
     snap.build(drv);
@@ -245,6 +280,13 @@ function fault(kind) {
     scope.repaint();
 }
 
+function toggleTour() {
+    if (k === null || stopping || tour === null) return;
+    if (tour.active) { tour.stop(); note('tour stopped'); }
+    else { tour.start(now()); note('the tour drives the same controls you have -- press t to stop it'); }
+    paintTour();
+}
+
 function selectNext() {
     const s = scope.selected();
     scope.select((s + 1) % N);
@@ -253,6 +295,8 @@ function selectNext() {
 function shutdown() {
     if (k === null || stopping) return;
     stopping = true;
+    if (tour !== null) tour.stop();
+    paintTour();
     $btnShutdown.hidden = true;
     note('SHUTTING DOWN: draining, settling in-flight requests, retiring workers...');
     status('shutting down (lite-di-orchestrator)...', 'warn');
@@ -286,6 +330,8 @@ $btnRateDown.addEventListener('click', () => { if (k !== null) setRate(rateDown(
 $btnRateUp.addEventListener('click', () => { if (k !== null) setRate(rateUp(k.traffic.rate)); });
 for (const b of $faultButtons) b.addEventListener('click', () => fault(b.getAttribute('data-fault')));
 $btnShutdown.addEventListener('click', shutdown);
+$btnTour.addEventListener('click', toggleTour);
+$btnTourStop.addEventListener('click', toggleTour);
 $btnReboot.addEventListener('click', reboot);
 $fleet.addEventListener('click', (ev) => {
     const b = ev.target.closest('button[data-w]');
@@ -307,6 +353,7 @@ globalThis.addEventListener('keydown', (ev) => {
     else if (ch === '+' || ch === '=') { if (k !== null) setRate(rateUp(k.traffic.rate)); }
     else if (ch === '-') { if (k !== null) setRate(rateDown(k.traffic.rate)); }
     else if (ch === 'q') shutdown();
+    else if (ch === 't') toggleTour();
     else if (FAULT_KEYS[ch]) fault(FAULT_KEYS[ch]);
 });
 
@@ -348,4 +395,17 @@ globalThis.__pickLive = {
     get kernel() { return k; },
     get exitCode() { return exitCode; },
     get stopping() { return stopping; },
+    get tour() { return tour; },
+    /** The structural decisions at or after `since` (page clock, ms), oldest first, as the panel words them. */
+    decisions(since) {
+        const out = [];
+        if (k === null) return out;
+        const lane = k.stream.structural;
+        const m = lane.count < STREAM_CAP ? lane.count : STREAM_CAP;
+        for (let j = m - 1; j >= 0; j--) {
+            const idx = (lane.head - 1 - j + STREAM_CAP) % STREAM_CAP;
+            if (lane.time[idx] >= since) out.push(eventText(lane.type[idx], lane.payload[idx]));
+        }
+        return out;
+    },
 };

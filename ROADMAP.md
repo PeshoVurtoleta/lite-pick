@@ -295,6 +295,15 @@ data (dump() snapshot) + pathology detectors; only the render target differs. Se
 
 ## 5. THE CAPSTONE (north-star, user 2026-09-23) -- a served, FUNCTIONING load-balancing system
 
+**Status: BUILT (2026-10-05)** -- `pickEcosystem/`, served at https://peshovurtoleta.github.io/lite-pick/pickEcosystem/
+(research/capstone-pickEcosystem.md, phases P0-P5): lite-worker-pool 1.1.0's `createWorkerSet` (P0); the kernel,
+`bootKernel`, over real workers with a per-worker supervised scope, health and breaker (P1); Pool Scope on the live
+system in the terminal (P2) and in the browser over Web Workers (P3); the hub and the Pages deploy after every gate
+(P4); the soak heartbeat and the guided tour (P5). Differences from the sketch below: the backends are workers
+(Web Workers in the page, worker_threads in the terminal) rather than a feed server, so the served system runs in
+each visitor's tab; the heartbeat runs nightly in CI rather than under `caffeinate`; the lite-query read path,
+flight-recorder replay and drain-vs-remove are not built yet.
+
 Modeled on lite-di-container's `diEcosystem/` (a served hub page + REAL working sub-apps -- audio-rooms,
 market-map with a live feed-server -- deployed via CI, "not built but functioning, anyone can see the served
 system"). The lite-pick equivalent, built when the roster is complete (>= 1.0), UNIFIES the already-planned

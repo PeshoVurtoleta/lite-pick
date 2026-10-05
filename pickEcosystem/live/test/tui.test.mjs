@@ -7,6 +7,8 @@
  *      ends with exit code 0; the per-frame data-path badge reads < 8 B/op.
  *   T2 two runs print byte-identical frames (the badge, a heap measurement, masked): the live TUI is as
  *      reproducible as the simulated one.
+ *   T3 `--tour` plays the guided tour (tour.js) in the TUI: its caption line advances step by step, and the kill
+ *      it announces is narrated.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -45,4 +47,15 @@ test('T1 the live TUI narrates the live system: fleet, decisions, shutdown', () 
 test('T2 two scripted runs print byte-identical frames', () => {
     const mask = (s) => s.replace(/data-path=[0-9.]+ B\/op/, '').replace(/data [^ ]+ B\/op/g, '');
     assert.equal(mask(scripted()), mask(scripted()));
+});
+
+test('T3 --tour: the caption line advances and the announced kill is narrated', () => {
+    const out = execFileSync(process.execPath, ['--expose-gc', TUI, '--frames', '200', '--tour'],
+        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 120000 }).replace(ANSI, '');
+    assert.match(out, /TOUR 1\/12 Eight workers, strategy P2C/);
+    assert.match(out, /TOUR 2\/12 w2 is killed/);
+    assert.match(out, /TOUR 3\/12 w3 now runs 10x slower/);
+    assert.ok(out.indexOf('TOUR 2/12') < out.indexOf('TOUR 3/12'), 'in order');
+    assert.match(out.slice(out.indexOf('TOUR 2/12')), /w2 restarted by its supervisor/);
+    assert.match(out, /shutdown exit code 0/);
 });

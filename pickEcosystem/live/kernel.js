@@ -65,15 +65,6 @@ export const DEFAULTS = Object.freeze({
     recorder: 4096,                        // flight-recorder entries
 });
 
-// The host's timers as plain functions. lite-di-orchestrator 1.0.0's default `timers` is a frozen object holding
-// the global setTimeout and calls it as `timers.setTimeout(...)`: a browser rejects that receiver ("Illegal
-// invocation"), the deadline cannot be armed, and shutdown() fails closed at once with DEADLINE (2) -- found by
-// this page's real-browser smoke run; Node does not mind. Always injecting these keeps the shutdown portable.
-const HOST_TIMERS = Object.freeze({
-    setTimeout: (fn, ms) => setTimeout(fn, ms),
-    clearTimeout: (t) => clearTimeout(t),
-});
-
 class TrafficJob { constructor(t) { this.t = t; } run(ctx) { this.t.tick(ctx.now); } }
 class FleetJob { constructor(f) { this.f = f; } run(ctx) { this.f.tick(ctx.now); } }
 class StatsJob { constructor(s) { this.s = s; } run(ctx) { this.s.roll(ctx.now); } }
@@ -214,15 +205,25 @@ export async function bootKernel(io) {
         fault(i, kind) { fleet.fault(i, kind); },
         heal(i) { fleet.heal(i); },
         reset(i) { return fleet.reset(i); },
-        /** Resolves with the exit code; `exit` is injected (run.mjs passes process.exit). */
+        /**
+         * Resolves with the exit code as soon as the orchestrator decides it -- including DEADLINE (2) when a step
+         * hangs: the orchestrator calls exit(2) at the deadline but its own promise waits for the hung step, which in
+         * a terminal process.exit cuts short and in a browser would leave the page waiting forever (found by the
+         * heartbeat's stuck-restart control). `exit` is injected (run.mjs passes process.exit).
+         */
         shutdown(opts) {
-            let code = -1;
             const o = opts || {};
-            return orch.shutdown({
-                exit: (x) => { code = x; if (o.exit) o.exit(x); },
-                deadlineMs: o.deadlineMs || 10000,
-                timers: o.timers || HOST_TIMERS,
-            }).then(() => code);
+            return new Promise((resolve) => {
+                let code = -1;
+                orch.shutdown({
+                    exit: (x) => { code = x; if (o.exit) o.exit(x); resolve(x); },
+                    deadlineMs: o.deadlineMs || 10000,
+                    // lite-di-orchestrator >= 1.0.1: the default timers work in a browser too (1.0.0 called the
+                    // global setTimeout with the wrong receiver and failed every browser shutdown at once with
+                    // DEADLINE -- found by test/browser-smoke.mjs in P3; this kernel injected timers until the fix).
+                    timers: o.timers,
+                }).then(() => resolve(code));
+            });
         },
     };
 }

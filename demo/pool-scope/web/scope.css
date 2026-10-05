@@ -217,6 +217,15 @@ nav.tabs button[aria-selected="true"] {
     width: 100%;
     height: var(--h, 220px);
     position: relative;
+    overflow: hidden;
+}
+
+/* Grid items keep their content's minimum width by default: a chart canvas sized for a wide window would then
+   hold its panel wide after the window narrows, and lite-charts' ResizeObserver on the host would never see it
+   shrink. Let the stage and its panels shrink below their content. */
+.stage,
+.stage .panel {
+    min-width: 0;
 }
 
 /* scene visibility: default show all (overview); a selected non-"all" scene isolates one panel */

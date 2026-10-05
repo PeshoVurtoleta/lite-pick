@@ -2,7 +2,7 @@
   "name": "pick-ecosystem-live",
   "private": true,
   "version": "0.0.0",
-  "description": "The lite-pick capstone: a served, functioning load-balancing system (headless kernel P1, terminal UI P2, browser page P3, hub + Pages deploy P4).",
+  "description": "The lite-pick capstone: a served, functioning load-balancing system (headless kernel P1, terminal UI P2, browser page P3, hub + Pages deploy P4, soak heartbeat + guided tour P5).",
   "type": "module",
   "license": "MIT",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
@@ -17,7 +17,9 @@
     "web": "node ../../demo/pool-scope/web/serve.mjs --page live",
     "browser-smoke": "node test/browser-smoke.mjs",
     "graph": "node graph.mjs",
-    "site": "node site.mjs"
+    "site": "node site.mjs",
+    "heartbeat": "node --expose-gc test/heartbeat.mjs",
+    "heartbeat:teeth": "node test/heartbeat-teeth.mjs"
   },
   "dependencies": {
     "@zakkster/lite-adaptive": "1.11.0",
@@ -27,7 +29,7 @@
     "@zakkster/lite-di-event-bus": "1.1.0",
     "@zakkster/lite-di-graph": "1.0.0",
     "@zakkster/lite-di-health": "1.0.0",
-    "@zakkster/lite-di-orchestrator": "1.0.0",
+    "@zakkster/lite-di-orchestrator": "1.0.1",
     "@zakkster/lite-di-strategies": "1.0.0",
     "@zakkster/lite-di-supervisor": "1.0.0",
     "@zakkster/lite-pick": "1.1.0",

@@ -10,12 +10,14 @@
  *   HUB         the site root redirects to the hub; it loads, the composition graph renders, and every relative
  *               link on it resolves inside the built site
  *   LIVE page   every module loads (no banner) and the system boots: 8 Web Workers up, requests served;
+ *               the tour (key t)       -> its caption bar, step 2 kills w2 and the restart is narrated; t stops it
  *               kill w2 (key k)        -> "w2 restarted by its supervisor" in DECISIONS
  *               crash w5 (key c)       -> "w5 restarted by its supervisor" (the browser crash path: an uncaught
  *                                         error in the worker, not a silent close())
  *               flaky w1 (key f)       -> "w1 breaker OPEN", then heal (key x)
  *               engine B (key e)       -> still serving; back to A
  *               next strategy (key n)  -> the header follows
+ *               the window narrows to 390 px after the charts mounted -> nothing stays wider (lite-charts follows)
  *               no request failed; graceful shutdown (key q) -> orchestrator exit code 0, nothing in flight
  *   SIM page    Pool Scope's simulated page (the shared renderer) loads with 12/12 workers
  *   both        no uncaught exception or console error
@@ -34,7 +36,8 @@ const PORT = Number(process.env.SMOKE_PORT || 8790);
 const BASE = 'http://127.0.0.1:' + PORT;
 const log = (s) => process.stderr.write(s + '\n');
 const checks = [];
-const check = (ok, what) => { checks.push([ok, what]); log((ok ? '  ok   ' : '  FAIL ') + what); return ok; };
+const check = (ok, what) => { checks.push([ok, what]); log((ok ? '  ok   ' : '  FAIL ') + what + (failedProbe ? failedProbe() : '')); return ok; };
+let failedProbe = null;   // set once the live page runs: each check line then shows the failed count so far
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function findChrome() {
@@ -94,11 +97,13 @@ class Cdp {
         return r.result.value;
     }
     async key(ch) {
+        if (this.refreshFailed) await this.refreshFailed();
         await this.send('Input.dispatchKeyEvent', { type: 'keyDown', key: ch, text: ch });
         await this.send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
     }
     /** Poll `expr` until it is truthy; resolve with its value, or with null after `ms`. */
     async until(expr, ms) {
+        if (this.refreshFailed) await this.refreshFailed();
         const end = Date.now() + ms;
         for (;;) {
             let v = null;
@@ -181,20 +186,45 @@ try {
         log('  status: ' + await cdp.eval("document.getElementById('boot-status').textContent").catch(() => '?'));
         throw new Error('the live page did not boot');
     }
+    let failedSoFar = 0;
+    failedProbe = () => (failedSoFar ? '   [failed so far: ' + failedSoFar + ']' : '');
+    const refreshFailed = async () => { try { failedSoFar = await cdp.eval('__pickLive.kernel ? __pickLive.kernel.stats.c[2] : 0'); } catch { /* page gone */ } };
+    cdp.refreshFailed = refreshFailed;
     check(await cdp.eval("document.getElementById('cdn-error').hidden"), 'live page: no module-load banner');
     check(await cdp.eval("Array.from(__pickLive.kernel.balancers.shared.up).every((u) => u === 1)"), 'live page: all 8 Web Workers up and eligible');
     log('  ' + await cdp.eval("document.getElementById('boot-status').textContent + ' | cpu ' + document.getElementById('back-cpu').textContent + ' | render ' + document.getElementById('back-render').textContent"));
 
-    const decided = (text, ms) => cdp.until('document.getElementById("decisions").textContent.indexOf(' + JSON.stringify(text) + ') >= 0', ms);
+    // A decision at or after `since` (the page's clock): the panel shows only the newest lines, which may be older.
+    const decided = (text, ms, since) => cdp.until('__pickLive.decisions(' + (since || 0) + ').some((d) => d.indexOf(' + JSON.stringify(text) + ') >= 0)', ms);
+    const pageNow = () => cdp.eval('performance.now()');
+    // One fault at a time: a worker is back only when it is back in rotation (READY and eligible), not when its
+    // restart begins -- with `tries: 2`, a crash while another worker is still restarting can lose a request.
+    const backIn = (w, since) => decided('w' + w + ' back in rotation', 10000, since);
     const select = (w) => cdp.eval('document.querySelector(\'.wchip[data-w="' + w + '"]\').click(), true');
 
+    // The guided tour (key t): its caption bar appears, its second step kills w2 and says so, the restart is
+    // narrated; key t again stops it.
+    let since = await pageNow();
+    await cdp.key('t');
+    const cap1 = await cdp.until("!document.getElementById('tour').hidden && document.getElementById('tour-step').textContent", 3000);
+    check(cap1 === 'TOUR 1/12', 'tour (key t): the caption bar shows step 1 (' + cap1 + ')');
+    const cap2 = await cdp.until("document.getElementById('tour-caption').textContent.indexOf('w2 is killed') === 0", 12000);
+    check(!!cap2 && !!await decided('w2 restarted by its supervisor', 6000, since), 'tour step 2: "w2 is killed" -- and its supervisor restarted it');
+    await cdp.key('t');
+    check(await cdp.until("document.getElementById('tour').hidden", 3000) === true, 'tour (key t again): stopped');
+    await backIn(2, since);
+
+    since = await pageNow();
     await select(2); await cdp.key('k');
-    check(!!await decided('w2 restarted by its supervisor', 15000), 'kill w2 (key k): restarted by its supervisor');
+    check(!!await decided('w2 restarted by its supervisor', 15000, since) && !!await backIn(2, since), 'kill w2 (key k): restarted by its supervisor, back in rotation');
+    since = await pageNow();
     await select(5); await cdp.key('c');
-    check(!!await decided('w5 restarted by its supervisor', 15000), 'crash w5 (key c): the worker died loudly and was restarted');
+    check(!!await decided('w5 restarted by its supervisor', 15000, since) && !!await backIn(5, since), 'crash w5 (key c): the worker died loudly, was restarted, back in rotation');
+    since = await pageNow();
     await select(1); await cdp.key('f');
-    check(!!await decided('w1 breaker OPEN', 15000), 'flaky w1 (key f): its breaker opened');
+    check(!!await decided('w1 breaker OPEN', 15000, since), 'flaky w1 (key f): its breaker opened');
     await cdp.key('x');
+    check(!!await decided('w1 breaker CLOSED', 15000, since) && !!await backIn(1, since), 'heal w1 (key x): the probe closed its breaker, back in rotation');
     await cdp.key('e');
     const atB = await cdp.eval('__pickLive.kernel.stats.c[1]');
     const servedB = await cdp.until('__pickLive.kernel.engine.mode === 1 && __pickLive.kernel.stats.c[1] > ' + (atB + 1000), 15000);
@@ -204,6 +234,13 @@ try {
     await cdp.key('n');
     const s1 = await cdp.until("document.getElementById('head-strategy').textContent !== " + JSON.stringify(s0) + " && document.getElementById('head-strategy').textContent", 3000);
     check(!!s1, 'next strategy (key n): ' + s0 + ' -> ' + s1);
+    // The window narrows after the charts mounted (a phone rotating, a window dragged): nothing stays wider.
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await sleep(800);
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+    const narrow = await cdp.until("(() => { const w = document.documentElement.scrollWidth; const c = Math.max(...Array.from(document.querySelectorAll('canvas')).map((x) => x.getBoundingClientRect().width)); return w <= 390 && c <= 390 ? w + '/' + Math.round(c) : null; })()", 4000);
+    check(!!narrow, 'narrowed to 390 px after mount: the page and every chart follow (' + narrow + ')');
+    await cdp.send('Emulation.clearDeviceMetricsOverride');
     await sleep(1000);
     await cdp.key('q');
     const exit = await cdp.until('__pickLive.exitCode !== null && String(__pickLive.exitCode)', 20000);

@@ -81,6 +81,30 @@ jobs:
             console.log("tarball OK: exactly " + files.length + " files");
           '
 
+  # The capstone's headless kernel (pickEcosystem/live, research/capstone-P1-spec.md F8): its own package.json
+  # pins the published bricks (lite-pick 1.1.0, lite-worker-pool 1.1.0, the di-* line); `npm test` runs the
+  # gates over virtual workers (deterministic) plus one suite against THIS working tree's Pick.js / Pool.js, so a
+  # kernel change cannot silently break the capstone; `npm run smoke` is ~20 s over real worker_threads with
+  # every fault once (a lower rate for the 2-core runner).
+  capstone:
+    name: capstone (pickEcosystem/live, node 22)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pickEcosystem/live
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: pickEcosystem/live/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run smoke
+        env:
+          SMOKE_RATE: '600'
+
   # Compile a real consumer against the PACKED tarball (not the working tree) so the exports
   # map and the typesVersions /pool mapping are exercised. ubuntu is deliberate: its filesystem
   # is CASE-SENSITIVE, so `@zakkster/lite-pick/pool` -> Pool.d.ts only resolves via typesVersions

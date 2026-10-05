@@ -1,7 +1,8 @@
 # Research: the capstone -- `pickEcosystem/`, a served, FUNCTIONING load-balancing system
 
 **Status:** DECIDED 2026-10-05 -- all recommendations accepted (C1-C9). P0 (the worker layer) IMPLEMENTED
-2026-10-05 as lite-worker-pool 1.1.0 `createWorkerSet` (LiteWorkerPool research/worker-set.md). Next: P1, the headless kernel.
+2026-10-05 as lite-worker-pool 1.1.0 `createWorkerSet` (LiteWorkerPool research/worker-set.md). P1 (the headless kernel, `pickEcosystem/live/`)
+IMPLEMENTED 2026-10-05 (research/capstone-P1-spec.md). Next: P2, the terminal UI on the live system.
 **North-star (ROADMAP section 5, your words 2026-09-23):** "to see the whole system built, and not only built --
 but functioning, anyone can see the served system; both operational through a browser and terminal" -- the
 proof that an A+, zero-GC module is still worth building.

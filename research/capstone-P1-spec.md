@@ -1,25 +1,37 @@
 # Spec: capstone P1 -- the headless kernel (`pickEcosystem/live/`)
 
-**Status:** PROPOSED 2026-10-05 -- decisions F1-F8 need your call. Plan: `capstone-pickEcosystem.md` section 9.
+**Status:** DECIDED 2026-10-05 -- all recommendations accepted (F1-F8) -- and IMPLEMENTED 2026-10-05 in
+`pickEcosystem/live/` (README there). Two measured changes: the F1 numbers (see the correction below), and gate
+G3 is about TAIL LATENCY, not share (a slow worker's share drops under every load-aware strategy; its p99 does not). Plan: `capstone-pickEcosystem.md` section 9.
 **Goal:** the whole system running HEADLESS -- real workers, health, breakers, supervision, traffic, faults,
 shutdown -- booted by `bootKernel(io)`, proven by tests, runnable in a terminal with 1 Hz stats. P2/P3 add only
 renderers (Pool Scope reads it through its existing driver interface).
 
 ## One measurement that changes the plan (F1)
 
-The plan said requests go through lite-pick's `/pool`. Measured per request (measureOps, 20k requests, the
-deterministic loopback with the real kernel; Node 26.8 / 22.23):
+The plan said requests go through lite-pick's `/pool`. Measured per request, as an allocation RATE (scavenges
+at a pinned 1 MB young generation -- the PerfGate method; `test/rate-probe.mjs`), over the whole steady state
+of the virtual-worker system (traffic, picks, replies, feedback, the fleet tick, event emits):
 
-| request path | allocation per request (our code) |
-|---|---|
-| A: `lb.pickFrom(clk, 0)` + `set.post(i, job, tag)` + `onSettle` -> `inflight--`, `recordRttFrom` | **1.09 / 2.69 B** (the loopback harness's own allocations included) |
-| B: `pool.run((i, signal) => set.submit(i, job, { signal }))` | **1361 / 1280 B** |
+| request path | Node 26.8 | Node 22.23 |
+|---|---|---|
+| A: `lb.pickFrom(clk, 0)` + `set.post(i, job, tag)` + `onSettle` -> `inflight--`, `recordRttFrom` | **0 scavenges over 1.9M requests** | 2 scavenges, flat from 481k to 1.9M requests (one-off warm-up) |
+| B: `pool.run((i, signal) => set.submit(i, job, { signal }))` | **~2.9 KB/request** (168 scavenges / 60k) | -- |
 
 The only other per-request allocation on the main thread is Node's MessagePort (~1.1-1.4 KB/job, measured in
-lite-worker-pool 1.1.0, disclosed). So B would double the per-request garbage of a system whose whole point is
-"zero-GC is still possible", while A adds nothing to the transport's share. (Side finding for lite-pick: `/pool`'s docs describe its cost as "O(1) counter ops
-+ one small per-run array"; the measured ~1.3 KB includes `submit`'s Promise -- to be broken down and the docs
-corrected in a separate lite-pick item, not here.)
+lite-worker-pool 1.1.0, disclosed). So B would roughly triple the per-request garbage of a system whose whole
+point is "zero-GC is still possible", while A adds nothing to the transport's share.
+
+**Correction (2026-10-05, during P1).** This section first quoted A at "1.09 / 2.69 B" and B at "1361 / 1280 B".
+Those came from lite-gc-profiler's `measureOps` with `stabilize` on, which reports the RETAINED live-set delta, not
+the allocation rate: it could not see transient garbage, so it under-stated both (B's figure only showed because
+its Promises could not settle inside a synchronous loop). The conclusion stands and is stronger; the numbers above
+are the allocation rate. Getting A to zero also took two fixes the rate method exposed: traffic keys kept in
+[0, 2^30) (a uint32 >= 2^31 boxed crossing `_key()` -> `request()`), and the Poisson / Zipf uniforms computed
+in place rather than returned from a helper (a fractional double boxes across a call V8 does not inline).
+(Side finding for lite-pick: `/pool`'s docs describe its cost as "O(1) counter ops + one small per-run array";
+B's ~2.9 KB includes `submit`'s Promise; how it splits between /pool and submit is to be measured and the docs corrected
+in a separate lite-pick item, not here.)
 
 ## Decisions
 

@@ -1,0 +1,35 @@
+{
+  "name": "pick-ecosystem-live",
+  "private": true,
+  "version": "0.0.0",
+  "description": "The lite-pick capstone: a served, functioning load-balancing system (headless kernel, P1).",
+  "type": "module",
+  "license": "MIT",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --expose-gc --test test/*.test.mjs",
+    "smoke": "node test/smoke.mjs",
+    "start": "node run.mjs"
+  },
+  "dependencies": {
+    "@zakkster/lite-pick": "1.1.0",
+    "@zakkster/lite-worker": "1.4.0",
+    "@zakkster/lite-worker-pool": "1.1.0",
+    "@zakkster/lite-di-container": "2.2.1",
+    "@zakkster/lite-di-health": "1.0.0",
+    "@zakkster/lite-di-supervisor": "1.0.0",
+    "@zakkster/lite-di-orchestrator": "1.0.0",
+    "@zakkster/lite-di-strategies": "1.0.0",
+    "@zakkster/lite-di-event-bus": "1.1.0",
+    "@zakkster/lite-di-cron": "1.0.0",
+    "@zakkster/lite-di-graph": "1.0.0",
+    "@zakkster/lite-statechart": "1.1.0",
+    "@zakkster/lite-signal": "1.5.2",
+    "@zakkster/lite-sketch": "1.1.2"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "1.16.0",
+    "@zakkster/lite-leak": "1.10.0"
+  }
+}

@@ -19,7 +19,8 @@
  * n), proving the instrument has teeth on the lite-pick surface.
  */
 
-import { test } from 'node:test';
+import { test, beforeEach, afterEach } from 'node:test';
+import { loadavg } from 'node:os';
 import assert from 'node:assert/strict';
 import { zgcSuite, measure } from '@zakkster/lite-perf-gate';
 import {
@@ -71,11 +72,16 @@ const SCAN_CAP = 256;     // LeastConn / SED / NQ (all O(cap) scans)
 // reducer to fire ~2 GCs after its ~8s idle-allocation timer and trip the oldgen lane (a false
 // positive -- FINDINGS H5). A SMALL dedicated pool exercises the IDENTICAL exhausted-rejection ->
 // rotated-linear-scan code path (integer locals only, still 0 B/op) at a fraction of the wall time,
-// so every phase finishes well under 8s. Chosen over --no-memory-reducer: shrinking keeps the gate
+// so every phase finishes under 8s. Chosen over --no-memory-reducer: shrinking keeps the gate
 // honest (a genuinely slow low-alloc lane would still be caught) rather than masking a whole GC
-// class. At FB_CAP=2048 the 64-try rejection loop misses ~96.9% of the time (hit prob 64/2048), so
-// the fallback scan is the path taken on almost every pick -- the branch this lane exists to gate.
-const FB_CAP = 2048;
+// class. Audit 2026-10-05 T1: at FB_CAP=2048 the lane took 7.9-8.8 s at load 0.7-3.7 (11.8-16.2 s
+// loaded) once the 1.1.0 L2 fallback walked the weights twice (K2), and failed 3 of 8 runs with
+// oldgen 2 -- the same memory-reducer false positive. FB_CAP=512 runs the identical path ~4x faster.
+// The 64 tries are ALIAS draws (weight-proportional): the one eligible node (index 1) has weight 2 of
+// a total 8.5 x FB_CAP, so a try hits with p = 2/4352 and all 64 miss with (1 - p)^64 = ~97.1% (vs
+// ~99.3% at 2048): the fallback scan is still the path taken on almost every pick -- the branch this
+// lane exists to gate.
+const FB_CAP = 512;
 
 // The PeakEWMA driver clock is masked to CLK_MASK every step so its VALUE stays a Smi on EVERY build.
 // Smi width is BUILD-DEPENDENT: on stock 64-bit Node built WITHOUT pointer compression (this machine
@@ -501,7 +507,7 @@ const weightedRandomPick = {
  * FB_CAP pool (all others down), so the 64-try rejection loop misses ~every time (hit prob ~64/FB_CAP)
  * and each pick() runs the rotated linear-scan FALLBACK -- the branch the dense/half scenario never
  * reaches. It must be 0 B/op too (the scan uses only integer locals). FB_CAP (see its definition) is a
- * SMALL dedicated pool so this O(cap) lane finishes well under V8's ~8s memory-reducer timer (H5).
+ * SMALL dedicated pool so this O(cap) lane finishes under V8's ~8s memory-reducer timer (H5, T1).
  * Same `grows` counter (nothing reallocates -> 0 delta).
  */
 const weightedRandomPickFallback = {
@@ -961,6 +967,17 @@ function steady(scenario) {
         },
     };
 }
+
+// Audit 2026-10-05 T1: every lane prints its wall time and the load average, so a future flake (an
+// oldgen hit from V8's ~8 s memory-reducer timer on a slow or loaded runner) can be diagnosed from the
+// log alone. Outside every measured window (the hooks run between tests).
+let laneT0 = 0;
+beforeEach(() => { laneT0 = performance.now(); });
+afterEach((t) => {
+    const l = loadavg();
+    console.log('  lane ' + ((performance.now() - laneT0) / 1000).toFixed(1) + ' s | load ' +
+        l[0].toFixed(1) + ' ' + l[1].toFixed(1) + ' ' + l[2].toFixed(1) + ' | ' + t.name);
+});
 
 zgcSuite({
     N: 200000,

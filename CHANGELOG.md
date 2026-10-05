@@ -87,6 +87,14 @@ per-run array" cost claim for `Pool.run` was wrong; it is now measured, gated, a
   20000-iteration chunks leave heapUsed within 32 KB (cap 1500 ms); the gate itself is unchanged (0 scavenges at
   N and 8N). A per-op allocation never goes quiet and still fails: a lane switched to the plain `recordRtt` and
   the pre-1.1.0 PRNG (8 lanes) both fail with inlining off.
+- **PerfGate's WeightedRandom heavy-outage lane flaked under load (audit 2026-10-05 T1).** At `FB_CAP` 2048 the
+  lane took 7.9-8.8 s at load 0.7-3.7 and 11.8-16.2 s loaded, long enough for V8's ~8 s memory-reducer timer to
+  fire (`oldgen 2 > 0`, 0 scavenges; 3 of 8 `test:perf` runs failed). The 1.1.0 L2 fallback walks the weights twice
+  (K2), which pushed it over. `FB_CAP` is now 512: the same exhausted-rejection -> fallback-scan path, still taken
+  on 97.1% of picks (measured; 99.2% at 2048), about 4x faster. `--no-memory-reducer` was again not used (it hides a
+  whole GC class from the gate, the H5 decision). Every lane now prints its wall time and the load average. Proof
+  on Node 22.23.3 with 16 busy loops on 12 cores (load 6-38): `test:perf` 10/10 and `test:perf:noinline` 5/5, all
+  40/40, the lane at 3.4-3.6 s (4.5-4.6 s without inlining).
 
 ## [1.1.0] - 2026-10-05
 

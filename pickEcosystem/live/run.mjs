@@ -13,6 +13,7 @@ import * as poolMod from '@zakkster/lite-pick/pool';
 import * as wp from '@zakkster/lite-worker-pool';
 import { bootKernel, ENGINE_A, ENGINE_B } from './kernel.js';
 import { nodeSetSpawn } from './nodeworker.js';
+import { calibrateUnitsPerMs } from './calibrate.js';
 
 const args = process.argv.slice(2);
 const opt = (name, dflt) => { const k = args.indexOf('--' + name); return k >= 0 ? args[k + 1] : dflt; };
@@ -24,12 +25,16 @@ for (let k = 0; k < args.length; k++) if (args[k] === '--fault') {
 const config = { strategy: opt('strategy', 'p2c'), rate: Number(opt('rate', 2000)) };
 const seconds = Number(opt('seconds', 0));
 
+// Real threads: calibrate this host's busy-loop speed so a job is ~1 ms of real CPU here (NOT on virtual paths).
+config.unitsPerMs = calibrateUnitsPerMs(() => performance.now(), 80);
+
 const t0 = performance.now();
 const kernel = await bootKernel({ lp, poolMod, wp, spawn: nodeSetSpawn, now: () => performance.now(), timers: 'real', config });
 if (opt('engine', 'A') === 'B') kernel.setEngine(ENGINE_B); else kernel.setEngine(ENGINE_A);
 const tBoot = performance.now();
 process.stdout.write('pickEcosystem live: ' + kernel.cfg.workers + ' worker threads up in ' + (tBoot - t0).toFixed(0) +
-    ' ms; strategy ' + kernel.balancers.name + ', ' + kernel.cfg.rate + ' req/s, engine ' + opt('engine', 'A') + '\n');
+    ' ms; strategy ' + kernel.balancers.name + ', ' + kernel.cfg.rate + ' req/s, engine ' + opt('engine', 'A') +
+    ', ~' + (config.unitsPerMs / 1000).toFixed(0) + 'k loop units/ms\n');
 
 const B = ['closed', 'OPEN', 'half'];
 const tick = setInterval(() => {

@@ -195,10 +195,37 @@ export async function bootKernel(io) {
     orch.step('scopes', () => fleet.shutdownScopes());
     orch.step('stop-cron', () => { cron.stop(); });
 
-    return {
+    const api = {
         cfg, container: c, set, engine, fleet, traffic, stats, balancers, bus, cron, events, stream, orchestrator: orch,
-        /** Drive every due cron job at `t` (tests / a virtual clock). */
-        tick(t) { cron.tick(t); },
+        halted: false,
+        _halting: false,
+        /**
+         * STOP the system, once (idempotent): no more arrivals, drain, stop the cron, retire the workers. The
+         * shutdown exit callback calls this so a virtual clock stops ticking the moment the orchestrator exits
+         * (Cron.tick ignores Cron.stop, and virtual mode only arms the cron), and a terminal / browser stops the
+         * same way; a hung-step DEADLINE still force-terminates the workers here. Called through the object so a
+         * test can sabotage it (prove the gate's teeth). `halted` is published only AFTER set.dispose() returns
+         * (the page gates Reboot on it -- a reboot is safe only once the workers are actually retired); a separate
+         * `_halting` re-entry guard keeps a nested halt() during dispose a no-op.
+         */
+        halt() {
+            if (api.halted || api._halting) return;
+            api._halting = true;
+            traffic.stop();
+            engine.draining = true;
+            cron.stop();
+            // `halted` is published only AFTER set.dispose() returns; if dispose THROWS, the re-entry guard is
+            // still cleared in finally (otherwise _halting would latch true and halted false forever, and a
+            // retry/reboot could never proceed), and the throw propagates so the caller sees the failed retire.
+            try {
+                set.dispose();
+                api.halted = true;
+            } finally {
+                api._halting = false;
+            }
+        },
+        /** Drive every due cron job at `t` (tests / a virtual clock); a halted kernel ticks nothing. */
+        tick(t) { if (!api.halted) cron.tick(t); },
         setStrategy(name) { balancers.set(name); engine.rebindPool(); },
         setEngine(mode) { engine.setMode(mode); },
         setRate(r) { traffic.rate = r; },
@@ -209,14 +236,16 @@ export async function bootKernel(io) {
          * Resolves with the exit code as soon as the orchestrator decides it -- including DEADLINE (2) when a step
          * hangs: the orchestrator calls exit(2) at the deadline but its own promise waits for the hung step, which in
          * a terminal process.exit cuts short and in a browser would leave the page waiting forever (found by the
-         * heartbeat's stuck-restart control). `exit` is injected (run.mjs passes process.exit).
+         * heartbeat's stuck-restart control). `exit` is injected (run.mjs passes process.exit). The exit callback
+         * calls `api.halt()` first, so even a DEADLINE stops the clock and force-terminates the workers (a hung
+         * step would otherwise leave them up and the cron ticking); a clean exit halts the same way.
          */
         shutdown(opts) {
             const o = opts || {};
             return new Promise((resolve) => {
                 let code = -1;
                 orch.shutdown({
-                    exit: (x) => { code = x; if (o.exit) o.exit(x); resolve(x); },
+                    exit: (x) => { code = x; try { api.halt(); } finally { if (o.exit) o.exit(x); resolve(x); } },
                     deadlineMs: o.deadlineMs || 10000,
                     // lite-di-orchestrator >= 1.0.1: the default timers work in a browser too (1.0.0 called the
                     // global setTimeout with the wrong receiver and failed every browser shutdown at once with
@@ -226,4 +255,5 @@ export async function bootKernel(io) {
             });
         },
     };
+    return api;
 }

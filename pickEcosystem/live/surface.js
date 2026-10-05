@@ -6,45 +6,12 @@
  * The terminal scene assumes the reference machine: UNITS_PER_MS busy-loop units are ~1 ms there. A visitor's
  * browser may be a phone, so the page MEASURES the job's own loop on this device before booting (~80 ms, once)
  * -- "~1 ms of real CPU per job" then holds on every machine -- and offers less traffic to a device with fewer
- * cores.
+ * cores. The measurement itself (`calibrateUnitsPerMs`) lives in calibrate.js and is re-exported here so the
+ * page and the tests keep their single `./surface.js` import.
  */
 
-import { jobFn, CTL_LEN, CTL_UNITS, CTL_SLOW, UNITS_PER_MS } from './job.js';
-
-const CAL_STEP = 20000;          // units per timed run (~0.1 ms on the reference machine)
-const CAL_WINDOWS = 4;
-const CAL_MAX_RUNS = 1000;       // per phase: a frozen or broken clock still ends (~0.1 s each on the reference)
-
-/**
- * Busy-loop units per millisecond of THIS thread, by running the job's own transform: half the budget warms
- * the loop up (V8 optimizes it in tiers; a cold measurement reads ~3-4x slow -- seen in a browser: 57k cold
- * vs ~200k warm), then the best of CAL_WINDOWS timed windows (the optimized speed a worker settles at).
- * Clamped to [UNITS_PER_MS / 20, UNITS_PER_MS x 5], and a clock that does not advance yields UNITS_PER_MS:
- * a coarse or broken clock cannot produce a scene that is absurdly heavy or empty, nor hang the page.
- */
-export function calibrateUnitsPerMs(now, budgetMs) {
-    const budget = budgetMs > 0 ? budgetMs : 80;
-    const ctl = new Float64Array(CTL_LEN);
-    ctl[CTL_UNITS] = CAL_STEP;
-    ctl[CTL_SLOW] = 1;
-    let t = now();
-    const warmEnd = t + budget / 2;
-    let w = 0;
-    while (t < warmEnd && w < CAL_MAX_RUNS) { jobFn(w++ & 1023, ctl); t = now(); }
-    const win = budget / 2 / CAL_WINDOWS;
-    let best = 0;
-    for (let k = 0; k < CAL_WINDOWS; k++) {
-        let units = 0, runs = 0;
-        const t0 = now();
-        t = t0;
-        while (t - t0 < win && runs++ < CAL_MAX_RUNS) { jobFn(units & 1023, ctl); units += CAL_STEP; t = now(); }
-        const dt = t - t0;
-        const per = dt > 0 ? units / dt : 0;
-        if (per > best) best = per;
-    }
-    const lo = UNITS_PER_MS / 20, hi = UNITS_PER_MS * 5;
-    return Math.round(!(best > 0) ? UNITS_PER_MS : best < lo ? lo : best > hi ? hi : best);
-}
+// Re-exported so page.js / the web tests keep importing it from ./surface.js (the measurement is in calibrate.js).
+export { calibrateUnitsPerMs } from './calibrate.js';
 
 /** The scene's offered rate for a device with `cores` hardware threads (8 workers always). */
 export function browserScene(cores) {
@@ -64,4 +31,11 @@ export function applyFault(kernel, kind, w) {
     if (kind === 'reset') return kernel.reset(w);
     if (kind === 'heal') return kernel.heal(w);
     return kernel.fault(w, kind);
+}
+
+/** The note the surfaces show when the orchestrator's shutdown resolves with exit code `code`. */
+export function shutdownNote(code) {
+    if (code === 0) return 'every worker retired cleanly.';
+    if (code === 2) return 'deadline hit: workers terminated, in-flight requests failed.';
+    return 'shutdown ended with code ' + code + ': workers terminated.';
 }

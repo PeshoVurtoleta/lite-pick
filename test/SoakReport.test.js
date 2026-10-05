@@ -22,7 +22,7 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,16 +35,28 @@ const REPORT = join(SOAK_DIR, 'SoakReport.mjs');
 const NODE = process.execPath;
 const FLAGS = ['--expose-gc', '--min-semi-space-size=4', '--max-semi-space-size=4'];
 
+// The fixture streams come from the REAL harness (main.mjs), which imports three devDependencies. Node 18 CI
+// runs `npm test` with NO install (as test/LognSeam.test.js): there, and only on Node < 20, missing harness
+// dependencies skip this suite. Anywhere else a missing devDependency FAILS it.
+const MAJOR = Number(process.versions.node.split('.')[0]);
+const SOAK_DEPS = ['lite-sketch', 'lite-leak', 'lite-gc-profiler'];
+const MISSING = SOAK_DEPS.filter((d) => !existsSync(join(ROOT, 'node_modules', '@zakkster', d, 'package.json')));
+const SKIP = MISSING.length > 0 && MAJOR < 20
+    ? 'no node_modules on the Node 18 job: ' + MISSING.join(', ') + ' not installed' : false;
+const soakTest = (name, fn) => test(name, { skip: SKIP }, fn);
+
 let TMP;
 const F = {};          // fixture stream paths
 
-function runMain(env, out) {
+/** Run main.mjs and require EXACTLY the expected exit and a written stream (stderr is surfaced on a miss). */
+function runMain(env, out, wantExit) {
     const r = spawnSync(NODE, FLAGS.concat([MAIN]), {
         cwd: ROOT, env: Object.assign({}, process.env, env, { SOAK_OUT: out }),
-        stdio: 'ignore', timeout: 120000,
+        stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: 120000,
     });
-    // main exits 1 on a FAIL stream (poolretain) -- the stream is still what we want.
-    assert.ok(r.status === 0 || r.status === 1, 'main.mjs produced ' + out + ' (exit ' + r.status + ')');
+    const why = ' (exit ' + r.status + (r.error ? ', ' + r.error.message : '') + ')\n' + String(r.stderr || '').slice(-2000);
+    assert.equal(r.status, wantExit, 'main.mjs must exit ' + wantExit + ' for ' + out + why);
+    assert.ok(existsSync(out), 'main.mjs wrote no stream ' + out + why);
     return out;
 }
 
@@ -63,12 +75,14 @@ function report(reportPath, file, extra) {
 }
 
 before(() => {
+    if (SKIP) return;
+    if (MISSING.length > 0) throw new Error('soak harness devDependencies missing: ' + MISSING.join(', ') + ' (run npm ci)');
     TMP = mkdtempSync(join(tmpdir(), 'litepick-soakreport-'));
 
     // (a) a clean two-lane smoke stream (reason 'end', complete grid, verdict PASS).
-    F.clean = runMain({ SOAK_SMOKE: '1', SOAK_LANES: 'RoundRobin,SmoothWRR' }, join(TMP, 'clean.jsonl'));
+    F.clean = runMain({ SOAK_SMOKE: '1', SOAK_LANES: 'RoundRobin,SmoothWRR' }, join(TMP, 'clean.jsonl'), 0);
     // (b) a genuine pool A6 FAIL smoke stream (poolretain -> retention never drains).
-    F.a6 = runMain({ SOAK_SMOKE: '1', SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolretain' }, join(TMP, 'a6.jsonl'));
+    F.a6 = runMain({ SOAK_SMOKE: '1', SOAK_LANES: 'PoolP2C', SOAK_MUSTFAIL: 'poolretain' }, join(TMP, 'a6.jsonl'), 1);
 
     // signal-interrupted COMPLETE grid: reason 'signal' re-derives INCONCLUSIVE (interrupted). (Baseline for
     // the red-baseline case: integrity-OK on both versions, but not PASS.)
@@ -98,46 +112,46 @@ before(() => {
     F.parityBad = writeRecs(recs(F.clean).map((r) => { if (r.type === 'header') r.parity = { ok: false, mismatched: ['Pick.js'], error: null }; return r; }));
 });
 
-after(() => { try { rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ } });
+after(() => { if (TMP) try { rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ } });
 
 // NOTE: these six assertions are ABSOLUTE (the exact exit code + message the current report must give).
 // The one-time revert-check that >= 5 of 6 of them differed from the pre-change report (cd060cd's
 // SoakReport.mjs) is recorded in CHANGELOG.md -- it must NOT run here, because once committed HEAD is this
 // code and a `git show HEAD:` diff is always empty (0 of 6 differ -> a permanently red suite).
 
-test('a genuine pool A6 FAIL re-derives FAIL with integrity OK (exit 0)', () => {
+soakTest('a genuine pool A6 FAIL re-derives FAIL with integrity OK (exit 0)', () => {
     const r = report(REPORT, F.a6, []);
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /\[integrity OK\]/);
     assert.match(r.stdout, /re-derived=FAIL/);
 });
 
-test('a signal-interrupted partial grid is INCONCLUSIVE with integrity OK (exit 0)', () => {
+soakTest('a signal-interrupted partial grid is INCONCLUSIVE with integrity OK (exit 0)', () => {
     const r = report(REPORT, F.signalPartial, []);
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /\[integrity OK\]/);
     assert.match(r.stdout, /re-derived=INCONCLUSIVE/);
 });
 
-test('the same partial grid without reason signal is an INTEGRITY MISMATCH (exit 1)', () => {
+soakTest('the same partial grid without reason signal is an INTEGRITY MISMATCH (exit 1)', () => {
     const r = report(REPORT, F.endPartial, []);
     assert.equal(r.status, 1, r.stdout);
     assert.match(r.stderr, /soak:report: (ISSUE|INTEGRITY MISMATCH)/);
 });
 
-test('a red (non-PASS) baseline is refused BASELINE NOT GREEN (exit 1)', () => {
+soakTest('a red (non-PASS) baseline is refused BASELINE NOT GREEN (exit 1)', () => {
     const r = report(REPORT, F.clean, ['--baseline', F.signalComplete]);
     assert.equal(r.status, 1, r.stdout);
     assert.match(r.stderr, /soak:report: BASELINE NOT GREEN/);
 });
 
-test('a foreign-schema baseline is refused BASELINE INCOMPATIBLE (exit 1)', () => {
+soakTest('a foreign-schema baseline is refused BASELINE INCOMPATIBLE (exit 1)', () => {
     const r = report(REPORT, F.clean, ['--baseline', F.schemaBad]);
     assert.equal(r.status, 1, r.stdout);
     assert.match(r.stderr, /soak:report: BASELINE INCOMPATIBLE/);
 });
 
-test('a parity mismatch is refused (exit 1), allowed with --allow-parity-mismatch (exit 0)', () => {
+soakTest('a parity mismatch is refused (exit 1), allowed with --allow-parity-mismatch (exit 0)', () => {
     const r = report(REPORT, F.parityBad, []);
     assert.equal(r.status, 1, r.stdout);
     assert.match(r.stderr, /soak:report: PARITY MISMATCH/);
@@ -156,7 +170,7 @@ function signalWithout(pred) {
 function rosterOf(path) { return recs(path).find((r) => r.type === 'header').laneRoster; }
 function lastCycleOf(path) { return Math.max(...recs(path).filter((r) => r.type === 'cycle').map((r) => r.cycle)); }
 
-test('an unknown flag exits 2 with a did-you-mean', () => {
+soakTest('an unknown flag exits 2 with a did-you-mean', () => {
     const r = report(REPORT, F.clean, ['--basline', F.clean]);
     assert.equal(r.status, 2, r.stdout);
     assert.match(r.stderr, /soak:report: unknown flag --basline -- did you mean --baseline\?/);
@@ -165,13 +179,13 @@ test('an unknown flag exits 2 with a did-you-mean', () => {
     assert.match(far.stderr, /soak:report: unknown flag --zzzzzzzzzzzzz$/m);
 });
 
-test('--allow-parity-mismatch is accepted on a clean stream (exit 0, PASS)', () => {
+soakTest('--allow-parity-mismatch is accepted on a clean stream (exit 0, PASS)', () => {
     const r = report(REPORT, F.clean, ['--allow-parity-mismatch']);
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /re-derived=PASS {2}\[integrity OK\]/);
 });
 
-test('signal run with a MIDDLE roster lane short of the last cycle (not a prefix) is a MISMATCH (exit 1)', () => {
+soakTest('signal run with a MIDDLE roster lane short of the last cycle (not a prefix) is a MISMATCH (exit 1)', () => {
     const roster = rosterOf(F.clean), k = lastCycleOf(F.clean);
     assert.ok(roster.length >= 3, 'fixture roster has a middle lane: ' + roster.join(','));
     const mid = roster[1];
@@ -181,21 +195,21 @@ test('signal run with a MIDDLE roster lane short of the last cycle (not a prefix
     assert.match(r.stderr, /INTEGRITY MISMATCH/);
 });
 
-test('signal run with the FIRST lane short and later lanes complete (k-1 then k) is a MISMATCH (exit 1)', () => {
+soakTest('signal run with the FIRST lane short and later lanes complete (k-1 then k) is a MISMATCH (exit 1)', () => {
     const roster = rosterOf(F.clean), k = lastCycleOf(F.clean);
     const r = report(REPORT, signalWithout((c) => c.lane === roster[0] && c.cycle === k), []);
     assert.equal(r.status, 1, r.stdout);
     assert.match(r.stderr, /ISSUE ragged lane x cycle grid \(signal run/);
 });
 
-test('signal run with the last cycle missing on EVERY lane is integrity OK, INCONCLUSIVE (exit 0)', () => {
+soakTest('signal run with the last cycle missing on EVERY lane is integrity OK, INCONCLUSIVE (exit 0)', () => {
     const k = lastCycleOf(F.clean);
     const r = report(REPORT, signalWithout((c) => c.cycle === k), []);
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /re-derived=INCONCLUSIVE {2}\[integrity OK\]/);
 });
 
-test('the same every-lane-short grid with reason end is a MISMATCH (header.config.cycles not met)', () => {
+soakTest('the same every-lane-short grid with reason end is a MISMATCH (header.config.cycles not met)', () => {
     const k = lastCycleOf(F.clean);
     const list = recs(F.clean).filter((r) => !(r.type === 'cycle' && r.cycle === k));
     const n = list.filter((r) => r.type === 'cycle').length;
@@ -204,7 +218,7 @@ test('the same every-lane-short grid with reason end is a MISMATCH (header.confi
     assert.match(r.stderr, /ISSUE lane \S+ has \d+ cycles, header\.config\.cycles = /);
 });
 
-test('an empty / whitespace-only / header-only stream fails closed (exit 2, clear message)', () => {
+soakTest('an empty / whitespace-only / header-only stream fails closed (exit 2, clear message)', () => {
     const empty = join(TMP, 'empty.jsonl'); writeFileSync(empty, '');
     const blank = join(TMP, 'blank.jsonl'); writeFileSync(blank, '\n  \n\n');
     for (const p of [empty, blank]) {
@@ -222,7 +236,7 @@ test('an empty / whitespace-only / header-only stream fails closed (exit 2, clea
     assert.match(n.stderr, /non-object JSONL line/);
 });
 
-test('a baseline that is the same file as the current stream is sane: no regression (exit 0)', () => {
+soakTest('a baseline that is the same file as the current stream is sane: no regression (exit 0)', () => {
     const r = report(REPORT, F.clean, ['--baseline', F.clean]);
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /\[integrity OK\]/);
@@ -234,7 +248,7 @@ test('a baseline that is the same file as the current stream is sane: no regress
 // the diff was skipped and the report exited 0 with no "vs baseline" section. A requested comparison that never
 // ran must fail closed (exit 2), like an unknown flag. Same for `--out`, and for a flag where the value should be.
 for (const argv of [['--baseline'], ['--out'], ['--baseline', '--allow-parity-mismatch'], ['--out', '']]) {
-    test('flag without its value fails closed (exit 2): ' + JSON.stringify(argv), () => {
+    soakTest('flag without its value fails closed (exit 2): ' + JSON.stringify(argv), () => {
         const r = report(REPORT, F.clean, argv);
         assert.equal(r.status, 2, 'exit ' + r.status + ': ' + r.stdout.slice(0, 200));
         assert.match(r.stderr + r.stdout, /needs a path/);

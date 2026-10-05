@@ -142,6 +142,71 @@ The soak harness gained real teeth and a stricter analyser. No library change: `
   on Node 22.23.3 with 16 busy loops on 12 cores (load 6-38): `test:perf` 10/10 and `test:perf:noinline` 5/5, all
   40/40, the lane at 3.4-3.6 s (4.5-4.6 s without inlining).
 
+### Capstone (pickEcosystem/live, session 3)
+
+No library change: `Pick.js`, `Pool.js`, `Pick.d.ts`, `Pool.d.ts` are untouched by this work (the `npm run
+parity` pins hold). The headless kernel's resilience and overload behaviour were hardened and gated.
+
+- **P1 lost probe (G12).** A HalfOpen probe whose worker dies (`LWP_WORKER_DOWN` / `LWP_DISPOSED` / a
+  capacity code) is NO VERDICT: the breaker releases the probe (`probeOut = 0`, stays HalfOpen) instead of
+  taking a worker death as a breaker failure, and `_bringUp` resets `probeOut` on respawn. The next tick
+  re-admits a probe once health is ready; a crash-every-probe still escalates via the 5/30 s supervisor. Gate
+  G12 (both engines): the breaker closes within one cool-down of the lost probe, restarts exactly once, no
+  escalation, no failed request. Controls: HEAD and a mutant with the release branch + `probeOut` reset
+  removed both fail (stuck HalfOpen).
+- **P3 graceful shutdown (G11 clean + deadline).** `kernel.halt()` stops traffic, drains, stops the cron and
+  disposes the worker set once; `halted` is published only AFTER `set.dispose()` returns (a separate
+  `_halting` re-entry guard keeps a nested halt a no-op), and the page gates Reboot on it. `kernel.tick`
+  ticks nothing once halted (Cron.tick ignores Cron.stop; virtual mode only arms the cron). The shutdown
+  exit callback calls `halt()` first, so even a DEADLINE (code 2) stops the clock and force-terminates the
+  workers. Gates G11 (clean: code 0, live 0, cron stopped; deadline: code 2, live 0, cron stopped) and
+  `shutdown:real` over real worker_threads, each with a sabotage control (no-op `halt` / `set.dispose` ->
+  live stays up, cron keeps ticking).
+- **P2 per-Pool forwarder (G8 engine B).** Engine B drives `/pool` through a per-Pool FORWARDER (not the
+  whole Balancers facade) rebuilt on every switch: its `constructor` is the strategy class (Pool keeps its
+  fail-closed KEY/CLOCK checks), `pick` + markers stay pinned to the balancer the Pool was built over but
+  fail closed on that balancer's frozen eligibility (a now-down result returns PICK_NONE so the failover scan
+  re-routes by CURRENT `shared.up`), and `note`/`recordRtt` forward to the CURRENT balancer. Four engine-B
+  controls each pass the G8 cycle + affinity probe but fail their own tooth: drop the constructor marker
+  (mA), unguarded recordRtt after a latency switch (mF), pick via the current balancer so a keyed run hands
+  PeakEWMA a key as its clock (mP), and the stale-eligibility failover (pre-fix pick).
+- **P4 admission + host calibration + smoke (G13, A1b).** `request()` sheds an arrival when the system is at
+  capacity (`pending >= live x (slots + queue)`, `live > 0`) as O(1) small-integer math -- a 5x overload
+  stays zero-alloc on engine A (A1b), below capacity the run is byte-identical to the pre-P4 engine (the
+  golden P0 vectors hold). A whole-fleet outage (`live` 0) is NOT capacity: the test is skipped so the
+  arrival is classed as the real failure it is, never a disguised shed. Both engines distinguish a
+  never-ran capacity shed (S_SHED) from a request that RAN and failed or a non-READY refusal / PICK_NONE
+  (S_FAILED) -- engine B tracks it with a per-request flag so a final full-queue after a real attempt
+  failure is still a failure. `calibrate.js` moves `calibrateUnitsPerMs` (re-exported from `surface.js`) and
+  adds `estimateCapacity` / `measureThroughput`; the real-thread scripts set `config.unitsPerMs` from the
+  host. `smoke.mjs` measures the host's saturating throughput and runs at half it (or `SMOKE_OVERLOAD x` to
+  prove the shed path); `SMOKE_*` is allow-listed with a did-you-mean and the two knobs are validated finite
+  > 0 (exit 2). Gate G13 (both engines), each tooth naming its own control: admission -- an overload sheds
+  with no failure or breaker event, half capacity sheds nothing (control: HEAD -- no admission at all, so the
+  5x overload FAILS ~54k requests and sheds none); outage -- a whole-fleet outage fails requests, never sheds (control:
+  the admission guard's `live !== 0` check removed); ran-and-failed -- a ran-then-full-queue request is a
+  failure not a shed (control: engine B's `ran` flag never set; the engine-A case is a regression guard --
+  engine A's rRan/rCap already class it correctly, so there is no engine-A mutant).
+- **Kernel overlay (B4).** `npm run overlay` (`test/overlay.mjs`) runs the WHOLE capstone suite a second time
+  against the repo ROOT `Pick.js`/`Pool.js`/`*.d.ts` in a throwaway temp copy (node_modules copied, lite-pick
+  overwritten, sha256-verified it took AND every overlaid file confirmed to resolve INSIDE the temp tree -- so
+  a nested `node_modules/@zakkster/lite-pick` symlink can never be written through -- fail closed, exit 2),
+  printing an info line naming the files that differ from the pinned release (the expected dev skew -- Pool.js,
+  while the published 1.1.0 stays pinned). `--root <dir>` overrides the kernel tree (a `--root` with no path
+  exits 2); an unknown flag exits 2 with a did-you-mean; the temp dir is always removed, even on a fail-closed
+  abort. `npm run overlay:teeth` (`test/overlay-teeth.mjs`) is the must-fail control: a clean root overlays to
+  exit 0, a mutant root Pool.js makes the overlaid suite fail (non-zero, naming the G8 gate), a root missing
+  Pool.js exits 2, and a symlinked lite-pick's scratch TARGET is byte-unchanged after a full run (the overlay
+  rebuilds lite-pick from the real pinned install inside its temp tree, never through the link). The CI capstone job runs
+  `overlay`, `overlay:teeth` and `shutdown:real`, drops the fixed `SMOKE_RATE` (the rate is now measured) and
+  adds a 5x `SMOKE_OVERLOAD` smoke step; it still needs only `pickEcosystem/live` installed.
+- **Two CI-robustness fixes carried in the tree.** `test/SoakReport.test.js` now skips only on Node < 20 with
+  the soak devDependencies absent (the no-install Node 18 job); it had failed CI because its fixture helper
+  accepted exit 1 and hid an `ERR_MODULE_NOT_FOUND`, so it now requires the exact exit code AND a written
+  stream and prints stderr on mismatch. `pickEcosystem/live/test/browser-smoke.mjs` gives a silent Chrome
+  launch exactly one fresh-profile relaunch (exit status + stderr tail printed); page checks are never
+  retried (a CI run had seen no DevTools line in 20 s).
+
 ## [1.1.0] - 2026-10-05
 
 Kernel fixes, new API and observability, decided in `research/1.1.0-kernel-and-api.md` (D1-D8) and built in seven

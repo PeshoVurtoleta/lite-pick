@@ -22,7 +22,7 @@ import { bootKernel, DEFAULTS, STRATEGIES, ENGINE_A, ENGINE_B, STREAM_CAP } from
 import { LiveDriver } from './driver.js';
 import { S_OK, S_FAILED, S_FAILOVER, S_SHED } from './stats.js';
 import { workerState, WS_TAG, WS_LONG, WS_TONE, eventText, eventTone } from './narrate.js';
-import { calibrateUnitsPerMs, browserScene, FAULT_KEYS, rateUp, rateDown, applyFault } from './surface.js';
+import { calibrateUnitsPerMs, browserScene, FAULT_KEYS, rateUp, rateDown, applyFault, shutdownNote } from './surface.js';
 import { TourPlayer } from './tour.js';
 
 const N = DEFAULTS.workers;
@@ -306,14 +306,16 @@ function shutdown() {
         const c = kernel.stats.c;
         status('shut down: orchestrator exit code ' + code + (code === 0 ? ' (clean)' : '') + '; served ' + c[S_OK] +
             ', failed ' + c[S_FAILED], code === 0 ? 'ok' : 'bad');
-        note('every worker retired. Boot a fresh system to continue.');
+        note(shutdownNote(code));
         $btnReboot.hidden = false;
+        $btnReboot.disabled = !kernel.halted;   // a reboot is only safe once the kernel has actually halted
     });
 }
 
 function reboot() {
-    if (!stopping || exitCode === null) return;
+    if (k === null || !k.halted) return;         // only reboot a halted kernel (the shutdown has stopped everything)
     $btnReboot.hidden = true;
+    $btnReboot.disabled = false;
     start().catch(fail);
 }
 

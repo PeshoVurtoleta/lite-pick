@@ -124,20 +124,46 @@ if (chromePath === null) {
 const site = mkdtempSync(join(tmpdir(), 'pick-site-'));
 log('  site: ' + buildSite(site).length + ' files built into a temporary directory');
 const server = spawn(process.execPath, [SERVE, '--port', String(PORT), '--page', 'hub', '--root', site], { stdio: ['ignore', 'pipe', 'pipe'] });
-const profile = mkdtempSync(join(tmpdir(), 'pick-smoke-'));
+const profiles = [];
 let chrome = null;
 let code = 1;
+
+/**
+ * Start headless Chrome and resolve its DevTools URL. A runner's Chrome can stay silent at start-up (CI,
+ * 2026-10-05: no DevTools line in 20 s, where it normally takes ~1 s). That is a LAUNCH failure, not a page
+ * failure, so it gets exactly ONE relaunch on a fresh profile; each failed launch prints Chrome's exit
+ * status and stderr tail, and a second failure fails the smoke. Nothing about the page checks is retried.
+ */
+async function launchChrome() {
+    for (let attempt = 1; ; attempt++) {
+        const profile = mkdtempSync(join(tmpdir(), 'pick-smoke-'));
+        profiles.push(profile);
+        chrome = spawn(chromePath, [
+            '--headless=new', '--remote-debugging-port=0', '--user-data-dir=' + profile, '--no-first-run',
+            '--no-default-browser-check', '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+            '--disable-backgrounding-occluded-windows',
+            // CI containers often cannot use Chrome's user-namespace sandbox; a local run keeps it.
+            ...(process.env.CI && process.platform === 'linux' ? ['--no-sandbox'] : []),
+            'about:blank',
+        ], { stdio: ['ignore', 'ignore', 'pipe'] });
+        let tail = '';
+        chrome.stderr.on('data', (d) => { tail = (tail + d.toString()).slice(-1500); });
+        try {
+            return await waitFor(chrome.stderr, /DevTools listening on (ws:\/\/\S+)/, 20000, 'Chrome');
+        } catch (e) {
+            const proc = chrome;
+            proc.kill('SIGKILL');
+            chrome = null;
+            log('  Chrome launch ' + attempt + ' failed: ' + e.message + ' (exit ' + proc.exitCode + ', signal ' + proc.signalCode + ')');
+            log('  Chrome stderr tail: ' + (tail.trim() || '(empty)'));
+            if (attempt >= 2) throw e;
+        }
+    }
+}
+
 try {
     await waitFor(server.stdout, /open\s+http/, 10000, 'the static server');
-    chrome = spawn(chromePath, [
-        '--headless=new', '--remote-debugging-port=0', '--user-data-dir=' + profile, '--no-first-run',
-        '--no-default-browser-check', '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
-        '--disable-backgrounding-occluded-windows',
-        // CI containers often cannot use Chrome's user-namespace sandbox; a local run keeps it.
-        ...(process.env.CI && process.platform === 'linux' ? ['--no-sandbox'] : []),
-        'about:blank',
-    ], { stdio: ['ignore', 'ignore', 'pipe'] });
-    const m = await waitFor(chrome.stderr, /DevTools listening on (ws:\/\/\S+)/, 20000, 'Chrome');
+    const m = await launchChrome();
     const ws = new WebSocket(m[1]);
     await new Promise((resolve, reject) => { ws.addEventListener('open', resolve); ws.addEventListener('error', reject); });
     const cdp = new Cdp(ws);
@@ -271,7 +297,7 @@ try {
 } finally {
     if (chrome !== null) chrome.kill();
     server.kill();
-    try { rmSync(profile, { recursive: true, force: true }); } catch { /* best effort */ }
+    for (const p of profiles) { try { rmSync(p, { recursive: true, force: true }); } catch { /* best effort */ } }
     try { rmSync(site, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 if (code === 0) process.stdout.write('ok\n', () => process.exit(0));

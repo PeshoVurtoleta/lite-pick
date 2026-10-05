@@ -31,6 +31,7 @@ import { bootVirtual } from './virtual.js';
 import { LiveDriver } from './driver.js';
 import { workerState, WS_TAG, WS_TONE, eventText, eventTone } from './narrate.js';
 import { FAULT_KEYS, rateUp, rateDown, applyFault } from './surface.js';
+import { calibrateUnitsPerMs } from './calibrate.js';
 import { TourPlayer } from './tour.js';
 
 const FRAME_MS = 84;            // ~12 Hz
@@ -127,6 +128,7 @@ async function runScripted(argv) {
     });
     let kernel, step;
     if (argv.indexOf('--real') >= 0) {
+        config.unitsPerMs = calibrateUnitsPerMs(() => performance.now(), 80);   // real threads only (virtual keeps the reference)
         kernel = await bootKernel({ lp, poolMod, wp, spawn: nodeSetSpawn, now: () => performance.now(), timers: 'real', config });
         step = (ms) => new Promise((r) => setTimeout(r, ms));
     } else {
@@ -143,7 +145,9 @@ async function runScripted(argv) {
     await step(1000);                                   // warm the rings
     for (let f = 0; f < 6; f++) { await step(FRAME_MS); drv.beginFrame(FRAME_MS / 1000); snap.build(drv); det.evaluate(snap); }
     process.stdout.write('pool-scope LIVE scripted -- ' + (argv.indexOf('--real') >= 0 ? 'real threads' : 'virtual workers') +
-        ' strategy=' + config.strategy + ' rate=' + config.rate + ' frames=' + frames + '  data-path=' + dataBpo.toFixed(2) + ' B/op\n');
+        ' strategy=' + config.strategy + ' rate=' + config.rate + ' frames=' + frames +
+        (config.unitsPerMs ? ' ~' + (config.unitsPerMs / 1000).toFixed(0) + 'k units/ms' : '') +
+        '  data-path=' + dataBpo.toFixed(2) + ' B/op\n');
     if (argv.indexOf('--tour') >= 0) drv.tour.start(kernel.engine.now());
     let shownStrategy = kernel.balancers.name;
     for (let f = 0; f < frames; f++) {
@@ -171,6 +175,7 @@ async function runScripted(argv) {
 
 async function runInteractive(argv) {
     const config = { strategy: argVal(argv, '--strategy', 'p2c'), rate: Number(argVal(argv, '--rate', 2000)) };
+    config.unitsPerMs = calibrateUnitsPerMs(() => performance.now(), 80);   // real threads only (virtual keeps the reference)
     const kernel = await bootKernel({ lp, poolMod, wp, spawn: nodeSetSpawn, now: () => performance.now(), timers: 'real', config });
     const drv = new TuiDriver(kernel, kernel.engine.now());
     const snap = new LitePickSnapshot(kernel.cfg.workers);

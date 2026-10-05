@@ -92,11 +92,13 @@ jobs:
           '
 
   # The capstone's headless kernel (pickEcosystem/live, research/capstone-P1-spec.md F8): its own package.json
-  # pins the published bricks (lite-pick 1.1.0, lite-worker-pool 1.1.0, the di-* line); `npm test` runs the
-  # gates over virtual workers (deterministic) plus one suite against THIS working tree's Pick.js / Pool.js, so a
-  # kernel change cannot silently break the capstone; `npm run smoke` is ~20 s over real worker_threads with
-  # every fault once (a lower rate for the 2-core runner); `npm run browser-smoke` serves the P3 page and drives
-  # it in the runner's Chrome (headless, over the DevTools protocol) against the pinned esm.sh modules.
+  # pins the published bricks (lite-pick 1.1.0, lite-worker-pool 1.1.0, the di-* line). `npm test` runs the gates
+  # over virtual workers (deterministic); G10 re-runs G1 + G2 against THIS working tree's Pick.js, and the kernel
+  # OVERLAY (below) re-runs the whole suite against the repo ROOT Pick.js / Pool.js, so a kernel change cannot
+  # silently break the capstone. `npm run smoke` MEASURES this host's saturating throughput with a throwaway
+  # probe, then runs at half of it over real worker_threads with every fault once (the probe sweep and the
+  # flaky-breaker wait each take up to ~12 s, so the run is well over a minute); `npm run browser-smoke` serves
+  # the P3 page and drives it in the runner's Chrome (headless, over the DevTools protocol) against pinned esm.sh.
   capstone:
     name: capstone (pickEcosystem/live, node 22)
     runs-on: ubuntu-latest
@@ -112,9 +114,23 @@ jobs:
           cache-dependency-path: pickEcosystem/live/package-lock.json
       - run: npm ci
       - run: npm test
+      # Kernel overlay (B4): run the SAME capstone suite a second time against the repo ROOT Pick.js/Pool.js
+      # (sha256-verified, each overlaid file confirmed to resolve INSIDE the temp tree, info line names the files
+      # that differ from pinned 1.1.0), then its must-fail controls (a clean root -> exit 0; a mutant root Pool.js
+      # -> non-zero naming G8; a root missing Pool.js -> exit 2; a symlinked lite-pick whose scratch target stays
+      # byte-unchanged). Needs only live/node_modules.
+      - run: npm run overlay
+      - run: npm run overlay:teeth
+      # P3 graceful shutdown over REAL worker_threads: clean (code 0) + DEADLINE (code 2), each with a sabotage
+      # control; the terminate-counting spawn wrapper proves every thread is retired.
+      - run: npm run shutdown:real
+      # The run RATE is MEASURED (a throwaway probe finds this host's saturating throughput); the smoke then runs
+      # at half that (headroom). A second run at 5x overload proves the admission path sheds (and still loses no
+      # request outside a fault window).
+      - run: npm run smoke
       - run: npm run smoke
         env:
-          SMOKE_RATE: '600'
+          SMOKE_OVERLOAD: '5'
       - run: npm run browser-smoke
       # P5: every heartbeat gate and invariant tripped by a planted defect through the real harness (~20 s, virtual
       # workers); the long real-thread heartbeat itself runs in soak-nightly.yml.

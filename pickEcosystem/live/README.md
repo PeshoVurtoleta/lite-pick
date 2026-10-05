@@ -129,25 +129,51 @@ cycles 50 and 350 puts 75 KB of its 79 KB in compiled code (V8 optimizing more f
   Engine B (`/pool` + `submit`, a Promise per request) ~2.9 KB/request. Over real threads Node's MessagePort
   adds ~1.1-1.4 KB/job (measured in lite-worker-pool 1.1.0) -- the transport's, not this code's.
 - **One 10x-slow worker, 2000 req/s, p99:** PeakEWMA 10.1 ms, LeastConn 30.3 ms, P2C 40.0 ms, RoundRobin 340 ms.
-- **Faults, no failed request:** kill (failover + restart), 50% fail-fast (breaker opens, HalfOpen probe closes
-  it), hang (out at 500 ms, respawned at ~1 s), crash loop (escalated after 5 restarts), shutdown (every
-  in-flight request settles, exit 0). The real-thread smoke run: ~16,000 requests, 0 failed. One fault at a
-  time: with `tries: 2`, two overlapping faults can lose a request (a failover that lands on a second failing
-  worker), so the smoke timeline never overlaps them.
+- **Faults, no failed request OUTSIDE the fault's own window:** kill (failover + restart), 50% fail-fast
+  (breaker opens, HalfOpen probe closes it), hang (out at 500 ms, respawned at ~1 s), crash loop (escalated
+  after 5 restarts), shutdown (every in-flight request settles, exit 0). A fault MAY lose requests while it is
+  active -- those in-window failures are counted and printed, not gated; the gate is that no request fails
+  OUTSIDE a fault window and nothing sheds below capacity. The real-thread smoke run serves thousands of
+  requests with 0 failures outside any window. One fault at a time: with `tries: 2`, two overlapping faults can
+  lose a request (a failover that lands on a second failing worker), so the smoke timeline never overlaps them.
 - **Real threads:** 8 workers up in ~25 ms; ~1500 req/s at p50 ~1.95 ms on the reference machine.
 
 ## Gates
 
-`test/kernel.test.mjs` (G1-G10, each with a control that must fail), `test/alloc.test.mjs` (allocation rate by
-scavenge count; retention of 1000 supervised respawns and 200 scope rebuilds), `test/driver.test.mjs` (Pool
-Scope's real snapshot over the live system), `test/tui.test.mjs` (the live TUI scripted: fleet, decisions,
-shutdown; two runs byte-identical), `test/web.test.mjs` (W1-W6: import-map drift both ways, the browser's module
-graph, the DOM contract, the browser crash path, the device scene, the static server's allowlist),
-`test/site.test.mjs` (S1-S3: the site is exactly what the pages reach, the hub graph is the running kernel's, the
-hub's versions are package.json's), `test/tour.test.mjs` (U1-U2: the tour does what its captions say), `test/smoke.mjs` (real threads),
+`test/kernel.test.mjs` (G1-G13; most gates carry a control -- HEAD, a mutant, or an in-test sabotage -- that
+MUST fail, named below). The thirteen: G1 steady serves everything; G2 kill (failover + restart, eligible
+again -- control: `tries: 1` loses requests); G3 slow + PeakEWMA keeps the tail low where LeastConn and
+RoundRobin do not; G4 flaky (the breaker opens with no failed request and closes after healing -- control:
+breaker off); G5 hang (ineligible within 600 ms, respawned -- control: hang limits off); G6 crash loop
+(escalated after 5 restarts, reset brings it back -- control: a huge budget); G7 shutdown (drain, settle every
+in-flight request, exit 0, workers gone); **G8 switch** cycles all ten strategies, key affinity survives the
+switch, quiescence returns to 0 -- with four engine-B forwarder controls that each pass G8 but fail their own
+tooth: `mA` (drop the constructor marker -> no KEY/CLOCK fail-closed check), `mF` (unguarded recordRtt after a
+latency switch), `mP` (pick via the current balancer -> a keyed failover hands PeakEWMA the key as its clock),
+and the stale-pick (failover by lb0's frozen eligibility to a worker now down); G9 engine B (`/pool` + `submit`)
+serves the scene and survives a kill; G10 (F2) runs G1 + G2 against the repo's working-tree `Pick.js`;
+**G11 (clean + deadline)** graceful shutdown stops the cron and retires every worker (sabotage controls: a
+no-op `halt`, a no-op `set.dispose`); **G12 (both engines)** a crash-on-probe is released, restarted, and closes
+(HEAD + a no-D1-branch mutant fail); **G13 (both engines)** admission -- a 5x overload sheds with no failure or
+breaker event, half capacity sheds nothing (control: HEAD -- no admission at all, so the 5x overload FAILS ~54k requests and sheds none); outage --
+a whole-fleet outage FAILS requests, never sheds (control: the admission guard's `live !== 0` check removed);
+ran-and-failed -- a request that ran and then met a full queue is a failure not a shed (control: engine B's
+`ran` flag never set; the engine-A case is a regression guard -- engine A already classes it correctly).
+`test/alloc.test.mjs` (A1 engine A < 8 B/request and **A1b** < 8 B/arrival under 5x overload, both by scavenge
+count -- A2 engine B is the must-fail instrument control; retention **R1** 1000 supervised respawns, **R2** 200
+scope rebuilds, **R3** 20 boot/deadline-shutdown cycles, each with a pin-everything control). This alloc suite
+IS the package's torture harness (lite-leak retention kernels + the PerfGate scavenge-count method), run in
+`npm test`. `test/driver.test.mjs` (Pool Scope's real snapshot), `test/tui.test.mjs` (the live TUI scripted;
+two runs byte-identical), `test/web.test.mjs` (W1-W6), `test/site.test.mjs` (S1-S3), `test/tour.test.mjs`
+(U1-U2), `test/smoke.mjs` (real threads, measured rate; `SMOKE_OVERLOAD=5` proves the shed path),
+`test/shutdown-real.mjs` (`npm run shutdown:real`: clean + deadline over real worker_threads, each with a sabotage control),
+`test/overlay.mjs` (the kernel OVERLAY: the whole suite re-run against the repo ROOT kernel, sha256-verified and
+every overlaid file confirmed to resolve INSIDE the throwaway tree -- never written through a nested
+`node_modules/@zakkster/lite-pick` symlink; must-fail controls in `test/overlay-teeth.mjs` -- a mutant root
+Pool.js -> non-zero naming the G8 gate, a root missing Pool.js -> exit 2, and a symlinked lite-pick whose scratch
+link TARGET must be byte-unchanged after a full overlay run, with a clean-root exit-0 control),
 `test/heartbeat-teeth.mjs` + `test/heartbeat.mjs` (above), `test/browser-smoke.mjs` (the BUILT site in
-headless Chrome over the DevTools protocol, zero dependencies: the hub and its links; the live page booted, the tour,
-kill / crash / flaky through its own keys -- one fault at a time, each worker back in rotation before the next --
-engine B, a strategy switch, a window narrowed after mount, graceful shutdown with exit code 0, no failed request;
-the simulated page; no console error). G10 runs the
-gates against the repo's working-tree `Pick.js`, so a lite-pick change cannot silently break the capstone.
+headless Chrome over the DevTools protocol, zero dependencies: the hub and its links; the live page booted, the
+tour, kill / crash / flaky through its own keys -- one fault at a time, each worker back in rotation before the
+next -- engine B, a strategy switch, a window narrowed after mount, graceful shutdown with exit code 0, no
+failed request; the simulated page; no console error).

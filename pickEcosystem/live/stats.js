@@ -9,7 +9,7 @@ export const S_ARRIVED = 0;     // requests offered by the traffic generator
 export const S_OK = 1;          // requests that completed
 export const S_FAILED = 2;      // requests that failed after their last attempt
 export const S_FAILOVER = 3;    // second attempts (a different worker)
-export const S_SHED = 4;        // refused at admission: the request table was full
+export const S_SHED = 4;        // shed for capacity: at admission (pending >= live x (slots+queue)), or a never-placed request found every queue full
 export const S_NONE = 5;        // no eligible worker (PICK_NONE)
 export const S_REFUSED = 6;     // set.post refused (queue full / not READY) -- counted per attempt
 export const S_DRAINED = 7;     // offered while draining (shutdown)

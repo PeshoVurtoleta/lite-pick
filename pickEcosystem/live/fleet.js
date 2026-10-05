@@ -14,7 +14,10 @@
  * `tick(now)` (20 Hz, lite-di-cron) is the ONLY eligibility writer: up(i) = health ready AND the breaker
  * allows, applied through `setEligible` only on a change. It also turns a dead worker into a supervisor
  * fault, and a job hung past F4's 1 s into a kill (then a fault). Worker deaths are not breaker failures
- * (the supervisor owns them); a transform failure is.
+ * (the supervisor owns them); a transform failure is. A probe lost to a no-verdict reply (worker down /
+ * disposed, queue full, not ready) releases the HalfOpen probe WITHOUT a breaker verdict -- the breaker
+ * stays HalfOpen and the next tick re-admits a probe once the worker is healthy again (a respawn clears
+ * it too), so a crash-on-probe never strands a worker ineligible.
  */
 
 import { Supervisor, STATES as SUP } from '@zakkster/lite-di-supervisor';
@@ -143,6 +146,7 @@ export class Fleet {
             await this.set.respawn(i);
         }
         this.fails[i] = 0;
+        this.probeOut[i] = 0;    // a respawn clears any probe the dead worker still held
         return i;
     }
 
@@ -156,7 +160,10 @@ export class Fleet {
     }
 
     onResult(i, ok, code) {
-        if (code === 'LWP_WORKER_DOWN' || code === 'LWP_DISPOSED') return;   // the supervisor's, not the breaker's
+        if (!ok && (code === 'LWP_WORKER_DOWN' || code === 'LWP_DISPOSED' || code === 'LWP_QUEUE_FULL' || code === 'LWP_NOT_READY')) {
+            if (this.bState[i] === B_HALF) this.probeOut[i] = 0;   // no verdict: release the HalfOpen probe
+            return;                                                // the supervisor's / capacity's, not the breaker's
+        }
         const st = this.bState[i];
         if (st === B_CLOSED) {
             if (ok) { this.fails[i] = 0; return; }

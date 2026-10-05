@@ -821,3 +821,60 @@ test('C3 (N2): an unmarked balancer given BOTH key and clock gets pick(key), and
     assert.equal(duck.rtts, 1, 'latency feedback still fed on settle');
     for (let i = 0; i < 2; i++) assert.equal(inflight[i], 0);
 });
+
+// =====================================================================================
+// F1 boundary: attempt 0 is held in scalars (d0/e0/n0). A duck-typed balancer may return ANY value from
+// pick() -- not just an index or PICK_NONE. Every note(i,+1) must be paired with note(i,-1) (same value,
+// Object.is) and inflight must be left balanced, whether the run succeeds, throws, or fails over.
+// =====================================================================================
+
+class FixedPick {
+    constructor(n, v) { this.capacity = n; this.live = n; this.v = v; this.notes = []; }
+    pick() { return this.v; }
+    isEligible() { return true; }
+    note(i, d) { this.notes.push([i, d]); }
+}
+
+test('F1: a non-sentinel pick() (undefined/NaN/-2/\'x\'/null/-0/out-of-range/...) pairs every note(+1) with note(-1), inflight balanced', async () => {
+    const n = 4;
+    const values = [0, 1, n - 1, n, n + 1, 2 ** 32, '', null, undefined, NaN, -0, -2, 'x', '0', 1.5];
+    const fnErr = new Error('f1-attempt-fail');
+    for (const v of values) {
+        const label = Object.is(v, -0) ? '-0' : typeof v === 'string' ? JSON.stringify(v) : String(v);
+        for (const shape of ['ok', 'throw', 'failover']) {
+            const inflight = new Uint32Array(n);
+            const bal = new FixedPick(n, v);
+            const pool = new Pool(bal, inflight);
+            let calls = 0;
+            let first;
+            const fn = (i) => {
+                if (calls++ === 0) {
+                    first = i;
+                    assert.ok(bal.notes.length === 1 && Object.is(bal.notes[0][0], v) && bal.notes[0][1] === 1,
+                        label + '/' + shape + ': note(+1) landed for attempt 0 before fn ran');
+                    if (shape !== 'ok') throw fnErr;
+                }
+                return 'ok';
+            };
+            const p = pool.run(fn, { tries: shape === 'failover' ? 2 : 1 });
+            if (shape === 'throw') await assert.rejects(p, (e) => e === fnErr);
+            else assert.equal(await p, 'ok');
+            assert.ok(Object.is(first, v), label + '/' + shape + ': fn received the value pick() returned');
+            const pending = [];
+            let plus = 0, minus = 0;
+            for (const [i, d] of bal.notes) {
+                if (d === 1) { plus++; pending.push(i); continue; }
+                minus++;
+                const k = pending.findIndex((x) => Object.is(x, i));
+                assert.ok(k >= 0, label + '/' + shape + ': note(' + String(i) + ', -1) has no matching note(+1)');
+                pending.splice(k, 1);
+            }
+            assert.equal(plus, shape === 'failover' ? 2 : 1, label + '/' + shape + ': dispatch count');
+            assert.equal(minus, plus, label + '/' + shape + ': every note(+1) is paired with a note(-1)');
+            assert.equal(pending.length, 0, label + '/' + shape + ': no unpaired note(+1)');
+            for (const key of Object.keys(inflight)) {
+                assert.equal(inflight[key], 0, label + '/' + shape + ': inflight[' + key + '] left at ' + inflight[key]);
+            }
+        }
+    }
+});

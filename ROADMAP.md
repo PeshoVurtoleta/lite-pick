@@ -219,6 +219,18 @@ The zero-GC proof is TWO complementary tools, kept separate exactly as lite-o1 d
   byteLength) that must show a 0 delta (fixed capacity never reallocates). MUST include a
   `mustFail` scenario (e.g. a `pick()` variant that builds a fresh array per call) that TRIPS the
   gate -- proving the instrument has teeth. This is the node:test-native COMPLEMENT to torture.
+- **Pool.run async cost gate:** `npm run test:perf:pool` (`test/perf/PoolCost.test.mjs`, same pinned
+  1 MiB young gen) -- the kernel `pick()` is 0 B/op but `Pool.run` is a normal async function and is
+  NOT. A ladder (`test/perf/pool-cost-lanes.mjs`, one lane per child, FIXED 3,000,000-run warm-up;
+  `npm run bench:pool` prints it) attributes Pool's OWN share above the `await` driver floor L1 by
+  scavenge count -- attempt-0 (L3-L1, ~900 B/run) and each extra failover attempt (L6-L3, ~375 B/run)
+  -- and gates both at **`CEIL = measured share + 8 B` keyed by EXACT `process.version`** (`<= 912 B`
+  attempt-0 / `<= 1288 B` failover on v22.23.3). Teeth: an escaped boxed-double and an escaped
+  `{a:i}`/run control MUST trip both ceilings; a PROMOTE control MUST force an old-gen collection (the
+  oldGen==0 assertion is otherwise vacuous -- a retained, pretenured allocation does not show in B/run);
+  a retained-Pool control MUST keep the lite-leak tracker non-empty (else the no-Pool-outlives-its-cycle
+  check is blind). A `process.version` with no measured row fails closed, printing the shares
+  (decisions/0007 Amendment). The CI perf job is pinned to node 22.23.3.
 - **Throughput witness:** `test/witness.mjs` -- pick ops/ms stays within its flatness floor
   across the pool-size sweep (O(1)/O(d) does not decay with n).
 - **Balance quality (the anchor):** `test/balance.mjs` -- measured peak-to-average within

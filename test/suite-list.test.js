@@ -15,8 +15,9 @@
  * Guard 3 walks the WHOLE test/ tree (top-level AND every subdirectory), because the old
  * SUBDIRECTORY-only scan exempted the perf/ and types/ dirs WHOLESALE -- so a stray
  * test/perf/Extra.test.js or test/types/Extra.test.js passed the guard and was never run. Only the
- * two files that genuinely have their own runner are exempt now:
+ * files that genuinely have their own runner are exempt now:
  *   - test/perf/PerfGate.test.mjs  (run by `test:perf`, needs --expose-gc + pinned semi-space)
+ *   - test/perf/PoolCost.test.mjs  (run by `test:perf:pool`, same pinned flags)
  *   - any `*.test-d.ts`            (type-definition tests, run by `test:types` via tsc)
  *   - the test/types/consumer/ fixture's OWN files (index.ts, package.json, tsconfig*.json) -- that
  *     dir is WALKED, not skipped, so a stray suite planted inside it is still caught.
@@ -58,8 +59,11 @@ function looksLikeSuite(name) {
         /^test\.[cm]?js$/.test(n);               // a bare test.js/.mjs/.cjs
 }
 
-/** The ONLY nested file with its own runner (test:perf), exempt from the stray-suite scan. */
-const PERF_SUITE_REL = 'test/perf/PerfGate.test.mjs';
+/** The nested suites with their own runners (test:perf / test:perf:pool), exempt from the stray scan. */
+const PERF_SUITE_REL = new Set([
+    'test/perf/PerfGate.test.mjs',   // run by test:perf
+    'test/perf/PoolCost.test.mjs',   // run by test:perf:pool (Pool.run async cost gate)
+]);
 /**
  * The published-package TYPE fixture dir and the ONLY files it may legitimately contain. The dir is
  * WALKED (not skipped wholesale) so a stray suite planted there -- e.g. test/types/consumer/extra.test.js
@@ -110,7 +114,7 @@ function straySuites() {
             if (ent.isDirectory()) { walk(join(dir, ent.name), childRel + '/'); continue; }
             if (rel === TYPE_FIXTURE_DIR && isTypeFixtureFile(ent.name)) continue;  // fixture's own files
             if (!looksLikeSuite(ent.name)) continue;
-            if (childRel === PERF_SUITE_REL) continue;                 // run by test:perf
+            if (PERF_SUITE_REL.has(childRel)) continue;                // run by test:perf / test:perf:pool
             if (rel === 'test/' && SUITE_RE.test(ent.name)) continue;  // top-level standard suite: guards 1/2
             out.push(childRel);
         }
@@ -139,7 +143,7 @@ test('no test-looking file hides anywhere under test/ where no runner picks it u
     const strays = straySuites();
     assert.deepEqual(strays, [],
         'these test-looking files sit under test/ but no runner runs them (only ' +
-        'test/perf/PerfGate.test.mjs, *.test-d.ts and the test/types/consumer/ fixture are ' +
+        'test/perf/PerfGate.test.mjs, test/perf/PoolCost.test.mjs, *.test-d.ts and the test/types/consumer/ fixture are ' +
         'exempt): ' + strays.join(', '));
 });
 

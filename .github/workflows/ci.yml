@@ -51,13 +51,19 @@ jobs:
   # The heavy, timing-sensitive gates on one pinned runner. test:perf pins its own semi-space
   # flags in the script; torture needs --expose-gc (also in the script).
   gates:
-    name: gates (node 22 / ubuntu)
+    name: gates (node 22.23.3 / ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # Pinned to EXACT 22.23.3: test:perf:pool keys its per-run byte ceilings (CEIL = measured
+          # share + 8 B) by process.version, so the Pool cost gate must run on the version those rows
+          # were measured on. This also pins parity / torture / test:perf / test:perf:noinline /
+          # bench:verify + the tarball check (all version-robust 0 B/op gates). A patch bump here must
+          # re-measure the Pool cost rows (npm run bench:pool) and add a SHARES row, or the gate fails
+          # closed. The unit-test matrix (node 20/22/24) is a separate job and is unaffected.
+          node-version: 22.23.3
           cache: npm
       - run: npm ci
       # S6: shipped code (Pick/Pool .js/.d.ts) + the soak's invariant oracle must match their committed
@@ -68,6 +74,10 @@ jobs:
       # 1.1.0 B6: the same gate with V8 inlining OFF -- the worst case, a caller V8 will not inline into. Every
       # lane must still be 0 B/op (research/1.1.0-buffer-apis.md: the From methods + the self-contained PRNG).
       - run: npm run test:perf:noinline
+      # Pool.run async cost gate: Pool's own shares (attempt-0 L3-L1, failover L6-L1, by scavenge count)
+      # stay <= CEIL (measured share + 8 B, keyed by this exact process.version = v22.23.3); the box and
+      # object teeth trip, old-gen is 0, and no Pool outlives its cycle (decisions/0007 Amendment).
+      - run: npm run test:perf:pool
       - run: npm run bench:verify
       - name: tarball is exactly the 11 whitelisted files
         run: |

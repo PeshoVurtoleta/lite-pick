@@ -49,6 +49,8 @@
     "fuzz": "node test/fuzz.mjs",
     "test:perf": "node --expose-gc --min-semi-space-size=1 --max-semi-space-size=1 --test test/perf/PerfGate.test.mjs",
     "test:perf:noinline": "node --expose-gc --min-semi-space-size=1 --max-semi-space-size=1 --max-inlined-bytecode-size=0 --test test/perf/PerfGate.test.mjs",
+    "test:perf:pool": "node --expose-gc --min-semi-space-size=1 --max-semi-space-size=1 --test test/perf/PoolCost.test.mjs",
+    "bench:pool": "node benchmark/PoolCost.mjs",
     "bench": "node benchmark/Matrix.mjs",
     "bench:gc": "node --expose-gc benchmark/GcBlastRadius.mjs",
     "bench:fairness": "node benchmark/Fairness.mjs",
@@ -65,7 +67,7 @@
     "scope": "node --expose-gc demo/pool-scope/tui.mjs",
     "scope:frames": "node --expose-gc demo/pool-scope/tui.mjs --frames 40 --scenario flapstorm",
     "scope:web": "node demo/pool-scope/web/serve.mjs",
-    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run balance && npm run fuzz && npm run test:perf && npm run test:perf:noinline"
+    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run balance && npm run fuzz && npm run test:perf && npm run test:perf:noinline && npm run test:perf:pool"
   },
   "keywords": [
     "load-balancer",

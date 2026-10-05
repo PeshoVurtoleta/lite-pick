@@ -446,7 +446,14 @@ duck-typed and imports NOTHING from lite-query.
     backwards-stepping finite reading records NO sample and resolves normally. `opts.failurePenaltyNs`
     (finite > 0, default 1e9) is the minimum penalty rtt; a penalized node is re-probed roughly every
     `tauNs x ln(failurePenaltyNs / healthyRttNs)`. NOT a 0 B/op path (the kernel `pick()` is): a normal
-    async wrapper adding O(1) counter ops + one small per-run array. BOUNDARY: Pool owns SPATIAL
+    async function. A run that settles on ATTEMPT 0 (any `tries`) costs ~900 B/run (Node 22 v22.23.3,
+    Pool's own share above the bare-await driver floor, by scavenge count; `npm run bench:pool`), gated
+    <= 912 B/run; each extra failover attempt adds ~375 B/run (gated too); a latency-aware balancer
+    (PeakEWMA) driven by an epoch-ns clock adds ~32 B/run more per attempt (Node 22; the clock boxes) and
+    is gated on its own `clocked` row. Abort-before-dispatch is NOT cheaper than a successful run
+    (ungated, above L3). Your fn's closure, promise and I/O come on top -- a submit-shaped fn adds ~310
+    B/run (ladder L10-L3); the capstone's full request wiring measured ~2.9 KB/request end to end on
+    1.1.0, before this change. For 0 B/request use the hand-wired pickFrom + settle recipe. BOUNDARY: Pool owns SPATIAL
     failover; the caller / query cache owns TEMPORAL retry (decisions/0007).
 - `liteQueryFetcher(pool, perEndpoint, opts?)` -> a `({ key, signal }) => Promise` fetcher for a
   query cache (lite-query's `fetcher`, or any fetcher-shaped consumer). `perEndpoint({ endpoint,

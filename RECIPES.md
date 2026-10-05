@@ -513,8 +513,15 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
   clock or a key `>= 2^31` allocates ~16 B/op (transient, does not retain, does not force
   a major GC). The 1.1.0 `pickFrom` / `recordRttFrom` siblings read those numbers from your
   typed-array slots and are 0 B/op even when V8 does not inline them. See section 8/9.
-- The only async allocation is the promise your own `fn` already creates (disclosed;
-  `Pool.run` adds O(1) integer ops plus one small per-run array).
+- `Pool.run` is a normal async function. A run that settles on **attempt 0** (any `tries`) costs
+  ~900 B/run (Node 22 v22.23.3, Pool's own share above the bare-await driver floor, by scavenge
+  count; `npm run bench:pool`), gated <= 912 B/run; each extra failover attempt adds ~375 B/run
+  (gated too); a latency-aware balancer (PeakEWMA) driven by an epoch-ns `clock` adds ~32 B/run more
+  per attempt (Node 22; the clock boxes) and is gated on its own row. Abort-before-dispatch is **not**
+  cheaper than a successful run (ungated, above L3). Your `fn`'s closure, promise and I/O come on top --
+  a submit-shaped `fn` adds ~310 B/run (ladder L10-L3); the capstone's full request wiring measured
+  ~2.9 KB/request end to end on 1.1.0, before this change. For 0 B/request, use the hand-wired
+  `pickFrom` + settle recipe (sections 8/9) instead of the Pool wrapper.
 - Fixed capacity: the pool size is set at construction and the backing arrays never
   reallocate.
 

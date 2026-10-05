@@ -6,10 +6,68 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
-Tests and one RECIPES sentence; no library code changes.
+Tests, docs, and one hot-path fix (F1) to `Pool.run`. The published "O(1) counter ops + one small
+per-run array" cost claim for `Pool.run` was wrong; it is now measured, gated, and corrected everywhere.
+
+### Changed
+
+- **`Pool.run` keeps the attempt-0 path in scalars (F1).** A run that never fails over holds attempt
+  0's dispatched flag, endpoint and landed-note flag in locals `d0`/`e0`/`n0` (`d0` is a SEPARATE
+  dispatched flag, so `e0` is never used as a truthiness test -- a duck-typed balancer may return
+  undefined / NaN / a negative / a non-number, which an `e0 >= 0` test would mis-handle); the
+  `held`/`noteApplied` arrays are built LAZILY (with `push`, not a `[e0]` literal that would reallocate
+  on the first failover) only when a second attempt begins. So a run that settles on attempt 0 (incl. a
+  `tries >= 2` pool's common success-on-attempt-0 path, lane L6S) allocates no per-run bookkeeping
+  array. The diagnostics_channel publishers now take `(endpoint, attempt)` scalars instead of reading
+  them off `held`. Behaviour is byte-identical: a golden trace (every balancer x tries 1/2/3 x
+  success/throw/abort/no-endpoint/feedback-failure/throwing-note, both channels subscribed, PLUS
+  non-sentinel picks, a throwing note(+1) on a failover attempt, a throwing cleanup note(-1), a throwing
+  subscriber, a nested run, and PICK_NONE / scan exhaustion on a later attempt) has an UNCHANGED sha256
+  HEAD vs the working tree, and every suite passes with no test edits. Measured attempt-0 saving ~344
+  B/run (Node 26) / ~350 B/run (Node 22); ~10% faster per run on Node 22, ~3-5% on Node 26 (best-of-5 of
+  2M awaited attempt-0 runs). **Trade-off, NOT gone:** because 1.1.0 allocated the arrays on every run,
+  an ACTUAL one-failover run (attempt 0 throws, lane L6) now costs **~67 B/run MORE than 1.1.0 on Node
+  26** (1324.2 vs 1257.5) and **~16 B/run LESS on Node 22** (1484.5 vs 1500.2). A variant that allocates
+  the arrays up front when `tries > 1` removes the Node-26 failover cost but regresses the common
+  success-on-attempt-0 path (L6S) back to 1.1.0, so it was rejected (save on every success, pay ~67 B
+  only on the rare Node-26 failover). The gate pins L6 at its F1 value so failover cannot regress further.
+
+### Fixed
+
+- **The `Pool.run` cost claim was false and is corrected everywhere.** The class doc, README (x2),
+  llms.txt, RECIPES and ADR 0007 all claimed `Pool.run` adds "O(1) counter ops + one small per-run
+  array" and implied a near-free async layer. `Pool.run` is a normal async function: its promise,
+  frame and one await per attempt are an inherent per-run cost. Measured by scavenge count under a
+  pinned 1 MiB young generation (allocation RATE, not retained delta), Pool's OWN share above the
+  bare-await driver floor L1 is, after F1: **attempt-0 L3 - L1 = ~900 B/run** (Node 22 v22.23.3 904.0;
+  Node 26 865.9) and **each extra failover attempt L6 - L3 = ~375 B/run**. ADR 0015's ~1331 B/run was a
+  FULL-run P2C figure (counts `fn` AND the driver's await loop), NOT Pool's own share; the like-for-like
+  is HEAD's L3 - L1 (~1254 B/run on Node 22) falling to F1's ~904. The docs now state the measured
+  numbers, the gate (attempt-0 `<= 912 B`/run and failover `<= 1288 B`/run on Node 22), what a
+  submit-shaped caller adds (~310 B/run), and the 0-B/request alternative (hand-wired `pickFrom` + settle).
 
 ### Added
 
+- **A Pool.run async cost gate + ladder benchmark.** `npm run bench:pool`
+  (`benchmark/PoolCost.mjs` driving `test/perf/pool-cost-lanes.mjs`, one lane per child process, after a
+  FIXED 3,000,000-run warm-up) prints the full ladder by scavenge count under a pinned 1 MiB young
+  gen, plus the attempt-0 share (L3-L1), the failover share (L6-L1), the per-extra-attempt cost
+  (L6-L3), and the caller add (L10-L3). `npm run test:perf:pool` (`test/perf/PoolCost.test.mjs`,
+  appended to `verify` and the CI Node 22 perf job, which is pinned to node 22.23.3) asserts L0 is 0,
+  attempt-0 L3-L1 `<= CEIL.attempt0`, failover L6-L1 `<= CEIL.failover`, and clocked L8b-L1 `<=
+  CEIL.clocked` (a latency-aware balancer driven by a 1.7e15 epoch-ns clock, which V8 boxes at the
+  pick()/recordRtt boundary -- ~32 B/run more than L3 on Node 22, ~63 on Node 26) where **`CEIL =
+  measured share + 8 B` keyed by EXACT `process.version`** (attempt0/failover/clocked = 912 / 1288 /
+  944.2 on v22.23.3, 873.9 / 1284.3 / 936.8 on v26.8.2; the Node-26 failover lane L6 is bimodal under
+  CPU contention and its row pins the upper mode); escaped boxed-double (`PL_BOX`/`PL_BOX6`/`PL_BOX8b`)
+  and escaped-`{a:i}` (`CTRL_OBJ`/`CTRL_OBJ6`) teeth that MUST trip their ceilings, L9 (both channels
+  subscribed) == L3, a PROMOTE control that MUST force an old-gen collection (so the oldGen==0 assertion
+  is not vacuous -- a retained, pretenured per-run allocation does not show in B/run), old-gen 0 in every
+  real window, no Pool outlives its cycle (lite-leak, 50 x 1000 mixed-shape runs, in-flight drains to 0)
+  with a deliberately-retained-Pool control that MUST keep the tracker non-empty, and the gated ceiling
+  literal present at every doc site. Abort-before-dispatch (L7) is ungated and ABOVE a successful run, so
+  abort is never quoted as cheap. A `process.version` with no measured row fails closed, printing the
+  shares. See decisions/0007 (Amendment).
 - **`test/LognSeam.test.js` and a PerfGate lane pin the RECIPES section 17 snippet.** `@zakkster/lite-logn` is a
   devDependency (never a peer; `peerDependencies` stays `{}`). The snippet is extracted from RECIPES.md and run
   verbatim (`test/recipe17.mjs`): it fails closed, every pick equals a brute-force lower bound through reweights

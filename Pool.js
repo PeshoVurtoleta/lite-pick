@@ -14,9 +14,17 @@
  * belongs to the caller / a query cache (lite-query's `retry`). The two never double-own: Pool
  * moves ACROSS the pool once; the caller retries the whole operation over TIME.
  *
- * ZERO-GC boundary: the kernel `pick()` is 0 B/op; `Pool.run` is a NORMAL async wrapper -- the
- * request it wraps already allocates a promise -- adding only O(1) integer counter ops per
- * attempt plus one small per-run bookkeeping array. It is NOT held to the kernel's 0 B/op bar.
+ * ZERO-GC boundary: the kernel `pick()` is 0 B/op. Pool.run is a normal async function and is NOT. A run
+ * that SETTLES ON ATTEMPT 0 (any `tries` value) costs ~900 B/run (Node 22 v22.23.3, Pool's own share
+ * above the bare-await driver floor, by scavenge count; `npm run bench:pool`), gated <= 912 B/run; each
+ * extra failover attempt adds ~375 B/run and is gated too (test/perf/PoolCost.test.mjs). A latency-aware
+ * balancer (PeakEWMA) driven by an epoch-ns `clock` costs ~32 B/run more per attempt (Node 22; the clock
+ * reading boxes, read twice per successful attempt) and is gated on its own `clocked` row. (Abort before
+ * dispatch is NOT cheaper than a successful run -- it is ungated and above L3.) Your fn's closure,
+ * promise and I/O come on top -- a submit-shaped fn adds ~310 B/run (ladder L10-L3); the capstone's full
+ * request wiring measured ~2.9 KB/request end to end on 1.1.0, before this change. For 0 B/request, use
+ * the hand-wired pickFrom + settle recipe. It is NOT held to the kernel's 0 B/op bar.
+ * (F1: a run that never fails over keeps attempt 0 in scalars and allocates no per-run bookkeeping array.)
  *
  * Duck-typed, zero HARD deps, zero peers: `liteQueryFetcher` returns a value shaped like
  * lite-query's `fetcher` (`({ key, signal }) => Promise`) WITHOUT importing lite-query, so
@@ -63,18 +71,19 @@ const _chSettle = _ch !== null ? _ch.settle : null;
  * A publish NESTED inside a subscriber (a subscriber that starts a run) gets a fresh object, so the outer
  * publish's remaining subscribers still read their own event.
  *
- * The endpoint and attempt number are read off the run's `held` array (the endpoints dispatched so far, newest
- * last), so run() itself only adds a guarded call per event. Measured with NOBODY subscribed (semi-space pinned
- * at 1 MB, 3.5M runs): the same bytes as 1.0.x (4443 scavenges both) and the same 57-register run() frame.
+ * The endpoint and attempt number are passed to the publisher as scalars (on a dispatching iteration the
+ * attempt index IS held.length - 1 when the failover array exists), so run() itself only adds a guarded
+ * call per event. With NOBODY subscribed the hasSubscribers guard is one property read and no message is
+ * built; the dispatch/settle cost is gated by test/perf/PoolCost.test.mjs (lane L9 == L3).
  */
 const _dMsg = { pool: null, endpoint: -1, attempt: 0, key: undefined, now: undefined };
 const _sMsg = { pool: null, endpoint: -1, attempt: 0, ok: false, error: undefined, aborted: false };
 let _dDepth = 0, _sDepth = 0;
 
 /** Publish a dispatch event (only called when the channel has subscribers). */
-function _pubDispatch(pool, held, key, now) {
+function _pubDispatch(pool, endpoint, attempt, key, now) {
     const m = _dDepth === 0 ? _dMsg : { pool: null, endpoint: -1, attempt: 0, key: undefined, now: undefined };
-    m.pool = pool; m.endpoint = held[held.length - 1]; m.attempt = held.length - 1; m.key = key; m.now = now;
+    m.pool = pool; m.endpoint = endpoint; m.attempt = attempt; m.key = key; m.now = now;
     _dDepth++;
     try {
         _chDispatch.publish(m);
@@ -85,9 +94,9 @@ function _pubDispatch(pool, held, key, now) {
 }
 
 /** Publish a settle event (only called when the channel has subscribers). */
-function _pubSettle(pool, held, ok, error, aborted) {
+function _pubSettle(pool, endpoint, attempt, ok, error, aborted) {
     const m = _sDepth === 0 ? _sMsg : { pool: null, endpoint: -1, attempt: 0, ok: false, error: undefined, aborted: false };
-    m.pool = pool; m.endpoint = held[held.length - 1]; m.attempt = held.length - 1;
+    m.pool = pool; m.endpoint = endpoint; m.attempt = attempt;
     m.ok = ok; m.error = error; m.aborted = aborted;
     _sDepth++;
     try {
@@ -98,11 +107,11 @@ function _pubSettle(pool, held, ok, error, aborted) {
     }
 }
 /** fn resolved. */
-function _pubSettleOk(pool, held) { _pubSettle(pool, held, true, undefined, false); }
+function _pubSettleOk(pool, endpoint, attempt) { _pubSettle(pool, endpoint, attempt, true, undefined, false); }
 /** fn threw (the endpoint's failure). */
-function _pubSettleErr(pool, held, error) { _pubSettle(pool, held, false, error, false); }
+function _pubSettleErr(pool, endpoint, attempt, error) { _pubSettle(pool, endpoint, attempt, false, error, false); }
 /** fn threw after the caller's signal aborted (a cancel, not the endpoint's fault). */
-function _pubSettleAbort(pool, held, error) { _pubSettle(pool, held, false, error, true); }
+function _pubSettleAbort(pool, endpoint, attempt, error) { _pubSettle(pool, endpoint, attempt, false, error, true); }
 
 /**
  * Distinct-endpoint re-pick bound (M2): after a failed attempt Pool re-picks up to this many times
@@ -334,8 +343,19 @@ export class Pool {
         const notes = typeof b.note === 'function';
         const useNow = clock !== undefined && !useKey;
 
-        const held = [];         // endpoints incremented this run == the endpoints TRIED (kept elevated)
-        const noteApplied = [];   // per-held: whether note(+1) actually landed (so finally never unpairs)
+        // F1: a run that SETTLES on attempt 0 (the common path, any `tries` value) stays in SCALARS --
+        // `d0` whether attempt 0 dispatched, `e0` its endpoint (ANY value the balancer returned, never
+        // used as a truthiness flag -- a duck-typed balancer may return undefined / NaN / a negative /
+        // a non-number, which an `e0 >= 0` test would mis-handle), and
+        // `n0` whether its note(+1) landed. The `held` / `noteApplied` arrays (endpoints TRIED this run,
+        // kept elevated; per-held whether note(+1) landed so finally never unpairs) are built LAZILY at
+        // the top of the first attempt>0 iteration, so a run that never fails over allocates neither.
+        // held[0] is always e0; held[1..] are the failover endpoints.
+        let d0 = false;          // did attempt 0 dispatch? (separate from e0 so e0 is never a flag)
+        let e0;                  // attempt-0 endpoint (whatever the balancer returned)
+        let n0 = false;          // attempt-0 note(+1) landed
+        let held = null;         // lazily [e0, ...failover] once a second attempt begins
+        let noteApplied = null;  // lazily [n0, ...] in lockstep with held
         let lastErr;
         try {
             for (let attempt = 0; attempt < tries; attempt++) {
@@ -364,6 +384,10 @@ export class Pool {
                 // does drive pick(now) for any other clocked run (M3 + nit 7).
                 let i = useKey ? b.pick(key) : (useNow ? b.pick(now) : b.pick());
                 if (attempt > 0) {
+                    // F1: materialise the failover arrays from attempt 0's scalars, once, here.
+                    // Build with push (not a [e0] literal): the literal would size the backing store to
+                    // 1 and reallocate on the first failover push, costing MORE than the pre-F1 [] + push.
+                    if (held === null) { held = []; held.push(e0); noteApplied = []; noteApplied.push(n0); }
                     // M2: genuinely DISTINCT failover. Re-pick while the result repeats a tried
                     // endpoint (bounded), then a scan for an eligible UNTRIED endpoint from a start that
                     // is key-derived (keyed: stable per key, spread across keys) or cursor-rotated.
@@ -388,16 +412,15 @@ export class Pool {
                 }
 
                 inflight[i] = (inflight[i] + 1) >>> 0;
-                held.push(i);
-                noteApplied.push(false);
+                if (held === null) { d0 = true; e0 = i; } else { held.push(i); noteApplied.push(false); }
                 if (notes) {
-                    // A throwing note(+1) propagates (loud); noteApplied stays false so the finally
+                    // A throwing note(+1) propagates (loud); the landed flag stays false so the finally
                     // never sends an UNPAIRED note(-1) for this dispatch (nit 8). inflight is released.
                     b.note(i, 1);
-                    noteApplied[noteApplied.length - 1] = true;
+                    if (held === null) { n0 = true; } else { noteApplied[noteApplied.length - 1] = true; }
                 }
                 // D7 (1.1.0): guarded -- with nobody subscribed this is one property read, no message is built.
-                if (_chDispatch !== null && _chDispatch.hasSubscribers) _pubDispatch(this, held, key, now);
+                if (_chDispatch !== null && _chDispatch.hasSubscribers) _pubDispatch(this, i, attempt, key, now);
 
                 let out;
                 let ok = false;
@@ -409,10 +432,10 @@ export class Pool {
                     // N1: a caller abort is not the endpoint's fault. Check it BEFORE the penalty, so a
                     // cancel never feeds the 1 s penalty into the EWMA (peak rule) or the pool mean.
                     if (signal && signal.aborted) {
-                        if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleAbort(this, held, err);
+                        if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleAbort(this, i, attempt, err);
                         throw err;                              // abort: stop failover, propagate
                     }
-                    if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleErr(this, held, err);
+                    if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleErr(this, i, attempt, err);
                     if (rtt) {
                         // H1 penalty feedback in its OWN try/catch: fn's error identity is preserved.
                         // Boolean flag, not a null sentinel: a hook that throws `null` is still a failure.
@@ -441,7 +464,7 @@ export class Pool {
                     continue;                                   // keep inflight[i] elevated, re-pick distinct
                 }
                 if (ok) {
-                    if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleOk(this, held);
+                    if (_chSettle !== null && _chSettle.hasSubscribers) _pubSettleOk(this, i, attempt);
                     if (rtt) {
                         // Settle feedback runs OUTSIDE the attempt's try/catch (never re-runs fn). If it
                         // fails, REJECT loudly with LITE_PICK_FEEDBACK carrying .cause and .result.
@@ -467,13 +490,23 @@ export class Pool {
             }
             throw lastErr;
         } finally {
-            for (let k = 0; k < held.length; k++) {
-                const j = held[k];
-                inflight[j] = inflight[j] > 0 ? inflight[j] - 1 : 0;
-                // Settle note(-1) ONLY for a dispatch whose note(+1) landed (nit 8), and swallow a
-                // cleanup-time throw so it never masks the error being thrown (identity preserved).
-                if (notes && noteApplied[k]) {
-                    try { b.note(j, -1); } catch { /* best-effort net-zero cleanup */ }
+            // F1: release attempt 0's endpoint (held[0] == e0) FIRST, then the failover endpoints
+            // held[1..] -- byte-for-byte the same order and the same net-zero as the pre-F1 held[0..]
+            // loop. Settle note(-1) ONLY for a dispatch whose note(+1) landed (nit 8), and swallow a
+            // cleanup-time throw so it never masks the error being thrown (identity preserved).
+            if (d0) {
+                inflight[e0] = inflight[e0] > 0 ? inflight[e0] - 1 : 0;
+                if (notes && n0) {
+                    try { b.note(e0, -1); } catch { /* best-effort net-zero cleanup */ }
+                }
+            }
+            if (held !== null) {
+                for (let k = 1; k < held.length; k++) {
+                    const j = held[k];
+                    inflight[j] = inflight[j] > 0 ? inflight[j] - 1 : 0;
+                    if (notes && noteApplied[k]) {
+                        try { b.note(j, -1); } catch { /* best-effort net-zero cleanup */ }
+                    }
                 }
             }
         }

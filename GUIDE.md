@@ -80,9 +80,22 @@ Both send load proportional to a configured integer weight. They differ in HOW a
   it pays SAMPLING VARIANCE). No accumulator to desync.
 
 Rule of thumb: **small-to-medium pools or when smoothness matters -> SmoothWRR; very large pools where
-the O(cap) scan hurts -> WeightedRandom.** For **frequently-changing** weights, a `@zakkster/lite-logn`
-Fenwick tree (O(log n) update + sample) is the deferred dynamic-weight complement to WeightedRandom's
-static alias table (rebuilt cold on reweight); see the roadmap.
+the O(cap) scan hurts -> WeightedRandom.** For weights that change **all the time** (per-request load
+reports), use a `@zakkster/lite-logn` `Fenwick` (>= 1.4.0) beside lite-pick: O(log n) to change a weight,
+O(log n) to sample with `searchFrom(buf, i)` (0 B/op). At 1000 endpoints it picks in ~57-98 ns where
+WeightedRandom takes ~16 ns, but a weight change costs ~12-22 ns where WeightedRandom rebuilds its table
+in ~10-17 us -- so the tree wins once weights change more often than about once per 200 picks. lite-pick
+does not import it; RECIPES.md section 17 has the wiring.
+
+## Taking a backend out of ConsistentHash / BoundedLoad: drain or remove?
+
+- **Drain** -- `setEligible(i, false)`: the table is unchanged, **0** other keys move, and marking it up
+  again brings every key back. For health flaps, deploys, breaker trips.
+- **Remove** -- `setWeight(i, 0)`: the table is rebuilt (cold), **~0.5%** of other keys move at the default
+  M (~2.5% at M = 4099). For a backend that is gone for good, or many down at once (a drained backend's
+  keys probe past its slots). Note that IPVS's weight 0 DRAINS; lite-pick's weight 0 removes.
+
+Measured numbers and the full trade-off: RECIPES.md section 9, "Drain vs remove".
 
 ## Not sure you even want lite-pick? -- the sibling boundary
 

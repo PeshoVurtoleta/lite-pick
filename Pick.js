@@ -71,8 +71,9 @@
  *   WeightedRandom [M10] -- roster complete for now (NOT closed: AZ-aware routing, hedging, and
  *   subsetting are queued post-1.0). The EXACT-O(log n) fewest-in-flight variant is a deferred
  *   @zakkster/lite-logn BinaryHeap optional-peer seam (decisions/0006), not this exact-O(cap) scan;
- *   a lite-logn Fenwick tree is the deferred DYNAMIC-weight complement to WeightedRandom's static
- *   alias table, and lite-o1 AliasTable a deferred duck-typed optional-peer upgrade for the build.
+ *   a lite-logn `Fenwick` (search / searchFrom, >= 1.4.0) is the DYNAMIC-weight complement to
+ *   WeightedRandom's static alias table, used beside this file (RECIPES.md section 17), and lite-o1
+ *   AliasTable a deferred duck-typed optional-peer upgrade for the build.
  *
  * M5 (0.5.0) adds the ergonomic request layer at the @zakkster/lite-pick/pool subpath (a
  * SEPARATE file, Pool.js -- the async dispatch/settle counter wrapper + distinct-endpoint
@@ -83,7 +84,7 @@
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '1.0.2';
+export const VERSION = '1.1.0';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -1276,7 +1277,9 @@ function chIsPrime(n) {
  *
  * MINIMAL DISRUPTION is the selling point: on a scale event only ~1/N of keys move. Removing a
  * backend is just marking it down (`setEligible(i, false)`) -- the table is UNCHANGED, so every
- * key NOT on that backend keeps its exact backend (0 remap) and only its keys probe forward.
+ * key NOT on that backend keeps its exact backend (0 remap) and only its keys probe forward. That
+ * is a DRAIN; `setWeight(i, 0)` is a REMOVE (a rebuild: ~0.5% of other keys move at the default M --
+ * ADR 0010 amendment 2026-10-05, RECIPES.md section 9).
  * A membership or WEIGHT change rebuilds the table (COLD); a health flap NEVER does (the probe
  * absorbs it). test/balance.mjs anchors this: remove 1 of 64 backends -> <= 3.13% keys remapped,
  * vs the naive-modulo foil's >= 95%.
@@ -1775,10 +1778,11 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
  * Bound: O(1) per pick (one column draw + one compare, expected O(1) rejection draws when eligibility
  * is dense), 0 B/op (integer/float locals only) -- proven by test/torture.mjs + test/perf/PerfGate.test.mjs.
  *
- * DEFERRED optional-peer seams (import NOTHING; peerDependencies STAYS `{}` until a shipped path imports
- * one): a `@zakkster/lite-o1` `AliasTable` as a duck-typed drop-in for the inline Vose build, and a
- * `@zakkster/lite-logn` Fenwick/BinaryIndexedTree for the DYNAMIC-weight case (O(log n) update + sample)
- * -- the mutable-weight complement to this static table's O(1) sample / O(cap) rebuild (ADR 0012).
+ * Seams (import NOTHING; peerDependencies STAYS `{}` until a shipped path imports one): a
+ * `@zakkster/lite-o1` `AliasTable` as a duck-typed drop-in for the inline Vose build (deferred), and, for
+ * the DYNAMIC-weight case, a `@zakkster/lite-logn` `Fenwick` used beside this class -- O(log n) `set`,
+ * O(log n) 0-box sample via `searchFrom(buf, i)` -- the mutable-weight complement to this static table's
+ * O(1) sample / O(cap) rebuild (ADR 0012 amendment, RECIPES.md section 17).
  *
  * NOT `@zakkster/lite-random`: that sibling is a GAME RNG (Mulberry32; loot tables, particles, gaussian)
  * whose `weighted(items, weights)` returns an ITEM one-shot, is NOT eligibility-aware, holds no reusable

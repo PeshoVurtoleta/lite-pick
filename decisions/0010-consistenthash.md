@@ -108,3 +108,15 @@ README honest-cost table is corrected to match (it no longer says weight views a
   `(offset + j*skip) % M` -- identical tables (golden fingerprints in `test/ConsistentHash.test.js`), so an
   upgrade moves no key; 10.5 ms -> 1.3 ms per rebuild at the default M = 65537 (1.7x at 4099).
 - **`setWeights(weights)`:** copy all weights, one rebuild (the soak used to write `_weights` directly).
+
+## Amendment 2026-10-05 (1.1.0, research/1.1.0-kernel-and-api.md D6): drain vs remove -- documented, no code
+
+Linux IPVS `mh` takes a backend out two ways: weight 0 DRAINS (the table is built from the last non-zero
+weight, so the server keeps its slots; lookups skip it) and deleting the server REMOVES it (a rebuild). This
+balancer already has both: `setEligible(i, false)` is the drain (the table is unchanged, the probe skips the
+backend) and `setWeight(i, 0)` is the remove (a rebuild that gives it no slots). Measured on the 1.1.0 kernel,
+64 backends, 200,000 keys, every backend in turn: a drain moves 0 other keys and its keys spread over all 63
+others (largest share 2.9%); a remove moves a median 0.49% of other keys at M = 65537 (0.40-0.59%) and 2.5% at
+M = 4099; undoing either restores every key (the build is deterministic in the weights). BoundedLoad inherits
+both. No new API: RECIPES.md section 9, GUIDE.md and llms.txt document which to use and that our weight 0 is
+IPVS's delete, not its weight 0.

@@ -112,3 +112,16 @@ P2C's (ADR 0005 amendment) and ignored weights. 1.1.0 walks the cumulative eligi
 `u` in [0, eligible weight) -- the fast path's distribution, in a separate cold method (`_sparsePick`) so the
 fractional `u` never lives in `pick()`'s body: the first version kept it inline and the PerfGate heavy-outage
 lane read 12 scavenges at 8N (the zero-box law). `setWeights(weights)` (copy all, one rebuild) is added.
+
+## Amendment 2026-10-05 (1.1.0): the dynamic-weight seam is lite-logn `Fenwick.searchFrom`
+
+The "deferred lite-logn Fenwick tree" above is now a named seam. lite-logn 1.4.0 shipped `Fenwick.search(u)`
+(an exact lower bound over the tree's own prefix sums, O(log n)) and its zero-box sibling `searchFrom(buf, i)`,
+built for this use. A caller keeps `weight x eligible` in a `Fenwick`, draws `u` in (0, total] and calls
+`searchFrom`; RECIPES.md section 17 has the wiring, run verbatim against lite-logn 1.5.1: fails closed on an
+empty tree, never returns a weight-0 or down node over 5,000,000 picks and 100,000 reweights, and is 0 B/op with
+V8 inlining off on Node 22 and 26 (the plain `search(u)` costs 16 B/op there). At 1000 endpoints a pick is
+~57 ns (Node 22) / ~98 ns (Node 26) vs this balancer's ~16 ns, and a weight change ~12-22 ns vs a ~10-17 us
+rebuild -- the tree wins above roughly one weight change per 200 picks. It stays a documented seam: lite-pick
+imports nothing from lite-logn and `peerDependencies` stays `{}` (a peer is declared only when a shipped path
+imports one).

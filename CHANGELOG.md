@@ -6,10 +6,12 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
-Library changes so far for 1.1.0 (decided in `research/1.1.0-kernel-and-api.md`; bursts B1 -- the plain fixes --,
-B2 -- rotating ties and the BoundedLoad `minCap` --, B3 -- PeakEWMA's update rule and pool mean --, B4 --
-observability, decisions/0015 --, B5 -- Pool's diagnostics_channel events -- and B6 -- zero-box buffer APIs,
-decisions/0016).
+## [1.1.0] - 2026-10-05
+
+Kernel fixes, new API and observability, decided in `research/1.1.0-kernel-and-api.md` (D1-D8) and built in seven
+bursts: B1 the plain fixes, B2 rotating ties and the BoundedLoad `minCap`, B3 PeakEWMA's update rule and pool mean,
+B4 observability (decisions/0015), B5 Pool's diagnostics_channel events, B6 zero-box buffer APIs (decisions/0016),
+B7 docs. No API is removed. Behaviour changes are listed under Changed, plus the L2 and L3 fixes under Fixed.
 
 ### Added
 
@@ -58,6 +60,17 @@ decisions/0016).
   `WeightedRandomBalancer`.** Replace every weight at once with ONE table rebuild; `setWeight` rebuilds per
   call, so retuning N backends cost N rebuilds. The array is copied (CH/BL into the balancer-owned weights,
   WeightedRandom into the weights array it was built with) and validated before any write (RangeError).
+- **Docs: drain vs remove for ConsistentHash / BoundedLoad (D6, no new API).** `setEligible(i, false)` drains
+  (table unchanged, 0 other keys move, undo restores every key); `setWeight(i, 0)` removes (a rebuild; a median
+  0.49% of other keys move at M = 65537, 2.5% at M = 4099; restoring the weight restores every key). Measured on
+  64 backends and 200,000 keys. Our weight 0 is IPVS's delete, not IPVS's weight 0 (which drains). RECIPES
+  section 9, GUIDE, llms.txt, ADR 0010 amendment.
+- **Docs: the dynamic-weight seam is named -- lite-logn `Fenwick.searchFrom(buf, i)` (>= 1.4.0).** RECIPES section
+  17 wires it beside lite-pick (lite-pick imports nothing; `peerDependencies` stays `{}`). The snippet, run
+  verbatim against lite-logn 1.5.1: fails closed on an empty tree, never returns a weight-0 or down node over
+  5,000,000 picks, 0 B/op with V8 inlining off (plain `search(u)`: 16 B/op). At 1000 endpoints ~57-98 ns per pick
+  and ~12-22 ns per weight change, vs WeightedRandom's ~16 ns pick and ~10-17 us rebuild. Replaces the "deferred
+  lite-logn Fenwick tree" wording in README, GUIDE, llms.txt and Pick.js; ADR 0012 amendment.
 
 ### Fixed
 

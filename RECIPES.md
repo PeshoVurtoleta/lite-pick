@@ -371,9 +371,10 @@ function routeFor(sessionId) {
 ```
 
 Notes:
-- **Remove a backend by marking it down** (`lb.setEligible(i, false)`) -- the table is
+- **Take a backend out by marking it down** (`lb.setEligible(i, false)`) -- the table is
   untouched, so only that backend's keys reroute (~`1/N`); everyone else stays put. A health
-  flap costs nothing (the bounded probe absorbs it) -- it never rebuilds.
+  flap costs nothing (the bounded probe absorbs it) -- it never rebuilds. That is a DRAIN;
+  `setWeight(i, 0)` is a REMOVE, and moves other keys too (see "Drain vs remove" below).
 - **Add / reweight** rebuilds the table (cold): `new ConsistentHashBalancer(N + 1, ...)`, or
   `lb.setWeight(i, w)` / `lb.rebuild()`, or `lb.setWeights(weights)` to retune every backend with ONE
   rebuild (1.1.0). Pass a `Uint32Array` of weights for proportional shares.
@@ -403,6 +404,29 @@ Notes:
   keys[0] = fnv1a(sessionId);
   const i = ch.pickFrom(keys, 0);              // == ch.pick(keys[0])
   ```
+
+### Drain vs remove -- two ways to take a backend out
+
+Linux IPVS's `mh` scheduler names the two. A DRAIN keeps the backend's table slots and sends its
+keys elsewhere; a REMOVE rebuilds the table without it. In lite-pick:
+
+|        | call                   | table                     | other backends' keys | undo |
+|--------|------------------------|---------------------------|----------------------|------|
+| drain  | `lb.setEligible(i, false)` | unchanged, no rebuild | **0** move           | `setEligible(i, true)` -- every key comes back |
+| remove | `lb.setWeight(i, 0)`   | rebuilt (cold, ~1.2 ms at the default M) | **~0.5%** move at M = 65537, ~2.5% at M = 4099 | `setWeight(i, w)` -- the same table, every key comes back |
+
+Measured on the 1.1.0 kernel: 64 backends, 200,000 keys, each backend drained and removed in turn
+(medians; the remove share ranged 0.40-0.59% at M = 65537). A drained backend's own keys spread over
+all 63 others (the largest share 2.9%). BoundedLoad inherits both; its drain also moved 0 other keys.
+
+- **Drain for anything temporary** -- a health flap, a deploy, a breaker trip. This is what
+  lite-di-health and a breaker do through `setEligible` (recipe 3).
+- **Remove when the backend is gone for good, or when many are down at once.** A drained backend
+  keeps its slots, so each of its keys probes past them; when the 64 slots after a key's home are all
+  down, the pick sweeps the table (cold, O(M), counted in `STAT_FALLBACK_SCANS`, recipe 16).
+  `setWeights(weights)` removes several with one rebuild.
+- **Weight 0 means the opposite of IPVS.** In IPVS, weight 0 drains (the table keeps the last non-zero
+  weight). Here weight 0 removes: the backend gets no slots. Keep the old weight if you will restore it.
 
 ---
 
@@ -470,6 +494,8 @@ a shared TypedArray or a duck-typed shape, so you wire in a sibling only if you 
 - `@zakkster/lite-filter` -- a hot-key / known-key oracle at the ConsistentHash key-routing
   layer (warm/cold only, never the pick path; deferred).
 - `@zakkster/lite-await` -- hedging (race the P2C second choice past a percentile).
+- `@zakkster/lite-logn` -- `Fenwick` for weights that change all the time (recipe 17); an
+  exact-O(log n) least-conn over its `BinaryHeap` is a deferred seam (decisions/0006).
 
 None is required; the kernel runs over raw TypedArrays with nothing installed.
 
@@ -565,6 +591,51 @@ app.get('/admin/lb', (req, res) => res.json(lb.describe()));   // JSON-safe snap
 - In tests, call `lb.assertConsistent()` after driving the balancer: it throws
   `LITE_PICK_INCONSISTENT` when someone wrote `eligible[i]` or `weights[i]` directly, or changed
   BoundedLoad's `inflight` without `note()`. It is O(cap) -- not for the request path.
+
+---
+
+## 17. Weights that change all the time -- a lite-logn `Fenwick`
+
+`WeightedRandomBalancer` samples in O(1) from an alias table, but every `setWeight` rebuilds that
+table in O(cap). When weights change per request -- load reports, a cost you recompute
+continuously -- use a `Fenwick` tree from `@zakkster/lite-logn` (>= 1.4.0) instead: O(log n) to
+change a weight, O(log n) to sample. lite-pick does not import it (`peerDependencies` stays `{}`);
+this is the wiring:
+
+```js
+import { Fenwick } from '@zakkster/lite-logn';
+import { Prng, PICK_NONE } from '@zakkster/lite-pick';
+
+const U = 1073741824;                         // 2^30: nextBelow(U) is a small integer on every engine
+const weights = new Uint32Array(CAP);         // integer weights keep every sum exact
+const eligible = new Uint8Array(CAP);
+const tree = new Fenwick(CAP);                // holds weights[i] while i is up, 0 while it is down
+const target = new Float64Array(1);           // searchFrom reads the target from this slot
+const rng = new Prng(0x9e3779b9);
+
+function setWeight(i, w) { weights[i] = w; tree.set(i, eligible[i] ? w : 0); }      // O(log n)
+function setUp(i, up) { eligible[i] = up ? 1 : 0; tree.set(i, up ? weights[i] : 0); }
+
+function pick() {
+  const total = tree.prefix(CAP - 1);
+  if (!(total > 0)) return PICK_NONE;         // nothing up, or every weight 0: fail closed
+  target[0] = (rng.nextBelow(U) + 1) * (total / U);    // uniform in (0, total]
+  return tree.searchFrom(target, 0);          // the smallest i with prefix(i) >= target
+}
+```
+
+- **Exact with integer weights.** `search` is an exact lower bound over the tree's own prefix sums,
+  so a node with weight 0 (or marked down) is never returned. Measured: 5,000,000 picks over 1000
+  nodes with a tenth at weight 0 and every 13th down -- never a zero-weight or down node, and the
+  counts match the weights (chi-square z = 1.04). Through 100,000 reweights, one pick after each, the
+  same: never a zero-weight or down node.
+- **Call `searchFrom`, not `search`.** The target is a fraction; passed as an argument it boxes when
+  the call is not inlined. Measured with V8 inlining off: `search(u)` 16 B/op, `searchFrom` 0 B/op
+  (Node 22 and 26; recipe 14 explains the rule).
+- **Cost at 1000 endpoints:** a pick ~57 ns (Node 22) / ~98 ns (Node 26) -- two O(log n) walks; a
+  weight change ~12-22 ns. WeightedRandom picks in ~16 ns but rebuilds in ~10-17 us. So the tree wins
+  when weights change more often than about once per 200 picks; the crossover moves with pool size,
+  because the rebuild is O(cap).
 
 ---
 

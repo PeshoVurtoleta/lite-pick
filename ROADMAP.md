@@ -29,7 +29,7 @@ wiring proven zero-GC parts, not new low-level code.
 | **M9** | **BoundedLoad** (CHBL: ConsistentHash + occupancy cap) | 0.9.0 | O(1) lookup | SHIPPED |
 | **M10** | **WeightedRandom** (inline Vose alias table) + docs/GUIDE capstone | 1.0.0 | O(1) | SHIPPED |
 | **1.0.1** | **Audit fixes** (bug-fix, no new strategy): PeakEWMA black-hole (H1), eligibility ownership (H2), SmoothWRR weight-0 (H3), CHBL per-bin cap (H4), index validation (M1), the Pool contract (M2/M3/M4), green `verify` + CI | 1.0.1 | -- | SHIPPED |
-| **1.1.0** | **Buffer APIs + M5 + observability**: buffer-based `pick`/`recordRtt` variants reading the clock/key from a caller-owned typed array (0 B/op at realistic magnitudes -- the zero-box law, closing the 1.0.1 boxing limitation); the LeastConn/NQ rotating tie-break (M5, moved out of 1.0.1); the PeakEWMA Finagle blend + decaying (non-lifetime) mean (the busy-since stamp was dropped for documented per-attempt timeouts -- research/1.1.0-kernel-and-api.md D5); the open `recordRtt` isolation-allocation item; observability (audit RECOMMENDATIONS section 2: zero-cost counters, `diagnostics_channel`/hooks, `describe()`, error codes); DOC the concrete dynamic-weight seam -- lite-logn 1.4.0 shipped `Fenwick.search(u)` / the 0-box `searchFrom(buf, i)` built for lite-pick's WeightedRandom dynamic-weight sampling, so replace the vague "a lite-logn Fenwick tree" references (llms.txt, README, GUIDE, Pick.js) with the named seam, alongside our own buffer variants (same zero-box story) | 1.1.0 | -- | planned |
+| **1.1.0** | **Kernel fixes + buffer APIs + observability** (research/1.1.0-kernel-and-api.md D1-D8, bursts B1-B7): audit fixes L2/L3/L7/L8 + `setWeights`; rotating ties for LeastConn/SED/NQ (M5) and an opt-in BoundedLoad `minCap`; PeakEWMA on Finagle's update rule + a decaying pool mean (the busy-since stamp dropped for documented per-attempt timeouts, D5); error codes, a caller-owned stats slab (no per-pick counters -- measured), `describe()`, `assertConsistent()`, Pool `diagnostics_channel` events (ADR 0015); zero-box `pickFrom` / `recordRttFrom` + a PRNG that never boxes, 0 B/op with V8 inlining off (ADR 0016, closing the 1.0.1 boxing limitation and the `recordRtt` isolation item); docs: drain vs remove (D6, ADR 0010 amendment) and the named dynamic-weight seam, lite-logn `Fenwick.searchFrom` (ADR 0012 amendment, RECIPES 17) | 1.1.0 | -- | SHIPPED |
 
 **1.0.0 = ten strategies (RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, PeakEWMA,
 ConsistentHash, BoundedLoad, WeightedRandom) + the lite-query adapter + the two-round
@@ -195,7 +195,7 @@ counters; one bitmap path with fastbit32 later). M0 wires them; it does not re-l
   O(n) rebuild), NOT the lite-o1 `AliasTable` this row originally read -- the ~15-line cold Vose build
   is inlined so `peerDependencies` stays `{}` (the lite-o1 `AliasTable` remains a deferred optional-peer
   build-path upgrade, imported by nothing). Dynamic-weight callers are pointed at a lite-logn Fenwick
-  instead. Docs/GUIDE capstone.
+  instead (1.1.0 names it: `Fenwick.searchFrom(buf, i)`, wired in RECIPES.md section 17). Docs/GUIDE capstone.
 
 ---
 

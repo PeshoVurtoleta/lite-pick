@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-pick",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster of ten strategies: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, PeakEWMA (latency-aware peak-EWMA), ConsistentHash (Maglev sticky/affinity routing, minimal disruption), BoundedLoad (consistent hashing with bounded loads -- sticky routing with a per-backend occupancy cap that overflows a hotspot to neighbours), and WeightedRandom (O(1) Vose alias-table sampling with rejection-sampling eligibility); the /pool subpath adds dispatch/settle counters + failover and a duck-typed query-cache fetcher. See GUIDE.md to choose a strategy.",
   "type": "module",
   "main": "./Pick.js",

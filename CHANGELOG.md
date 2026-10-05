@@ -6,6 +6,30 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
+Tests and one RECIPES sentence; no library code changes.
+
+### Added
+
+- **`test/LognSeam.test.js` and a PerfGate lane pin the RECIPES section 17 snippet.** `@zakkster/lite-logn` is a
+  devDependency (never a peer; `peerDependencies` stays `{}`). The snippet is extracted from RECIPES.md and run
+  verbatim (`test/recipe17.mjs`): it fails closed, every pick equals a brute-force lower bound through reweights
+  and up/down flips, 1,000,000 picks follow the weights, and both ends of the draw are forced by steering the
+  Prng (a random run reaches them once in 2^30 draws). Mutants caught: a draw that can be 0 or exceed the total,
+  a reweight that ignores eligibility, a missing fail-closed guard, and the boxing `search(u)` (also caught by
+  the perf lane with inlining off). On Node < 20 with no install (the CI Node 18 job) the file skips; anywhere
+  else a missing devDependency fails.
+
+### Fixed
+
+- **PerfGate flaked on CI: the B6 1.7e15-clock lanes read 1 scavenge (N:1 8N:1) on GitHub's ubuntu runner.**
+  Cause: lite-perf-gate warms a lane with one 20000-iteration call, and on a slow runner V8's concurrent
+  optimizer had not installed the optimized code by the measured window; the lower tiers box every double.
+  Reproduced locally with `--concurrent-recompilation-delay=20/100` (Node 22: N:32-84). Changing the sample to an
+  integer did not help (the clock and the kernel's own doubles still box). Each gated lane now warms until two
+  20000-iteration chunks leave heapUsed within 32 KB (cap 1500 ms); the gate itself is unchanged (0 scavenges at
+  N and 8N). A per-op allocation never goes quiet and still fails: a lane switched to the plain `recordRtt` and
+  the pre-1.1.0 PRNG (8 lanes) both fail with inlining off.
+
 ## [1.1.0] - 2026-10-05
 
 Kernel fixes, new API and observability, decided in `research/1.1.0-kernel-and-api.md` (D1-D8) and built in seven

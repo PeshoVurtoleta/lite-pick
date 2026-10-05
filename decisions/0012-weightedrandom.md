@@ -124,4 +124,6 @@ V8 inlining off on Node 22 and 26 (the plain `search(u)` costs 16 B/op there). A
 ~57 ns (Node 22) / ~98 ns (Node 26) vs this balancer's ~16 ns, and a weight change ~12-22 ns vs a ~10-17 us
 rebuild -- the tree wins above roughly one weight change per 200 picks. It stays a documented seam: lite-pick
 imports nothing from lite-logn and `peerDependencies` stays `{}` (a peer is declared only when a shipped path
-imports one).
+imports one). Pinned since 1.1.0 by a DEVdependency on lite-logn: `test/LognSeam.test.js` runs the published
+snippet verbatim (fail closed; every pick equals a brute-force lower bound through reweights and flips; both ends
+of the draw forced) and a PerfGate lane holds it at 0 B/op with inlining on and off.

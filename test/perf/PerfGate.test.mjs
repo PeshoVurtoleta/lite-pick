@@ -27,6 +27,12 @@ import {
     LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer,
     BoundedLoadBalancer, WeightedRandomBalancer,
 } from '../../Pick.js';
+import { loadRecipe17 } from '../recipe17.mjs';
+
+// 1.1.0 B7: the RECIPES section 17 snippet (the lite-logn Fenwick dynamic-weight seam), loaded VERBATIM from
+// RECIPES.md. The gate needs the @zakkster/lite-logn devDependency -- fail closed when it is missing.
+const R17 = await loadRecipe17(1000);
+if (R17 === null) throw new Error('PerfGate: @zakkster/lite-logn (devDependency) is not installed -- run npm install');
 
 // FAIL-CLOSED semi-space pin check. New space is pinned to 1MB (min = max = 1) -- the SHARPEST
 // setting, no coarser than V8's default starting size, so the gate detects the smallest per-op
@@ -626,11 +632,34 @@ const peakEwmaRecordMod = {
     },
 };
 
+// RECIPES section 17 as published: Fenwick prefix + searchFrom over 1000 endpoints (a tenth at weight 0, every
+// 13th down). The docs claim 0 B/op with V8 inlining off (plain `search(u)` boxes its fractional target).
+const recipe17FenwickPick = {
+    name: 'RECIPES 17 lite-logn Fenwick pick() (verbatim snippet, 1000 endpoints)',
+    setup() {
+        for (let i = 0; i < 1000; i++) {
+            R17.setUp(i, i % 13 !== 0);
+            R17.setWeight(i, i % 10 === 0 ? 0 : 1 + ((i * 7919) % 1000));
+        }
+        return { acc: 0 };
+    },
+    hot(s, n) {
+        const pick = R17.pick;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + pick()) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf() {
+        return { grows: bufIds(R17.target.buffer, R17.weights.buffer, R17.eligible.buffer, R17.tree._t.buffer, R17.tree._mag.buffer) };
+    },
+};
+
 const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
     leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord, consistentHashPick,
     boundedLoadPick, boundedLoadNote, weightedRandomPick, weightedRandomPickFallback,
     peakEwmaPickFrom, peakEwmaRecordFrom, peakEwmaRecordMod, consistentHashPickFrom, boundedLoadPickFrom,
+    recipe17FenwickPick,
 ];
 
 /**
@@ -905,6 +934,34 @@ const every32MustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+// STEADY-STATE WARM-UP (1.1.0, after a CI flake on 2a08567). lite-perf-gate warms each lane with ONE 20000-iteration
+// call. On a slow runner V8's concurrent optimizer may not have installed the optimized code by the measured
+// window, and until it does the lower tiers box every double they produce (16 B each): the B6 lanes with a
+// 1.7e15 clock read N:1 8N:1 on GitHub's ubuntu runner, and N:32-84 locally under
+// --concurrent-recompilation-delay=20/100 (Node 22). That is tier-up timing, not a per-op allocation. So each gated
+// lane first runs its own hot loop in 20000-iteration chunks until TWO consecutive chunks leave heapUsed within
+// 32 KB (1.6 B/op, a tenth of one box per op), capped at 1500 ms. The gate is unchanged (0 scavenges at N and 8N):
+// a path that really allocates per op never goes quiet, runs out the cap and is measured -- and fails -- as before.
+// The must-fail controls are NOT wrapped.
+const WARM_CHUNK = 20000, WARM_QUIET_BYTES = 32 * 1024, WARM_CAP_MS = 1500;
+function steady(scenario) {
+    return {
+        ...scenario,
+        setup() {
+            const s = scenario.setup();
+            const t0 = performance.now();
+            let quiet = 0;
+            while (quiet < 2 && performance.now() - t0 < WARM_CAP_MS) {
+                const before = process.memoryUsage().heapUsed;
+                scenario.hot(s, WARM_CHUNK);
+                const d = process.memoryUsage().heapUsed - before;
+                quiet = d >= 0 && d < WARM_QUIET_BYTES ? quiet + 1 : 0;    // a negative delta = a GC ran: not quiet
+            }
+            return s;
+        },
+    };
+}
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -913,7 +970,7 @@ zgcSuite({
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
     maxRetainedKB: 64,
-    scenarios,
+    scenarios: scenarios.map(steady),
     mustFail: [
         drawMustFailAlloc, rrMustFailAlloc, wrrMustFailAlloc, p2cMustFailAlloc,
         lcMustFailAlloc, sedMustFailAlloc, nqMustFailAlloc, peMustFailAlloc, chMustFailAlloc,

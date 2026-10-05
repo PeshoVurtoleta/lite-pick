@@ -600,7 +600,8 @@ app.get('/admin/lb', (req, res) => res.json(lb.describe()));   // JSON-safe snap
 table in O(cap). When weights change per request -- load reports, a cost you recompute
 continuously -- use a `Fenwick` tree from `@zakkster/lite-logn` (>= 1.4.0) instead: O(log n) to
 change a weight, O(log n) to sample. lite-pick does not import it (`peerDependencies` stays `{}`);
-this is the wiring:
+this is the wiring (run verbatim by `test/LognSeam.test.js` and the perf gate, against lite-logn as a
+devDependency):
 
 ```js
 import { Fenwick } from '@zakkster/lite-logn';

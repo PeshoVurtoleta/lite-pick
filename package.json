@@ -41,7 +41,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/Base.test.js test/BoundedLoad.test.js test/BufferApis.test.js test/ConsistentHash.test.js test/LeastConn.test.js test/NQ.test.js test/Observability.test.js test/P2C.test.js test/PeakEWMA.test.js test/Pool.test.js test/PoolChannels.test.js test/RecipesDoc.test.js test/RoundRobin.test.js test/SED.test.js test/SmoothWRR.test.js test/SoakOracles.test.js test/SoakP2C.test.js test/SoakPool.test.js test/SoakTeeth.test.js test/WeightedRandom.test.js test/suite-list.test.js",
+    "test": "node --test test/Base.test.js test/BoundedLoad.test.js test/BufferApis.test.js test/ConsistentHash.test.js test/LeastConn.test.js test/LognSeam.test.js test/NQ.test.js test/Observability.test.js test/P2C.test.js test/PeakEWMA.test.js test/Pool.test.js test/PoolChannels.test.js test/RecipesDoc.test.js test/RoundRobin.test.js test/SED.test.js test/SmoothWRR.test.js test/SoakOracles.test.js test/SoakP2C.test.js test/SoakPool.test.js test/SoakTeeth.test.js test/WeightedRandom.test.js test/suite-list.test.js",
     "test:types": "tsc -p test/types/tsconfig.json && tsc -p test/types/tsconfig.es2022.json",
     "torture": "node --expose-gc test/torture.mjs",
     "witness": "node test/witness.mjs",
@@ -131,6 +131,7 @@
     "@zakkster/lite-charts": "^1.24.0",
     "@zakkster/lite-gc-profiler": "^1.16.0",
     "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-logn": "^1.5.1",
     "@zakkster/lite-perf-gate": "^1.4.3",
     "@zakkster/lite-signal": "^1.5.2",
     "@zakkster/lite-sketch": "^1.1.2",

@@ -8,14 +8,33 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 Benchmark-only (no shipped file changes; parity unchanged).
 
+### Changed
+
+- **soak:ab: K = 16 on hosted runners** (decisions/0017 Amendment 1). The first hosted A/A dispatch passed
+  20/20 at K = 10; its worst lane's process-to-process CV (SmoothWRR sparse, 8.1%) puts the runner in the
+  > 6% row of the research table, so `soak-ab.yml`'s `rounds` default is now 16 (10.5 min measured). The
+  local CLI default stays 10. 1.1.1's post-publish record at K = 16: PASS 20/20 vs 1.1.0, WeightedRandom
+  sparse 2.3% faster, nothing slower (soak-ab run 37414241263).
+
 ### Fixed
 
 - **soak:ab -- a relative `--out-dir` failed closed before measuring.** `fetchRelease` runs `npm pack` inside
   the scratch directory, so the workflow's relative `--out-dir benchmark/out/soak-ab` was resolved twice
   (`.../scratch/benchmark/out/soak-ab/scratch/*.tgz`, ENOENT) and the first hosted A/A run exited 3
   (INCONCLUSIVE). `fetchRelease` / `packTree` now absolutise their directories against the caller's cwd on
-  entry, and `SoakAB.mjs` resolves `--out-dir` / `--a-dir` / `--b-dir` once. Two regression tests run both
-  packers from a temp cwd with relative paths; both fail on the 1.1.1 `ab-pack.mjs`.
+  entry, and `SoakAB.mjs` resolves `--out-dir` / `--a-dir` / `--b-dir`; plan.json records `acceptPath`
+  absolute. Two regression tests run both packers from a temp cwd with relative paths (both fail on the
+  1.1.1 `ab-pack.mjs`); they skip on Windows, where ab-pack deliberately spawns npm without a shell
+  (`soak-ab.yml` is ubuntu-only). Every npm call now times out after 5 min (fail closed) instead of hanging.
+- **CI was red on every `test` leg at 1.1.1** (the shipped code was unaffected -- gates, types and the capstone
+  passed): the teeth-anchor test reads `git show 2a08567:Pick.js`, which a shallow checkout lacks. The `test`
+  and `test-node18` jobs now check out with `fetch-depth: 0` (as the soak workflows already did).
+- **The must-fail listings could silently lose their tail on macOS.** A piped stdout is asynchronous there,
+  so `process.exit()` straight after many writes dropped the queued lines at a line boundary with exit 0
+  (reproduced: 452 of 2000 lines kept); one CI leg listed a battery missing I1 through PF and failed the
+  coverage tests. `_mustfail.mjs` and `_ab-teeth.mjs` now write once and exit from the write callback, and
+  both listings end with a `{"end":true,"count":N}` sentinel that `SoakTeeth` / `SoakAB` require, so a
+  truncated list fails as truncated.
 
 ## [1.1.1] - 2026-10-06
 

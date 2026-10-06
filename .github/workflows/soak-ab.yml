@@ -24,9 +24,9 @@ on:
         type: string
         required: true
       rounds:
-        description: 'Rounds per side (8..40)'
+        description: 'Rounds per side (8..40); 16 = K fixed for hosted runners by the first A/A (ADR 0017 amendment)'
         type: string
-        default: '10'
+        default: '16'
       mode:
         description: 'release (A vs candidate) or aa (A/A control: the registry release on both sides)'
         type: choice

@@ -55,10 +55,15 @@ function readJsonVersion(pkgJsonPath) {
     return JSON.parse(readFileSync(pkgJsonPath, 'utf8')).version;
 }
 
-/** Run npm, capturing stdout only (a wide buffer for the pack JSON; stderr notices are discarded). */
+const NPM_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Run npm, capturing stdout only (a wide buffer for the pack JSON; stderr notices are discarded). A stalled
+ * registry throws after NPM_TIMEOUT_MS, never hangs: SoakAB.mjs turns the throw into INCONCLUSIVE (exit 3),
+ * _ab-teeth.mjs into exit 1 -- fail closed either way.
+ */
 function npm(args, cwd) {
     return execFileSync('npm', args, {
-        cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+        cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], timeout: NPM_TIMEOUT_MS,
     });
 }
 
@@ -84,7 +89,7 @@ function untar(tarball, destRoot) {
  * disagreement. `prev` is a bare version string (e.g. '1.1.0'); the spec is PKG@prev.
  */
 export function fetchRelease(prev, scratchDir, outDir) {
-    // npm runs IN scratchDir below, so a relative path would resolve twice (scratch/scratch/...): absolutise
+    // npm runs IN scratchDir below, so a relative path would resolve twice (<rel>/<rel>/...): absolutise
     // against the caller's cwd first (the 2026-10-06 hosted A/A run failed closed on exactly that).
     scratchDir = resolve(scratchDir);
     outDir = resolve(outDir);

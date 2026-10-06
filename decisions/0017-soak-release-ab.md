@@ -102,3 +102,26 @@ that CV first; K is then FIXED from the 5.3 table (<= 4% CV -> K=8, <= 6% -> K=1
 an amendment to this ADR, before the first real release-mode run gates 1.1.1 (published 1.1.0 vs the
 candidate). The decision rule (T=5%, R=15%, alpha 0.05, Holm over 20) and the FAIL/PASS windows were NOT
 moved; only REP was tuned and the SLOW10 expectation corrected as above.
+
+## Amendment 1 (2026-10-06): K = 16 on hosted runners
+
+The first hosted A/A dispatch (soak-ab run 37412882822, commit 6629796, ubuntu-latest, Node 22.23.3, K = 10,
+`--aa` with 1.1.0 on both sides) PASSED 20/20: no FAIL, worst sU +0.0537 (NQ sparse), well inside R. The
+process-to-process CV of the per-process medians was 0.2-2.4% on most lanes, 3.7-5.3% on P2C dense, NQ
+sparse and SmoothWRR dense, and **8.12% (detrended 8.01%) on SmoothWRR sparse, side B** (side A 5.31%).
+
+Every lane is gated, so the NOISIEST lane sets the gate's power: K is fixed from the worst lane's CV, not a
+median or pooled CV (that would quietly lower the power exactly where the noise is). 8.1% > 6%, so the 5.3
+table gives **K = 16**: `soak-ab.yml`'s `rounds` default is now 16. The A/A step took 9 min 14 s at K = 10;
+the first K = 16 run took 10 min 33 s, well inside the 75-minute job timeout. The decision rule (T, R, alpha, Holm over 20) is
+unchanged. The CLI default stays K = 10 for LOCAL runs: this laptop's process noise is ~2% (research
+section 4), where K = 10 already has full power at a 10% slowdown.
+
+One A/A run estimates a CV from 10 processes per side (relative standard error ~24%), so 8.1% could be 6-10%;
+K = 16 also covers the upper end. Revisit only with more A/A evidence, never to make a release pass.
+
+This A/A ran AFTER 1.1.1 was published, so 1.1.1's release-mode run is a post-publish record, not a gate;
+the first release that this gate blocks is the next one. That record (soak-ab run 37414241263, commit 6629796,
+K = 16, published 1.1.0 vs the packed tree == 1.1.1 by parity): **PASS 20/20**, 16/16 valid rounds, worst sU
++0.0459 (SmoothWRR sparse); WeightedRandom sparse s = -0.0233 (sU -0.0188: faster with the whole interval
+below 0; p99 983 -> 889 ns) -- the K2 cached eligible-weight sum, as the local K = 10 run showed (-0.0341).

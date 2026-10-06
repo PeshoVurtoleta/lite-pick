@@ -38,7 +38,12 @@ function listBattery() {
     delete env.MUSTFAIL_ONLY;
     const r = spawnSync(process.execPath, ['benchmark/soak/_mustfail.mjs'], { cwd: ROOT, env, encoding: 'utf8', timeout: 60000 });
     assert.equal(r.status, 0, 'MUSTFAIL_LIST=1 failed (a stale patch anchor?):\n' + r.stderr);
-    return r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+    const rows = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+    // The list must end with its sentinel and count every row: a truncated pipe (macOS) must FAIL, not
+    // quietly drop the tail of the battery.
+    const end = rows.pop();
+    assert.deepEqual(end, { end: true, count: rows.length }, 'MUSTFAIL_LIST output truncated or unterminated');
+    return rows;
 }
 const CONTROLS = listBattery();
 const CHECKS = checks();

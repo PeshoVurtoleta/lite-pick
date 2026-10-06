@@ -240,6 +240,7 @@ function buildSides(ctl, baseDir) {
 // --- LIST mode: resolve every anchor (offline: git, no network), run nothing --------------------------
 if (LIST) {
     const baseSrc = gitShow(BASE_COMMIT + ':Pick.js');   // identical bytes to the tarball; offline
+    const rows = [];
     let ok = true;
     for (const ctl of selected) {
         try {
@@ -249,9 +250,13 @@ if (LIST) {
             } else {
                 gitShow(COMPAT_COMMIT + ':Pick.js');   // the A kernel exists
             }
-            process.stdout.write(JSON.stringify({ id: ctl.id, run: 'ab', rounds: ROUNDS, expect: ctl.expect, doc: ctl.doc }) + '\n');
-        } catch (e) { ok = false; process.stdout.write(JSON.stringify({ id: ctl.id, error: String(e && e.message ? e.message : e) }) + '\n'); }
+            rows.push(JSON.stringify({ id: ctl.id, run: 'ab', rounds: ROUNDS, expect: ctl.expect, doc: ctl.doc }));
+        } catch (e) { ok = false; rows.push(JSON.stringify({ id: ctl.id, error: String(e && e.message ? e.message : e) })); }
     }
+    // One AWAITED write, then exit HERE (nothing below may run in LIST mode), + an end sentinel
+    // (see _mustfail.mjs: a piped macOS stdout is async, and process.exit() drops its queued tail).
+    rows.push(JSON.stringify({ end: true, count: rows.length }));
+    await new Promise((done) => process.stdout.write(rows.join('\n') + '\n', done));
     process.exit(ok ? 0 : 1);
 }
 
@@ -396,5 +401,6 @@ for (const ctl of selected) {
     if (!chk.ok) for (const f of chk.fails) process.stdout.write('       <<< ' + f + '\n');
 }
 if (KEEP) process.stdout.write('AB-TEETH: scratch kept at ' + TMP + ' (AB_KEEP=1)\n');
-process.stdout.write('AB-TEETH: ' + (allOk ? 'every control behaved AS REQUIRED (the A/B gate has teeth)' : 'A CONTROL MISBEHAVED -- the A/B gate is hollow or over-eager') + '\n');
+// await the LAST write (writes are FIFO) before exiting, so a piped macOS stdout keeps every line.
+await new Promise((done) => process.stdout.write('AB-TEETH: ' + (allOk ? 'every control behaved AS REQUIRED (the A/B gate has teeth)' : 'A CONTROL MISBEHAVED -- the A/B gate is hollow or over-eager') + '\n', done));
 process.exit(allOk ? 0 : 1);

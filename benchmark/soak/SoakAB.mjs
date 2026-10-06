@@ -342,7 +342,8 @@ function main() {
     // 2) Output tree.
     if (opts.outDir === '') die(2, "--out-dir '' is not a valid path");
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    // relative --out-dir / --a-dir / --b-dir resolve against the cwd ONCE, here (npm run: the package root).
+    // relative --out-dir / --a-dir / --b-dir / --accept resolve against the cwd (npm run: the package root);
+    // resolve() is idempotent, so ab-pack absolutising again is harmless.
     const outDir = opts.outDir ? resolve(opts.outDir) : join(REPO_ROOT, 'benchmark', 'out', 'soak-ab-' + stamp);
     const scratch = join(outDir, 'scratch');
     const streamsDir = join(outDir, 'streams');
@@ -526,7 +527,7 @@ function writePlan(outDir, p) {
         orderSeed: p.opts.orderSeed >>> 0,
         order: p.order,
         pin: p.pin,
-        acceptPath: p.acceptPath,
+        acceptPath: p.acceptPath ? resolve(p.acceptPath) : null,
         note: p.note || undefined,
         A: { dir: p.A.dir, version: p.A.version, pickSha256: p.A.pickSha256, poolSha256: p.A.poolSha256, integrity: p.A.integrity || null },
         B: { dir: p.B.dir, version: p.B.version, pickSha256: p.B.pickSha256, poolSha256: p.B.poolSha256, integrity: p.B.integrity || null, parityOk: p.B.parityOk, versionMatches: p.B.versionMatches },

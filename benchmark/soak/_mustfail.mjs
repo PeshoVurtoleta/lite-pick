@@ -688,10 +688,10 @@ tamperControl('RPT parity mismatch allowed', RPT_GREEN,
     null, null, ['--allow-parity-mismatch'], 0);
 
 if (out.length === 0) { allOk = false; out.push('  MISS MUSTFAIL_ONLY=' + process.env.MUSTFAIL_ONLY + ' selected no control'); }
-if (LIST) {
-    for (const l of out) process.stdout.write(l + '\n');
-    process.exit(allOk ? 0 : 1);
-}
-for (const l of out) process.stdout.write(l + '\n');
-process.stdout.write('MUSTFAIL(through main.mjs): ' + (allOk ? 'all controls behaved AS REQUIRED (gates have teeth)' : 'A CONTROL MISBEHAVED -- gate is hollow or over-eager') + '\n');
+// ONE write, AWAITED, then exit: on macOS a piped stdout is ASYNC, so process.exit() right after many writes
+// drops the queued tail at a line boundary with exit 0 (a CI macOS leg listed a battery missing I1..PF).
+// LIST ends with a {"end":true,"count":N} sentinel so a consumer can prove the list is complete.
+if (LIST) out.push(JSON.stringify({ end: true, count: out.length }));
+else out.push('MUSTFAIL(through main.mjs): ' + (allOk ? 'all controls behaved AS REQUIRED (gates have teeth)' : 'A CONTROL MISBEHAVED -- gate is hollow or over-eager'));
+await new Promise((done) => process.stdout.write(out.join('\n') + '\n', done));
 process.exit(allOk ? 0 : 1);

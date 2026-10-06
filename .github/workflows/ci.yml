@@ -22,6 +22,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # test/SoakAB.test.js teeth anchors `git show 2a08567:Pick.js` (the 1.1.0 kernel)
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -43,6 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # test/SoakAB.test.js teeth anchors `git show 2a08567:Pick.js` (the 1.1.0 kernel)
       - uses: actions/setup-node@v4
         with:
           node-version: 18

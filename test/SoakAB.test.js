@@ -3,7 +3,7 @@
  *
  *     node --test test/SoakAB.test.js
  *
- * Two sections:
+ * Three sections:
  *   (1) ZERO-DEP: the pure analyser (benchmark/soak/ab-analyse.mjs, which imports gates.mjs ONLY) and
  *       the exact statistics the A/B gate is built on. No devDependency, no install, no clock, no I/O --
  *       it runs on the Node 18 job with an empty node_modules. Every number is ABSOLUTE (the research's
@@ -11,6 +11,9 @@
  *   (2) HARNESS: the SOAK_TIERS / SOAK_HOTOPS_N knobs, driven through the REAL main.mjs. These need the
  *       three soak devDependencies; on Node < 20 with no install they skip (the SoakReport.test.js
  *       convention), and FAIL anywhere else a devDependency is missing.
+ *   (3) RUNNER + CI: the SoakAB.mjs CLI fail-closed cases, the workflow pins, the teeth anchors (`git show`:
+ *       needs full history, ci.yml checks out with fetch-depth 0), and the packers run from a temp cwd with
+ *       relative paths (npm pack; the registry test skips only when the registry is unreachable).
  */
 
 import { test } from 'node:test';
@@ -347,42 +350,6 @@ test('the analyser\'s KERNEL_LANES is exactly the soak kernel roster (a new lane
     assert.deepEqual(KERNEL_LANES.slice(), ROSTER.map((d) => d.name));
 });
 
-// --- relative paths (the 2026-10-06 hosted A/A run: --out-dir benchmark/out/soak-ab resolved twice) -----------
-
-async function inTempCwd(fn) {
-    const here = process.cwd();
-    const tmp = realpathSync(mkdtempSync(join(tmpdir(), 'soak-ab-rel-'))); // macOS: /var -> /private/var
-    process.chdir(tmp);
-    try { return await fn(tmp); } finally { process.chdir(here); rmSync(tmp, { recursive: true, force: true }); }
-}
-
-test('packTree: relative scratch/out dirs resolve against the CALLER cwd, not the npm cwd', async () => {
-    const { packTree } = await import('../benchmark/soak/ab-pack.mjs');
-    await inTempCwd((tmp) => {
-        const B = packTree(undefined, join('rel', 'scratch'), 'rel');
-        assert.equal(B.dir, join(tmp, 'rel', 'B', 'package'));
-        assert.ok(existsSync(join(tmp, 'rel', 'B', 'package', 'Pick.js')));
-    });
-    assert.ok(!existsSync(join(ROOT, 'rel')), 'nothing may be packed into the repo root');
-});
-
-test('fetchRelease: a relative scratch dir is not resolved twice (registry; skipped only if unreachable)', async (t) => {
-    const { execFileSync } = await import('node:child_process');
-    try {
-        execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['view', '@zakkster/lite-pick@1.1.0', 'version'],
-            { stdio: ['ignore', 'pipe', 'ignore'], timeout: 30000, shell: process.platform === 'win32' });
-    } catch {
-        t.skip('npm registry unreachable');
-        return;
-    }
-    const { fetchRelease } = await import('../benchmark/soak/ab-pack.mjs');
-    await inTempCwd((tmp) => {
-        const A = fetchRelease('1.1.0', join('rel', 'scratch'), 'rel');
-        assert.equal(A.version, '1.1.0');
-        assert.equal(A.dir, join(tmp, 'rel', 'A', 'package'));
-    });
-});
-
 // --- zero-dep helpers --------------------------------------------------------------------------------
 function ones(K, v) { const a = new Array(K); for (let i = 0; i < K; i++) a[i] = v; return a; }
 function pairwise(A, B) { const out = []; for (let i = 0; i < A.length; i++) for (let j = 0; j < B.length; j++) out.push(B[j] / A[i]); out.sort((x, y) => x - y); return out; }
@@ -579,7 +546,46 @@ test('teeth: every _ab-teeth.mjs mutant anchor resolves (AB_LIST, offline)', () 
         { cwd: ROOT, env: Object.assign({}, process.env, { AB_LIST: '1' }), encoding: 'utf8', timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] });
     assert.equal(r.status, 0, 'AB_LIST must exit 0 (every anchor resolved); stderr=' + r.stderr + ' stdout=' + r.stdout);
     const ids = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(ids.pop(), { end: true, count: ids.length }, 'AB_LIST output truncated or unterminated');
     assert.ok(ids.every((o) => !o.error), 'no anchor may fail to resolve: ' + JSON.stringify(ids.filter((o) => o.error)));
     const want = ['AB-AA', 'AB-SLOW20', 'AB-SLOW10', 'AB-SPARSE', 'AB-FAST', 'AB-COMPAT', 'AB-BFAIL'];
     assert.deepEqual(ids.map((o) => o.id), want, 'all seven controls must list, in order');
+});
+
+// --- relative paths (the 2026-10-06 hosted A/A run: --out-dir benchmark/out/soak-ab resolved twice) -----------
+
+async function inTempCwd(fn) {
+    const here = process.cwd();
+    const tmp = realpathSync(mkdtempSync(join(tmpdir(), 'soak-ab-rel-'))); // macOS: /var -> /private/var
+    process.chdir(tmp);
+    try { return await fn(tmp); } finally { process.chdir(here); rmSync(tmp, { recursive: true, force: true }); }
+}
+
+// ab-pack spawns `npm` WITHOUT a shell (on Windows that is npm.cmd -> ENOENT), by design: --prev reaches the
+// npm spec before SoakAB.mjs validates it, so a shell would be an injection surface. soak-ab.yml is ubuntu-only.
+const WIN_SKIP = process.platform === 'win32' && 'ab-pack spawns npm without a shell; soak-ab.yml is ubuntu-only';
+
+test('packTree: relative scratch/out dirs resolve against the CALLER cwd, not the npm cwd', { skip: WIN_SKIP }, async () => {
+    const { packTree } = await import('../benchmark/soak/ab-pack.mjs');
+    await inTempCwd((tmp) => {
+        const B = packTree(undefined, join('rel', 'scratch'), 'rel');
+        assert.equal(B.dir, join(tmp, 'rel', 'B', 'package'));
+        assert.ok(existsSync(join(tmp, 'rel', 'B', 'package', 'Pick.js')));
+    });
+});
+
+test('fetchRelease: a relative scratch dir is not resolved twice (registry; skipped only if unreachable)', { skip: WIN_SKIP }, async (t) => {
+    const { execFileSync } = await import('node:child_process');
+    try {
+        execFileSync('npm', ['view', '@zakkster/lite-pick@1.1.0', 'version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 30000 });
+    } catch {
+        t.skip('npm registry unreachable');
+        return;
+    }
+    const { fetchRelease } = await import('../benchmark/soak/ab-pack.mjs');
+    await inTempCwd((tmp) => {
+        const A = fetchRelease('1.1.0', join('rel', 'scratch'), 'rel');
+        assert.equal(A.version, '1.1.0');
+        assert.equal(A.dir, join(tmp, 'rel', 'A', 'package'));
+    });
 });

@@ -26,7 +26,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const PKG = '@zakkster/lite-pick';
@@ -84,6 +84,10 @@ function untar(tarball, destRoot) {
  * disagreement. `prev` is a bare version string (e.g. '1.1.0'); the spec is PKG@prev.
  */
 export function fetchRelease(prev, scratchDir, outDir) {
+    // npm runs IN scratchDir below, so a relative path would resolve twice (scratch/scratch/...): absolutise
+    // against the caller's cwd first (the 2026-10-06 hosted A/A run failed closed on exactly that).
+    scratchDir = resolve(scratchDir);
+    outDir = resolve(outDir);
     const spec = PKG + '@' + prev;
     mkdirSync(scratchDir, { recursive: true });
 
@@ -120,6 +124,9 @@ export function fetchRelease(prev, scratchDir, outDir) {
  * pickSha256/poolSha256 == parity.json (B is the pinned shipped code) and version == package.json.
  */
 export function packTree(repoRoot = REPO_ROOT, scratchDir, outDir, parityPath = PARITY_JSON) {
+    // npm runs IN repoRoot below: absolutise against the caller's cwd first (see fetchRelease).
+    scratchDir = resolve(scratchDir);
+    outDir = resolve(outDir);
     mkdirSync(scratchDir, { recursive: true });
     const meta = parsePackJson(npm(['pack', '--json', '--pack-destination', scratchDir], repoRoot));
     const tarball = join(scratchDir, meta.filename);

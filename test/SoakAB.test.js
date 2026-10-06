@@ -15,7 +15,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -345,6 +345,42 @@ test('holm refuses a family smaller than the number of p-values', () => {
 test('the analyser\'s KERNEL_LANES is exactly the soak kernel roster (a new lane cannot slip past the A/B)', async () => {
     const { KERNEL_LANES: ROSTER } = await import('../benchmark/soak/lanes.mjs');
     assert.deepEqual(KERNEL_LANES.slice(), ROSTER.map((d) => d.name));
+});
+
+// --- relative paths (the 2026-10-06 hosted A/A run: --out-dir benchmark/out/soak-ab resolved twice) -----------
+
+async function inTempCwd(fn) {
+    const here = process.cwd();
+    const tmp = realpathSync(mkdtempSync(join(tmpdir(), 'soak-ab-rel-'))); // macOS: /var -> /private/var
+    process.chdir(tmp);
+    try { return await fn(tmp); } finally { process.chdir(here); rmSync(tmp, { recursive: true, force: true }); }
+}
+
+test('packTree: relative scratch/out dirs resolve against the CALLER cwd, not the npm cwd', async () => {
+    const { packTree } = await import('../benchmark/soak/ab-pack.mjs');
+    await inTempCwd((tmp) => {
+        const B = packTree(undefined, join('rel', 'scratch'), 'rel');
+        assert.equal(B.dir, join(tmp, 'rel', 'B', 'package'));
+        assert.ok(existsSync(join(tmp, 'rel', 'B', 'package', 'Pick.js')));
+    });
+    assert.ok(!existsSync(join(ROOT, 'rel')), 'nothing may be packed into the repo root');
+});
+
+test('fetchRelease: a relative scratch dir is not resolved twice (registry; skipped only if unreachable)', async (t) => {
+    const { execFileSync } = await import('node:child_process');
+    try {
+        execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['view', '@zakkster/lite-pick@1.1.0', 'version'],
+            { stdio: ['ignore', 'pipe', 'ignore'], timeout: 30000, shell: process.platform === 'win32' });
+    } catch {
+        t.skip('npm registry unreachable');
+        return;
+    }
+    const { fetchRelease } = await import('../benchmark/soak/ab-pack.mjs');
+    await inTempCwd((tmp) => {
+        const A = fetchRelease('1.1.0', join('rel', 'scratch'), 'rel');
+        assert.equal(A.version, '1.1.0');
+        assert.equal(A.dir, join(tmp, 'rel', 'A', 'package'));
+    });
 });
 
 // --- zero-dep helpers --------------------------------------------------------------------------------

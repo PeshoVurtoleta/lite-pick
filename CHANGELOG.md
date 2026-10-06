@@ -6,6 +6,17 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
+Benchmark-only (no shipped file changes; parity unchanged).
+
+### Fixed
+
+- **soak:ab -- a relative `--out-dir` failed closed before measuring.** `fetchRelease` runs `npm pack` inside
+  the scratch directory, so the workflow's relative `--out-dir benchmark/out/soak-ab` was resolved twice
+  (`.../scratch/benchmark/out/soak-ab/scratch/*.tgz`, ENOENT) and the first hosted A/A run exited 3
+  (INCONCLUSIVE). `fetchRelease` / `packTree` now absolutise their directories against the caller's cwd on
+  entry, and `SoakAB.mjs` resolves `--out-dir` / `--a-dir` / `--b-dir` once. Two regression tests run both
+  packers from a temp cwd with relative paths; both fail on the 1.1.1 `ab-pack.mjs`.
+
 ## [1.1.1] - 2026-10-06
 
 Tests, docs, one hot-path fix (F1) to `Pool.run`, and a kernel correctness/clarity pass from the

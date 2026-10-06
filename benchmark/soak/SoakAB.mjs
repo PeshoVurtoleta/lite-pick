@@ -28,7 +28,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, cpSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { fetchRelease, packTree, hashUnpacked } from './ab-pack.mjs';
@@ -342,7 +342,8 @@ function main() {
     // 2) Output tree.
     if (opts.outDir === '') die(2, "--out-dir '' is not a valid path");
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const outDir = opts.outDir || join(REPO_ROOT, 'benchmark', 'out', 'soak-ab-' + stamp);
+    // relative --out-dir / --a-dir / --b-dir resolve against the cwd ONCE, here (npm run: the package root).
+    const outDir = opts.outDir ? resolve(opts.outDir) : join(REPO_ROOT, 'benchmark', 'out', 'soak-ab-' + stamp);
     const scratch = join(outDir, 'scratch');
     const streamsDir = join(outDir, 'streams');
     mkdirSync(streamsDir, { recursive: true });
@@ -355,8 +356,8 @@ function main() {
     try {
         if (opts.mode === 'control') {
             controlMode = true;
-            A = hashUnpacked('A', opts.aDir);
-            B = hashUnpacked('B', opts.bDir);
+            A = hashUnpacked('A', resolve(opts.aDir));
+            B = hashUnpacked('B', resolve(opts.bDir));
             prevVersion = '0.0.0'; candidateVersion = '0.0.1';   // neutralise the version/parity preconditions
             parityPickSha = B.pickSha256; parityPoolSha = B.poolSha256;
         } else if (opts.mode === 'aa') {

@@ -149,3 +149,34 @@ request into a penalized peak sample (Pool test C1c). The busy floor (`max(decay
 recordRtt measured 8.8 -> 8.6 ns all-blend (two `exp` now), 5.8 -> 4.9 ns all-peak (the node skips `exp`); 0 B/op
 on both paths (PerfGate). Zero-box note: the NaN guard multiplies first and maps NaN to 0, so it merges two
 doubles; a `pw > 0 ? ... : sampleNs` ternary merged a double with the tagged argument and Maglev boxed it.
+
+## Amendment 2026-10-06 (1.1.1, audit 2026-10-05 K1): the "costs no more" claim is platform-specific; the single-`exp` fix was measured and REVERTED
+
+The 2026-10-04 amendment above claimed `recordRtt` "costs no more: 8.8 -> 8.6 ns all-blend" (line 149) and
+the matching 1.1.0 CHANGELOG entry said the decaying mean "costs no more". The 2026-10-05 audit (K1) showed
+that claim is **platform-specific**: it was measured on darwin / arm64 Node 26. On **Node 22 / x64** the audit
+measured the blend path at **12.6 -> 18.9 ns** (1.0.x -> 1.1.0; interleaved A/B, min of 5-7) --
+a real regression caused by the SECOND `exp()` the decaying pool mean now computes per sample. The slowdown is
+accepted: it buys a pool mean that FORGETS a latency-regime change (the whole point of the 1.1.0 amendment),
+and the 1.0.1 failure penalty still guards the black hole. The universal "costs no more" phrasing was the only
+defect; the CHANGELOG `[Unreleased]` carries the correction (the released 1.1.0 text is left as shipped).
+
+K1 proposed a fix: when the node's recorded stamp equals the pool's newest stamp -- one caller clock, the
+recorded node also holding the pool's newest sample (back-to-back same node, or a batch sharing one `now`) --
+reuse the node-decay factor `w` for the pool decay instead of a second `exp()`. It was implemented (pool-decay
+block hoisted above the node branch; blend arm `const w = dt === pdt ? pw : Math.exp(-dt / this._tau)`),
+measured, and **REVERTED**. Measurements, arm64 / darwin, a HEAD-copy vs the tree in separate processes
+(an in-process A/B went polymorphic), min of 7, machine load 1.4-2.0 (new / HEAD, lower is better):
+
+| Node | back-to-back (same node) | interleaved (the common path) |
+|---|---|---|
+| v22.23.3 | 0.82 | 1.12 |
+| v26.8.2  | 0.96 | 1.08 |
+
+x64 was not re-measured. Likely root cause of the revert (a HYPOTHESIS, not a verified mechanism): hoisting
+the pool decay and gating the blend arm on `dt === pdt` **may serialise the two independent `exp()` calls
+behind a branch** -- HEAD lets V8 overlap them -- so the rare same-stamp case saves one `exp` while the common
+interleaved path pays ~8-12%. `_recordAt` is
+therefore left **byte-identical to 1.1.0** (confirmed by the prototype-`toString` diff: PeakEWMA is absent
+from the changed-method set). The single-`exp` idea is not re-queued; a cheaper decaying mean would need a
+different structure, not a reordering.

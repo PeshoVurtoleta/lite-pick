@@ -136,3 +136,50 @@ test('P5: keyed runs carry the key, latency runs carry now; unsubscribe stops de
     assert.equal(l.events.length, before, 'nothing delivered after unsubscribe');
     for (let i = 0; i < 8; i++) assert.equal(chInf[i], 0);
 });
+
+test('P6 (M3): a settle nested ON THE STACK gets a fresh message; the outer settle stays intact', { skip: !HAS }, async () => {
+    // Settle-channel analogue of P4, but it must put a SECOND settle on the call stack while the outer one
+    // is still publishing -- otherwise `_sDepth` is back to 0 and `_sMsg` is reused with nothing to smear.
+    // The inner run's fn therefore throws SYNCHRONOUSLY: `out = await fn(i, signal)` evaluates fn before it
+    // suspends, so the throw is caught and `_pubSettleErr` publishes the inner settle WITHOUT a microtask
+    // hop -- still inside the first subscriber, inside the outer publish, with `_sDepth === 1`. The guard
+    // (`_sDepth === 0 ? _sMsg : fresh`) hands that inner settle a FRESH object. The M3 mutant (`const m =
+    // _sMsg` always) instead overwrites the shared object with the inner pool=innerPool, ok=false, then its
+    // finally nulls `pool`, so the SECOND subscriber's view of the OUTER settle is smeared to pool=null,
+    // ok=false. We assert on the entry whose pool === the outer pool, which arrives AFTER the nested one.
+    const inf = new Uint32Array(4), pool = new Pool(new P2cBalancer(4, up(4), inf), inf);
+    const inner = new Uint32Array(4), innerPool = new Pool(new P2cBalancer(4, up(4), inner), inner);
+    const seen = [];
+    let nested = false, innerSeenOk = null;
+    const first = (m) => {
+        if (m.pool === pool && !nested) {
+            nested = true;
+            innerPool.run(() => { throw new Error('sync'); }).catch(() => {});
+        } else if (m.pool === innerPool) {
+            innerSeenOk = m.ok;
+        }
+    };
+    const second = (m) => { seen.push({ outer: m.pool === pool, inner: m.pool === innerPool, pool: m.pool, endpoint: m.endpoint, ok: m.ok, aborted: m.aborted }); };
+    dc.subscribe(POOL_CHANNEL_SETTLE, first);
+    dc.subscribe(POOL_CHANNEL_SETTLE, second);
+    try {
+        const out = await pool.run((i) => 'ok:' + i);
+        await new Promise((r) => setImmediate(r));
+        // The nested inner settle fired synchronously, so it is seen FIRST; the outer settle second.
+        assert.equal(seen.length, 2, 'both the nested inner settle and the outer settle reached the 2nd subscriber');
+        assert.ok(seen[0].inner && !seen[0].outer, 'the nested inner settle arrives first, on the stack');
+        assert.equal(seen[0].ok, false, 'the inner run threw synchronously');
+        assert.equal(innerSeenOk, false, 'the first subscriber also saw the inner settle as a failure');
+        const outer = seen[1];
+        assert.ok(outer.outer, 'the second entry is the outer settle, not smeared to pool=null by the nested run');
+        assert.equal(outer.pool, pool);
+        assert.equal(out, 'ok:' + outer.endpoint);
+        assert.equal(outer.ok, true, 'the outer settle still reports success (M3 smears it to false)');
+        assert.equal(outer.aborted, false);
+        for (let i = 0; i < 4; i++) assert.equal(inf[i], 0, 'outer inflight net-zero');
+        for (let i = 0; i < 4; i++) assert.equal(inner[i], 0, 'inner inflight net-zero');
+    } finally {
+        dc.unsubscribe(POOL_CHANNEL_SETTLE, first);
+        dc.unsubscribe(POOL_CHANNEL_SETTLE, second);
+    }
+});

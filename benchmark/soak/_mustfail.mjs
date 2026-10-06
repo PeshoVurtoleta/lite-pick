@@ -482,6 +482,11 @@ cfgCase('CYCLES+DURATION mutually exclusive', { SOAK_CYCLES: CYC, SOAK_DURATION:
 cfgCase('SOAK_DURATION=45 (no unit)', { SOAK_DURATION: '45' });
 cfgCase('SOAK_OUT empty', { SOAK_OUT: '', SOAK_CYCLES: CYC });
 cfgCase('unpinned semi-space', { SOAK_CYCLES: CYC }, ['--expose-gc']);
+// #8b D2/D3: the SOAK_TIERS / SOAK_HOTOPS_N knobs fail closed on a bad value exactly like the rest.
+cfgCase('SOAK_TIERS=kernal (unknown tier)', { SOAK_TIERS: 'kernal', SOAK_CYCLES: CYC });
+cfgCase('SOAK_HOTOPS_N without SOAK_TIERS=kernel', { SOAK_HOTOPS_N: 'RoundRobin:1024:1024', SOAK_CYCLES: CYC });
+cfgCase('SOAK_HOTOPS_N non-power-of-two', { SOAK_TIERS: 'kernel', SOAK_LANES: 'RoundRobin', SOAK_HOTOPS_N: 'RoundRobin:1000:1024', SOAK_CYCLES: CYC });
+cfgCase('SOAK_HOTOPS_N with SOAK_MUSTFAIL=decay', { SOAK_TIERS: 'kernel', SOAK_LANES: 'RoundRobin', SOAK_HOTOPS_N: 'RoundRobin:1024:1024', SOAK_MUSTFAIL: 'decay', SOAK_CYCLES: CYC });
 
 // --- the 1.0.0-revert check (audit 1.5): the ORIGINAL buggy kernel (before the 1.0.1 audit fixes) must
 // be CAUGHT by the new quality gates -- the whole point of adding them. git show the pre-fix Pick.js into

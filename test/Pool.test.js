@@ -878,3 +878,54 @@ test('F1: a non-sentinel pick() (undefined/NaN/-2/\'x\'/null/-0/out-of-range/...
         }
     }
 });
+
+// =====================================================================================
+// M4 / M5 (kill): the distinct-failover internals -- the bounded re-pick (REPICK_LIMIT) and the
+// rotating per-Pool scan cursor. Both survive the real-balancer failover tests above (B8-B11),
+// which never distinguish a re-pick result from a scan result, nor chain enough unkeyed runs to
+// observe the cursor rotating. Scripted / fixed stubs below make each one load-bearing.
+// =====================================================================================
+
+// A balancer whose pick() replays a fixed script of return values (no note(): the notes branch is off).
+class ScriptPick {
+    constructor(n, script) { this.capacity = n; this.live = n; this.script = script; this.i = 0; }
+    pick() { const v = this.script[this.i]; this.i++; return v; }
+    isEligible() { return true; }
+}
+
+test('M4 (kill): a re-pick that yields a DISTINCT untried endpoint is used BEFORE the scan', async () => {
+    const N = 4, inflight = new Uint32Array(N);
+    // attempt 0 picks 0 (fails); attempt 1 first repeats 0 (already tried), then the bounded re-pick
+    // yields 2 (distinct, untried) -> 2 is used. With REPICK_LIMIT = 0 the re-pick loop never runs, so 0
+    // stays tried and Pool falls to the scan, which from the rotated cursor (1) returns endpoint 1.
+    const pool = new Pool(new ScriptPick(N, [0, 0, 2]), inflight);
+    const seen = [];
+    await assert.rejects(
+        pool.run((i) => { seen.push(i); throw new Error('fail-' + i); }, { tries: 2 }),
+        /fail-/,
+    );
+    assert.deepEqual(seen, [0, 2],
+        'the bounded re-pick found the distinct endpoint 2 before the scan (REPICK_LIMIT=0 mutant: [0,1])');
+    for (let i = 0; i < N; i++) assert.equal(inflight[i], 0, 'inflight net-zero');
+});
+
+test('M5 (kill): the unkeyed failover scan start ROTATES across runs (covers each backend in turn)', async () => {
+    const N = 5, inflight = new Uint32Array(N);
+    // The stub always returns endpoint 0, so every run exhausts the re-pick and falls to the scan. The
+    // scan start is the per-Pool rotating cursor; over N-1 runs the failover target walks 1,2,3,4. If the
+    // cursor is not advanced (M5 mutant) the start is pinned and every run fails over to the same node 1.
+    const pool = new Pool(new FixedPick(N, 0), inflight);
+    const targets = [];
+    for (let run = 0; run < N - 1; run++) {
+        const seen = [];
+        await assert.rejects(
+            pool.run((i) => { seen.push(i); throw new Error('fail'); }, { tries: 2 }),
+            /fail/,
+        );
+        assert.equal(seen[0], 0, 'attempt 0 is the stub home (0)');
+        targets.push(seen[1]);
+    }
+    assert.deepEqual(targets, [1, 2, 3, 4],
+        'the per-Pool scan cursor advances each run (M5 mutant: pinned -> [1,1,1,1])');
+    for (let i = 0; i < N; i++) assert.equal(inflight[i], 0, 'inflight net-zero');
+});

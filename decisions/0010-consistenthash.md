@@ -120,3 +120,21 @@ others (largest share 2.9%); a remove moves a median 0.49% of other keys at M = 
 M = 4099; undoing either restores every key (the build is deterministic in the weights). BoundedLoad inherits
 both. No new API: RECIPES.md section 9, GUIDE.md and llms.txt document which to use and that our weight 0 is
 IPVS's delete, not its weight 0.
+
+## Amendment 2026-10-06 (1.1.1, audit 2026-10-05 K9): the table-size `M` upper bound
+
+Fork 5 bounded `M` below (prime, `> 1`, `>= capacity`) but not above. The Maglev populate (`_build`) indexes
+its per-permutation cursor through an `Int32Array` (`offset` / `cur`); for `M > 2^31 - 1` those offsets wrap
+negative and the populate silently corrupts the table (a slot backfilled to backend 0), with no error. 1.1.1
+adds the correctness bound to the constructor: `M > 2147483647` throws `RangeError` with code
+`LITE_PICK_OPTION`. BoundedLoad inherits it through `super()`. The guard lives on the cold constructor path, so
+`pick()` is byte-identical and every selection stream is unchanged (StreamParity). A regression test
+(`test/ConsistentHash.test.js`) stubs `globalThis.Uint32Array` to throw a sentinel for `length > 2^30` and
+asserts the ctor rejects `M = 2147483659` (a prime) with `LITE_PICK_OPTION` BEFORE allocating -- it fails on
+HEAD (the sentinel is reached) and passes on the tree.
+
+A **hard** allocation cap is still wanted: even a legal `M` near 2^31 asks for a multi-gigabyte `Uint32Array`,
+and an over-large typed array is an uncatchable V8 fatal, not a `RangeError` (packaging law). The decision is
+to ship only the correctness bound in 1.1.1 and defer the ergonomic `M <= 2^24` HARD cap (with a
+`LITE_PICK_OPTION` did-you-mean) to 1.2.0; the docs already RECOMMEND `M <= 2^24` because the build is
+`O(M x N)`. Recorded in the ROADMAP 1.2.0 queue.

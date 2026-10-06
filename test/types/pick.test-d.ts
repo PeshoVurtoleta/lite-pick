@@ -8,7 +8,7 @@
 
 import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT,
     STAT_FALLBACK_SCANS, STAT_REBUILDS, STAT_DISPLACED, STAT_COUNT } from '../../Pick.js';
-import type { LitePickErrorCode, BalancerDescription, BalancerStats } from '../../Pick.js';
+import type { LitePickErrorCode, LitePickError, BalancerDescription, BalancerStats } from '../../Pick.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -269,6 +269,19 @@ const badCode: LitePickErrorCode = 'ERR_LITE_PICK_INDEX';
 void badCode;
 const iFb: 0 = STAT_FALLBACK_SCANS, iRb: 1 = STAT_REBUILDS, iDp: 2 = STAT_DISPLACED;
 void iFb; void iRb; void iDp;
+// 1.1.1: STAT_COUNT is the exact literal 3 (not merely `number`), so slab sizing is a compile-time check.
+const statCount: 3 = STAT_COUNT;
+void statCount;
+// @ts-expect-error -- STAT_COUNT is the literal 3, never 4.
+const statCount4: 4 = STAT_COUNT;
+void statCount4;
+// 1.1.1: LitePickError is a type-only Error carrying a LitePickErrorCode on `.code`.
+declare const caught: unknown;
+const liteErr = caught as LitePickError;
+const liteErrAsError: Error = liteErr;
+const liteErrCode: LitePickErrorCode = (caught as LitePickError).code;
+const liteErrCodeSat = (caught as LitePickError).code satisfies LitePickErrorCode;
+void liteErrAsError; void liteErrCode; void liteErrCodeSat;
 const obsSlab = new Float64Array(STAT_COUNT);
 const obsCh = new ConsistentHashBalancer(4, new Uint8Array(4), null, 257);
 obsCh.attachStats(obsSlab);

@@ -148,6 +148,60 @@ async function main() {
     }
     fillTrackerCH();
 
+    // WeightedRandom.setWeights(buf.subarray(0, cap)) retention (K5, 1.1.1): setWeights COPIES via
+    // `_weights.set(weights.subarray(0, cap))`, so the passed-in view (and its buffer) must NOT be
+    // retained -- every argument must finalize even while the balancer that received it STAYS ALIVE.
+    //
+    // Teeth (reviewer rv2/wrret.mjs): if the balancer were dropped each iteration, a setWeights that
+    // retained its argument (`this._kept = w`) would be collected WITH the balancer and the arg would
+    // finalize anyway -- the lane would pass a leaking mutant. So the balancer is LONG-LIVED here: one
+    // instance takes every setWeights call and is held past the forced-GC drain. With the balancer alive,
+    // a retained argument can never finalize. The real WR copies, so every tracked view finalizes and the
+    // tracker returns to 0; a LEAKY subclass (`setWeights` keeps the arg) is run through this SAME lane
+    // function as the MUST-RETAIN control and MUST trip. Track the ARGUMENT view (NOT the ctor weights the
+    // balancer keeps by design); the cleanup closes over NOTHING.
+    const WR_CAP = 1 << 10, WR_CYCLES = 50, WR_PER = 1000;
+    const wrLaneEl = new Uint8Array(WR_CAP).fill(1);
+    function runWRSetWeightsLane(balancer, trk, cycles, per) {
+        for (let c = 0; c < cycles; c++) {
+            for (let k = 0; k < per; k++) {
+                const argBuf = new Uint32Array(WR_CAP);
+                for (let i = 0; i < WR_CAP; i++) argBuf[i] = 1 + (i & 7);
+                const view = argBuf.subarray(0, WR_CAP);             // the VIEW handed to setWeights
+                balancer.setWeights(view);
+                balancer.pick();
+                trk.track(view, noop, 'wr-setweights-arg', { audit: true });
+            }
+        }
+    }
+    // The long-lived receivers are held in this array, which is referenced AFTER the GC drain (its
+    // length is printed), so V8 cannot prove them dead early: a retained argument therefore cannot
+    // finalize while its balancer lives. The lane runs in its own function so the churn frame (and the
+    // transient `view` locals) are torn down before the drain.
+    const wrKeepAlive = [];
+    const wrLiveBalancer = new WeightedRandomBalancer(
+        WR_CAP, wrLaneEl, new Uint32Array(WR_CAP).fill(1), 0x1234abcd);
+    wrKeepAlive.push(wrLiveBalancer);
+    runWRSetWeightsLane(wrLiveBalancer, tracker, WR_CYCLES, WR_PER);
+
+    // MUST-RETAIN control: the SAME lane function, but the receiver is a LEAKY subclass that pushes every
+    // setWeights argument into a field array. Because this long-lived instance retains the views, they can
+    // never finalize: this tracker's size() must stay == the arg count after the forced GC. If it drops to
+    // 0 the real lane above is blind (it would pass this exact mutant), and the gate fails closed.
+    const wrCtrlWarns = [];
+    const wrCtrlTracker = createLeakTracker({
+        name: 'lite-pick-wr-setweights-ctrl',
+        onWarning: (w) => wrCtrlWarns.push(w.kind + ':' + w.reason),
+    });
+    class LeakyWRBalancer extends WeightedRandomBalancer {
+        setWeights(w) { (this._kept || (this._kept = [])).push(w); return super.setWeights(w); }
+    }
+    const WR_CTRL_ARGS = 64;
+    const wrCtrlBalancer = new LeakyWRBalancer(
+        WR_CAP, wrLaneEl, new Uint32Array(WR_CAP).fill(1), 0x5eed1e55);
+    wrKeepAlive.push(wrCtrlBalancer);
+    runWRSetWeightsLane(wrCtrlBalancer, wrCtrlTracker, 1, WR_CTRL_ARGS);
+
     globalThis.gc();
     await new Promise((r) => setTimeout(r, 0));
     globalThis.gc();
@@ -158,6 +212,10 @@ async function main() {
         live = tracker.size();
     }
     const findings = tracker.audit();
+
+    // The MUST-RETAIN control reads its size AFTER the same forced-GC drain: the kept args must survive.
+    const wrCtrlLive = wrCtrlTracker.size();
+    const wrCtrlTrips = wrCtrlLive >= 1 && wrCtrlWarns.length === 0;
 
     // ---- phase 2: substrate hot path -- 0 retained B/op --------------------
     // One reused Prng + one reused BalancerBase. Steady state: one PRNG draw + one
@@ -341,6 +399,10 @@ async function main() {
     process.stdout.write('  retention: tracker.size()=' + live +
         ' findings=' + findings.length + ' warns=' + warns.length +
         ' -> ' + (retentionOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  WR.setWeights(subarray) arg retention: MUST-RETAIN control size=' + wrCtrlLive +
+        ' warns=' + wrCtrlWarns.length + ' -> ' +
+        (wrCtrlTrips ? 'TRIPPED (lane has teeth)' : 'BLIND -- gate is broken') + '\n');
+    void wrKeepAlive.length;    // keep both lane receivers reachable PAST the drain (teeth)
     process.stdout.write('  (hot-path figures are RETAINED B/op: bytes alive after a forced GC, not an alloc rate;\n' +
         '   the 0-B/op allocation claim is proven by PerfGate scavenge counting -- npm run test:perf)\n');
     process.stdout.write('  substrate hot-path retained: ' + showBytes(allocBytes) + ' B/op -> ' +
@@ -376,8 +438,12 @@ async function main() {
 
     if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk ||
         !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk || !chAllocOk ||
-        !blAllocOk || !noteAllocOk || !wrandAllocOk || !wrandFbAllocOk || !mustFailTrips) {
+        !blAllocOk || !noteAllocOk || !wrandAllocOk || !wrandFbAllocOk || !mustFailTrips || !wrCtrlTrips) {
         process.stderr.write('torture: FAIL\n');
+        if (!wrCtrlTrips) {
+            process.stderr.write('  WR.setWeights MUST-RETAIN control did not trip (size=' + wrCtrlLive +
+                ', warns=' + wrCtrlWarns.length + '): the setWeights-arg retention lane is blind\n');
+        }
         if (!mustFailTrips) {
             process.stderr.write('  MUST-FAIL control did not trip (retained=' + showBytes(mustFailBytes) +
                 '): the retention lane cannot see retained bytes -- gate is not trustworthy\n');

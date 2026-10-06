@@ -88,6 +88,36 @@ test('R1+R2 (D1): the recipe does not black-hole a fast-failing node (<= 5% fail
     assert.ok(r.stats.served[0] >= 1, 'node 0 is still re-probed (recovery works)');
 });
 
+test('D-lit (K7): README and llms.txt teach Number(process.hrtime.bigint()) as the PeakEWMA clock', () => {
+    const CLOCK = 'Number(process.hrtime.bigint())';
+    const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+    const llms = readFileSync(join(ROOT, 'llms.txt'), 'utf8');
+    assert.ok(readme.includes(CLOCK), 'README.md passes the hrtime clock through Number(...), not a raw BigInt');
+    assert.ok(llms.includes(CLOCK), 'llms.txt passes the hrtime clock through Number(...), not a raw BigInt');
+});
+
+test('D-lit (K6): README and llms.txt require the PeakEWMA clock `now` to be >= 0', () => {
+    const PHRASE = 'no busy floor, no pool-mean decay';
+    const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+    const llms = readFileSync(join(ROOT, 'llms.txt'), 'utf8');
+    assert.ok(readme.includes('`>= 0`') && readme.includes(PHRASE),
+        'README.md must state `now` >= 0 and that a negative clock disables PeakEWMA learning');
+    assert.ok(llms.includes('`>= 0`') && llms.includes(PHRASE),
+        'llms.txt must state `now` >= 0 and that a negative clock disables PeakEWMA learning');
+});
+
+test('D-lit (K23): Pool.d.ts documents a throwing subscriber as an uncaughtException', () => {
+    const poolDts = readFileSync(join(ROOT, 'Pool.d.ts'), 'utf8');
+    assert.ok(poolDts.includes('uncaughtException'),
+        'Pool.d.ts states a throwing diagnostics_channel subscriber surfaces as an uncaughtException');
+});
+
+test('D-lit (K-info): Pick.d.ts no longer claims "TypeError for a wrong type"', () => {
+    const pickDts = readFileSync(join(ROOT, 'Pick.d.ts'), 'utf8');
+    assert.ok(!pickDts.includes('TypeError for a wrong type'),
+        'the error-class note must not use the wrong "TypeError for a wrong type" phrasing (RangeError covers a wrong-type/out-of-range value)');
+});
+
 test('R3 (D1/N1): a caller abort feeds no penalty -- the node keeps its estimate and its share', async () => {
     const r = await loadRecipe();
     for (let k = 0; k < 200; k++) await r.handle({});          // every node settles at ~1 ms

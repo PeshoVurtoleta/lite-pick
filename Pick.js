@@ -84,7 +84,7 @@
  */
 
 /** Version stamp. Synced across package.json and llms.txt (three-place rule). */
-export const VERSION = '1.1.0';
+export const VERSION = '1.1.1';
 
 /**
  * Fail-closed sentinel returned by pick() when no endpoint is eligible.
@@ -317,7 +317,8 @@ export class BalancerBase {
      * LITE_PICK_INCONSISTENT) on any mismatch. The usual cause is a direct `eligible[i] = ...` write, which
      * bypasses setEligible() and desyncs `live` (PICK_NONE with a node up, wrong ratios). O(cap); for tests
      * and debug builds, not the request path. Strategies add their own caches (SmoothWRR's eligible-weight
-     * total, WeightedRandom's weight sum, BoundedLoad's noted total).
+     * total; WeightedRandom checks the live weights vs the built snapshot element-wise, naming the first
+     * index, plus an eligible-weight sum recount; BoundedLoad's noted total).
      */
     assertConsistent() {
         const cap = this._cap, el = this._eligible;
@@ -1332,7 +1333,19 @@ export class ConsistentHashBalancer extends BalancerBase {
         if (typeof m !== 'number') {
             throw _err(TypeError, 'LITE_PICK_OPTION', '[lite-pick] table size M must be a number');
         }
-        if (!Number.isInteger(m) || m < 2 || !chIsPrime(m)) {
+        if (!Number.isInteger(m) || m < 2) {
+            throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] table size M must be an integer > 1: ' + m);
+        }
+        // K9 (1.1.1): the Maglev build holds slot positions (offset / skip / cur) in Int32Array, so a
+        // table size above 2^31 - 1 wraps those indices negative and silently corrupts the lookup table
+        // (backfilled to backend 0). Cap M at the positive-int32 ceiling; fail closed before allocating.
+        // Checked BEFORE the primality test: a huge prime M (near 2^53) would otherwise run ~sqrt(M)
+        // (~3e7) trial divisions in chIsPrime before rejection.
+        if (m > 2147483647) {
+            throw _err(RangeError, 'LITE_PICK_OPTION',
+                '[lite-pick] table size M must be <= 2147483647 (2^31 - 1): ' + m);
+        }
+        if (!chIsPrime(m)) {
             throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] table size M must be a prime integer > 1: ' + m);
         }
         if (capacity > m) {
@@ -1819,6 +1832,13 @@ export class WeightedRandomBalancer extends BalancerBase {
         this._scaled = new Float64Array(capacity);
         this._psum = 0;      // sum of ALL weights (the eligible-independent normalizer); 0 => degenerate.
         this._builds = 0;    // COLD rebuild counter (observability / the anti-flap gate: a flap adds 0).
+        // K4: a snapshot of the weights the alias table was built on, so assertConsistent can name the
+        // first element that changed without a rebuild (a swap keeps the sum, so a sum check misses it).
+        this._built = new Uint32Array(capacity);
+        // K2: the eligible-weight sum the sparse fallback normalizes over, cached here and maintained
+        // on the cold setEligible so _sparsePick walks the table ONCE. A one-slot Float64Array (never a
+        // boxed field): the sum is exact < 2^53. Both are allocated BEFORE _build(), which fills them.
+        this._ew = new Float64Array(1);
         this._build();
     }
 
@@ -1837,9 +1857,13 @@ export class WeightedRandomBalancer extends BalancerBase {
         this._stats[STAT_REBUILDS] += 1;
         const cap = this._cap, wt = this._weights, prob = this._prob, alias = this._alias;
         const scaled = this._scaled, small = this._small, large = this._large;
-        let total = 0;
-        for (let i = 0; i < cap; i++) total += wt[i];
+        const built = this._built, el = this._eligible;
+        // K4 + K2: in the one sum loop, snapshot each weight into _built and accumulate the eligible
+        // subset into ew. Both _psum and _ew are set BEFORE the degenerate early return.
+        let total = 0, ew = 0;
+        for (let i = 0; i < cap; i++) { const v = wt[i]; built[i] = v; total += v; if (el[i]) ew += v; }
         this._psum = total;
+        this._ew[0] = ew;
         if (total <= 0) {
             // Degenerate all-zero weights: no positive-weight column. pick() short-circuits on _psum===0
             // (PICK_NONE), so the table is never read -- fill it defensively (each column self-referential).
@@ -1867,6 +1891,36 @@ export class WeightedRandomBalancer extends BalancerBase {
     }
 
     /**
+     * COLD path (K2): mark endpoint i up/down, maintaining the cached eligible-weight sum `_ew` -- the
+     * sparse fallback's normalizer -- in lockstep with `_live`. No alias-table rebuild (an eligibility
+     * flap NEVER rebuilds, A9): the table is weight-only and eligibility-independent. The toggle's
+     * weight comes from the BUILT snapshot, so `_ew` tracks exactly what `_sparsePick` walks.
+     * Zero-alloc once optimized; the interpreter may box a built weight > 2^31 on the running +=/-= path
+     * (Node 22, ~15 B/call; 0 B/call optimized -- the cold eligibility path, not the request path).
+     * @param {number} i
+     * @param {boolean} up
+     */
+    setEligible(i, up) {
+        const l = this._live;
+        super.setEligible(i, up);               // validates range, flips the bit, updates _live
+        if (this._live !== l) {
+            // Supported regime (total weight < 2^53): the running +=/-= is EXACT and equals a fresh sum.
+            if (this._psum < 9007199254740992) {
+                this._ew[0] += this._live > l ? this._built[i] : -this._built[i];
+            } else {
+                // Past 2^53 total weight a single +=/-= drifts (Float64 can no longer represent every
+                // integer step), so a flap would desync _ew from a per-call recount and assertConsistent
+                // would false-positive. Recount ASCENDING over the built snapshot -- bit-identical to the
+                // fallback's own per-call sum in every regime (the uncapped-capacity correctness bound).
+                let ew = 0;
+                const cap = this._cap, built = this._built, el = this._eligible;
+                for (let j = 0; j < cap; j++) if (el[j]) ew += built[j];
+                this._ew[0] = ew;
+            }
+        }
+    }
+
+    /**
      * COLD: reconfigure endpoint i's weight (uint32) and REBUILD the alias table from the new weights.
      * The balancer is the sole writer of the derived table (the SmoothWRR / ConsistentHash precedent).
      * @param {number} i
@@ -1891,8 +1945,10 @@ export class WeightedRandomBalancer extends BalancerBase {
         if (!(weights instanceof Uint32Array) || weights.length < this._cap) {
             throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
-        const wt = this._weights;
-        for (let i = 0; i < this._cap; i++) wt[i] = weights[i];
+        // K5: TypedArray.prototype.set copies correctly even when `weights` is a view OVERLAPPING the
+        // balancer's own array (e.g. a subarray of it) -- an index-ascending element copy would smear
+        // a right-shifted source. Cold; the ConsistentHash owned-copy precedent (Pick.js set() at 1350).
+        this._weights.set(weights.subarray(0, this._cap));
         this._build();
     }
 
@@ -1938,9 +1994,8 @@ export class WeightedRandomBalancer extends BalancerBase {
      */
     _sparsePick() {
         this._stats[STAT_FALLBACK_SCANS] += 1;
-        const cap = this._cap, el = this._eligible, wt = this._weights;
-        let s = 0;
-        for (let i = 0; i < cap; i++) if (el[i]) s += wt[i];
+        const cap = this._cap, el = this._eligible, built = this._built;
+        const s = this._ew[0];                    // K2: the cached eligible-weight sum (no first walk)
         if (s === 0) return PICK_NONE;            // no eligible positive-weight node
         const rng = this._rng;
         let x = rng._s;                           // rng.next(), inline (zero-box, B6)
@@ -1952,7 +2007,7 @@ export class WeightedRandomBalancer extends BalancerBase {
         let u = (x / 4294967296) * s;
         let last = PICK_NONE;
         for (let i = 0; i < cap; i++) {
-            if (el[i] && wt[i] > 0) { u -= wt[i]; last = i; if (u < 0) return i; }
+            if (el[i] && built[i] > 0) { u -= built[i]; last = i; if (u < 0) return i; }
         }
         return last;                              // float residue: the last positive-weight eligible node
     }
@@ -1966,14 +2021,29 @@ export class WeightedRandomBalancer extends BalancerBase {
         return d;
     }
 
-    /** Cold, opt-in (1.1.0): the base recount plus the table's weight sum (a direct `weights[i]` write without
-     *  rebuild() leaves the alias table stale). */
+    /** Cold, opt-in (1.1.0): the base recount plus the live weights vs the built snapshot element-wise
+     *  (naming the first changed index), plus an eligible-weight sum recount (a direct `weights[i]` write --
+     *  even a sum-preserving swap -- or a direct `eligible[i]` write leaves the alias table / `_ew` stale). */
     assertConsistent() {
         super.assertConsistent();
-        const t = _sum(this._weights, this._cap);
-        if (t !== this._psum) {
-            throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] the alias table was built on a weight sum of ' + this._psum +
-                ' but the weights sum to ' + t + ': weights[] changed without rebuild() -- use setWeight() / setWeights()');
+        const cap = this._cap, wt = this._weights, built = this._built, el = this._eligible;
+        // K4: the alias table is a function of the BUILT snapshot, not the live weight sum. A direct
+        // weights[i] write -- even a SWAP that preserves the sum -- desyncs it; compare element-wise and
+        // name the first offender (a sum check cannot see a swap).
+        for (let i = 0; i < cap; i++) {
+            if (wt[i] !== built[i]) {
+                throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] the alias table was built on weights[' + i +
+                    '] = ' + built[i] + ' but weights[' + i + '] is now ' + wt[i] +
+                    ': weights[] changed without rebuild() -- use setWeight() / setWeights()');
+            }
+        }
+        // K2: the cached eligible-weight sum must match a fresh recount over the built snapshot -- a
+        // direct eligible[] write (e.g. a SWAP that keeps _live) desyncs _ew while the base check passes.
+        let ew = 0;
+        for (let i = 0; i < cap; i++) if (el[i]) ew += built[i];
+        if (ew !== this._ew[0]) {
+            throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] the cached eligible-weight sum is ' + this._ew[0] +
+                ' but the eligible weights sum to ' + ew + ': eligible[] was written directly -- flip it only through setEligible()');
         }
     }
 }

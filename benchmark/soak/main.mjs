@@ -16,7 +16,7 @@
 import { performance, monitorEventLoopDelay } from 'node:perf_hooks';
 import { DDSketch } from '@zakkster/lite-sketch';
 import { Prng, PICK_NONE } from './kernel.mjs';
-import { readConfig } from './config.mjs';
+import { readConfig, HOTOPS_N_MIN, HOTOPS_N_MAX } from './config.mjs';
 import { ROSTER, KERNEL_LANES, TINY_LANES, CAP, M_CH, checkLane, KEYS, KEY_COUNT, KEY_MASK } from './lanes.mjs';
 import { POOL_LANES, runPoolCycle } from './pool-lane.mjs';
 import { seedFor, selfCheckSeeds } from './seeds.mjs';
@@ -41,8 +41,6 @@ const HOTOPS_WARM = 50000;       // warm the fixed hotOps batch before timing
 // SAME length and records the median -- comparable across cycles, long enough to be stable.
 const HOTOPS_MIN_MS = 25;
 const HOTOPS_REPS = 5;
-const HOTOPS_N_MIN = 1024;
-const HOTOPS_N_MAX = 1 << 26;
 const LAT_PICKS = 96000;             // dense latency pass, every pick timed: 96000 samples/cycle (p999 stable)
 const LAT_SPARSE_PICKS = 20000;      // sparse latency pass (each pick O(cap)): report-only p50/p99/p999
 const LEAK_ARRAY_LEN = 700000;   // MUSTFAIL=leak/heap: plain-array retained per lane-cycle
@@ -111,7 +109,7 @@ async function main() {
     }
     assertPinnedFlags();   // the hotAlloc gate is only meaningful with semi-space pinned (fail closed)
 
-    const cfg = readConfig(process.env, ROSTER.concat(POOL_LANES));
+    const cfg = readConfig(process.env, ROSTER, POOL_LANES);
 
     const seedErr = selfCheckSeeds(cfg.seed, ROSTER.length);
     if (seedErr !== null) {
@@ -122,9 +120,10 @@ async function main() {
     // Drive BOTH the kernel lanes (CAP=256) and the tiny lanes (cap in {1,2,3}[cycle%3]) selected by
     // SOAK_LANES. Each entry carries a distinct laneId so gate/quality series never collide by name.
     const entries = [];
-    for (const l of KERNEL_LANES) if (cfg.lanes.indexOf(l.name) !== -1) entries.push({ lane: l, tier: 'kernel', laneId: l.name });
-    for (const l of TINY_LANES) if (cfg.lanes.indexOf(l.name) !== -1) entries.push({ lane: l, tier: 'tiny', laneId: l.name + '#tiny' });
-    for (const nm of POOL_LANES) if (cfg.lanes.indexOf(nm) !== -1) entries.push({ poolName: nm, tier: 'pool', laneId: nm });
+    const runTier = (t) => cfg.tiers.indexOf(t) !== -1;   // SOAK_TIERS subset (#8b D2)
+    for (const l of KERNEL_LANES) if (runTier('kernel') && cfg.lanes.indexOf(l.name) !== -1) entries.push({ lane: l, tier: 'kernel', laneId: l.name });
+    for (const l of TINY_LANES) if (runTier('tiny') && cfg.lanes.indexOf(l.name) !== -1) entries.push({ lane: l, tier: 'tiny', laneId: l.name + '#tiny' });
+    for (const nm of POOL_LANES) if (runTier('pool') && cfg.lanes.indexOf(nm) !== -1) entries.push({ poolName: nm, tier: 'pool', laneId: nm });
     const laneIds = entries.filter((e) => e.tier !== 'pool').map((e) => e.laneId);   // kernel+tiny -> computeGates
     const poolLaneIds = entries.filter((e) => e.tier === 'pool').map((e) => e.laneId);
 
@@ -266,6 +265,9 @@ async function main() {
 
     const qw = new QualityWindow(CAP);
     const opsN = new Map();   // S2: per-lane (name#cap) calibrated hotOps batch lengths { dense, sparse }
+    // #8b D3: SOAK_HOTOPS_N pins the batch lengths (kernel tier, CAP=256), so per-process calibration is
+    // skipped and both A/B sides time the SAME batch. A fresh object per lane (never a shared mutation).
+    if (cfg.hotOpsN) { for (const nm of Object.keys(cfg.hotOpsN)) opsN.set(nm + '#' + CAP, { dense: cfg.hotOpsN[nm].dense, sparse: cfg.hotOpsN[nm].sparse }); }
     // Sketches are created ONCE and clear()ed per lane-cycle -- a `new DDSketch` per cycle allocated
     // enough (over 20 lanes) to trigger a workload major GC inside the window. Strict-range bins are
     // pre-allocated at construction; clear() zeroes counts without allocating.

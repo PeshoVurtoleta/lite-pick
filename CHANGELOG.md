@@ -6,8 +6,13 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
-Tests, docs, and one hot-path fix (F1) to `Pool.run`. The published "O(1) counter ops + one small
-per-run array" cost claim for `Pool.run` was wrong; it is now measured, gated, and corrected everywhere.
+## [1.1.1] - 2026-10-06
+
+Tests, docs, one hot-path fix (F1) to `Pool.run`, and a kernel correctness/clarity pass from the
+2026-10-05 audit (see "Kernel (audit Unit 3)" below -- WeightedRandom `assertConsistent` / `setWeights`,
+the ConsistentHash table-size bound, the cached eligible-weight sum, the type and doc fixes, and a
+correction to 1.1.0's "costs no more" claim). The published "O(1) counter ops + one small per-run array"
+cost claim for `Pool.run` was wrong; it is now measured, gated, and corrected everywhere.
 
 ### Changed
 
@@ -77,6 +82,102 @@ per-run array" cost claim for `Pool.run` was wrong; it is now measured, gated, a
   the perf lane with inlining off). On Node < 20 with no install (the CI Node 18 job) the file skips; anywhere
   else a missing devDependency fails.
 
+### Kernel (audit Unit 3)
+
+Correctness, clarity and type fixes to the selection kernel from the 2026-10-05 audit (the K / type / doc
+items). The hot `pick()` body and every selection stream are UNCHANGED: a new golden suite
+`test/StreamParity.test.js` (FNV fingerprints per program across all ten strategies -- interleaved eligibility
+flaps, `setWeight` / `setWeights` / `rebuild`, and PeakEWMA latency feedback in four clock modes) is
+bit-identical HEAD vs the working tree, a 4000-program HEAD-vs-tree differential fuzz (caps 1..702, ~9.6M ops)
+agrees, and the prototype-`toString` diff shows ONLY eight methods changed: the six WeightedRandom methods
+(`constructor`, `_build`, `setEligible`, `setWeights`, `_sparsePick`, `assertConsistent`),
+`ConsistentHashBalancer.constructor` (the K9 `M <= 2^31-1` guard), and `BalancerBase.constructor`
+(a JSDoc comment update only -- no logic). `Pool.js` is byte-identical.
+
+#### Fixed
+
+- **WeightedRandom `assertConsistent()` now compares weights element by element (K4).** Through 1.1.0 it
+  recounted only the weight SUM, so swapping `[1,2,3,4]` to `[4,2,3,1]` without `rebuild()` passed while picks
+  kept following the stale alias table. It now keeps a `_built` snapshot (the weights the table was built from),
+  compares the live weights against it index by index naming the first mismatch, and recounts the cached
+  eligible-weight sum. A new `test/WeightedRandom.test.js` case fails on HEAD (no throw) and passes on the tree.
+- **WeightedRandom `setWeights` is overlap-safe (K5).** The copy is `wt.set(weights.subarray(0, cap))`, correct
+  when the caller passes a subarray overlapping the balancer's own weights (a forward element loop could smear:
+  a HEAD mutant reads `[9,9,9,9]` where the tree reads `[9,1,2,3]`). ConsistentHash / BoundedLoad were never
+  affected (they copy into a private array on build). Tested both overlap directions.
+- **ConsistentHash / BoundedLoad reject a table size `M > 2^31 - 1` (K9).** The Maglev populate indexes its
+  cursor through an `Int32Array`; above `2147483647` those offsets wrap negative and silently corrupt the table
+  (a slot backfilled to backend 0). The constructor now throws `RangeError` / `LITE_PICK_OPTION`; BoundedLoad
+  inherits it through `super()`. A `test/ConsistentHash.test.js` case stubs `Uint32Array` to throw for
+  `length > 2^30` and asserts rejection of `M = 2147483659` (prime) BEFORE allocating -- it fails on HEAD (the
+  stub's sentinel is reached) and passes on the tree. (A HARD `M <= 2^24` allocation cap is deferred to 1.2.0;
+  the docs already recommend `M <= 2^24` because the build is `O(M x N)`.)
+
+#### Performance
+
+- **WeightedRandom heavy-outage fallback caches the eligible-weight sum (K2).** The 1.1.0 fallback walked the
+  weight array twice (sum, then place `u`), which made the heavy-outage lane 1.2-1.5x slower (audit K2) and
+  pushed PerfGate past V8's ~8 s memory reducer (T1). A one-slot `Float64Array` (`_ew`) maintained by `setEligible` / `setWeight` /
+  `setWeights` lets `_sparsePick` make a single walk; uint32 weights keep the sum exact below 2^53, so the same
+  `u` scales to the same node (stream-identical). Above total weight 2^53 (capacity is uncapped) `setEligible`
+  recounts `_ew` from the snapshot in ascending order (bit-identical to HEAD's per-call sum). Measured
+  new / HEAD (arm64 darwin, min of 3, machine load 1.4-2.0): **0.75 on Node 22.23.3, 0.82 on Node 26.8.2** --
+  faster but NOT halved: the FIX-PLAN expected the lane time to roughly halve (removing one of two walks), but
+  the lane is dominated by the shared 64-try rejection loop, which dilutes the single-walk saving (consistent
+  with audit K2's 1.2-1.5x: new/HEAD 0.75/0.82 implies the two-walk version was ~1.22-1.33x slower, not 2x).
+
+#### Types
+
+- **`Pick.d.ts`: `LitePickError`, `STAT_COUNT: 3`, error-class doc fix.** Added
+  `export interface LitePickError extends Error { code: LitePickErrorCode }`; narrowed `STAT_COUNT` from
+  `number` to the literal `3`; rewrote the error-class note that wrongly said "TypeError for a wrong type"
+  (verified against every throw site: `TypeError` only for a non-number numeric arg / a non-function balancer;
+  `RangeError` for an out-of-range value or a wrong-type / too-short typed array). `test/types/pick.test-d.ts`
+  gains the matching assertions; `npm run test:types` exits 0 on the tree and fails against HEAD's `Pick.d.ts`.
+
+#### Docs
+
+- **K7 -- the PeakEWMA clock is a JS `number`, never a `BigInt`.** README, llms.txt and RECIPES now spell out
+  `const nowNs = () => Number(process.hrtime.bigint());`: a raw `BigInt` to `pick(now)` throws an UNCODED
+  `TypeError` ("Cannot convert a BigInt value to a number"), and to `recordRtt` a coded `LITE_PICK_ARGUMENT`.
+- **K3 -- NQ's residual positional tie bias is documented** (README, GUIDE, llms.txt): under mixed weights the
+  idle-first grab plus the single cursor skews ties by <= ~1 pp (audit Poisson sim, weights
+  `[1,1,1,1,4,4,4,4]` at load 0.9: the four weight-4 nodes took 20.6 / 20.1 / 19.8 / 19.6% vs a flat 20%;
+  LeastConn / SED are fair). The fail-closed / exact-optimum contract holds; a seeded-reservoir fix is queued
+  for 1.2.0.
+- **`assertConsistent` (element-wise), the CH `M` bound, and the Pool throwing-subscriber behaviour** are
+  corrected / added across README, llms.txt and `Pool.d.ts` (a subscriber that throws surfaces as a process
+  `uncaughtException`; the `run()` is unaffected).
+- **ADR amendments:** 0009 (K1 -- see the correction below), 0012 (K2 / K4 / K5), 0010 (K9). ROADMAP section 4b
+  records the 1.2.0 queue.
+- **Correction to 1.1.0's "the decaying pool mean costs no more" (K1).** The 1.1.0 entry and ADR 0009 claimed
+  the second `exp()` the decaying pool mean adds "costs no more" (8.8 -> 8.6 ns); that was measured on
+  darwin / arm64 Node 26 and is platform-specific. On Node 22 / x64 the audit measured the blend path
+  **12.6 -> 18.9 ns** (1.0.x -> 1.1.0) -- a real regression, accepted for the forgetting pool mean
+  it buys. A single-`exp` fix (reuse the node decay when the node and pool stamps coincide) was implemented,
+  measured and REVERTED: it cost ~8-12% on the common interleaved path (likely because it serialises the two
+  independent `exp()` calls behind a branch -- a hypothesis, see ADR 0009), measured
+  new / HEAD arm64 darwin, min of 7: interleaved 1.12 on Node 22, 1.08 on Node 26;
+  back-to-back 0.82 / 0.96) to save one `exp` only in the rare same-stamp case, so `_recordAt` stays
+  byte-identical to 1.1.0. Platform numbers are in ADR 0009. (The released 1.1.0 text is left unedited.)
+
+#### Tests (mutation closures, K11)
+
+- New focused tests kill the K11 survivors: **M1** (NQ wrap-arm cursor, `test/NQ.test.js`), **M2** (CH/BL
+  `setWeights` last-weight copy, `test/ConsistentHash.test.js`), **M3** (a settle nested on the call stack by
+  a SETTLE subscriber whose inner run throws synchronously, so `_pubSettleErr` runs with `_sDepth === 1` --
+  `test/PoolChannels.test.js` P6 asserts the outer settle is not smeared), **M4** (Pool re-pick limit) and
+  **M5** (Pool scan cursor) in `test/Pool.test.js`. **M6** was already killed by the existing PoolChannels P4.
+  `test/torture.mjs` gains a
+  `WR.setWeights(subarray)` retention lane (50 x 1000 cycles, tracker returns to 0; a retain control trips).
+  A new PerfGate lane (`peakEwmaRecordFromBlend`) holds the blend feedback path at 0 B/op.
+
+#### Deferred to 1.2.0
+
+- K3 (NQ tie fairness -- documented now), K6, K8, K10, the ConsistentHash `M <= 2^24` hard allocation cap, the
+  `setWeights` no-op short-circuit, and a `CODES` runtime export (a new public API = a minor). See ROADMAP
+  section 4b.
+
 ### Soak harness (benchmark-only)
 
 The soak harness gained real teeth and a stricter analyser. No library change: `Pick.js`, `Pool.js`,
@@ -122,6 +223,45 @@ The soak harness gained real teeth and a stricter analyser. No library change: `
   jobs), failing ~81% of 30-minute nightlies (2026-10-05). Both now hold the fault until the breaker moves
   (capped at 16 s; a miss < 1e-6) and shift the rest of the timeline; `flakyWaitS` per heartbeat cycle; new
   teeth control `nobreaker`.**
+
+### Release-time soak A/B (benchmark-only, #8b)
+
+A new hand-run (`workflow_dispatch`) release gate that runs the PREVIOUS published release and the
+candidate INTERLEAVED on one runner and compares them per lane with the soak's own exact Mann-Whitney
+test (research/soak-release-ab.md, ADR 0017). #8b changes no library file: `Pick.js`, `Pool.js`, `Pick.d.ts`,
+`Pool.d.ts` and `parity.json` are untouched by this work (1.1.1's own kernel changes land separately), and
+`SCHEMA_VERSION` stays 5 (the two new header fields are additive). It gates no release until 1.1.1.
+
+- **Knobs + plumbing.** `SOAK_TIERS` (select kernel/tiny/pool tiers) and `SOAK_HOTOPS_N` (pin the hotOps
+  batch lengths per lane+metric so a slower candidate cannot time a different power-of-two batch); both
+  fail closed on a bad value with a did-you-mean hint. `uDist`/`medianOf` (`gates.mjs`) and `editDistance`
+  (`config.mjs`) gained `export` (no behaviour change). `provenance.mjs` records `config.tiers` /
+  `config.hotOpsN`.
+- **Pure analyser + runner + CI.** `benchmark/soak/ab-analyse.mjs` (imports `gates.mjs` only: Hodges-Lehmann
+  slowdown, exact MW p, Holm over the 20 comparisons, FAIL = `pHolm < 0.05 AND s > 5%`, PASS = 95% upper
+  bound `< 15%`, else INCONCLUSIVE). It fails CLOSED on an untrustworthy run: a lane family that is not
+  exactly 20 comparisons, a `K` below 8, or any lane+metric without exactly `K` per-process medians on each
+  side is INCONCLUSIVE, never a silent PASS or a verdict decided on a short sample. `latencyP99` (median A
+  vs B), per-side CV / detrended CV, and improvements (`s < -5%`) are printed per comparison and stored in
+  `analysis.json`, report-only (they never change the verdict or exit); the tiny and pool lanes are NOT run.
+  `ab-pack.mjs` (integrity-checked registry tarball A vs `npm pack` tree B), `SoakAB.mjs` (the runner:
+  calibrate-then-pin, K balanced-seeded rounds, exit 0/1/3, 2 for bad config), a per-version `ab-accept.json`
+  acceptance file whose lane must be one of the ten kernel lanes (an unknown lane fails closed with a
+  did-you-mean hint), and `.github/workflows/soak-ab.yml`.
+- **Teeth (`npm run soak:ab:teeth`, `benchmark/soak/_ab-teeth.mjs`).** Seven controls drive the REAL runner
+  end to end over the 1.1.0 tarball base (sha256 asserted `== git show 2a08567:Pick.js`); the slowdown
+  mutants add a read-only extra scan whose counter and sink stay in integer (Smi) slots, so they add TIME
+  only (no allocation, no hotAlloc trip). Measured K=10, M4 Pro, Node 22.23.3, serial, machine idle:
+  AB-AA PASS (exit 0, 0/20 INCONCLUSIVE, 413 s); AB-SLOW20 FAIL (SmoothWRR dense s=0.201 / sparse s=0.261,
+  pHolm 1.08e-4, 416 s); AB-SLOW10 FAIL (SmoothWRR dense s=0.115 and sparse s=0.160, pHolm 1.08e-4,
+  nothing else, 416 s); AB-SPARSE FAIL (P2C sparse s=0.192 / PeakEWMA sparse s=0.136, zero dense, 410 s);
+  AB-FAST PASS (SmoothWRR dense s=-0.247, 404 s); AB-COMPAT INCONCLUSIVE (baseline A, 6 s); AB-BFAIL FAIL
+  (B process, 37 s). Every one of the AB-AA run's 660 kernel cycle records (22 streams x 10 lanes x 3
+  cycles) had `gcMajor` 0 and `trackerSize` 0, and all 440 post-warm-up records read
+  `hotBytesPerOp <= 0.3`. AB-SLOW10's
+  expectation was corrected from "dense only" to both SmoothWRR comparisons: the same extra scan is a
+  larger share of SmoothWRR's cheaper sparse pick, a real ~16% slowdown the gate must FAIL (ADR 0017). K is
+  still to be fixed from the hosted A/A dispatch.
 
 ### Fixed
 

@@ -1,0 +1,79 @@
+name: soak-ab
+
+# Release-time relative soak A/B (research/soak-release-ab.md, ROADMAP #8b): the previous registry
+# release (A) and the release candidate (B, npm pack of the tree) interleaved on ONE fresh runner, K
+# rounds in a balanced seeded order, compared per kernel lane with the soak's own exact Mann-Whitney
+# test (benchmark/soak/ab-analyse.mjs). Run BY HAND (workflow_dispatch) on the release-candidate commit
+# before `npm publish`; the run URL goes in the release notes. One job, Node pinned to the gates line.
+#
+# It fails closed: 0 PASS, 1 FAIL (a lane got materially slower, or the candidate failed its own soak),
+# 3 INCONCLUSIVE (any precondition failed -- not enough evidence), 2 bad configuration. Every non-zero
+# exit fails the job, so INCONCLUSIVE blocks the release until it is understood -- the soak's rule.
+#
+# mode=aa runs the registry release on BOTH sides (a free A/A control, research 5.6) to measure the
+# hosted runner's process-to-process CV before the gate is trusted; K is fixed from it (Batch 5).
+#
+# NOTE: workflow_dispatch inputs are read ONLY through `env:`; no `${{ inputs.* }}` appears inside a
+# `run:` body (a value could otherwise be interpolated into the shell). test/SoakAB.test.js asserts this.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prev:
+        description: 'The previous registry release (A side), e.g. 1.1.0'
+        type: string
+        required: true
+      rounds:
+        description: 'Rounds per side (8..40)'
+        type: string
+        default: '10'
+      mode:
+        description: 'release (A vs candidate) or aa (A/A control: the registry release on both sides)'
+        type: choice
+        options:
+          - release
+          - aa
+        default: release
+
+permissions:
+  contents: read
+
+jobs:
+  soak-ab:
+    name: soak A/B (node 22.23.3 / ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # provenance records the git SHA; packTree reads the full tree
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned to EXACT 22.23.3 == the ci.yml `gates` job: both sides run with the same V8/GC regime
+          # the perf gates were measured on, so the A/B never blames the kernel for a Node change.
+          node-version: 22.23.3
+          cache: npm
+      - run: npm ci
+      # B (the candidate) must be the PINNED shipped code (benchmark/soak/parity.json) before it is packed.
+      - name: parity
+        run: npm run parity
+      - name: soak A/B
+        shell: bash
+        env:
+          PREV: ${{ inputs.prev }}
+          ROUNDS: ${{ inputs.rounds }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -o pipefail
+          mkdir -p benchmark/out/soak-ab
+          args=(--prev "$PREV" --rounds "$ROUNDS" --out-dir benchmark/out/soak-ab)
+          if [ "$MODE" = aa ]; then args+=(--aa); fi
+          npm run soak:ab -- "${args[@]}" 2>&1 | tee benchmark/out/soak-ab/soak-ab.log
+      - name: upload soak A/B evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-ab-${{ github.run_id }}
+          path: benchmark/out/soak-ab
+          if-no-files-found: error
+          retention-days: 90

@@ -27,12 +27,22 @@ export const DEFAULT_SEED = 0xC0FFEE >>> 0;
 export const SMOKE_CYCLES = 3;
 export const SMOKE_PICKS = PICKS_MIN;
 
+// hotOps batch bounds (#8b D3): moved here from main.mjs so SOAK_HOTOPS_N can validate the pinned
+// lengths against the SAME range the per-process calibration uses (main.mjs imports them back). The
+// pin is a power of two in [HOTOPS_N_MIN, HOTOPS_N_MAX].
+export const HOTOPS_N_MIN = 1024;
+export const HOTOPS_N_MAX = 1 << 26;   // 67108864
+
+// The three lane TIERS the harness drives (main.mjs: KERNEL_LANES, TINY_LANES, POOL_LANES). SOAK_TIERS
+// selects a subset; default = all three. An unknown tier is an error with a did-you-mean hint.
+export const TIERS = Object.freeze(['kernel', 'tiny', 'pool']);
+
 // Every SOAK_* key the harness understands. An env key with the SOAK_ prefix that is not
 // here is a typo -> exit 2 with a did-you-mean hint (fail closed on unknown option).
 const KNOWN_KEYS = [
     'SOAK_CYCLES', 'SOAK_DURATION', 'SOAK_PICKS', 'SOAK_SEED', 'SOAK_LANES',
     'SOAK_SMOKE', 'SOAK_OUT', 'SOAK_MUSTFAIL', 'SOAK_KERNEL', 'SOAK_POOL',
-    'SOAK_REQUIRE_PROVENANCE',
+    'SOAK_REQUIRE_PROVENANCE', 'SOAK_TIERS', 'SOAK_HOTOPS_N',
 ];
 
 // Every SOAK_MUSTFAIL mode is WIRED to actually trip a gate (exit 1); an unknown value is an error,
@@ -59,7 +69,7 @@ function fail(msg) {
 }
 
 /** Levenshtein distance (cold, tiny) -> the closest known key for the did-you-mean hint. */
-function editDistance(a, b) {
+export function editDistance(a, b) {
     const m = a.length, n = b.length;
     const d = new Array(n + 1);
     for (let j = 0; j <= n; j++) d[j] = j;
@@ -79,13 +89,29 @@ function editDistance(a, b) {
     return d[n];
 }
 
-function nearestKey(key) {
+/** Closest entry of `list` to `word` within edit distance 4 (the did-you-mean hint), else null. */
+function nearestFrom(word, list) {
     let best = null, bestD = Infinity;
-    for (const k of KNOWN_KEYS) {
-        const dd = editDistance(key, k);
+    for (const k of list) {
+        const dd = editDistance(word, k);
         if (dd < bestD) { bestD = dd; best = k; }
     }
     return bestD <= 4 ? best : null;
+}
+
+function nearestKey(key) {
+    return nearestFrom(key, KNOWN_KEYS);
+}
+
+/** Strict power-of-two env parse in [HOTOPS_N_MIN, HOTOPS_N_MAX] (SOAK_HOTOPS_N batch length). */
+function parsePow2(label, raw) {
+    if (!INT_RE.test(raw)) fail('SOAK_HOTOPS_N ' + label + "='" + raw + "' must be an integer");
+    const v = Number(raw);
+    if (!Number.isInteger(v) || v < HOTOPS_N_MIN || v > HOTOPS_N_MAX || (v & (v - 1)) !== 0) {
+        fail('SOAK_HOTOPS_N ' + label + "='" + raw + "' must be a power of two in [" +
+            HOTOPS_N_MIN + ', ' + HOTOPS_N_MAX + ']');
+    }
+    return v;
 }
 
 /** Strict integer env parse. raw is the string value (already known defined). */
@@ -128,10 +154,13 @@ function parseEnum(name, raw, allowed) {
 }
 
 /**
- * Parse the SOAK_* environment. `roster` is the array of valid lane names (kernel roster).
- * Returns a frozen config, or calls process.exit(2) on any bad/unknown input.
+ * Parse the SOAK_* environment. `kernelRoster` is the array of valid kernel lane names; `poolLanes`
+ * is the array of pool lane names (default []). The full lane roster is their concatenation (SOAK_LANES
+ * selects from it); the two are kept distinct so SOAK_TIERS/SOAK_HOTOPS_N can reason about kernel vs
+ * pool lanes. Returns a frozen config, or calls process.exit(2) on any bad/unknown input.
  */
-export function readConfig(env, roster) {
+export function readConfig(env, kernelRoster, poolLanes = []) {
+    const roster = kernelRoster.concat(poolLanes);
     // 1) Reject any unknown SOAK_* key first, so a typo never gets a silent default.
     for (const key of Object.keys(env)) {
         if (key.indexOf('SOAK_') !== 0) continue;
@@ -191,10 +220,71 @@ export function readConfig(env, roster) {
         lanes = roster.filter((nm) => requested.indexOf(nm) !== -1);
     }
 
+    // 6b) TIERS -- which lane tiers run (kernel/tiny/pool). Default all three; order follows TIERS.
+    let tiers = TIERS.slice();
+    if (has('SOAK_TIERS')) {
+        const requested = env.SOAK_TIERS.split(',').map((s) => s.trim()).filter((s) => s.length);
+        if (requested.length === 0) fail("SOAK_TIERS='" + env.SOAK_TIERS + "' selects no tiers");
+        for (const t of requested) {
+            if (TIERS.indexOf(t) === -1) {
+                const hint = nearestFrom(t, TIERS);
+                fail("SOAK_TIERS: unknown tier '" + t + "'" + (hint ? ' (did you mean ' + hint + '?)' : '') +
+                    ' (tiers: ' + TIERS.join(', ') + ')');
+            }
+        }
+        tiers = TIERS.filter((t) => requested.indexOf(t) !== -1);
+    }
+
+    // 6c) A tier x lane selection that drives nothing is an error (fail closed, never a 0-lane PASS).
+    // kernel+tiny tiers draw from the kernel roster; the pool tier draws from the pool lanes.
+    const selKernel = lanes.filter((nm) => kernelRoster.indexOf(nm) !== -1);
+    const selPool = lanes.filter((nm) => poolLanes.indexOf(nm) !== -1);
+    const kernelTierRuns = (tiers.indexOf('kernel') !== -1 || tiers.indexOf('tiny') !== -1) && selKernel.length > 0;
+    const poolTierRuns = tiers.indexOf('pool') !== -1 && selPool.length > 0;
+    if (!kernelTierRuns && !poolTierRuns) {
+        fail('SOAK_TIERS=[' + tiers.join(',') + '] x SOAK_LANES=[' + lanes.join(',') + '] selects no lane to run');
+    }
+
     // 7) MUSTFAIL (teeth knob; every mode is wired to trip a gate, validated, fail closed).
     const mustFail = has('SOAK_MUSTFAIL')
         ? parseEnum('SOAK_MUSTFAIL', env.SOAK_MUSTFAIL, MUSTFAIL_MODES)
         : null;
+
+    // 7b) HOTOPS_N -- pin the per-lane hotOps batch lengths (#8b D3) instead of per-process calibration,
+    // so a slower B cannot land on the other side of a power of two and time a different batch. Format:
+    // Lane:dense:sparse,... Requires SOAK_TIERS=kernel exactly (only the kernel tier is timed); the pinned
+    // lane set must equal the selected kernel lanes; incompatible with the recalibrating decay teeth.
+    let hotOpsN = null;
+    if (has('SOAK_HOTOPS_N')) {
+        if (!(tiers.length === 1 && tiers[0] === 'kernel')) {
+            fail('SOAK_HOTOPS_N requires SOAK_TIERS=kernel (got tiers=[' + tiers.join(',') + '])');
+        }
+        if (mustFail === 'decay' || mustFail === 'decaysparse') {
+            fail('SOAK_HOTOPS_N is incompatible with SOAK_MUSTFAIL=' + mustFail + ' (it recalibrates the batch per cycle)');
+        }
+        const parts = env.SOAK_HOTOPS_N.split(',').map((s) => s.trim()).filter((s) => s.length);
+        if (parts.length === 0) fail("SOAK_HOTOPS_N='" + env.SOAK_HOTOPS_N + "' pins no lanes");
+        const map = {};
+        for (const part of parts) {
+            const seg = part.split(':');
+            if (seg.length !== 3) fail("SOAK_HOTOPS_N entry '" + part + "' must be Lane:dense:sparse");
+            const lane = seg[0];
+            if (kernelRoster.indexOf(lane) === -1) {
+                const hint = nearestFrom(lane, kernelRoster);
+                fail("SOAK_HOTOPS_N: unknown lane '" + lane + "'" + (hint ? ' (did you mean ' + hint + '?)' : '') +
+                    ' (roster: ' + kernelRoster.join(', ') + ')');
+            }
+            if (Object.prototype.hasOwnProperty.call(map, lane)) fail("SOAK_HOTOPS_N: duplicate lane '" + lane + "'");
+            map[lane] = { dense: parsePow2(lane + ' dense', seg[1]), sparse: parsePow2(lane + ' sparse', seg[2]) };
+        }
+        const pinned = Object.keys(map);
+        const equal = pinned.length === selKernel.length && selKernel.every((nm) => Object.prototype.hasOwnProperty.call(map, nm));
+        if (!equal) {
+            fail('SOAK_HOTOPS_N lanes [' + pinned.slice().sort().join(',') + '] must equal the selected kernel lanes [' +
+                selKernel.slice().sort().join(',') + ']');
+        }
+        hotOpsN = Object.freeze(map);
+    }
 
     // 8) OUT -- an empty string is invalid (fail closed, never a silent default-path fallback).
     if (has('SOAK_OUT') && env.SOAK_OUT === '') fail("SOAK_OUT='' is not a valid path");
@@ -202,6 +292,7 @@ export function readConfig(env, roster) {
 
     return Object.freeze({
         cycles, durationMs, picks, seed, lanes, smoke, mustFail, out, requireProvenance,
+        tiers, hotOpsN,
         warmupCycles: WARMUP_CYCLES, gateN: GATE_N, minActiveCycles: MIN_ACTIVE_CYCLES,
         picksMin: PICKS_MIN, picksMax: PICKS_MAX,
         forever: cycles === 0 && durationMs === 0,

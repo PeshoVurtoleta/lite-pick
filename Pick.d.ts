@@ -18,17 +18,31 @@ export const PICK_NONE: -1;
 
 /**
  * The stable `code` on every error lite-pick throws or rejects with (1.1.0). Messages may change in any
- * release; codes are semver API. The error CLASS is unchanged (TypeError for a wrong type, RangeError for a
- * value out of its domain, Error otherwise). Kernel: CAPACITY, ARRAY (a typed array of the wrong type or too
- * short, or a bad stats slab), INDEX, WEIGHT, OPTION (a constructor / run option out of its domain), ARGUMENT
- * (a call argument: recordRtt's sample / clock, note's delta, Pool.run's fn), ABSTRACT, INCONSISTENT
- * (assertConsistent). Pool adds KEY_REQUIRED, CLOCK_REQUIRED, CLOCK_INVALID, ABORTED, NONE, FEEDBACK.
+ * release; codes are semver API. The error CLASS is stable: `TypeError` ONLY when a required numeric option
+ * or argument is not a number (tauNs / table size M / eps / minCap / note's delta / recordRtt's sample or
+ * clock), and when `Pool` / `liteQueryFetcher` get a non-function or a structurally-invalid balancer;
+ * `RangeError` for an out-of-range or out-of-domain VALUE (index, capacity, weight, a non-finite or negative
+ * number, an option outside its domain) AND for a typed-array argument of the wrong type or too short
+ * (`LITE_PICK_ARRAY` -- a wrong CONTAINER type is a RangeError, never a TypeError); `Error` otherwise. Kernel:
+ * CAPACITY, ARRAY (a typed array of the wrong type or too short, or a bad stats slab), INDEX, WEIGHT, OPTION
+ * (a constructor / run option out of its domain), ARGUMENT (a call argument: recordRtt's sample / clock,
+ * note's delta, Pool.run's fn), ABSTRACT, INCONSISTENT (assertConsistent). Pool adds KEY_REQUIRED,
+ * CLOCK_REQUIRED, CLOCK_INVALID, ABORTED, NONE, FEEDBACK.
  */
 export type LitePickErrorCode =
     | 'LITE_PICK_CAPACITY' | 'LITE_PICK_ARRAY' | 'LITE_PICK_INDEX' | 'LITE_PICK_WEIGHT' | 'LITE_PICK_OPTION'
     | 'LITE_PICK_ARGUMENT' | 'LITE_PICK_ABSTRACT' | 'LITE_PICK_INCONSISTENT'
     | 'LITE_PICK_KEY_REQUIRED' | 'LITE_PICK_CLOCK_REQUIRED' | 'LITE_PICK_CLOCK_INVALID' | 'LITE_PICK_ABORTED'
     | 'LITE_PICK_NONE' | 'LITE_PICK_FEEDBACK';
+
+/**
+ * A lite-pick error: a standard `Error` (`TypeError` / `RangeError` / `Error`, per the class rule above)
+ * carrying one of the stable `LitePickErrorCode` values on its `code`. Narrow a caught `unknown` with it:
+ * `if (e instanceof Error && 'code' in e) { const code = (e as LitePickError).code; ... }`.
+ */
+export interface LitePickError extends Error {
+    code: LitePickErrorCode;
+}
 
 /**
  * Stats slab indices (1.1.0). Attach a caller-owned `Float64Array(STAT_COUNT)` with `attachStats`; the
@@ -41,8 +55,8 @@ export const STAT_FALLBACK_SCANS: 0;
 export const STAT_REBUILDS: 1;
 /** A ConsistentHash / BoundedLoad keyed pick that did not return its home backend (home down, or over cap). */
 export const STAT_DISPLACED: 2;
-/** The number of stats indices in this version. */
-export const STAT_COUNT: number;
+/** The number of stats indices in this version (3 in 1.1.x; indices are only ever appended, so this only grows). */
+export const STAT_COUNT: 3;
 
 /** The counters in a `describe()` snapshot (null when no slab is attached). */
 export interface BalancerStats {
@@ -107,9 +121,10 @@ export class BalancerBase {
     /** Cold (1.1.0): a plain-object snapshot (allocates; never per pick). Node's `util.inspect` prints it too. */
     describe(): BalancerDescription;
     /**
-     * Cold, opt-in (1.1.0): recount the cached state (the live count; SmoothWRR's eligible-weight total,
-     * WeightedRandom's table weight sum, BoundedLoad's noted total) and throw `LITE_PICK_INCONSISTENT` on a
-     * mismatch -- the trace of a direct `eligible[i]` / `weights[i]` write or a missing `note()`. O(cap).
+     * Cold, opt-in (1.1.0): recount the cached state (the live count; SmoothWRR's eligible-weight total;
+     * WeightedRandom checks the live weights vs the built snapshot element-wise, naming the first index,
+     * plus an eligible-weight sum recount; BoundedLoad's noted total) and throw `LITE_PICK_INCONSISTENT` on
+     * a mismatch -- the trace of a direct `eligible[i]` / `weights[i]` write or a missing `note()`. O(cap).
      */
     assertConsistent(): void;
     /**
@@ -261,6 +276,8 @@ export class NqBalancer extends BalancerBase {
  * (`PICK_NONE`) when the whole pool is down. A request that never returns is handled by a per-attempt
  * timeout (the attempt throws; /pool records `max(elapsed, failurePenaltyNs)`), not by the kernel.
  * Latency-aware: @zakkster/lite-pick/pool REQUIRES an `opts.clock` for this strategy.
+ * Clock contract: every `now` is a finite Number in nanoseconds, >= 0 (pass a BigInt clock as
+ * `Number(process.hrtime.bigint())`); a negative `now` silently disables learning (1.2.0 will reject it).
  */
 export class PeakEwmaBalancer extends BalancerBase {
     /** Marker: latency-aware; /pool requires `opts.clock` and feeds recordRtt() from it. */
@@ -278,7 +295,10 @@ export class PeakEwmaBalancer extends BalancerBase {
     /**
      * Warm feedback path: record an rtt sample (ns) for endpoint `i` at time `now` (ns). The first sample
      * sets the estimate exactly; then a larger sample replaces it, a smaller one blends in as
-     * `ewma x w + sample x (1 - w)` (Finagle, 1.1.0). Also feeds the decaying pool mean. 0 B/op.
+     * `ewma x w + sample x (1 - w)` (Finagle, 1.1.0). Also feeds the decaying pool mean. Allocation-free in
+     * steady state, BUT `sampleNs` and `now` cross this call as boxed `Number`s (~16 B each) on a build that
+     * does not inline it -- Node 22's `performance.now()` is itself a boxed double. Use `recordRttFrom`, which
+     * reads both from a caller-owned `Float64Array` slot, for a guaranteed 0-box path.
      */
     recordRtt(i: number, sampleNs: number, now: number): void;
     /**
@@ -287,7 +307,11 @@ export class PeakEwmaBalancer extends BalancerBase {
      * plus RangeError `LITE_PICK_ARRAY` unless `buf` is a `Float64Array` with slots `j` and `j + 1`. 0 B/op.
      */
     recordRttFrom(i: number, buf: Float64Array, j: number): void;
-    /** Pick by latency-aware power-of-two-choices at time `now` (ns), or `PICK_NONE`. O(d)=O(1). */
+    /**
+     * Pick by latency-aware power-of-two-choices at time `now` (ns), or `PICK_NONE`. O(d)=O(1). `now` crosses
+     * this call as a boxed `Number` (~16 B) on a build that does not inline it (Node 22's `performance.now()`
+     * is itself boxed); `pickFrom`, reading `now` from a `Float64Array` slot, is the guaranteed 0-box path.
+     */
     pick(now: number): number;
     /**
      * The ZERO-BOX sibling of `pick(now)` (1.1.0): `now = buf[i]`, read inside, so a nanosecond clock (never a
@@ -327,7 +351,8 @@ export class ConsistentHashBalancer extends BalancerBase {
      * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param weights optional per-backend weights (length >= capacity), COPIED at construction;
      *   null = equal weight.
-     * @param m the Maglev table size: a prime, > 1, and >= capacity (default 65537).
+     * @param m the Maglev table size: a prime, > 1, >= capacity, and <= 2^31 - 1 (2147483647; a larger M
+     *   would overflow the Int32 build indices -- a `RangeError`, `LITE_PICK_OPTION`). Default 65537.
      * @param seed deterministic salt for the permutation mix (default 0x9e3779b9); reproducible.
      */
     constructor(capacity: number, eligible: Uint8Array, weights?: Uint32Array | null, m?: number, seed?: number);
@@ -388,7 +413,8 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
      *   EXCLUSIVELY via `note` / the /pool adapter (direct mutation desyncs `_total` -- UB).
      * @param eps the bounded-load slack over the mean (finite, > 0); default 0.25 (Vimeo).
      * @param weights optional per-backend weights (length >= capacity), COPIED; null = equal weight.
-     * @param m the Maglev table size: a prime, > 1, and >= capacity (default 65537).
+     * @param m the Maglev table size: a prime, > 1, >= capacity, and <= 2^31 - 1 (2147483647; a larger M
+     *   would overflow the Int32 build indices -- a `RangeError`, `LITE_PICK_OPTION`). Default 65537.
      * @param seed deterministic salt for the permutation mix (default 0x9e3779b9); reproducible.
      * @param minCap OPT-IN floor on the per-backend cap (1.1.0; default 0 = the paper's capacity):
      *   cap = max(minCap, ceil((1+eps)(T+1)/live)). At low load the paper's cap is 1, so a second

@@ -127,3 +127,35 @@ imports nothing from lite-logn and `peerDependencies` stays `{}` (a peer is decl
 imports one). Pinned since 1.1.0 by a DEVdependency on lite-logn: `test/LognSeam.test.js` runs the published
 snippet verbatim (fail closed; every pick equals a brute-force lower bound through reweights and flips; both ends
 of the draw forced) and a PerfGate lane holds it at 0 B/op with inlining on and off.
+
+## Amendment 2026-10-06 (1.1.1, audit 2026-10-05 K2/K4/K5): cached eligible-weight sum, element-wise consistency, overlap-safe `setWeights`
+
+Three audit findings, all WeightedRandom-local (Pick.js), shipped together in 1.1.1. The hot `pick()` body and
+every selection stream are unchanged: a HEAD-vs-tree differential fuzz (4000 programs, caps 1..702, ~9.6M ops)
+and the new `test/StreamParity.test.js` golden suite (FNV fingerprints per program, all ten strategies) are
+bit-identical, and the prototype-`toString` diff shows only six WR methods changed (`constructor`, `_build`,
+`setEligible`, `setWeights`, `_sparsePick`, `assertConsistent`); Pool.js is byte-identical. (The full 1.1.1
+`toString` diff is eight methods: these six, plus `ConsistentHashBalancer.constructor` -- the K9 `M <= 2^31-1`
+guard, ADR 0010 -- and a JSDoc-only edit to `BalancerBase.constructor`; neither is WeightedRandom-local.)
+
+- **K2 -- cache the eligible-weight sum.** The 2026-10-04 `_sparsePick` walked the array TWICE (once to sum the
+  eligible weight, once to place `u`); under a heavy outage that made the hot fallback lane 1.2-1.5x slower
+  (audit K2) and pushed the PerfGate lane past V8's ~8 s memory reducer (audit T1). 1.1.1 keeps the running eligible-weight sum in a
+  one-slot `Float64Array` (`_ew`), maintained by `setEligible` / `setWeight` / `setWeights` and read once, so
+  `_sparsePick` makes a SINGLE walk. uint32 weights keep the sum exact below 2^53, so the same `u` scales to the
+  same node -- stream-identical to the two-walk version. ABOVE total weight 2^53 (capacity is uncapped) `_ew`
+  would drift, so `setEligible` recounts `_ew` from the built snapshot in ASCENDING order in that regime
+  (bit-identical to HEAD's per-call sum). Measured heavy-outage fallback lane (new / HEAD, arm64 darwin, min of
+  3): **0.75 (v22.23.3), 0.82 (v26.8.2)** -- faster but NOT "halved": the FIX-PLAN expected the lane time to
+  roughly halve (one of two walks removed), but the lane is dominated by the shared 64-try rejection loop,
+  which dilutes the single-walk saving. (new/HEAD 0.75/0.82 implies the two-walk version was ~1.22-1.33x
+  slower, matching audit K2's 1.2-1.5x -- not 2x; the fix ships on its correctness/flake merit, not a halving.)
+- **K4 -- `assertConsistent()` checks WeightedRandom ELEMENT BY ELEMENT.** Through 1.1.0 it recounted only the
+  weight SUM, so swapping `[1,2,3,4]` to `[4,2,3,1]` without `rebuild()` passed while picks followed the stale
+  alias table. 1.1.1 keeps a `_built` snapshot (the weights the table was built from) and compares the live
+  weights against it element by element, naming the first mismatched index, plus the `_ew` recount. The 1.1.0
+  docs (class JSDoc, README, llms.txt, Pick.d.ts) that said "the table's weight sum" are corrected to match.
+- **K5 -- overlap-safe `setWeights`.** `setWeights(w)` now copies via `wt.set(w.subarray(0, cap))`, which is
+  safe when the caller passes a subarray that overlaps the balancer's own weights (forward element copy could
+  smear). CH / BL were never affected (they copy into a private array on build). A differential test drives both
+  overlap directions.

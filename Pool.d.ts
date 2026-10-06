@@ -13,6 +13,12 @@ export const VERSION: string;
  * exists (Node >= 20.16 / 22.3; never in browsers), only when the channel has subscribers, and never from
  * the kernel's `pick()`. Each channel reuses ONE message object: subscribers run synchronously inside the
  * publish and must copy what they need -- after the publish the object's references are cleared.
+ *
+ * A subscriber that THROWS does not corrupt the dispatch loop: by the time the throw is reported `run()`
+ * has already settled with its result. But `diagnostics_channel` re-raises it out of band as a process
+ * `uncaughtException` on the next tick, so with NO `process.on('uncaughtException')` handler installed Node
+ * TERMINATES the process (its default for an unhandled exception), after the run resolved. Keep subscribers
+ * total and non-throwing -- a throw there is a subscriber bug, not a routing fault.
  */
 export const POOL_CHANNEL_DISPATCH: 'lite-pick:pool:dispatch';
 /** See `POOL_CHANNEL_DISPATCH`. */

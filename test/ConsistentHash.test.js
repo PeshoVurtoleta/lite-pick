@@ -20,7 +20,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ConsistentHashBalancer, BalancerBase, PICK_NONE, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../Pick.js';
+import { ConsistentHashBalancer, BoundedLoadBalancer, BalancerBase, PICK_NONE, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../Pick.js';
 
 const up = (n) => { const e = new Uint8Array(n); e.fill(1); return e; };
 const M = 8191; // a prime table size, large enough for smooth distribution at n<=64
@@ -234,3 +234,100 @@ test('all-zero weights -> equal-quota fallback (valid, fully populated table)', 
     for (let s = 0; s < M; s++) { assert.ok(b._lookup[s] < 4); counts[b._lookup[s]]++; }
     for (let i = 0; i < 4; i++) assert.ok(counts[i] > 0, 'backend ' + i + ' still represented');
 });
+
+test('K9: M <= 2^31-1 passes validation (reaches allocation); M > 2^31-1 is rejected BEFORE it (CH + BL)', () => {
+    // The K9 bound must be EXACTLY the positive-int32 ceiling 2^31-1 = 2147483647 (above it the Int32Array
+    // slot positions in _build wrap negative and silently corrupt the table). Two cases pin that boundary:
+    //
+    //   M_OK  = 2147483647  (2^31-1, PRIME): the LEGAL maximum. It must pass every validation check and
+    //           REACH the lookup allocation -- proven by the Uint32Array stub tripping its SENTINEL. A
+    //           too-tight mutant (`m > 1073741824` or `m >= 2147483647`) would reject it with
+    //           LITE_PICK_OPTION, never reaching allocation, so this case FAILS under those mutants.
+    //   M_BIG = 2147483659  (PRIME, 12 above the ceiling): it passes the prime/> 1 checks but must be
+    //           rejected with LITE_PICK_OPTION BEFORE the allocation (no SENTINEL). On HEAD (no bound) it
+    //           reaches allocation and trips SENTINEL, so this case FAILS on HEAD.
+    const M_OK = 2147483647, M_BIG = 2147483659;
+    assert.ok(chIsPrimeLocal(M_OK), 'test prerequisite: M_OK (2^31-1) is prime');
+    assert.ok(chIsPrimeLocal(M_BIG), 'test prerequisite: M_BIG is prime');
+
+    // A Uint32Array stub that throws a SENTINEL for any length > 2^30: the lookup table (M slots) trips
+    // it, the small owned-weights / inflight arrays (capacity) do not.
+    const SENTINEL = Symbol('ch-m-overflow');
+    const RealU32 = globalThis.Uint32Array;
+    class U32Stub extends RealU32 {
+        constructor(arg) {
+            if (typeof arg === 'number' && arg > 0x40000000) {
+                const e = new Error('SENTINEL: refused to allocate a ' + arg + '-element Uint32Array');
+                e.sentinel = SENTINEL;
+                throw e;
+            }
+            super(arg);
+        }
+    }
+    // BoundedLoad validates `inflight instanceof Uint32Array` before super(), so inflight is allocated
+    // INSIDE the ctor closure (under the stub) as a small (capacity-sized) array -- a stub instance that
+    // passes the instanceof check; only the M-sized lookup trips the SENTINEL.
+    const ctors = [
+        ['ConsistentHash', (m) => new ConsistentHashBalancer(4, up(4), null, m)],
+        ['BoundedLoad', (m) => new BoundedLoadBalancer(4, up(4), new Uint32Array(4), 0.25, null, m)],
+    ];
+    globalThis.Uint32Array = U32Stub;
+    try {
+        for (const [name, make] of ctors) {
+            // M_OK (2^31-1): validation passes, the lookup allocation is REACHED -> SENTINEL fires.
+            assert.throws(
+                () => make(M_OK),
+                (err) => {
+                    assert.equal(err.sentinel, SENTINEL,
+                        name + ': M = 2^31-1 must pass validation and REACH the lookup allocation (got ' +
+                        (err && err.code ? err.code : err) + ')');
+                    return true;
+                },
+                name + ': M = 2^31-1 is the legal maximum and must not be rejected by the bound'
+            );
+            // M_BIG (> 2^31-1): rejected with LITE_PICK_OPTION BEFORE allocation (no SENTINEL).
+            assert.throws(
+                () => make(M_BIG),
+                (err) => {
+                    assert.notEqual(err.sentinel, SENTINEL,
+                        name + ': M > 2^31-1 must be rejected BEFORE the lookup allocation (no SENTINEL)');
+                    assert.ok(err instanceof RangeError, name + ': wrong error type: ' + err);
+                    assert.equal(err.code, 'LITE_PICK_OPTION', name + ': wrong error code: ' + err.code);
+                    return true;
+                }
+            );
+        }
+    } finally {
+        globalThis.Uint32Array = RealU32;
+    }
+});
+
+test('M2 (kill): setWeights copies the LAST weight w[cap-1] -- the rebuild honours it (CH + BL)', () => {
+    // The existing setWeights test changes no weight away from the default at index cap-1 (1 + 15%5 == 1
+    // == the fill default), so a copy loop that stops one short (`i < cap - 1`) is invisible there. Here
+    // ONLY w[cap-1] moves, from 1 to a dominating 1000, so the last backend must own the vast majority of
+    // the Maglev slots after the rebuild; a loop that skips the last element leaves it at ~1/N share.
+    const N = 4, m = 257, last = N - 1;
+    const cases = [
+        ['ConsistentHash', () => new ConsistentHashBalancer(N, up(N), Uint32Array.from([1, 1, 1, 1]), m)],
+        // BoundedLoad inherits setWeights verbatim; with inflight all-0 and no notes (_total === 0) its
+        // cap test is skipped, so pick(slot) returns the pure Maglev home -- the same table observable.
+        ['BoundedLoad', () => new BoundedLoadBalancer(N, up(N), new Uint32Array(N), 0.25, Uint32Array.from([1, 1, 1, 1]), m)],
+    ];
+    for (const [name, make] of cases) {
+        const b = make();
+        b.setWeights(Uint32Array.from([1, 1, 1, 1000]));   // only w[cap-1] changes: 1 -> 1000
+        let owned = 0;
+        for (let slot = 0; slot < m; slot++) if (b.pick(slot) === last) owned++;
+        assert.ok(owned > m / 2, name + ': backend ' + last + ' owns the majority of slots after reweighting (got ' +
+            owned + '/' + m + '); the M2 mutant skips w[cap-1] -> ~' + Math.floor(m / N) + ' slots');
+    }
+});
+
+// Local prime check for the K9 prerequisite (independent of the kernel's internal chIsPrime).
+function chIsPrimeLocal(n) {
+    if (!Number.isInteger(n) || n < 2) return false;
+    if (n % 2 === 0) return n === 2;
+    for (let d = 3; d * d <= n; d += 2) if (n % d === 0) return false;
+    return true;
+}

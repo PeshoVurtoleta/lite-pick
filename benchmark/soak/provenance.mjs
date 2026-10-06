@@ -22,6 +22,8 @@ import * as G from './gates.mjs';
 // simulated RTTs (rttP50Ns/rttP99Ns/rttMeanNs/svcMeanNs), simUs/events/traceHash (S9 deterministic simulation).
 // 5: keyed lanes run at M = 4099 (was 257; S14), and oracle-lane quality records gain propertyChecks /
 // propertyViol (+ rejMax/skipped kept for WeightedRandom, which now also runs a per-category oracle).
+// #8b adds header.config.tiers + header.config.hotOpsN -- purely ADDITIVE (new optional fields), so the
+// schema stays 5; a reader that ignores them is unaffected.
 export const SCHEMA_VERSION = 5;
 
 const PICK_PATH = fileURLToPath(KERNEL_URL);   // the RESOLVED kernel (SOAK_KERNEL override or in-tree)
@@ -105,6 +107,8 @@ export function buildHeader(cfg) {
             cycles: cfg.cycles, durationMs: cfg.durationMs, picks: cfg.picks, seed: cfg.seed,
             lanes: cfg.lanes, smoke: cfg.smoke, mustFail: cfg.mustFail,
             warmupCycles: cfg.warmupCycles, gateN: cfg.gateN, minActiveCycles: cfg.minActiveCycles,
+            // #8b (SCHEMA 5, additive): the tier subset and any pinned hotOps batch lengths this run used.
+            tiers: cfg.tiers, hotOpsN: cfg.hotOpsN,
         },
         seedFormula: SEED_FORMULA,
         gates: {

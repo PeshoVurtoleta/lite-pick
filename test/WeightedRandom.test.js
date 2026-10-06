@@ -22,7 +22,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { WeightedRandomBalancer, BalancerBase, PICK_NONE } from '../Pick.js';
+import { WeightedRandomBalancer, BalancerBase, PICK_NONE, STAT_REBUILDS, STAT_COUNT } from '../Pick.js';
 import { checkWeightedRandom } from './invariants.mjs';
 
 const up = (n) => { const e = new Uint8Array(n); e.fill(1); return e; };
@@ -280,4 +280,137 @@ test('setWeights (1.1.0): one rebuild, copies into the caller array, a bad array
     for (const bad of [null, [1, 2, 3, 4], w([1, 2, 3]), new Float64Array(4)]) assert.throws(() => b.setWeights(bad), RangeError);
     assert.equal(b._builds, builds + 1, 'a rejected setWeights does not rebuild');
     assert.deepEqual(Uint32Array.from(weights), next);
+});
+
+test('K4: a direct weights SWAP (sum preserved) is caught by assertConsistent, naming the index', () => {
+    // assertConsistent compares the live weights to the BUILT snapshot element-wise, not by sum. A swap
+    // of two weights keeps the sum, so the 1.1.0 sum check missed it (the alias table is then stale).
+    const weights = w([1, 2, 3, 4]);
+    const b = new WeightedRandomBalancer(4, up(4), weights);
+    b.assertConsistent();                              // clean after the ctor build
+    const t = weights[0]; weights[0] = weights[1]; weights[1] = t;   // [2,1,3,4], sum still 10
+    assert.throws(() => b.assertConsistent(),
+        (e) => e.code === 'LITE_PICK_INCONSISTENT' && /weights\[0\]/.test(e.message),
+        'a swap that preserves the sum must still be caught, naming weights[0]');
+    b.rebuild();                                       // re-snapshots -> consistent again
+    b.assertConsistent();
+});
+
+test('K5: setWeights snapshots a source that OVERLAPS the balancer array (no forward-copy smear)', () => {
+    // The balancer's weights are a VIEW into a shared buffer, and setWeights is handed an overlapping
+    // view of the SAME buffer whose slots start one BELOW the owned slots. A forward element copy smears
+    // buf[0] across every slot ([9,9,9,9]); TypedArray.set snapshots first, so the slots become [9,1,2,3].
+    const buf = Uint32Array.from([9, 1, 2, 3, 99]);
+    const owned = buf.subarray(1, 5);                  // the balancer's weights: buf[1..4] = [1,2,3,99]
+    const b = new WeightedRandomBalancer(4, up(4), owned);
+    b.setWeights(buf.subarray(0, 4));                  // overlaps `owned`, offset one below: [9,1,2,3]
+    assert.deepEqual(Array.from(owned), [9, 1, 2, 3], 'overlapping setWeights must snapshot, not smear');
+    // The other direction: owned slots start ABOVE the source. A forward copy is accidentally safe here,
+    // but .set must still agree (both-ways coverage).
+    const buf2 = Uint32Array.from([5, 6, 7, 8, 42]);
+    const owned2 = buf2.subarray(0, 4);                // buf2[0..3] = [5,6,7,8]
+    const b2 = new WeightedRandomBalancer(4, up(4), owned2);
+    b2.setWeights(buf2.subarray(1, 5));                // [6,7,8,42]
+    assert.deepEqual(Array.from(owned2), [6, 7, 8, 42], 'the non-smearing overlap direction must also match');
+});
+
+test('K5/no-op: setWeights with the SAME values still rebuilds (+1 STAT_REBUILDS; no short-circuit)', () => {
+    const slab = new Float64Array(STAT_COUNT);
+    const b = new WeightedRandomBalancer(4, up(4), w([1, 2, 3, 4]));
+    b.attachStats(slab);
+    const before = slab[STAT_REBUILDS], builds = b._builds;
+    b.setWeights(w([1, 2, 3, 4]));                     // identical values -- no-op short-circuit is 1.2.0
+    assert.equal(slab[STAT_REBUILDS], before + 1, 'setWeights always rebuilds, even with unchanged values');
+    assert.equal(b._builds, builds + 1);
+});
+
+test('K2: a direct eligible[] SWAP (live preserved) is caught by the _ew recount in assertConsistent', () => {
+    // Swapping an UP node with a DOWN node of a DIFFERENT weight keeps _live, so the base live-count
+    // check still passes, but the cached eligible-weight sum (_ew) is now wrong -- the recount catches it.
+    const el = Uint8Array.from([1, 0, 1, 1]);          // nodes 0,2,3 up; node 1 down -> live 3
+    const b = new WeightedRandomBalancer(4, el, w([10, 20, 30, 40]));
+    b.assertConsistent();
+    el[0] = 0; el[1] = 1;                              // direct swap: live still 3, eligible weight changed
+    assert.throws(() => b.assertConsistent(),
+        (e) => e.code === 'LITE_PICK_INCONSISTENT' && /eligible-weight sum/.test(e.message),
+        'a direct eligibility swap must be caught via the _ew recount');
+});
+
+test('K2: setEligible keeps _ew exact -- assertConsistent clean across a flap sequence', () => {
+    // The supported path (never a direct eligible[] write): every flap goes through setEligible, which
+    // maintains _ew from the built snapshot, so the recount always agrees.
+    const b = new WeightedRandomBalancer(4, up(4), w([10, 20, 30, 40]));
+    for (const [i, u] of [[1, false], [3, false], [1, true], [0, false], [3, true], [0, true]]) {
+        b.setEligible(i, u);
+        b.assertConsistent();
+    }
+});
+
+test('finding 1: past 2^53 total weight, setEligible recounts _ew so assertConsistent stays clean', () => {
+    // `_ew` is exact via the running +=/-= only while the TOTAL weight sum < 2^53. Capacity is uncapped,
+    // so near-max uint32 weights past ~cap 2^21 overflow that: a single flap's += would drift from a fresh
+    // sum, the sparse fallback would scale its uniform by a wrong eligible-weight sum, and assertConsistent
+    // would FALSE-POSITIVE. The drift-regime branch recounts ASCENDING over the built snapshot -- bit-
+    // identical to the fallback's own per-call sum in every regime. An incremental-only `_ew` (the unshipped
+    // B1 draft that maintained `_ew` with the running +=/-= ALONE -- NOT git HEAD, which has no `_ew`) throws here.
+    const cap = 3 * (1 << 20);                 // 3145728: total ~1.35e16, comfortably above 2^53
+    const el = up(cap);
+    const weights = new Uint32Array(cap);
+    for (let i = 0; i < cap; i++) weights[i] = 4294967295 - (i % 7);
+    const b = new WeightedRandomBalancer(cap, el, weights);
+    assert.ok(b._psum > 2 ** 53, 'precondition: total weight sum exceeds 2^53 (got ' + b._psum + ')');
+    assert.doesNotThrow(() => b.assertConsistent(), 'clean immediately after build');
+    for (let k = 0; k < 8; k++) {
+        b.setEligible((k * 977) % cap, false);
+        b.setEligible((k * 977) % cap, true);
+        b.setEligible((k * 131) % cap, false);
+        assert.doesNotThrow(() => b.assertConsistent(),
+            'flap ' + k + ': _ew must equal a fresh ascending recount (HEAD drifts and throws)');
+    }
+});
+
+test('regime switch MID-SEQUENCE: setWeight crosses 2^53 total weight up and back; _ew stays exact through flaps', () => {
+    // finding 1 BUILDS above 2^53; this one starts below it and crosses it with ONE setWeight on a live
+    // balancer, then crosses back. The regime is a property of the CURRENT built weights, re-read on every
+    // flap: a kernel that decided "exact running sum" once (at construction) would keep the +=/-= path
+    // after the crossing, drift, and false-positive here. Below 2^53 the cached sum must equal the TRUE
+    // (BigInt) eligible-weight sum exactly, not merely agree with assertConsistent's own recount.
+    const MAXW = 4294967295;
+    const cap = (1 << 21) + 1;                 // 2^21 near-max weights + one zero weight at the end
+    const weights = new Uint32Array(cap);
+    weights.fill(MAXW, 0, cap - 1);            // total = 2^21 * (2^32 - 1) = 2^53 - 2^21  (< 2^53)
+    const el = up(cap);
+    const b = new WeightedRandomBalancer(cap, el, weights);
+    const trueEw = () => {                     // the definition: exact integer sum over eligible built weights
+        let s = 0n;
+        for (let i = 0; i < cap; i++) if (el[i]) s += BigInt(b._built[i]);
+        return s;
+    };
+    // Each round takes two nodes down and brings them back, so EVERY round starts from the full pool: the
+    // crossing below happens with the whole eligible sum at the total (an eligible sum left under 2^53 by
+    // earlier flaps would be exact under any regime rule, and the crossing would prove nothing).
+    const flaps = (tag) => {
+        for (let k = 1; k <= 6; k++) {
+            const x = (k * 977) % (cap - 1), y = (k * 131) % (cap - 1);
+            b.setEligible(x, false);
+            b.setEligible(y, false);
+            b.setEligible(x, true);
+            assert.doesNotThrow(() => b.assertConsistent(), tag + ' flap ' + k + ': _ew must equal a fresh recount');
+            b.setEligible(y, true);
+            assert.doesNotThrow(() => b.assertConsistent(), tag + ' flap ' + k + ' (restored): _ew must equal a fresh recount');
+        }
+        assert.equal(b.live, cap, tag + ': every round restored the full pool');
+    };
+    assert.ok(b._psum < 2 ** 53, 'precondition: built below 2^53 (got ' + b._psum + ')');
+    flaps('below');
+    assert.equal(BigInt(b._ew[0]), trueEw(), 'below 2^53: _ew is the exact eligible-weight sum');
+
+    b.setWeight(cap - 1, MAXW);                // ONE weight pushes the total past 2^53
+    assert.ok(b._psum > 2 ** 53, 'precondition: crossed 2^53 (got ' + b._psum + ')');
+    flaps('above');
+
+    b.setWeight(cap - 1, 0);                   // and back below
+    assert.ok(b._psum < 2 ** 53, 'precondition: back below 2^53 (got ' + b._psum + ')');
+    flaps('back below');
+    assert.equal(BigInt(b._ew[0]), trueEw(), 'back below 2^53: _ew is exact again');
 });

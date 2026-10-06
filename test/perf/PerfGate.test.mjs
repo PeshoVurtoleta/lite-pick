@@ -573,6 +573,30 @@ const peakEwmaRecordFrom = {
         return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.fb.buffer) };
     },
 };
+// 1.1.1: the single-node BLEND path of recordRttFrom, not covered by the varying-sample lane above. ONE
+// node, a CONSTANT fractional sample so the peak-snap branch stays out of the loop (sampleNs == the stored
+// EWMA -> the blend arm `v*w + sampleNs*(1-w)` runs every step), and a large (1.7e15) fractional-scale
+// clock advancing by a fixed step -- all read from the caller-owned Float64Array slot, so the blend + the
+// decaying pool mean must stay 0 B/op. (A K1 pw-reuse refactor for this exact path was measured and
+// reverted for a ~9-11% interleaved regression; the lane stays as the blend-path allocation gate.)
+const peakEwmaRecordFromBlend = {
+    name: 'PeakEwmaBalancer.recordRttFrom single-node blend (constant fractional sample, clock~1.7e15)',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xFEEDBEEF);
+        const fb = new Float64Array([250.5, REAL_NOW]);
+        pe.recordRttFrom(0, fb, 0);   // prime node + pool stamp so every HOT step takes the blend arm
+        return { el, inflight, pe, fb };
+    },
+    hot(s, n) {
+        const pe = s.pe, fb = s.fb;
+        for (let i = 0; i < n; i++) { fb[1] += 1000; pe.recordRttFrom(0, fb, 0); }
+    },
+    statsOf(s) {
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.fb.buffer) };
+    },
+};
 function realKeys() {
     const keys = new Uint32Array(4096);
     for (let i = 0; i < keys.length; i++) keys[i] = (0x80000000 + i * 97) >>> 0;   // all >= 2^31
@@ -664,7 +688,7 @@ const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
     leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord, consistentHashPick,
     boundedLoadPick, boundedLoadNote, weightedRandomPick, weightedRandomPickFallback,
-    peakEwmaPickFrom, peakEwmaRecordFrom, peakEwmaRecordMod, consistentHashPickFrom, boundedLoadPickFrom,
+    peakEwmaPickFrom, peakEwmaRecordFrom, peakEwmaRecordFromBlend, peakEwmaRecordMod, consistentHashPickFrom, boundedLoadPickFrom,
     recipe17FenwickPick,
 ];
 

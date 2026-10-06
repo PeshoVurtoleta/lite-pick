@@ -108,3 +108,19 @@ test('M5 (1.1.0): idle nodes take turns; with none idle, equal scores rotate', (
     inf[2] = 0;                                   // an idle node wins outright over any score
     assert.equal(b.pick(), 2);
 });
+
+test('M1 (kill): the cursor advances when the idle winner is found in the [0, cursor) wrap arm', () => {
+    // The existing M5 test only exercises the FIRST scan arm's `this._cur = i + 1` (idle nodes at or
+    // after the cursor). Deleting the SECOND arm's identical assignment (the one reached only after a
+    // wrap, when the winner sits at an index BELOW the cursor) survives every other NQ test. Here the
+    // cursor is driven to the last index and the only idle nodes sit at 0 and 1 (below it), so every
+    // pick resolves in the wrap arm. If that arm forgets to advance the cursor, pick() never leaves 0.
+    const N = 5, inf = new Uint32Array(N), wt = new Uint32Array(N).fill(1);
+    const b = new NqBalancer(N, up(N), inf, wt);
+    for (let r = 0; r < 4; r++) b.pick();          // all idle: returns 0,1,2,3 -> tie cursor now 4
+    inf.set([0, 0, 5, 5, 5]);                       // nodes 0,1 idle; 2,3,4 busy; cursor parked at 4
+    const got = [];
+    for (let r = 0; r < 4; r++) got.push(b.pick()); // no dispatch, so 0 and 1 stay idle across the picks
+    assert.deepEqual(got, [0, 1, 0, 1],
+        'the wrap-arm idle winner advances the cursor (M1 mutant / 1.0.x: stuck at [0,0,0,0])');
+});

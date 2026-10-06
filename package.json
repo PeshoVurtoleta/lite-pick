@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-pick",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Zero-dependency, zero-GC load-balancing selection kernel: one hot pick() -> endpoint index over a fixed pool, 0 B/op steady-state. A pure selector (consumes health/circuit state, never a proxy) for the in-process hop, complementary to AWS NLB/ALB. Tree-shakeable ESM roster of ten strategies: RoundRobin, SmoothWRR, P2C, LeastConn, SED, NQ, PeakEWMA (latency-aware peak-EWMA), ConsistentHash (Maglev sticky/affinity routing, minimal disruption), BoundedLoad (consistent hashing with bounded loads -- sticky routing with a per-backend occupancy cap that overflows a hotspot to neighbours), and WeightedRandom (O(1) Vose alias-table sampling with rejection-sampling eligibility); the /pool subpath adds dispatch/settle counters + failover and a duck-typed query-cache fetcher. See GUIDE.md to choose a strategy.",
   "type": "module",
   "main": "./Pick.js",
@@ -41,7 +41,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/Base.test.js test/BoundedLoad.test.js test/BufferApis.test.js test/ConsistentHash.test.js test/LeastConn.test.js test/LognSeam.test.js test/NQ.test.js test/Observability.test.js test/P2C.test.js test/PeakEWMA.test.js test/Pool.test.js test/PoolChannels.test.js test/RecipesDoc.test.js test/RoundRobin.test.js test/SED.test.js test/SmoothWRR.test.js test/SoakOracles.test.js test/SoakP2C.test.js test/SoakPool.test.js test/SoakReport.test.js test/SoakTeeth.test.js test/WeightedRandom.test.js test/suite-list.test.js",
+    "test": "node --test test/Base.test.js test/BoundedLoad.test.js test/BufferApis.test.js test/ConsistentHash.test.js test/LeastConn.test.js test/LognSeam.test.js test/NQ.test.js test/Observability.test.js test/P2C.test.js test/PeakEWMA.test.js test/Pool.test.js test/PoolChannels.test.js test/RecipesDoc.test.js test/RoundRobin.test.js test/SED.test.js test/SmoothWRR.test.js test/SoakAB.test.js test/SoakOracles.test.js test/SoakP2C.test.js test/SoakPool.test.js test/SoakReport.test.js test/SoakTeeth.test.js test/StreamParity.test.js test/WeightedRandom.test.js test/suite-list.test.js",
     "test:types": "tsc -p test/types/tsconfig.json && tsc -p test/types/tsconfig.es2022.json",
     "torture": "node --expose-gc test/torture.mjs",
     "witness": "node test/witness.mjs",
@@ -61,6 +61,8 @@
     "soak:teeth": "node benchmark/soak/_mustfail.mjs",
     "soak:probe": "node --expose-gc --min-semi-space-size=4 --max-semi-space-size=4 benchmark/soak/_probe.mjs",
     "soak:report": "node benchmark/soak/SoakReport.mjs",
+    "soak:ab": "node benchmark/soak/SoakAB.mjs",
+    "soak:ab:teeth": "node benchmark/soak/_ab-teeth.mjs",
     "parity": "node benchmark/soak/parity.mjs",
     "parity:update": "node benchmark/soak/parity.mjs --update",
     "demo": "node demo/fanout.mjs",

@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 1.1.0
+Version: 1.1.1
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,6 +14,9 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
+1.1.1 -- kernel correctness pass (WeightedRandom cached eligible-weight sum + element-wise assertConsistent,
+overlap-safe setWeights, ConsistentHash/BoundedLoad table-size bound m <= 2^31-1), type/doc fixes, StreamParity
+goldens, and the release-time soak A/B gate (decisions/0017) -- CHANGELOG [1.1.1] -- on top of
 1.1.0 -- kernel fixes (rotating ties, Finagle's PeakEWMA update, unbiased sparse fallbacks, no PICK_NONE
 while a hashed backend is reachable), zero-box `pickFrom` / `recordRttFrom`, and observability (error codes,
 stats slab, describe(), assertConsistent(), Pool diagnostics_channel events) -- CHANGELOG [1.1.0],
@@ -176,9 +179,12 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     `console.log` print it under the class name (`Symbol.for('nodejs.util.inspect.custom')`, no import).
   - `assertConsistent()` -> void (1.1.0, audit H2). Cold, opt-in, O(cap): recount the live count from
     `eligible[]` (and reject a byte other than 0/1), SmoothWRR's eligible-weight total, WeightedRandom's
-    table weight sum, BoundedLoad's noted total vs the inflight sum; THROWS Error
-    `LITE_PICK_INCONSISTENT` on a mismatch (a direct `eligible[i]` / `weights[i]` write, a weight write
-    without rebuild(), an inflight change without note()). For tests and debug builds.
+    weights ELEMENT BY ELEMENT against the snapshot the alias table was built from (naming the first
+    mismatched index) plus an eligible-weight-sum recount, BoundedLoad's noted total vs the inflight
+    sum; THROWS Error `LITE_PICK_INCONSISTENT` on a mismatch (a direct `eligible[i]` / `weights[i]`
+    write, a weight write without rebuild(), an inflight change without note()). For tests and debug
+    builds. (Through 1.1.0 WeightedRandom checked only the weight SUM, so `[1,2,3,4]`->`[4,2,3,1]`
+    without rebuild() slipped past; the element-wise check closes that.)
 - `RoundRobinBalancer extends BalancerBase` -- class. The baseline strategy (M1).
   - `new RoundRobinBalancer(capacity, eligible)` -- same shared-eligibility contract as the base.
   - `pick()` -> number. Next eligible index in round-robin order (a wrapping cursor that
@@ -233,7 +239,12 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - `pick()` -> number. Returns an idle eligible positive-weight node (in-flight 0) if one exists --
     never queueing while a server is free; idle nodes take turns (1.1.0 rotating cursor: the first idle
     node at or after it) -- else the SED minimum (ties rotate), else `PICK_NONE`. O(cap) worst case,
-    O(distance to the next idle node) when one is idle. 0 B/op.
+    O(distance to the next idle node) when one is idle. 0 B/op. KNOWN positional tie bias (1.2.0 fix
+    queued): idle-first + the single cursor leaves a small position skew under MIXED weights -- audit
+    Poisson sim, weights [1,1,1,1,4,4,4,4] at load 0.9, the four weight-4 nodes took 20.6/20.1/19.8/
+    19.6% (ideal 20% each), lower index favoured, stable across seeds; LeastConn/SED are fair. <= ~1
+    pp; the fail-closed / exact-optimum contract holds. Fix = a seeded uniform reservoir pick among
+    tied minima (0 B/op). Do NOT depend on exact within-tie fairness in NQ under mixed weights.
 - `PeakEwmaBalancer extends BalancerBase` -- class. Latency-aware P2C (M7, Finagle peak-EWMA).
   - `new PeakEwmaBalancer(capacity, eligible, inflight, tauNs, seed?=0x9e3779b9)` -- `inflight` is a
     caller-owned Uint32Array (length >= capacity) read LIVE; `tauNs` is the EWMA TIME CONSTANT in
@@ -250,7 +261,10 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     cold-but-busy node is NOT the old 1.0 ns black hole); a sampled node costs
     `(inflight+1) x max(decayedEWMA, dt)` while busy (a hung node -- dt grows, no completion -- gets
     MORE expensive), else `(inflight+1) x decayedEWMA`. `dt = max(now - stamp, 0)` (clamped, L6).
-    `now` is caller-supplied nanoseconds. Decays ON READ -> O(d)=O(1), 0 B/op. `PICK_NONE` when the
+    `now` is caller-supplied nanoseconds and MUST be finite and `>= 0`: the "never sampled" marker is a
+    negative `_stamp`, so a finite NEGATIVE `now` reads as unsampled and silently disables the latency
+    learning (no blend, no busy floor, no pool-mean decay -- plain in-flight P2C). Use a `>= 0` clock origin
+    (`Number(process.hrtime.bigint())` / `performance.now()` / `Date.now()`). Decays ON READ -> O(d)=O(1), 0 B/op. `PICK_NONE` when the
     whole pool is down. CAVEAT: an idle-then-busy node is priced by time-since-last-response until
     that response completes; there is NO busy-since stamp, by decision (1.1.0 D5: Finagle/tower/
     Linkerd keep none) -- a request that never returns is handled by a PER-ATTEMPT TIMEOUT inside
@@ -282,15 +296,22 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     0 B/op. (Idiom: `fb[0] = done - start; fb[1] = done; lb.recordRttFrom(i, fb, 0)`.)
   - CONTRACT: `now` and `sampleNs` MUST be FINITE numbers. `recordRtt` THROWS on a non-finite
     argument (warm path); `pick(now)` NEVER throws (fail-closed contract), so a non-finite `now`
-    yields P2C-random selection, not an error.
+    yields P2C-random selection, not an error. The clock is a JS `number`, NOT a `BigInt`: use
+    `const nowNs = () => Number(process.hrtime.bigint());`. A raw `BigInt` to `pick(now)` throws an
+    UNCODED `TypeError` ("Cannot convert a BigInt value to a number") from the arithmetic -- not the
+    fail-closed path -- and to `recordRtt` a coded `LITE_PICK_ARGUMENT` `TypeError`. (A double carries
+    integer ns losslessly to 2^53, ~104 days of monotonic range.)
 - `ConsistentHashBalancer extends BalancerBase` -- class. Sticky/affinity routing via a prebuilt
   MAGLEV lookup table (M8, IPVS `mh` / Meta Katran / Cilium).
   - `new ConsistentHashBalancer(capacity, eligible, weights?=null, m?=65537, seed?=0x9e3779b9)` --
     `weights` is an optional caller Uint32Array (length >= capacity) COPIED into balancer-owned
-    weights (null = equal). `m` is the table size: a PRIME, > 1, and >= capacity (the guard: capacity
-    > m throws -- it would overfill / starve backends). Validates typeof-first BEFORE allocating the
-    table. Builds the table COLD (O(M x N) weighted Maglev populate; the M x 4-byte table is ~256KB at
-    the 65537 default -- disclosed cold cost, M configurable down for small pools).
+    weights (null = equal). `m` is the table size: a PRIME, > 1, >= capacity, and <= 2^31 - 1
+    (the guard: capacity > m throws -- it would overfill / starve backends; m > 2147483647 throws
+    RangeError `LITE_PICK_OPTION` -- an Int32Array populate offset would wrap and silently corrupt the
+    table; K9, 1.1.1). m <= 2^24 is RECOMMENDED because the build is O(M x N). Validates typeof-first
+    BEFORE allocating the table. Builds the table COLD (O(M x N) weighted Maglev populate; the M
+    x 4-byte table is ~256KB at the 65537 default -- disclosed cold cost, M configurable down for small
+    pools). (A dedicated 2^24 HARD allocation cap is a 1.2.0 item.)
   - `pick(keyHash)` -> number. Maps an INTEGER key: slot = (keyHash >>> 0) % M, read `lookup[slot]`,
     and if down forward-probe up to CH_PROBE_LIMIT (64) slots for the next eligible backend. O(1),
     0 B/op. `keyHash` is coerced `>>> 0` (NaN -> 0) and pick NEVER throws. Past the 64-slot window a
@@ -470,8 +491,10 @@ duck-typed and imports NOTHING from lite-query.
   channel (subscribed: ~10 ns per event, 0 extra allocation) -- copy what you need synchronously; after
   the publish its references are cleared (it never retains a Pool or error). A run started inside a
   subscriber gets a fresh message. Loaded via `process.getBuiltinModule` (Node >= 20.16 / 22.3): no
-  channels in browsers or on Node 18, and no top-level await. A throwing subscriber does not affect the
-  run (Node reports it as an uncaught exception on the next tick). Never inside the kernel's `pick()`.
+  channels in browsers or on Node 18, and no top-level await. A throwing subscriber does not corrupt the
+  run (the `run()` promise has already settled with its result), but Node re-raises the throw as a process
+  `uncaughtException` on the next tick -- with no `uncaughtException` handler installed that TERMINATES the
+  process (Node default), after the run resolved. Never inside the kernel's `pick()`.
   Types: `PoolDispatchMessage`, `PoolSettleMessage`.
 
 ## Gates (every session)

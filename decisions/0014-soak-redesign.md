@@ -478,3 +478,31 @@ non-PASS `BASELINE NOT GREEN`. A stream whose `header.parity.ok` is not true is 
 unless `--allow-parity-mismatch`. Unknown flags fail closed with a did-you-mean hint. An unhandled rejection
 is the structured `pool=A7` breach only while a pool lane is in flight (`current.tier === 'pool'`);
 elsewhere it is a CRASH, like an uncaught exception.
+
+## Amendment 2026-10-06 -- the release-time A/B seams (#8b; full design in ADR 0017)
+
+The release-time relative soak A/B (ADR 0017, research/soak-release-ab.md) reuses THIS harness unchanged
+for both sides; it only needed two selector knobs and three `export`s, all additive. `SCHEMA_VERSION`
+stays **5** -- the two new header fields are additive, not a format change.
+
+- **`SOAK_TIERS`** selects which lane tiers run (`kernel`, `tiny`, `pool`; default all three). The A/B runs
+  `SOAK_TIERS=kernel` so only the ten gated kernel lanes are timed. An unknown tier is `die(2)` with a
+  did-you-mean hint; an empty tier x lane selection is `die(2)` (fail closed, like every other config key).
+- **`SOAK_HOTOPS_N`** pins the hotOps batch length per lane+metric (`Lane:dense:sparse,...`), so a slower
+  candidate cannot self-calibrate onto the other side of a power of two and time a different batch. Values
+  must be powers of two in `[HOTOPS_N_MIN, HOTOPS_N_MAX]` (those two constants MOVED from `main.mjs` into
+  `config.mjs` and are imported back); the lane set must equal the selected kernel lanes; it requires
+  `SOAK_TIERS=kernel`; and it is incompatible with `SOAK_MUSTFAIL=decay|decaysparse` (both recalibrate).
+  The runner (`SoakAB.mjs` `batchMismatch`) re-checks each round cycle's `hotOpsDenseN`/`hotOpsSparseN`
+  against the pin -> a mismatch is INCONCLUSIVE. `provenance.mjs` records `config.tiers` and `config.hotOpsN`
+  in the header.
+- **Three `export`s, no behaviour change.** `uDist` and `medianOf` (`gates.mjs`) and `editDistance`
+  (`config.mjs`) are now exported. `ab-analyse.mjs` reuses `uDist`/`medianOf` for the A/B's Hodges-Lehmann
+  bounds and one-sided Mann-Whitney p (one source of truth: the same `uDist`/`mwOneSidedP` the soak gates
+  use); it keeps a tiny inline `editDistance` ON PURPOSE so it imports `gates.mjs` ONLY (its zero-coupling,
+  Node-18 no-install invariant). The exported `config.mjs` `editDistance` is reused by the runner
+  `SoakAB.mjs`, which dropped its private copy. The memoised `uDist` arrays are never mutated by the analyser.
+- **Four fail-closed config controls** were added to `_mustfail.mjs` (`SOAK_TIERS=kernal`; `SOAK_HOTOPS_N`
+  without `SOAK_TIERS=kernel`; a non-power-of-two length; `SOAK_HOTOPS_N` with `SOAK_MUSTFAIL=decay`) -- each
+  exits 2. The G2 golden stream projection is byte-identical before and after these edits (the timed loops
+  are untouched); only `SOAK_TIERS=kernel` changes it, by dropping the tiny/pool lanes.

@@ -124,7 +124,7 @@ function madOf(arr, count) {
 const uDistMemo = new Map();
 /** Exact null distribution of the Mann-Whitney U for sample sizes (m, n): counts[u] = number of the
  * C(m+n, m) equally likely orderings with U = u. f(m,n)[u] = f(m-1,n)[u-n] + f(m,n-1)[u]. */
-function uDist(m, n) {
+export function uDist(m, n) {
     const key = m + ',' + n;
     const hit = uDistMemo.get(key);
     if (hit) return hit;
@@ -168,7 +168,7 @@ function shiftStats(el, dir) {
     };
 }
 
-function medianOf(arr, count) {
+export function medianOf(arr, count) {
     if (count === 0) return 0;
     const a = Array.prototype.slice.call(arr, 0, count).sort((x, y) => x - y);
     const m = a.length >> 1;

@@ -31,10 +31,11 @@
  * `peerDependencies` stays empty and the same helper serves any fetcher-shaped consumer.
  */
 
-import { VERSION, PICK_NONE } from './Pick.js';
+import { VERSION, PICK_NONE, CODES } from './Pick.js';
 
-/** Re-exported so a /pool-only importer can read the version without importing the core. */
-export { VERSION };
+/** Re-exported so a /pool-only importer can read the version -- and (1.2.0) the frozen error-code map,
+ *  the SAME object as the core's `CODES` -- without importing the core. */
+export { VERSION, CODES };
 
 /** diagnostics_channel name (1.1.0, D7): published once per DISPATCH -- an endpoint was chosen, its in-flight
  *  count raised, and `fn` is about to be called. Message: `{ pool, endpoint, attempt, key, now }`. */

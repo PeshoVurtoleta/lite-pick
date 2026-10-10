@@ -197,8 +197,11 @@ function oracleStickiness(b, el, wt, keys, keyCount, cap, rng) {
     }
     // PROPERTIES (S14; research/s14-hash-and-tie-oracles.md, decision 2) -- stated, not a re-walk. They
     // describe a real pool: below PROP_MIN_LIVE eligible nodes (the tiny lanes, cap 1-3) a rebuild of a
-    // 2-3 entry table legitimately moves most keys, and draining the ONLY positive weight falls back to the
-    // documented all-zero table -- so the properties are not evaluated there.
+    // 2-3 entry table legitimately moves most keys -- so the properties are not evaluated there. All-zero
+    // weights never reach them: the freeze restores the keyed gradient (main.mjs, CAP >= 8) and (4) drains one
+    // of >= 2 positive-weight homes. A tiny lane CAN freeze all-zero; the loaded kernel's rule then decides the
+    // homes (1.1.x: equal quotas, routed; 1.2.0 K8: PICK_NONE, so every home is < 0 and is skipped), and both
+    // are accepted -- the soak:ab A side runs the 1.1.x registry kernel through this oracle.
     let propChecks = 0, propViol = 0, live = 0, livePos = 0;
     _oracleStat[0] = -1;
     for (let i = 0; i < cap; i++) if (el[i]) { live++; if (wt && wt[i] > 0) livePos++; }
@@ -264,9 +267,22 @@ function pickHome(el, cap, rng, wt) {
  * _total contract, note()-maintained and asserted by checkBoundedLoad), live = count of eligible -- NOT
  * read from b._total / b._live, so a kernel that miscounts either is CAUGHT, not masked by shared state.
  * The static Maglev table b._lookup is fine to read (it is the built table, not a live decision). */
-function oracleBoundedLoad(b, el, inf, keys, keyCount, cap, rng) {
+function oracleBoundedLoad(b, el, inf, wt, keys, keyCount, cap, rng) {
     const M = b._m, lookup = b._lookup, eps = b._eps, minCap = b.minCap | 0;
     let checks = 0, viol = 0, propChecks = 0, propViol = 0;
+    // All-zero weights under the LOADED kernel's rule (1.2.0 review B4). A tiny lane gets no freeze restore,
+    // so it can arrive here with every weight 0. 1.2.0 (K8; the `_wmask` field) removes every backend:
+    // PICK_NONE for every key. 1.1.x builds equal quotas and routes -- the walk below -- and the soak:ab A
+    // side runs 1.1.x through this oracle. The all-zero test reads the soak's own weight mirror `wt`.
+    let k8none = b._wmask !== undefined && wt !== null ? 1 : 0;
+    for (let i = 0; k8none === 1 && i < cap; i++) if (wt[i] !== 0) k8none = 0;
+    if (k8none === 1) {
+        for (let t = 0; t < keyCount; t++) {
+            checks++; propChecks++;
+            if (b.pick(keys[t] >>> 0) !== -1) { viol++; propViol++; }
+        }
+        return { checks, viol, propChecks, propViol, insufficient: checks < MIN_CHECKS };
+    }
     for (let t = 0; t < keyCount; t++) {
         const key = keys[t] >>> 0;
         // INDEPENDENT recompute: total = sum inflight over ALL nodes (kernel _total contract); live = eligible.
@@ -405,6 +421,6 @@ export function evaluateOracle(laneName, b, el, inf, wt, keys, keyCount, cap, rn
     if (laneName === 'PeakEWMA') return oraclePeakEwma(b, el, inf, cap, rng);
     if (laneName === 'ConsistentHash') return oracleStickiness(b, el, wt, keys, keyCount, cap, rng);
     if (laneName === 'WeightedRandom') return oracleWeightedRandom(b, el, wt, cap);
-    if (laneName === 'BoundedLoad') return oracleBoundedLoad(b, el, inf, keys, keyCount, cap, rng);
+    if (laneName === 'BoundedLoad') return oracleBoundedLoad(b, el, inf, wt, keys, keyCount, cap, rng);
     return null;
 }

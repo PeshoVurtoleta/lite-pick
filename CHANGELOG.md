@@ -6,11 +6,15 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
-Benchmark-only (no shipped file changes; parity unchanged).
+Shipped kernel changes -- 1.2.0 material (Pick.js, Pool.js, Pick.d.ts, Pool.d.ts; soak parity.json hashes re-pinned; StreamParity unchanged).
+1.2.0 has NO breaking change. One behaviour change is a fix: K8, ConsistentHash / BoundedLoad all-zero weights
+now return `PICK_NONE`, as the documented weight-0 rule always said (see "Weights, CODES"). The hard
+`M <= 2^24` table-size cap is deferred to 2.0 (SemVer: 1.1.1 documented `M <= 2^31 - 1`). The soak:ab entries
+under Changed and Fixed are benchmark / CI only and touch no shipped file.
 
 ### Changed
 
-- **soak:ab: K = 16 on hosted runners** (decisions/0017 Amendment 1). The first hosted A/A dispatch passed
+- **soak:ab: K = 16 on hosted runners** (decisions/0017 Amendment 1; benchmark-only, no shipped file). The first hosted A/A dispatch passed
   20/20 at K = 10; its worst lane's process-to-process CV (SmoothWRR sparse, 8.1%) puts the runner in the
   > 6% row of the research table, so `soak-ab.yml`'s `rounds` default is now 16 (10.5 min measured). The
   local CLI default stays 10. 1.1.1's post-publish record at K = 16: PASS 20/20 vs 1.1.0, WeightedRandom
@@ -35,6 +39,84 @@ Benchmark-only (no shipped file changes; parity unchanged).
   coverage tests. `_mustfail.mjs` and `_ab-teeth.mjs` now write once and exit from the write callback, and
   both listings end with a `{"end":true,"count":N}` sentinel that `SoakTeeth` / `SoakAB` require, so a
   truncated list fails as truncated.
+
+- **The soak lanes now hold on the kernel they LOAD, not only the in-tree one** (benchmark-only). soak:ab
+  runs the in-tree `lanes.mjs` against the registry release on side A (and on both sides for `--aa` and
+  soak:ab:teeth), but the K6 PeakEWMA invariant read the 1.2.0-only `_sampled` bitmap (a TypeError at the
+  first checkpoint on 1.1.x: no A/B verdict), and the ConsistentHash / BoundedLoad fail-closed mass still
+  assumed 1.1.x equal quotas on all-zero weights, which the chaos `allZero` phase reaches (the in-tree soak
+  breached `fail-closed desync` on K8). The bitmap checks now run only where `_sampled` exists, and the keyed
+  mass is 0 on all-zero mirrored weights when the loaded kernel carries K8 (`_wmask`). `SoakTeeth` runs the
+  PeakEWMA lane and an all-zero CH / BL `setWeights` through `checkLane` on 1.1.0, 1.1.1 and the in-tree
+  kernel, asserts the in-tree PeakEWMA HAS a `Uint8Array` `_sampled` (a renamed field would silently skip the
+  bitmap check), and runs a must-fail control (`_sampled[i] = 2` is a lane violation). `SoakOracles` now
+  asserts the ConsistentHash oracle's all-zero check count: > 0 on 1.1.x, and `insufficient` (0 checks) on the
+  in-tree kernel, where every home is `PICK_NONE`.
+
+### K6 -- PeakEWMA offset clocks
+
+- **PeakEWMA accepts any finite `now`, negative included** (ROADMAP K6, decisions/0009 amendment 2026-10-10).
+  Through 1.1.1 a negative `_stamp` was the "never sampled" marker, so a negative clock (an offset clock such as
+  `hrtime - start`, or one crossing 0) left every node unsampled: no EWMA blend, no busy floor, no pool-mean
+  decay -- plain in-flight P2C. 1.1.1 documented `now >= 0`; that requirement is lifted. A per-node `_sampled`
+  `Uint8Array` bitmap now marks a node's first sample, and the pool stamp `_samp[2]` seeds to
+  `-Number.MAX_VALUE` (a 0 seed kept the pool mean from ever decaying on a negative clock). Only differences of
+  `now` are read: on an integer clock (every shifted reading exact, below 2^53) a run at `now - 2^40` is
+  bit-identical to the run at `now`; a fractional clock matches to rounding level. For `now >= 0` the kernel is
+  byte-identical to 1.1.1 (the five StreamParity PeakEWMA digests are unchanged; a per-step fixture cut from
+  1.1.1, `test/fixtures/peak-k6-head.json`, matches). `pick()` does one byte test per candidate (the `_stamp` load moves into the
+  sampled arm): 0 B/op on every PerfGate lane, inlining on and off; `recordRttFrom` ~+0.2-0.9 ns (one byte store,
+  darwin / arm64 Node 26; x64 not measured).
+- **`PeakEwmaBalancer.assertConsistent()`** (new override): the base check, then every `_sampled[i]` is 0 or 1
+  and the pool mean has a sample iff some node is marked sampled; else `LITE_PICK_INCONSISTENT`.
+- Internal state change (not API): `_stamp` is no longer seeded to -1 and is read only for sampled nodes; code
+  that inspected `_stamp < 0` to find unsampled nodes should use `describe().sampled` or `ewmaAt`.
+- Tests: K6-translate (interleaved and backwards clocks), the blend / busy floor / pool-mean decay at a negative
+  clock, a zero-crossing clock, the fixture parity, a 1000-balancer retention check; fuzz runs odd seeds on a
+  -2^40 clock and checks `describe().sampled === popcount(_sampled)`; PerfGate adds `pickFrom` and
+  `recordRttFrom` lanes on a -1.7e15 clock and gates the `_sampled` buffer identity.
+
+### Weights, CODES
+
+Shipped-code changes (Pick.js, Pool.js, Pick.d.ts, Pool.d.ts; soak parity.json hashes re-pinned; StreamParity unchanged). Minor-bump material: one
+new runtime export and one behaviour change that is a fix (K8). No breaking change.
+
+- **Behaviour change (fix, K8): ConsistentHash / BoundedLoad all-zero weights now fail closed.** Weight 0 removes
+  a backend (README "Drain vs remove", decisions/0010), and the 1.1.1 docs promised fail closed when every
+  eligible node has weight 0 and that a weight-0 node is never returned; 1.1.x broke that rule on all-zero
+  weights (undocumented, ROADMAP K8). So all-zero weights remove every backend: `pick` / `pickFrom` return
+  `PICK_NONE` for every key, in O(1), and never throw; `Pool.run` rejects with `LITE_PICK_NONE`. This is the
+  answer WeightedRandom always gave. The hot `_pickSlot` guard folds a build-time mask into its existing test
+  (`(this._live & this._wmask) === 0`: one load + one AND, no new branch), so the O(1) guard answers -- no
+  probe (`STAT_DISPLACED` +0), no O(M) sweep (`STAT_FALLBACK_SCANS` +0). Non-degenerate tables are
+  byte-identical (StreamParity digests unchanged). **Migration:** 1.1.x fell back to EQUAL quotas on
+  all-zero weights and routed every key everywhere; if you relied on that, keep at least one positive weight
+  (or use `setEligible` to drain instead of weight 0 to remove).
+  KNOWN (ROADMAP 4b, phase 2): /pool failover (tries > 1) ignores weights; pair a remove with `setEligible(i, false)`.
+- **ConsistentHash / BoundedLoad table size: unchanged, `M <= 2^31 - 1` (K9, 1.1.1).** The planned hard
+  `M <= 2^24` cap is deferred to 2.0: 1.1.1 documented `M` valid up to `2^31 - 1`, so rejecting
+  `(2^24, 2^31 - 1]` in a minor would break SemVer (ROADMAP "2.0 candidates"). `M <= 2^24` stays the
+  recommendation (the cold build is `O(M x N)`).
+- **ConsistentHash / BoundedLoad `assertConsistent()`** (new override): the base check, then the K8
+  all-zero-weights mask must agree with the owned weights the table was built from (`_wmask` is 0 iff they sum
+  to 0); else `LITE_PICK_INCONSISTENT`. Cold, O(cap).
+- **`setWeights` skips a no-op rebuild (ConsistentHash, BoundedLoad, WeightedRandom).** Weights equal to the
+  built snapshot perform no build and add nothing to `STAT_REBUILDS`, which now counts builds actually
+  performed; `rebuild()` stays unconditional. WeightedRandom copies first (K5, overlap-safe) and compares
+  against `_built`, so an in-place edit of your own weights array is still seen; `WeightedRandom.setWeight(i, w)`
+  now does the same (1.1.x compared `_weights[i]`, so `setWeight(i, v)` after writing `v` in place skipped the rebuild). Disclosed: a direct
+  `eligible[i]` write (UB) is no longer re-synced by a same-weights `setWeights`; `assertConsistent()`
+  still names it.
+- **New: `CODES`** -- a frozen runtime map of the 14 error codes (value === key), exported from the core and
+  re-exported (the same object) from `/pool`. Typed `{ readonly [K in LitePickErrorCode]: K }`.
+  `test/Codes.test.js` censuses every throw site against it.
+- Docs: Pick.d.ts / Pool.d.ts, llms.txt, README, GUIDE, RECIPES section 9 ("removing every backend is
+  pool-down"), ADR amendments 0010, 0011, 0012, 0015; ROADMAP section 4b rows K8, the
+  setWeights skip and CODES are DONE; the 2^24 cap row is deferred to 2.0. Tests: ConsistentHash / BoundedLoad
+  K8 + the K9 boundary (2^31 - 1 accepted, primes above 2^24 accepted, 2^31 and above rejected) + the mask
+  check + skip + retention, WeightedRandom skip (the 1.1.1 "always rebuilds" test is inverted), fuzz pathological block 2
+  and its CH / BL fail-closed oracle, balance.mjs all-zero CH / BL, the type surface. The soak must-fail
+  anchors for `_pickSlot` (M10, MH1) follow the new guard line.
 
 ## [1.1.1] - 2026-10-06
 

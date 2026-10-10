@@ -36,6 +36,13 @@ export type LitePickErrorCode =
     | 'LITE_PICK_NONE' | 'LITE_PICK_FEEDBACK';
 
 /**
+ * Every `LitePickErrorCode` as a frozen runtime map, value === key (1.2.0): `e.code === CODES.LITE_PICK_INDEX`
+ * instead of a string literal. The 8 kernel codes plus the 6 /pool codes; `@zakkster/lite-pick/pool`
+ * re-exports the SAME object.
+ */
+export const CODES: { readonly [K in LitePickErrorCode]: K };
+
+/**
  * A lite-pick error: a standard `Error` (`TypeError` / `RangeError` / `Error`, per the class rule above)
  * carrying one of the stable `LitePickErrorCode` values on its `code`. Narrow a caught `unknown` with it:
  * `if (e instanceof Error && 'code' in e) { const code = (e as LitePickError).code; ... }`.
@@ -51,7 +58,11 @@ export interface LitePickError extends Error {
  */
 /** P2C / PeakEWMA / WeightedRandom very-sparse fallback, or the ConsistentHash / BoundedLoad full-table sweep. */
 export const STAT_FALLBACK_SCANS: 0;
-/** A ConsistentHash / BoundedLoad / WeightedRandom table build (rebuild, setWeight, setWeights; the constructor's too). */
+/**
+ * A ConsistentHash / BoundedLoad / WeightedRandom table build actually PERFORMED (rebuild, setWeight, setWeights;
+ * the constructor's too). 1.2.0: a `setWeights` equal to the built snapshot performs none, so it counts nothing;
+ * `rebuild()` always builds.
+ */
 export const STAT_REBUILDS: 1;
 /** A ConsistentHash / BoundedLoad keyed pick that did not return its home backend (home down, or over cap). */
 export const STAT_DISPLACED: 2;
@@ -123,7 +134,9 @@ export class BalancerBase {
     /**
      * Cold, opt-in (1.1.0): recount the cached state (the live count; SmoothWRR's eligible-weight total;
      * WeightedRandom checks the live weights vs the built snapshot element-wise, naming the first index,
-     * plus an eligible-weight sum recount; BoundedLoad's noted total) and throw `LITE_PICK_INCONSISTENT` on
+     * plus an eligible-weight sum recount; BoundedLoad's noted total; PeakEWMA's sampled bitmap -- 0 / 1 only,
+     * and set iff the pool mean has a sample, 1.2.0; ConsistentHash / BoundedLoad's all-zero-weights mask
+     * vs the built weights, 1.2.0) and throw `LITE_PICK_INCONSISTENT` on
      * a mismatch -- the trace of a direct `eligible[i]` / `weights[i]` write or a missing `note()`. O(cap).
      */
     assertConsistent(): void;
@@ -264,7 +277,8 @@ export class NqBalancer extends BalancerBase {
  * unsampled+busy -> `(inflight + 1) x decaying pool mean`; sampled -> `(inflight + 1) x max(decayedEWMA,
  * dt-while-busy)`); a slow endpoint (high decayed EWMA rtt) is avoided even with a short queue,
  * and a hung node grows more expensive over time. `inflight` is the
- * caller-owned Uint32Array read LIVE; the EWMA state (`_ewma` / `_stamp`, Float64) is BALANCER-OWNED
+ * caller-owned Uint32Array read LIVE; the EWMA state (`_ewma` / `_stamp`, Float64, plus the `_sampled`
+ * Uint8Array bitmap, 1.2.0) is BALANCER-OWNED
  * and written ONLY by `recordRtt` (the warm feedback path). `pick(now)` decays on READ -- never
  * writes -- so it is 0 B/op, as is `recordRtt`. `now` / `sampleNs` are caller-supplied nanoseconds.
  * Cold start: an unsampled node costs 0 WHILE IDLE (graceful least-connections) and the pool's
@@ -276,8 +290,12 @@ export class NqBalancer extends BalancerBase {
  * (`PICK_NONE`) when the whole pool is down. A request that never returns is handled by a per-attempt
  * timeout (the attempt throws; /pool records `max(elapsed, failurePenaltyNs)`), not by the kernel.
  * Latency-aware: @zakkster/lite-pick/pool REQUIRES an `opts.clock` for this strategy.
- * Clock contract: every `now` is a finite Number in nanoseconds, >= 0 (pass a BigInt clock as
- * `Number(process.hrtime.bigint())`); a negative `now` silently disables learning (1.2.0 will reject it).
+ * Clock contract: every `now` is a finite Number in nanoseconds -- any finite `now`, negative included (pass
+ * a BigInt clock as `Number(process.hrtime.bigint())`). Only differences of `now` are read, so an offset
+ * clock (`hrtime - start`, or one that crosses 0) learns like its translate by a constant C -- bit-identically
+ * when every shifted reading `now - C` is exact (integer clocks and offsets below 2^53), to rounding level
+ * otherwise (a fractional clock's differences can round differently) (1.2.0, K6: "unsampled" is
+ * the `_sampled` bitmap; through 1.1.1 it was a negative `_stamp`, and a negative `now` disabled learning).
  */
 export class PeakEwmaBalancer extends BalancerBase {
     /** Marker: latency-aware; /pool requires `opts.clock` and feeds recordRtt() from it. */
@@ -341,7 +359,10 @@ export const CH_PROBE_LIMIT: number;
  * weights array; `setWeight` / `rebuild` rebuild the table (COLD). A health flap is absorbed by the
  * probe -- never a rebuild -- so removing a backend (`setEligible(i, false)`) remaps only ~1/N keys.
  * Fails closed (`PICK_NONE`) only when no eligible backend owns a table slot: past the 64-slot probe window
- * a cold O(M) sweep finds a far eligible backend (1.1.0; 1.0.x returned `PICK_NONE` there).
+ * a cold O(M) sweep finds a far eligible backend (1.1.0; 1.0.x returned `PICK_NONE` there). ALL-ZERO weights
+ * (1.2.0, K8) mean every backend is removed: `pick` / `pickFrom` return `PICK_NONE` for every key, in O(1),
+ * never throwing (1.1.x fell back to equal quotas and routed everywhere, against the documented
+ * weight-0-removes rule -- a fix, not a breaking change).
  */
 export class ConsistentHashBalancer extends BalancerBase {
     /** Marker: keyed; /pool requires a numeric `opts.key`. Inherited by BoundedLoadBalancer. */
@@ -353,6 +374,7 @@ export class ConsistentHashBalancer extends BalancerBase {
      *   null = equal weight.
      * @param m the Maglev table size: a prime, > 1, >= capacity, and <= 2^31 - 1 (2147483647; a larger M
      *   would overflow the Int32 build indices -- a `RangeError`, `LITE_PICK_OPTION`). Default 65537.
+     *   M <= 2^24 is recommended: the cold build is O(M x N) and the table M x 4 bytes.
      * @param seed deterministic salt for the permutation mix (default 0x9e3779b9); reproducible.
      */
     constructor(capacity: number, eligible: Uint8Array, weights?: Uint32Array | null, m?: number, seed?: number);
@@ -363,13 +385,15 @@ export class ConsistentHashBalancer extends BalancerBase {
     /**
      * Cold path (1.1.0): replace ALL weights (copied, length >= capacity) and rebuild the table ONCE --
      * the batch form of `setWeight`. Validated before any write; throws RangeError on a bad array.
+     * 1.2.0: weights equal to the current ones skip the rebuild (no build, no `STAT_REBUILDS`).
      */
     setWeights(weights: Uint32Array): void;
     /** Cold path: rebuild the lookup table from the current owned weights. */
     rebuild(): void;
     /**
      * Map an integer `keyHash` to a backend index (bounded probe past down slots, then a cold full-table
-     * sweep -- 1.1.0), or `PICK_NONE` only when no eligible backend owns a table slot.
+     * sweep -- 1.1.0), or `PICK_NONE` only when no eligible backend owns a table slot (all-zero weights
+     * own none -- 1.2.0).
      */
     pick(keyHash: number): number;
     /**
@@ -402,7 +426,7 @@ export class ConsistentHashBalancer extends BalancerBase {
  * direct mutation of `inflight` without the matching `note` desyncs `_total` -- UB. It inherits the Maglev table + `setWeight` /
  * `setWeights` / `rebuild` / `tableSize` from ConsistentHashBalancer (reused verbatim). `pick()` and `note()` are
  * both 0 B/op / O(1). Fails closed (`PICK_NONE`) ONLY when no eligible backend owns a table slot (the
- * 1.1.0 full-table sweep past the probe window) -- NEVER merely because backends are over cap. NOT the P2C-with-cap "overload"
+ * 1.1.0 full-table sweep past the probe window; all-zero weights own none -- 1.2.0) -- NEVER merely because backends are over cap. NOT the P2C-with-cap "overload"
  * variant (that is byte-identical to P2C; the cap is only load-bearing on a sticky hash -- ADR 0011).
  */
 export class BoundedLoadBalancer extends ConsistentHashBalancer {
@@ -415,6 +439,7 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
      * @param weights optional per-backend weights (length >= capacity), COPIED; null = equal weight.
      * @param m the Maglev table size: a prime, > 1, >= capacity, and <= 2^31 - 1 (2147483647; a larger M
      *   would overflow the Int32 build indices -- a `RangeError`, `LITE_PICK_OPTION`). Default 65537.
+     *   M <= 2^24 is recommended (the cold build is O(M x N)).
      * @param seed deterministic salt for the permutation mix (default 0x9e3779b9); reproducible.
      * @param minCap OPT-IN floor on the per-backend cap (1.1.0; default 0 = the paper's capacity):
      *   cap = max(minCap, ceil((1+eps)(T+1)/live)). At low load the paper's cap is 1, so a second
@@ -478,7 +503,10 @@ export class WeightedRandomBalancer extends BalancerBase {
     setWeight(i: number, w: number): void;
     /**
      * Cold path (1.1.0): replace ALL weights (copied into the weights array this balancer was built with,
-     * length >= capacity) and rebuild the alias table ONCE. Validated before any write.
+     * length >= capacity) and rebuild the alias table ONCE. Validated before any write. 1.2.0: when the copied
+     * weights equal the BUILT snapshot the rebuild is skipped (no build, no `STAT_REBUILDS`); an in-place edit
+     * of the caller's array is still seen (the compare is against the snapshot). A direct `eligible[i]` write
+     * (UB) is no longer re-synced by a same-weights call -- `assertConsistent` names it; `rebuild()` always builds.
      */
     setWeights(weights: Uint32Array): void;
     /** Cold path: rebuild the alias table from the current caller weights (e.g. after a membership change). */

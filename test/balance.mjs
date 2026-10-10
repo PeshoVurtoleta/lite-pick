@@ -555,6 +555,17 @@ process.stdout.write('lite-pick balance (M10: WeightedRandom -- weighted-random 
         check(worst < 0.03, 'half-down survivor shares within 3% relative of weight/sum(eligible) (worst ' + (worst * 100).toFixed(2) + '%)');
         const z = new WeightedRandomBalancer(n, new Uint8Array(n).fill(1), new Uint32Array(n));
         check(z.pick() === PICK_NONE, 'WeightedRandom all-zero weights -> PICK_NONE');
+        // K8 (1.2.0): ConsistentHash / BoundedLoad agree -- all-zero weights = every backend removed, for every
+        // key (1.1.x fell back to equal quotas and routed everywhere).
+        const zc = new ConsistentHashBalancer(n, new Uint8Array(n).fill(1), new Uint32Array(n), 4099);
+        const zb = new BoundedLoadBalancer(n, new Uint8Array(n).fill(1), new Uint32Array(n), 0.25, null, 4099);
+        zb.setWeights(new Uint32Array(n));
+        let routed = 0;
+        for (let k = 0; k < 1000; k++) {
+            if (zc.pick(k * 2654435761) !== PICK_NONE) routed++;
+            if (zb.pick(k * 2654435761) !== PICK_NONE) routed++;
+        }
+        check(routed === 0, 'ConsistentHash / BoundedLoad all-zero weights -> PICK_NONE for 1000/1000 keys (routed ' + routed + ')');
     }
 }
 

@@ -6,7 +6,7 @@
  * Falsifiable assertions:
  *   Z1. PeakEWMA `pickFrom(buf, i)` selects exactly what `pick(buf[i])` does, step for step, on twin balancers
  *       (same seed, same feedback) -- realistic 1.7e15 clocks included.
- *   Z2. `recordRttFrom(i, buf, j)` leaves byte-identical state (`_ewma`, `_stamp`, `_samp`) to
+ *   Z2. `recordRttFrom(i, buf, j)` leaves byte-identical state (`_ewma`, `_stamp`, `_sampled`, `_samp`) to
  *       `recordRtt(i, buf[j], buf[j + 1])`, for fractional samples and large clocks.
  *   Z3. `recordRttFrom` rejects a bad endpoint (LITE_PICK_INDEX), a non-Float64Array / missing slot
  *       (LITE_PICK_ARRAY), a non-finite or negative sample / non-finite now (LITE_PICK_ARGUMENT) -- with no write.
@@ -38,6 +38,7 @@ function twinsPe(n, seed) {
 function sameState(a, b, msg) {
     assert.deepEqual(Array.from(a._ewma), Array.from(b._ewma), msg + ': _ewma');
     assert.deepEqual(Array.from(a._stamp), Array.from(b._stamp), msg + ': _stamp');
+    assert.deepEqual(Array.from(a._sampled), Array.from(b._sampled), msg + ': _sampled');
     assert.deepEqual(Array.from(a._samp), Array.from(b._samp), msg + ': _samp');
 }
 
@@ -63,7 +64,7 @@ test('Z1/Z2: PeakEWMA pickFrom == pick and recordRttFrom == recordRtt, step for 
 test('Z3: recordRttFrom rejects with a code and writes nothing', () => {
     const [b] = twinsPe(4, 1);
     b.recordRtt(1, 500, 10);
-    const snap = { e: Array.from(b._ewma), s: Array.from(b._stamp), m: Array.from(b._samp) };
+    const snap = { e: Array.from(b._ewma), s: Array.from(b._stamp), sm: Array.from(b._sampled), m: Array.from(b._samp) };
     const ok = new Float64Array([700, 20]);
     code(() => b.recordRttFrom(9, ok, 0), RangeError, 'LITE_PICK_INDEX');
     code(() => b.recordRttFrom(1.5, ok, 0), RangeError, 'LITE_PICK_INDEX');
@@ -79,7 +80,7 @@ test('Z3: recordRttFrom rejects with a code and writes nothing', () => {
     // The plain method keeps its own codes, now routed through the same body.
     code(() => b.recordRtt(1, '700', 20), TypeError, 'LITE_PICK_ARGUMENT');
     code(() => b.recordRtt(1, 700, NaN), RangeError, 'LITE_PICK_ARGUMENT');
-    assert.deepEqual({ e: Array.from(b._ewma), s: Array.from(b._stamp), m: Array.from(b._samp) }, snap, 'no write');
+    assert.deepEqual({ e: Array.from(b._ewma), s: Array.from(b._stamp), sm: Array.from(b._sampled), m: Array.from(b._samp) }, snap, 'no write');
 });
 
 test('Z4: pickFrom never throws for any value or index (past the end == pick(NaN))', () => {

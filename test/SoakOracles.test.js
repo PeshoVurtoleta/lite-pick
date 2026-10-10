@@ -17,7 +17,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
     Prng, LeastConnBalancer, NqBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer,
 } from '../Pick.js';
@@ -92,6 +96,57 @@ test('BoundedLoad: the clean kernel passes the reference walk and the cap proper
     assert.equal(r.viol, 0);
     assert.equal(r.propViol, 0);
     assert.equal(r.propChecks, KEY_COUNT);
+});
+
+// 1.2.0 review B4: a TINY keyed lane (cap 1-3, no freeze restore) can reach the oracle with every weight 0. The
+// oracle must judge the LOADED kernel's rule -- 1.1.x routes everywhere on equal quotas, 1.2.0 (K8) answers
+// PICK_NONE -- because soak:ab runs the 1.1.x registry kernel through it on side A. Both rules pass with 0
+// violations. BoundedLoad's oracle checks every key on both rules. ConsistentHash's stickiness oracle checks
+// only routed homes: on 1.1.x (routed everywhere) it has a non-trivial check count; on the in-tree kernel every
+// home is PICK_NONE, so it runs 0 checks and reports `insufficient` -- the BoundedLoad oracle (and the test
+// below) is what proves the K8 rule. A 1.2.0 kernel that ROUTES on all-zero must still be caught.
+async function kernelAt(rev) {
+    if (rev === null) return import('../Pick.js');
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const g = spawnSync('git', ['show', rev + ':Pick.js'], { cwd: root, encoding: 'utf8', maxBuffer: 1 << 26 });
+    assert.equal(g.status, 0, 'git show ' + rev + ':Pick.js failed (CI needs fetch-depth 0): ' + g.stderr);
+    const dir = mkdtempSync(join(tmpdir(), 'oracle-xver-'));
+    try {
+        writeFileSync(join(dir, 'Pick.js'), g.stdout);
+        return await import(pathToFileURL(join(dir, 'Pick.js')).href);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+for (const [label, rev] of [['1.1.0', '2a08567'], ['1.1.1', '7ff60f5'], ['in-tree', null]]) {
+    test('keyed oracles on all-zero weights, tiny lane (' + label + ' kernel): 0 violations', async () => {
+        const K = await kernelAt(rev);
+        for (const cap of [1, 2, 3]) {
+            const el = new Uint8Array(cap).fill(1), wt = new Uint32Array(cap).fill(1), inf = new Uint32Array(cap);
+            const bl = new K.BoundedLoadBalancer(cap, el, inf, 0.25, wt, 17, 0x9e3779b9);
+            const ch = new K.ConsistentHashBalancer(cap, el, wt, 17, 0x9e3779b9);
+            wt.fill(0);
+            bl.setWeights(wt); ch.setWeights(wt);
+            const r = evaluateOracle('BoundedLoad', bl, el, inf, wt, KEYS, KEY_COUNT, cap, new Prng(0xB2));
+            assert.deepEqual([r.viol, r.propViol, r.checks, r.propChecks], [0, 0, KEY_COUNT, KEY_COUNT], 'BoundedLoad cap ' + cap);
+            const c = evaluateOracle('ConsistentHash', ch, el, null, wt, KEYS, KEY_COUNT, cap, new Prng(0xB3));
+            assert.deepEqual([c.viol, c.propViol], [0, 0], 'ConsistentHash cap ' + cap);
+            if (rev !== null) {
+                assert.ok(c.checks > 0, 'ConsistentHash cap ' + cap + ': 1.1.x routes all-zero -> real checks (got ' + c.checks + ')');
+                assert.equal(c.insufficient, false, 'ConsistentHash cap ' + cap + ': 1.1.x has enough checks');
+            } else {
+                assert.equal(c.checks, 0, 'ConsistentHash cap ' + cap + ': in-tree K8 -> every home PICK_NONE -> 0 checks');
+                assert.equal(c.insufficient, true, 'ConsistentHash cap ' + cap + ': in-tree 0 checks must be flagged insufficient');
+            }
+        }
+    });
+}
+test('BoundedLoad oracle, all-zero weights: a K8 kernel that still ROUTES is caught', () => {
+    class Routes extends BoundedLoadBalancer {   // K8 field present, but the all-zero guard is gone
+        pick(key) { const p = super.pick(key); return p >= 0 ? p : (this._live > 0 ? this._lookup[(key >>> 0) % this._m] : p); }
+    }
+    const cap = 3, el = new Uint8Array(cap).fill(1), wt = new Uint32Array(cap), inf = new Uint32Array(cap);
+    const b = new Routes(cap, el, inf, 0.25, wt, 17, 0x9e3779b9);
+    const r = evaluateOracle('BoundedLoad', b, el, inf, wt, KEYS, KEY_COUNT, cap, new Prng(0xB4));
+    assert.ok(r.viol > 0 && r.propViol > 0, 'viol ' + r.viol + ' propViol ' + r.propViol);
 });
 
 test('WeightedRandom: clean passes the per-category pass; a pick-level +10% bias is caught', () => {

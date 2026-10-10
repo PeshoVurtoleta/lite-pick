@@ -140,9 +140,23 @@ const DESCRIPTORS = [
             const inflight = new Uint32Array(cap);
             return { b: new PeakEwmaBalancer(cap, eligible, inflight, 1e6, seed), eligible, inflight, weights: null };
         },
+        // Mirrors the fuzz PeakEWMA invariant (1.2.0, K6) without describe(): this runs at soak checkpoints,
+        // so it stays allocation-free -- the bitmap holds 0 / 1 and the pool mean has a sample iff a node does.
+        // The bitmap checks run only where `_sampled` exists: the soak:ab A side (the registry release,
+        // <= 1.1.x) and soak:ab:teeth (1.1.0 both sides) load kernels that predate K6 through these lanes.
+        // Likewise `_samp` (the 1.0.1 pool mean) is absent from the pre-1.0.1 kernel soak:teeth's REVERT
+        // control loads.
         extra: (b, ctx) => {
             if (!allFinite(b._ewma, ctx.cap)) return '_ewma has a non-finite cell';
             if (!allFinite(b._stamp, ctx.cap)) return '_stamp has a non-finite cell';
+            if (b._samp !== undefined && !allFinite(b._samp, 3)) return '_samp (decaying pool mean) has a non-finite cell';
+            if (b._sampled === undefined) return null;
+            let pc = 0;
+            for (let i = 0; i < ctx.cap; i++) {
+                if (b._sampled[i] > 1) return '_sampled[' + i + '] is ' + b._sampled[i];
+                pc += b._sampled[i];
+            }
+            if ((b._samp[1] > 0) !== (pc > 0)) return 'pool-mean count ' + b._samp[1] + ' disagrees with ' + pc + ' sampled nodes';
             return null;
         },
     },
@@ -192,13 +206,27 @@ export const TINY_LANES = DESCRIPTORS.map((d) => Object.freeze({
     ...d, tier: 'tiny', capOf: (cycle) => TINY_CAPS[cycle % TINY_CAPS.length], mOf: () => M_TINY,
 }));
 
+/**
+ * ConsistentHash / BoundedLoad all-zero weights under the LOADED kernel's rule. The chaos `allZero` phase
+ * (main.mjs) reaches every-weight-0 on the keyed lanes via setWeights. 1.2.0 (K8) answers PICK_NONE there;
+ * 1.1.x builds an equal-quota table and routes everywhere -- and the soak:ab A side runs 1.1.x through these
+ * lanes, so the rule is chosen by the kernel's K8 field (`_wmask`), while the all-zero test itself reads the
+ * soak's OWN weight mirror (`ctx.weights`, kept in lockstep with every setWeight / setWeights), never the
+ * balancer's copy. 1 iff the loaded kernel fails closed AND every mirrored weight is 0.
+ */
+function keyedAllZero(ctx) {
+    if (ctx.b._wmask === undefined || ctx.weights === null) return 0;
+    for (let i = 0; i < ctx.cap; i++) if (ctx.weights[i] !== 0) return 0;
+    return 1;
+}
+
 /** The pickable mass for a lane's fail-closed IFF (matches each pick()'s exact PICK_NONE). */
 export function massOf(lane, ctx) {
     switch (lane.massKind) {
         case 'live': return recomputeLive(ctx.eligible, ctx.cap);
         case 'eligibleWeight': return recomputeEligibleWeight(ctx.eligible, ctx.weights, ctx.cap);
         case 'eligibleWeighted': return recomputeEligibleWeighted(ctx.eligible, ctx.weights, ctx.cap);
-        case 'reachable': return reachableInTable(ctx.b, ctx.eligible);
+        case 'reachable': return keyedAllZero(ctx) ? 0 : reachableInTable(ctx.b, ctx.eligible);
         default: throw new Error('[soak] unknown massKind ' + lane.massKind);
     }
 }

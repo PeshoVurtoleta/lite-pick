@@ -134,3 +134,13 @@ no reference implementation offers a knob (research/1.1.0-kernel-and-api.md sect
 is active (`_total > 0`), as before. For integer in-flight counts `inf < max(minCap, x)` equals the paper's
 `inf < max(minCap, ceil(x))`, so the kernel still skips the ceil. The soak's BoundedLoad oracle and the pool
 lane's A1 check read `minCap`.
+
+## Amendment 2026-10-10 (1.2.0): K8, the K9 bound and the setWeights skip are inherited
+
+BoundedLoad reuses ConsistentHash's build, constructor validation, `setWeights` and `assertConsistent` verbatim,
+so the 1.2.0 ConsistentHash decisions (ADR 0010 amendment 2026-10-10) apply unchanged: all-zero weights ->
+`PICK_NONE` for every key, `M <= 2^31 - 1` (K9, kept; the hard `2^24` cap is deferred to 2.0 for SemVer), an
+equal-weights `setWeights` that performs no build, and the all-zero-mask check in `assertConsistent`. Its own
+cap-aware `_pickSlot` carries the same one-AND guard, `(this._live & this._wmask) === 0`, ahead of the cap
+math -- so all-zero fails closed even with the cap active (a noted load), where the sticky-first-eligible
+fallback would otherwise have returned the zeroed table's backend 0. Over-cap still never fails closed.

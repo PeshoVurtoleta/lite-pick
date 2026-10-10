@@ -24,6 +24,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     BoundedLoadBalancer, ConsistentHashBalancer, BalancerBase, PICK_NONE,
+    STAT_COUNT, STAT_DISPLACED, STAT_FALLBACK_SCANS,
 } from '../Pick.js';
 import { Pool } from '../Pool.js';
 
@@ -292,4 +293,27 @@ test('minCap (1.1.0, N4): opt-in low-load affinity; default 0 is the paper capac
         assert.throws(() => new BoundedLoadBalancer(4, new Uint8Array(4).fill(1), new Uint32Array(4), 0.25, null, 7, 1, bad), RangeError, String(bad));
     }
     assert.throws(() => new BoundedLoadBalancer(4, new Uint8Array(4).fill(1), new Uint32Array(4), 0.25, null, 7, 1, '2'), TypeError);
+});
+
+test('K8 (1.2.0): all-zero weights -> PICK_NONE with the cap ACTIVE too (noted load), via the inherited O(1) guard', () => {
+    // BoundedLoad overrides _pickSlot; its guard must carry the same `_live & _wmask` fold. With a noted
+    // total the cap is active and the sticky-fallback walk would otherwise return the zeroed table's
+    // backend 0 (HEAD: equal quotas, every key routed).
+    const n = 8, m = 257;
+    const inf = new Uint32Array(n);
+    const bl = new BoundedLoadBalancer(n, up(n), inf, 0.25, null, m, 3);
+    for (let i = 0; i < n; i++) { inf[i] = 2; bl.note(i, 2); }   // cap active: total 16
+    const slab = new Float64Array(STAT_COUNT);
+    bl.attachStats(slab);
+    bl.setWeights(new Uint32Array(n));
+    const buf = new Uint32Array(1);
+    for (let k = 0; k < 1000; k++) {
+        assert.equal(bl.pick(k * 2654435761), PICK_NONE);
+        buf[0] = k * 40503; assert.equal(bl.pickFrom(buf, 0), PICK_NONE);
+    }
+    assert.equal(slab[STAT_DISPLACED], 0, 'answered by the guard, not the cap-aware walk');
+    assert.equal(slab[STAT_FALLBACK_SCANS], 0, 'never the O(M) sweep');
+    bl.assertConsistent();
+    bl.setWeight(4, 1);                                            // one backend restored
+    for (let k = 0; k < 200; k++) assert.equal(bl.pick(k), 4, 'the lone positive-weight backend takes every key (fail open on cap)');
 });

@@ -64,7 +64,7 @@ Is routing decided by a KEY (same key -> same backend, for cache/session affinit
 | **LeastConn** | in-flight load | O(cap) | none (reads live) | the **exact** least-loaded in a feedback loop; dozens-hundreds of nodes |
 | **SED** | (inflight+1)/weight | O(cap) | none (reads live) | **weighted** exact least-loaded (load settles proportional to weight) |
 | **NQ** | idle-first, else SED | O(cap) | none (reads live) | **worker pools** -- never queue while a server is idle |
-| **PeakEWMA** | (inflight+1) x decayed rtt | **O(1)** | EWMA rtt state (`_ewma`/`_stamp`) | you have latency and want to steer around a **slow-but-up** node |
+| **PeakEWMA** | (inflight+1) x decayed rtt | **O(1)** | EWMA rtt state (`_ewma`/`_stamp`/`_sampled`) | you have latency and want to steer around a **slow-but-up** node |
 | **ConsistentHash** | key hash (Maglev) | **O(1)** | a Maglev lookup table | **sticky** cache/session affinity; minimal disruption on scale events (~1/N keys move) |
 | **BoundedLoad** | key hash + occupancy cap | **O(1)** | Maglev table + a running `_total` | sticky routing **and** a few hot keys would otherwise overload one backend |
 
@@ -100,7 +100,9 @@ does not import it; RECIPES.md section 17 has the wiring.
   again brings every key back. For health flaps, deploys, breaker trips.
 - **Remove** -- `setWeight(i, 0)`: the table is rebuilt (cold), **~0.5%** of other keys move at the default
   M (~2.5% at M = 4099). For a backend that is gone for good, or many down at once (a drained backend's
-  keys probe past its slots). Note that IPVS's weight 0 DRAINS; lite-pick's weight 0 removes.
+  keys probe past its slots). Note that IPVS's weight 0 DRAINS; lite-pick's weight 0 removes -- and
+  removing EVERY backend (all-zero weights) is pool-down: `PICK_NONE` for every key (1.2.0; 1.1.x routed
+  everywhere on equal shares).
 
 Measured numbers and the full trade-off: RECIPES.md section 9, "Drain vs remove".
 

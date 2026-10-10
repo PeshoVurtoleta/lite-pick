@@ -82,3 +82,16 @@ attempt, ok, error, aborted }`, once per attempt, from `Pool.run` only (never th
   anything without it get no channels, and the module needs no top-level await (which would break `require()`
   of it on Node 22+). Observability can never break a Pool.
 - A throwing subscriber does not affect the run: Node reports it as an uncaught exception on the next tick.
+
+## Amendment 2026-10-10 (1.2.0): `STAT_REBUILDS` counts builds performed; the `CODES` runtime export
+
+- **`STAT_REBUILDS` semantics.** It counts a table build actually PERFORMED. A ConsistentHash / BoundedLoad /
+  WeightedRandom `setWeights` whose weights equal the built snapshot now performs none and counts nothing
+  (ADR 0010 / 0012 amendments 2026-10-10); `rebuild()` and every real reweight still count one. The index and
+  `STAT_COUNT` (3) are unchanged.
+- **`CODES`.** Fork 1 shipped the codes as strings plus a type (`LitePickErrorCode`); 1.2.0 adds the runtime
+  value: `export const CODES` -- a frozen object, value === key, all 14 codes (8 kernel + 6 /pool). `/pool`
+  re-exports the SAME object; `Pick.d.ts` types it `{ readonly [K in LitePickErrorCode]: K }`. The throw sites
+  keep their literals; `test/Codes.test.js` is the census: the key set equals the d.ts union, every thrown code
+  (`_err(X, 'LITE_PICK_*'` / `code = 'LITE_PICK_*'`) is a key, and every key is thrown somewhere (the census
+  skips the CODES block itself, or "every key used" would pass trivially).

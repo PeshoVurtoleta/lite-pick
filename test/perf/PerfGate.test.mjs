@@ -320,7 +320,7 @@ const nqPick = {
  * peakewma-pick: reused PeakEwmaBalancer over a half-eligible pool + a caller-owned inflight
  * array; each op two rejection draws + two decay-on-read exp() + a compare (a PURE read -- pick
  * NEVER writes the owned EWMA state). O(d)=O(1), so CAP is fine. `now` advances each op. The
- * `grows` counter covers the eligibility + inflight arrays AND the owned _ewma / _stamp buffers
+ * `grows` counter covers the eligibility + inflight arrays AND the owned _ewma / _stamp / _sampled buffers
  * (none reallocates -> 0 delta).
  */
 const peakEwmaPick = {
@@ -341,7 +341,7 @@ const peakEwmaPick = {
         s.acc = acc | 0; s.now = now | 0;
     },
     statsOf(s) {
-        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._sampled.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
     },
 };
 
@@ -374,7 +374,7 @@ const peakEwmaRecord = {
         s.now = now | 0;
     },
     statsOf(s) {
-        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._sampled.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
     },
 };
 
@@ -554,7 +554,7 @@ const peakEwmaPickFrom = {
         s.acc = acc | 0;
     },
     statsOf(s) {
-        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.clk.buffer) };
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._sampled.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.clk.buffer) };
     },
 };
 const peakEwmaRecordFrom = {
@@ -570,7 +570,7 @@ const peakEwmaRecordFrom = {
         for (let i = 0; i < n; i++) { fb[1] += 1000; fb[0] = (i & 4095) * 250.5; pe.recordRttFrom(i & MASK, fb, 0); }
     },
     statsOf(s) {
-        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.fb.buffer) };
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._sampled.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.fb.buffer) };
     },
 };
 // 1.1.1: the single-node BLEND path of recordRttFrom, not covered by the varying-sample lane above. ONE
@@ -594,7 +594,56 @@ const peakEwmaRecordFromBlend = {
         for (let i = 0; i < n; i++) { fb[1] += 1000; pe.recordRttFrom(0, fb, 0); }
     },
     statsOf(s) {
-        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.fb.buffer) };
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._sampled.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.fb.buffer) };
+    },
+};
+// 1.2.0 (K6): the same two zero-box lanes on a NEGATIVE offset clock (~ -1.7e15, e.g. `hrtime - start`). Through
+// 1.1.x a negative `now` left every node "unsampled" (a negative _stamp was the marker), so these lanes ran the
+// cold arm only; with the _sampled bitmap the sampled arm, the blend and the pool-mean decay all run here and
+// must stay 0 B/op.
+const NEG_NOW = -1.7e15;
+const peakEwmaPickFromNeg = {
+    name: 'PeakEwmaBalancer.pickFrom(clock~-1.7e15 in a Float64Array, K6 offset clock)',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        for (let i = 0; i < CAP; i++) inflight[i] = i & 15;
+        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xABCDEF);
+        const fb = new Float64Array([0, NEG_NOW]);
+        for (let i = 0; i < CAP; i += 8) { fb[0] = (i & 31) * 1000 + 0.5; pe.recordRttFrom(i, fb, 0); }
+        // The lane must price the SAMPLED arm on the negative clock, or it gates the 1.1.x cold arm only.
+        assert.equal(pe.describe().sampled, CAP / 8, 'every node fed at clock -1.7e15 must be sampled');
+        return { el, inflight, pe, clk: new Float64Array([NEG_NOW]), acc: 0 };
+    },
+    hot(s, n) {
+        const pe = s.pe, clk = s.clk;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) { clk[0] += 1000; acc = (acc + pe.pickFrom(clk, 0)) | 0; }
+        s.acc = acc | 0;
+    },
+    statsOf(s) {
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._sampled.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.clk.buffer) };
+    },
+};
+const peakEwmaRecordFromNeg = {
+    name: 'PeakEwmaBalancer.recordRttFrom([fractional sample, clock~-1.7e15], K6 offset clock)',
+    setup() {
+        const el = makePool();
+        const inflight = new Uint32Array(CAP);
+        const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0xFEEDBEEF);
+        const fb = new Float64Array([0.5, NEG_NOW]);
+        for (let i = 0; i < CAP; i++) pe.recordRttFrom(i, fb, 0);
+        // Primed at the negative clock: every HOT record takes the sampled (peak / blend) arm, never the
+        // first-sample init a 1.1.x kernel would repeat forever on a negative clock.
+        assert.equal(pe.describe().sampled, CAP, 'every node fed at clock -1.7e15 must be sampled');
+        return { el, inflight, pe, fb };
+    },
+    hot(s, n) {
+        const pe = s.pe, fb = s.fb;
+        for (let i = 0; i < n; i++) { fb[1] += 1000; fb[0] = (i & 4095) * 250.5; pe.recordRttFrom(i & MASK, fb, 0); }
+    },
+    statsOf(s) {
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._sampled.buffer, s.pe._samp.buffer, s.pe._arg.buffer, s.fb.buffer) };
     },
 };
 function realKeys() {
@@ -658,7 +707,7 @@ const peakEwmaRecordMod = {
         s.now = now | 0;
     },
     statsOf(s) {
-        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
+        return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.pe._ewma.buffer, s.pe._stamp.buffer, s.pe._sampled.buffer, s.pe._samp.buffer, s.pe._arg.buffer) };
     },
 };
 
@@ -688,7 +737,7 @@ const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
     leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord, consistentHashPick,
     boundedLoadPick, boundedLoadNote, weightedRandomPick, weightedRandomPickFallback,
-    peakEwmaPickFrom, peakEwmaRecordFrom, peakEwmaRecordFromBlend, peakEwmaRecordMod, consistentHashPickFrom, boundedLoadPickFrom,
+    peakEwmaPickFrom, peakEwmaRecordFrom, peakEwmaRecordFromBlend, peakEwmaRecordMod, peakEwmaPickFromNeg, peakEwmaRecordFromNeg, consistentHashPickFrom, boundedLoadPickFrom,
     recipe17FenwickPick,
 ];
 

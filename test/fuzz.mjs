@@ -32,6 +32,17 @@ import {
 /** A small PRIME Maglev table size for the fuzzer -- large enough for CAPS max (63), fast to rebuild. */
 const CH_FUZZ_M = 127;
 
+/**
+ * The ConsistentHash / BoundedLoad fail-closed mass (K8, 1.2.0): a weight-0 backend owns no table slot, so
+ * with EVERY weight 0 no backend is reachable (PICK_NONE) whatever the table holds; otherwise PICK_NONE iff
+ * no eligible backend owns a slot. Reads the fuzzer's own weight mirror (`ctx.weights`, kept in lockstep
+ * with every setWeight), never the balancer's owned copy.
+ */
+function chMass(ctx) {
+    for (let i = 0; i < ctx.cap; i++) if (ctx.weights[i] > 0) return reachableInTable(ctx.b, ctx.el);
+    return 0;
+}
+
 /** The fuzzer's OWN deterministic RNG (an LCG), independent of any balancer's internal PRNG. */
 function lcg(seed) {
     let s = (seed >>> 0) || 0x9e3779b9;
@@ -131,11 +142,23 @@ const SPECS = {
         make: (cap, el, inf) => new PeakEwmaBalancer(cap, el, inf, 1e6, 0xC0FFEE),
         mass: (ctx) => ctx.b.live,
         // Two-choice: no exact-min claim. The state invariant is that the owned EWMA state stays
-        // finite (never NaN / +-Infinity) under the recordRtt / pick / setEligible barrage.
+        // finite (never NaN / +-Infinity) under the recordRtt / pick / setEligible barrage, and (1.2.0,
+        // K6) the sampled bitmap equals the DRIVER's shadow (`ctx.shadow`, set on each successful recordRtt)
+        // element-wise, describe().sampled is the shadow's popcount, and the pool mean has a sample iff some
+        // node does -- on a clock that is negative for odd seeds. The shadow, not describe() (which sums the
+        // same bitmap), is the oracle.
         extra: (b, ctx) => {
             if (!allFinite(b._ewma, ctx.cap)) return '_ewma has a non-finite cell';
             if (!allFinite(b._stamp, ctx.cap)) return '_stamp has a non-finite cell';
             if (!allFinite(b._samp, 3)) return '_samp (decaying pool mean) has a non-finite cell';
+            let pc = 0;
+            for (let i = 0; i < ctx.cap; i++) {
+                if (b._sampled[i] !== ctx.shadow[i]) return '_sampled[' + i + '] is ' + b._sampled[i] + ', the driver recorded ' + ctx.shadow[i];
+                pc += ctx.shadow[i];
+            }
+            const ds = b.describe().sampled;
+            if (ds !== pc) return 'describe().sampled ' + ds + ' != recorded nodes ' + pc;
+            if ((b._samp[1] > 0) !== (pc > 0)) return 'pool-mean count ' + b._samp[1] + ' disagrees with ' + pc + ' sampled nodes';
             return null;
         },
     },
@@ -148,7 +171,7 @@ const SPECS = {
         // pick falls back to the first eligible, so PICK_NONE holds iff none is reachable).
         weighted: true, loadAware: true, usesSetWeight: true, keyed: true, boundedLoad: true,
         make: (cap, el, inf, w) => new BoundedLoadBalancer(cap, el, inf, 0.25, w, CH_FUZZ_M, 0xC0FFEE),
-        mass: (ctx) => reachableInTable(ctx.b, ctx.el),
+        mass: chMass,
         // Structural (table maps in-range, pick eligible/in-range) AND the owned _total stays exact.
         extra: (b, ctx, p) => checkConsistentHash(b, ctx.el, ctx.cap, p) || checkBoundedLoad(b, ctx.inflight, ctx.cap),
     },
@@ -166,9 +189,9 @@ const SPECS = {
     ConsistentHash: {
         weighted: true, loadAware: false, usesSetWeight: true, keyed: true,
         make: (cap, el, _inf, w) => new ConsistentHashBalancer(cap, el, w, CH_FUZZ_M, 0xC0FFEE),
-        // Fail-closed IFF for a bounded-probe consistent hash is per-KEY: PICK_NONE holds exactly
-        // when no eligible backend is reachable from the key's slot within the probe bound.
-        mass: (ctx) => reachableInTable(ctx.b, ctx.el),
+        // Fail-closed IFF: PICK_NONE holds exactly when no eligible backend owns a table slot (probe +
+        // L3 sweep) -- or every weight is 0 (K8, 1.2.0: all-zero = every backend removed).
+        mass: chMass,
         // Structural: the table maps only to in-range indices, and the pick is eligible/in-range.
         extra: (b, ctx, p) => checkConsistentHash(b, ctx.el, ctx.cap, p),
     },
@@ -191,7 +214,8 @@ function runOne(name, seed, cap, steps) {
     if (spec.weighted) for (let i = 0; i < cap; i++) weights[i] = drawWeight(rnd);
 
     const b = spec.make(cap, el, inflight, weights);
-    const ctx = { b, cap, el, inflight, weights, keyHash: 0 };
+    // shadow: the driver's own record of which nodes took a successful recordRtt (the K6 bitmap's oracle).
+    const ctx = { b, cap, el, inflight, weights, keyHash: 0, shadow: spec.latencyAware ? new Uint8Array(cap) : null };
     // For BoundedLoad, every inflight change goes through note() so _total stays in lockstep; for the
     // other load-aware strategies inflight is mutated directly (the shared-counter seam).
     const applyInflight = (i, newVal) => {
@@ -203,8 +227,9 @@ function runOne(name, seed, cap, steps) {
             inflight[i] = newVal;
         }
     };
-    // A monotonic caller clock for the latency-aware strategy (pick(now) + recordRtt(...,now)).
-    let now = 0;
+    // A monotonic caller clock for the latency-aware strategy (pick(now) + recordRtt(...,now)). 1.2.0 (K6):
+    // odd seeds run it from a NEGATIVE offset (-2^40), so an offset clock is fuzzed beside the 0-origin one.
+    let now = (seed & 1) ? -(2 ** 40) : 0;
 
     for (let step = 0; step < steps; step++) {
         const r = rnd() % 100;
@@ -220,17 +245,26 @@ function runOne(name, seed, cap, steps) {
             applyInflight(i, nv);
         } else if (r < 60 && spec.weighted) {
             const i = rnd() % cap, w = drawWeight(rnd);
-            if (spec.usesSetWeight) b.setWeight(i, w); else weights[i] = w;    // live vs sole-writer
+            // live vs sole-writer; the sole-writer path also mirrors into `weights` (WeightedRandom's own
+            // array already; ConsistentHash / BoundedLoad own a COPY, so this is the oracle's mirror).
+            if (spec.usesSetWeight) b.setWeight(i, w);
+            weights[i] = w;
         }
         // Sometimes exercise the pathological max on SmoothWRR's summed total directly.
-        if ((r & 31) === 7 && spec.weighted && spec.usesSetWeight) b.setWeight(rnd() % cap, 0xFFFFFFFF);
+        if ((r & 31) === 7 && spec.weighted && spec.usesSetWeight) {
+            const i = rnd() % cap;
+            b.setWeight(i, 0xFFFFFFFF);
+            weights[i] = 0xFFFFFFFF;                                           // the oracle's mirror
+        }
 
         // Barrage the latency-aware feedback path: a mix of ordinary, zero, and huge rtt samples.
         if (spec.latencyAware && (r & 3) === 1) {
             now += 1 + (rnd() % 4096);
             const kind = rnd() % 4;
             const sample = kind === 0 ? 0 : kind === 1 ? 1e8 : rnd() % 500000;
-            b.recordRtt(rnd() % cap, sample, now);
+            const ri = rnd() % cap;
+            b.recordRtt(ri, sample, now);
+            ctx.shadow[ri] = 1;                                                // reached only if it did not throw
         }
 
         now += 1 + (rnd() % 1024);
@@ -265,11 +299,25 @@ function pathological() {
         if (b._totalEligibleWeight !== want) fails.push('pathological max-weight total desync ' + b._totalEligibleWeight + ' != ' + want);
         if (!allFinite(b._current, cap)) fails.push('pathological max-weight _current non-finite');
     }
-    // 2. All-zero weight while live > 0: SmoothWRR / SED / NQ / WeightedRandom all fail closed.
+    // 2. All-zero weight while live > 0: SmoothWRR / SED / NQ / WeightedRandom / ConsistentHash / BoundedLoad
+    //    all fail closed (K8, 1.2.0: CH / BL no longer fall back to equal quotas) -- via the constructor AND
+    //    via setWeights, for every key, never throwing.
     {
         const cap = 4, el = new Uint8Array(cap).fill(1), w = new Uint32Array(cap), inf = new Uint32Array(cap);
-        for (const b of [new SmoothWRRBalancer(cap, el, w), new SedBalancer(cap, el, inf, w), new NqBalancer(cap, el, inf, w), new WeightedRandomBalancer(cap, el, w)]) {
+        const chSet = new ConsistentHashBalancer(cap, el, null, CH_FUZZ_M);
+        chSet.setWeights(w);
+        const blSet = new BoundedLoadBalancer(cap, el, new Uint32Array(cap), 0.25, null, CH_FUZZ_M);
+        blSet.setWeights(w);
+        const all = [new SmoothWRRBalancer(cap, el, w), new SedBalancer(cap, el, inf, w), new NqBalancer(cap, el, inf, w),
+            new WeightedRandomBalancer(cap, el, w), new ConsistentHashBalancer(cap, el, w, CH_FUZZ_M),
+            new BoundedLoadBalancer(cap, el, new Uint32Array(cap), 0.25, w, CH_FUZZ_M), chSet, blSet];
+        for (const b of all) {
             if (b.pick() !== PICK_NONE) fails.push('all-zero-weight ' + b.constructor.name + ' did not fail closed (live=' + b.live + ')');
+        }
+        for (const b of [all[4], all[5], chSet, blSet]) {
+            for (let k = 0; k < 1000; k++) {
+                if (b.pick(k * 2654435761) !== PICK_NONE) { fails.push('all-zero-weight keyed ' + b.constructor.name + ' routed key ' + k); break; }
+            }
         }
     }
     // 2b. WeightedRandom: an eligibility flap NEVER rebuilds the alias table (anti-flap, ADR 0002/0012).

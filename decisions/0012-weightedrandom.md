@@ -159,3 +159,21 @@ guard, ADR 0010 -- and a JSDoc-only edit to `BalancerBase.constructor`; neither 
   safe when the caller passes a subarray that overlaps the balancer's own weights (forward element copy could
   smear). CH / BL were never affected (they copy into a private array on build). A differential test drives both
   overlap directions.
+
+## Amendment 2026-10-10 (1.2.0): `setWeights` skips a rebuild equal to the built snapshot
+
+`setWeights(w)` keeps the K5 overlap-safe copy (`wt.set(w.subarray(0, cap))`, which also repairs a drifted
+shared array) and THEN compares the copied weights against `_built`, the snapshot the alias table was built
+from. All equal -> return: no build, no `_builds++`, no `STAT_REBUILDS`. The compare MUST be against `_built`,
+never a pre-copy `_weights`: the caller often passes the very array it mutated in place, which a pre-copy
+compare would see as "unchanged" (a test pins that mutant). Sufficient because the alias table and `_psum`
+are pure functions of `_built`, and `setEligible` keeps `_ew` exact, so an eligibility change since the last
+build needs no rebuild. Disclosed cost: a direct `eligible[i]` write (UB) used to be re-synced as a side effect
+of any `setWeights` call; a same-weights call no longer does that -- `assertConsistent()` still names it, and
+`rebuild()` stays unconditional. All-zero weights were already `PICK_NONE` here (Fork 2); 1.2.0 brings
+ConsistentHash / BoundedLoad to the same answer (ADR 0010 amendment 2026-10-10).
+
+- `setWeight(i, w)` gets the same treatment. In 1.1.x it compared the new value against `_weights[i]`, which a
+  caller-shared array may already hold after an in-place edit, so it could skip a needed rebuild. Now it writes
+  `_weights[i]` first and then compares against `_built[i]` (the built snapshot); equal -> return with no
+  build and no `STAT_REBUILDS`.

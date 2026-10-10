@@ -8,6 +8,9 @@
 /** The source-of-truth version stamp (re-exported from the core). */
 export const VERSION: string;
 
+/** The frozen error-code map (1.2.0), re-exported from the core: the SAME object as `CODES` there. */
+export { CODES } from './Pick.js';
+
 /**
  * `node:diagnostics_channel` names (1.1.0). Pool publishes on them only where `process.getBuiltinModule`
  * exists (Node >= 20.16 / 22.3; never in browsers), only when the channel has subscribers, and never from

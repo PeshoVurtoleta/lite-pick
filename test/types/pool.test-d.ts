@@ -6,8 +6,9 @@
  */
 
 import { Pool, liteQueryFetcher, VERSION, type AbortLike, type RunOptions,
-    POOL_CHANNEL_DISPATCH, POOL_CHANNEL_SETTLE, type PoolDispatchMessage, type PoolSettleMessage } from '../../Pool.js';
-import { LeastConnBalancer, BoundedLoadBalancer, PeakEwmaBalancer } from '../../Pick.js';
+    POOL_CHANNEL_DISPATCH, POOL_CHANNEL_SETTLE, CODES as POOL_CODES, type PoolDispatchMessage, type PoolSettleMessage } from '../../Pool.js';
+import { LeastConnBalancer, BoundedLoadBalancer, PeakEwmaBalancer, CODES as CORE_CODES } from '../../Pick.js';
+import type { LitePickErrorCode } from '../../Pick.js';
 
 // VERSION is a string (re-exported from the core).
 const v: string = VERSION;
@@ -118,3 +119,16 @@ void onDispatch; void onSettle;
 declare const dm: PoolDispatchMessage;
 // @ts-expect-error -- messages are read-only (the object is reused; copy, never write)
 dm.endpoint = 3;
+
+// CODES re-exported from /pool: literal values, readonly, same type as the core map.
+const poolCodeIdx: 'LITE_PICK_INDEX' = POOL_CODES.LITE_PICK_INDEX;
+const poolCodeAny: LitePickErrorCode = POOL_CODES.LITE_PICK_FEEDBACK;
+const poolCodeKey: keyof typeof POOL_CODES = 'LITE_PICK_NONE';
+const poolCodeKeyIsCode: LitePickErrorCode = poolCodeKey;
+const poolCodesAsCore: typeof CORE_CODES = POOL_CODES;
+const coreCodesAsPool: typeof POOL_CODES = CORE_CODES;
+void poolCodeIdx; void poolCodeAny; void poolCodeKeyIsCode; void poolCodesAsCore; void coreCodesAsPool;
+// @ts-expect-error -- not a lite-pick code
+void POOL_CODES.ERR_LITE_PICK_INDEX;
+// @ts-expect-error -- CODES is readonly
+POOL_CODES.LITE_PICK_INDEX = 'LITE_PICK_INDEX';

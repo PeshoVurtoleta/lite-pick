@@ -14,10 +14,17 @@
  *   A7. VALIDATION: the constructor and recordRtt throw typeof-first on bad inputs, before allocation.
  *   L4. (1.1.0) the update is Finagle's observe() exactly: 10 ms, one tau, then 5 ms -> 6.84 ms.
  *   D4. (1.1.0) the unsampled-busy price is a DECAYING pool mean that follows a latency-regime change.
+ *   K6. (1.2.0) "unsampled" is the `_sampled` bitmap, not a negative `_stamp`: ANY finite clock learns.
+ *       A run at `now - 2^40` is bit-identical to the run at `now` (picks, _ewma, _samp[0..1], ewmaAt);
+ *       the blend, the busy floor and the pool-mean decay work at a negative / zero-crossing clock; the
+ *       now >= 0 behaviour is byte-identical to 1.1.1 (test/fixtures/peak-k6-head.json, cut from HEAD).
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { PeakEwmaBalancer, P2cBalancer, BalancerBase, PICK_NONE } from '../Pick.js';
 
 const up = (n) => { const e = new Uint8Array(n); e.fill(1); return e; };
@@ -98,7 +105,7 @@ test('A3: at dt = tau the EWMA decays to sample / e within ~1%', () => {
 test('A3b: cold start under a LARGE clock degrades to LeastConn, not random (0.7.1 regression)', () => {
     // The bug: with _stamp seeded to 0, an unsampled node decays as exp(-now/tau) -> 0 under a real
     // large clock, so every cold cost collapses to ~0 and selection becomes random. With the
-    // unsampled sentinel, cost = (inflight+1) x 1 undecayed -> the lower-inflight node wins.
+    // unsampled marker (1.2.0: the _sampled bitmap), cost = (inflight+1) x 1 undecayed -> the lower-inflight node wins.
     const NOW = 1e12;                         // a realistic large-magnitude ns clock
     const inflight = Uint32Array.from([0, 5]);
     const b = new PeakEwmaBalancer(2, up(2), inflight, 1e6, 0xC0FFEE);
@@ -299,4 +306,241 @@ test('never returns a down index under adversarial flapping', () => {
             if ((step & 7) === 0) b.recordRtt(p, rnd() % 100000, step); // warm feedback churn
         }
     }
+});
+
+// --- K6 (1.2.0): offset / negative clocks. "Unsampled" is the _sampled bitmap, not a negative _stamp. ---
+
+const SHIFT = 2 ** 40;   // 1.0995e12: every shifted clock below is negative, every value an exact integer
+
+/** A seeded control PRNG for the K6 programs (never the balancer's own). */
+function k6rnd(seed) {
+    let s = seed >>> 0;
+    return () => {
+        s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+        let x = s ^ (s >>> 15);
+        x = Math.imul(x, 0x2c1b3c6d) >>> 0;
+        return (x ^ (x >>> 12)) >>> 0;
+    };
+}
+
+/** A test-only spy: records every candidate draw of the CURRENT pick so the driver can see the arm it prices. */
+class DrawSpy extends PeakEwmaBalancer {
+    _draw() { const x = super._draw(); if (this._spy !== null) this._spy.push(x); return x; }
+}
+
+/**
+ * Drive a 16-node balancer for 2000 steps on an INTEGER clock starting at `t0` (interleaved nodes, or a
+ * non-monotonic clock), churning inflight so the busy floor and the unsampled-busy mean are both live.
+ * The node index has its OWN stream (independent of the op / sample / clock / inflight stream), and nodes
+ * 12..15 take no sample before step 1000, so the unsampled-and-busy arm is priced for half the run.
+ * Returns the per-step trace (the pick, then _ewma, _samp[0..1] and ewmaAt for every node) and coverage
+ * counts: `blend` records on a sampled node at or below its estimate (the exp-blend arm, not first-sample /
+ * peak), `backwards` clock steps, and `unsampledBusy` pick candidates (first and final draw) that were
+ * unsampled with inflight > 0 when priced.
+ */
+function k6trace(mode, t0) {
+    const n = 16, inflight = new Uint32Array(n);
+    const b = new DrawSpy(n, up(n), inflight, TAU, 0x2222);
+    b._spy = null;
+    const rnd = k6rnd(0x5555), rndNode = k6rnd(0x7777);
+    const picks = [], state = [], drawn = [];
+    let now = t0, blend = 0, backwards = 0, unsampledBusy = 0;
+    for (let k = 0; k < 2000; k++) {
+        const i = rndNode() % n;
+        const sample = (rnd() % 1000) + (rnd() % 100) / 100;
+        const step = mode === 'backwardsClock' && (rnd() & 3) === 0 ? -(rnd() % 500) : 100 + (rnd() % 1000);
+        if (step < 0) backwards++;
+        now += step;
+        inflight[rnd() % n] = rnd() % 3;
+        if (((k & 1) === 0 || k < 64) && (i < 12 || k >= 1000)) {
+            if (b._sampled[i] === 1 && !(sample > b._ewma[i])) blend++;
+            b.recordRtt(i, sample, now);
+        }
+        drawn.length = 0;
+        b._spy = drawn;
+        picks.push(b.pick(now));
+        b._spy = null;
+        if (drawn.length >= 2) {
+            const c0 = drawn[0], c1 = drawn[drawn.length - 1];
+            if (b._sampled[c0] === 0 && inflight[c0] > 0) unsampledBusy++;
+            if (c1 !== c0 && b._sampled[c1] === 0 && inflight[c1] > 0) unsampledBusy++;
+        }
+        const row = [b._samp[0], b._samp[1]];
+        for (let j = 0; j < n; j++) row.push(b._ewma[j], b.ewmaAt(j, now));
+        state.push(row);
+    }
+    return { b, picks, state, now, blend, backwards, unsampledBusy };
+}
+
+for (const mode of ['interleaved', 'backwardsClock']) {
+    test('K6-translate (' + mode + '): a run at now - 2^40 is bit-identical to the run at now', () => {
+        const a = k6trace(mode, 1e9);
+        const z = k6trace(mode, 1e9 - SHIFT);
+        assert.ok(z.now < 0, 'the shifted clock is negative throughout');
+        // Coverage floors, so the equality below is not vacuous. Measured (darwin / arm64, Node 26):
+        // interleaved blend 766 / unsampled-busy 360; backwardsClock blend 770 / backwards 488 /
+        // unsampled-busy 316. Floors sit ~20% below the measured values; the streams are seeded, so a
+        // drop below a floor means the driver stopped reaching the arm, not noise.
+        assert.ok(z.blend >= 600, 'blend records ' + z.blend + ' < 600');
+        assert.ok(z.unsampledBusy >= 250, 'unsampled-and-busy candidates ' + z.unsampledBusy + ' < 250');
+        if (mode === 'backwardsClock') assert.ok(z.backwards >= 400, 'backwards clock steps ' + z.backwards + ' < 400');
+        let pickEq = 0;
+        for (let k = 0; k < a.picks.length; k++) if (a.picks[k] === z.picks[k]) pickEq++;
+        assert.equal(pickEq, 2000, 'picks equal: ' + pickEq + '/2000');
+        for (let k = 0; k < a.state.length; k++) {
+            const ra = a.state[k], rz = z.state[k];
+            for (let c = 0; c < ra.length; c++) {
+                if (!Object.is(ra[c], rz[c])) assert.fail('step ' + k + ' column ' + c + ': ' + ra[c] + ' !== ' + rz[c]);
+            }
+        }
+        let ewmaEq = 0;
+        for (let j = 0; j < 16; j++) if (Object.is(a.b._ewma[j], z.b._ewma[j])) ewmaEq++;
+        assert.equal(ewmaEq, 16, '_ewma bit-equal: ' + ewmaEq + '/16');
+        assert.equal(a.b._samp[2] - z.b._samp[2], SHIFT, '_samp[2] differs by exactly 2^40');
+        assert.equal(z.b.describe().sampled, 16, 'every node learned at a negative clock (1.1.1: 0)');
+        z.b.assertConsistent();
+    });
+}
+
+test('K6-blend: the Finagle blend runs at a negative now (1000 @ -5e6, then 100 @ -4e6, tau 1e6)', () => {
+    const b = new PeakEwmaBalancer(2, up(2), new Uint32Array(2), 1e6);
+    b.recordRtt(0, 1000, -5e6);
+    b.recordRtt(0, 100, -4e6);
+    const w = Math.exp(-1);
+    assert.equal(b._ewma[0], 1000 * w + 100 * (1 - w), 'blended, not re-initialized (1.1.1: 100)');
+    assert.equal(b.ewmaAt(0, -4e6), b._ewma[0], 'ewmaAt at the sample time is the stored estimate');
+    assert.equal(b.ewmaAt(0, -3e6), b._ewma[0] * Math.exp(-1), 'and it decays on read');
+    assert.equal(b._samp[1], 1 * w + 1, 'the pool count decayed across the negative gap');
+    assert.equal(b._samp[2], -4e6, 'the pool stamp is the newest (negative) time');
+});
+
+test('K6: the busy floor holds at a negative now (a hung node loses to a healthy busy peer)', () => {
+    const inflight = Uint32Array.from([1, 1]);
+    const b = new PeakEwmaBalancer(2, up(2), inflight, TAU, 0xC0FFEE);
+    const now = -1e9 + 1e7;
+    b.recordRtt(0, 100, -1e9);               // node 0: fast once, then hung for 1e7 ns
+    b.recordRtt(1, 1000, now - 10);          // node 1: healthy, sampled just now
+    // node 0 cost = 2 x max(100 e^-10, 1e7) = 2e7; node 1 = 2 x ~1000. 1.1.1 priced both at the mean (a coin flip).
+    for (let i = 0; i < 1000; i++) assert.equal(b.pick(now), 1, 'the hung node must lose at a negative clock');
+});
+
+test('K6: a zero-crossing clock (-1e6 -> +1e6) learns exactly as its positive translate', () => {
+    const run = (off) => {
+        const inflight = new Uint32Array(8);
+        const b = new PeakEwmaBalancer(8, up(8), inflight, TAU, 0xBEEF);
+        const rnd = k6rnd(0x77);
+        const picks = [];
+        for (let t = -1e6; t <= 1e6; t += 1000) {
+            inflight[rnd() & 7] = rnd() & 1;
+            b.recordRtt(rnd() & 7, (rnd() % 5000) + 0.25, t + off);
+            picks.push(b.pick(t + off));
+        }
+        return { b, picks };
+    };
+    const neg = run(0), pos = run(2 ** 30);
+    assert.deepEqual(neg.picks, pos.picks, 'pick stream identical across the zero crossing');
+    for (let j = 0; j < 8; j++) assert.ok(Object.is(neg.b._ewma[j], pos.b._ewma[j]), '_ewma[' + j + '] bit-equal');
+    assert.ok(Object.is(neg.b._samp[0], pos.b._samp[0]) && Object.is(neg.b._samp[1], pos.b._samp[1]), '_samp[0..1] bit-equal');
+    assert.equal(neg.b.describe().sampled, 8);
+});
+
+test('K6: a fresh node reads its undecayed 1.0 baseline at any clock magnitude or sign', () => {
+    const b = new PeakEwmaBalancer(4, up(4), new Uint32Array(4), TAU);
+    for (const now of [1e18, -1e18, 0, -0, -1, 1.7e15]) {
+        for (let i = 0; i < 4; i++) assert.equal(b.ewmaAt(i, now), 1.0, 'ewmaAt(' + i + ', ' + now + ')');
+    }
+    assert.equal(b.describe().sampled, 0);
+    assert.equal(b._samp[2], -Number.MAX_VALUE, 'the pool stamp seeds to the running-max identity');
+});
+
+test('K6: assertConsistent checks the sampled bitmap against the pool mean', () => {
+    const b = new PeakEwmaBalancer(8, up(8), new Uint32Array(8), TAU);
+    b.assertConsistent();                    // fresh: no node sampled, count 0
+    b.recordRtt(2, 500, -7);
+    b.assertConsistent();
+    b._sampled[3] = 2;
+    assert.throws(() => b.assertConsistent(), (e) => e.code === 'LITE_PICK_INCONSISTENT' && /_sampled\[3\] is 2/.test(e.message));
+    const c = new PeakEwmaBalancer(8, up(8), new Uint32Array(8), TAU);
+    c._sampled[5] = 1;                       // marked sampled, but the pool mean has no sample
+    assert.throws(() => c.assertConsistent(), (e) => e.code === 'LITE_PICK_INCONSISTENT');
+    const d = new PeakEwmaBalancer(8, up(8), new Uint32Array(8), TAU);
+    d.recordRtt(0, 500, 1);
+    d._sampled[0] = 0;                       // a sample in the mean, but no node marked
+    assert.throws(() => d.assertConsistent(), (e) => e.code === 'LITE_PICK_INCONSISTENT');
+});
+
+/**
+ * Fixture parity (K6 TASK 0): the 5 StreamParity peakMode programs, folding per step every node's sampled
+ * flag, its _stamp where sampled, ewmaAt(j, now) and describe().sampled. The fixture was cut from
+ * `git show HEAD:Pick.js` at 1.1.1 (where "sampled" was `_stamp >= 0`), so the now >= 0 behaviour of the
+ * bitmap is proven byte-identical to the sentinel's. The driver mirrors test/stream-program.mjs peakMode.
+ */
+const _dv = new DataView(new ArrayBuffer(8));
+function fU32(h, v) {
+    v >>>= 0;
+    for (let s = 0; s < 32; s += 8) { h ^= (v >>> s) & 0xff; h = Math.imul(h, 0x01000193) >>> 0; }
+    return h;
+}
+function fF64(h, x) { _dv.setFloat64(0, x); return fU32(fU32(h, _dv.getUint32(0)), _dv.getUint32(4)); }
+function k6capture(mode) {
+    const n = 16, inflight = new Uint32Array(n);
+    const b = new PeakEwmaBalancer(n, up(n), inflight, 1e6, 0x2222);
+    const rnd = k6rnd(0x5555);
+    let h = 0x811c9dc5 >>> 0, now = mode === 'fracClock' ? 1.7e15 : 1e9;
+    for (let k = 0; k < 2000; k++) {
+        const i = mode === 'backToBack' ? 5 : (rnd() % n);
+        const sample = (rnd() % 1000) + (rnd() % 100) / 100;
+        if (mode === 'batchOneNow') { if ((k % 8) === 0) now += 1000 + (rnd() % 1000); }
+        else if (mode === 'backwardsClock') now += ((rnd() & 3) === 0) ? -(rnd() % 500) : (rnd() % 1000);
+        else if (mode === 'fracClock') now += 1000 + (rnd() % 4096) + (rnd() % 4) * 0.25;
+        else now += 100 + (rnd() % 1000);
+        b.recordRtt(i, sample, now);
+        for (let j = 0; j < n; j++) {
+            const sj = b._sampled[j] === 1;
+            h = fU32(h, sj ? 1 : 0);
+            if (sj) h = fF64(h, b._stamp[j]);
+            h = fF64(h, b.ewmaAt(j, now));
+        }
+        h = fU32(h, b.describe().sampled);
+        b.pick(now);
+    }
+    const stamp = [], ewmaAt = [];
+    for (let j = 0; j < n; j++) { stamp.push(b._sampled[j] === 1 ? b._stamp[j] : null); ewmaAt.push(b.ewmaAt(j, now)); }
+    return { digest: (h >>> 0).toString(16).padStart(8, '0'), finalNow: now, finalSampled: b.describe().sampled, finalStamp: stamp, finalEwmaAt: ewmaAt };
+}
+
+test('K6: the bitmap is byte-identical to the 1.1.1 sentinel for now >= 0 (fixture cut from HEAD)', () => {
+    const fx = JSON.parse(readFileSync(new URL('./fixtures/peak-k6-head.json', import.meta.url), 'utf8'));
+    const modes = Object.keys(fx.modes);
+    assert.deepEqual(modes, ['backToBack', 'interleaved', 'batchOneNow', 'backwardsClock', 'fracClock']);
+    for (const m of modes) assert.deepEqual(k6capture(m), fx.modes[m], 'peakMode ' + m + ' drifted from the 1.1.1 fixture');
+});
+
+test('K6 retention: 1000 balancers driven on a negative clock are all collected (FinalizationRegistry -> 0)', async () => {
+    setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc');        // a gc() handle without a CLI flag (node --test runs this file)
+    let live = 0;
+    const reg = new FinalizationRegistry(() => { live--; });
+    const churn = () => {
+        const fb = new Float64Array(2);
+        for (let c = 0; c < 1000; c++) {
+            const inflight = new Uint32Array(64);
+            const b = new PeakEwmaBalancer(64, up(64), inflight, TAU, c + 1);
+            const t0 = -1.7e15 - c * 1e6;
+            for (let k = 0; k < 64; k++) {
+                fb[0] = 100 + k + 0.5; fb[1] = t0 + k * 1000;
+                b.recordRttFrom(k, fb, 0);
+                inflight[b.pick(fb[1])] = k & 3;
+            }
+            reg.register(b, undefined);      // the held value is a primitive: nothing closes over b
+            live++;
+        }
+    };
+    churn();
+    assert.equal(live, 1000);
+    for (let r = 0; r < 50 && live > 0; r++) {
+        gc();
+        await new Promise((res) => setTimeout(res, 10));
+    }
+    assert.equal(live, 0, 'tracker size after gc(): ' + live + ' of 1000 balancers retained');
 });

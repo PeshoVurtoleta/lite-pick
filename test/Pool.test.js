@@ -362,7 +362,7 @@ test('B3d (M4): a backwards-stepping but finite clock records NO sample and RESO
     assert.equal(out, 'ok:' + endpoint, 'resolves normally -- a finite clock quirk is not a rejection');
     // No fabricated 0 ns sample: the sample count is unchanged and the endpoint is still unsampled.
     assert.equal(pe._samp[1], 0, 'no sample recorded for a backwards reading');
-    assert.ok(pe._stamp[endpoint] < 0, 'endpoint stays unsampled');
+    assert.equal(pe._sampled[endpoint], 0, 'endpoint stays unsampled');
     for (let i = 0; i < n; i++) assert.equal(inflight[i], 0);
 });
 

@@ -105,13 +105,38 @@ export const PICK_NONE = -1;
  *  that is mostly down. */
 export const STAT_FALLBACK_SCANS = 0;
 /** A lookup or alias table was (re)built: ConsistentHash / BoundedLoad / WeightedRandom, the constructor's
- *  build included (it lands in the slab attached at that moment, i.e. the scratch slab). */
+ *  build included (it lands in the slab attached at that moment, i.e. the scratch slab). Counts a build
+ *  actually PERFORMED (1.2.0): a `setWeights` equal to the built snapshot performs none and counts nothing;
+ *  `rebuild()` always builds. */
 export const STAT_REBUILDS = 1;
 /** ConsistentHash / BoundedLoad: a keyed pick that did NOT return its home slot's backend (home down, or --
  *  BoundedLoad -- over cap). The affinity-loss signal. */
 export const STAT_DISPLACED = 2;
 /** The number of stats indices in this version (a slab must be at least this long). */
 export const STAT_COUNT = 3;
+
+/**
+ * Every stable error `code` lite-pick throws or rejects with, as a frozen runtime map (1.2.0): value === key,
+ * so `e.code === CODES.LITE_PICK_INDEX` replaces a string literal. Kernel: CAPACITY, ARRAY, INDEX, WEIGHT,
+ * OPTION, ARGUMENT, ABSTRACT, INCONSISTENT. /pool (which re-exports this object): KEY_REQUIRED,
+ * CLOCK_REQUIRED, CLOCK_INVALID, ABORTED, NONE, FEEDBACK. Codes are semver API; messages are not.
+ */
+export const CODES = /* @__PURE__ */ Object.freeze({
+    LITE_PICK_CAPACITY: 'LITE_PICK_CAPACITY',
+    LITE_PICK_ARRAY: 'LITE_PICK_ARRAY',
+    LITE_PICK_INDEX: 'LITE_PICK_INDEX',
+    LITE_PICK_WEIGHT: 'LITE_PICK_WEIGHT',
+    LITE_PICK_OPTION: 'LITE_PICK_OPTION',
+    LITE_PICK_ARGUMENT: 'LITE_PICK_ARGUMENT',
+    LITE_PICK_ABSTRACT: 'LITE_PICK_ABSTRACT',
+    LITE_PICK_INCONSISTENT: 'LITE_PICK_INCONSISTENT',
+    LITE_PICK_KEY_REQUIRED: 'LITE_PICK_KEY_REQUIRED',
+    LITE_PICK_CLOCK_REQUIRED: 'LITE_PICK_CLOCK_REQUIRED',
+    LITE_PICK_CLOCK_INVALID: 'LITE_PICK_CLOCK_INVALID',
+    LITE_PICK_ABORTED: 'LITE_PICK_ABORTED',
+    LITE_PICK_NONE: 'LITE_PICK_NONE',
+    LITE_PICK_FEEDBACK: 'LITE_PICK_FEEDBACK',
+});
 
 /** Every balancer without an attached slab writes here, unconditionally (no branch in the counting sites).
  *  Shared, never read. */
@@ -318,7 +343,7 @@ export class BalancerBase {
      * bypasses setEligible() and desyncs `live` (PICK_NONE with a node up, wrong ratios). O(cap); for tests
      * and debug builds, not the request path. Strategies add their own caches (SmoothWRR's eligible-weight
      * total; WeightedRandom checks the live weights vs the built snapshot element-wise, naming the first
-     * index, plus an eligible-weight sum recount; BoundedLoad's noted total).
+     * index, plus an eligible-weight sum recount; BoundedLoad's noted total; ConsistentHash's all-zero mask).
      */
     assertConsistent() {
         const cap = this._cap, el = this._eligible;
@@ -904,7 +929,7 @@ export class NqBalancer extends BalancerBase {
  * strategy the multi-region FE case wants. O(d) = O(1) per pick.
  *
  * Cost, per candidate i (a pure READ -- scalar-only, no write, no clock call, 0 B/op):
- *   - unsampled (`_stamp < 0`) AND idle (`inflight === 0`) -> cost 0. This is NOT a one-shot probe the
+ *   - unsampled (`_sampled[i] === 0`) AND idle (`inflight === 0`) -> cost 0. This is NOT a one-shot probe the
  *     kernel can enforce: an idle unsampled node costs 0 EVERY time it is idle, so it holds exactly one
  *     request in flight at a time (the next pick sees inflight > 0) until its FIRST recordRtt. A node
  *     that never gets a sample -- e.g. one that fails fast so the caller records nothing -- stays at
@@ -922,18 +947,20 @@ export class NqBalancer extends BalancerBase {
  *
  * Ownership (ADR 0001, ADR 0009): `inflight` is the CALLER's Uint32Array, read LIVE (the P2C /
  * LeastConn seam). The EWMA state -- `_ewma` (the decayed rtt estimate) and `_stamp` (the ns
- * timestamp of each node's last update), both Float64Array -- is BALANCER-OWNED (the SmoothWRR
+ * timestamp of each node's last update), both Float64Array, plus the `_sampled` Uint8Array bitmap
+ * (1.2.0, K6: 1 once a node has its first sample) -- is BALANCER-OWNED (the SmoothWRR
  * precedent: a strategy may own algorithm state), and the balancer is its SOLE writer, via the
  * warm `recordRtt()` feedback path. `pick()` NEVER writes: it decays ON READ, so the hot path
  * stays a pure read -> 0 B/op.
  *
- * Decay-on-read: ewmaAt(i, now) = _ewma[i] x exp(-max(now - _stamp[i], 0) / tau). No write, no clock
+ * Decay-on-read: ewmaAt(i, now) = _ewma[i] x exp(-max(now - _stamp[i], 0) / tau) for a sampled node. No write, no clock
  * call on the gated path -- `now` (and the rtt sample) are CALLER-supplied nanoseconds, consistent
  * between `pick(now)` and `recordRtt(i, sampleNs, now)`, so the whole strategy is deterministic
  * and testable and allocates nothing. `dt` is clamped at 0 (L6) so a non-monotonic clock can never
  * inflate the estimate via `exp(+x)`.
  *
- * Cold start: `_ewma` seeds to 1.0 and `_stamp` to a NEGATIVE "unsampled" sentinel (-1). An unsampled
+ * Cold start: `_ewma` seeds to 1.0 and `_sampled` to 0 (1.2.0, K6: a separate bitmap -- through 1.1.x a
+ * NEGATIVE `_stamp` sentinel marked "unsampled", so a negative clock disabled learning). An unsampled
  * node costs 0 WHILE IDLE (so it holds one request in flight at a time until its first recordRtt) and
  * the pool's decaying mean ONCE BUSY (1.0 only before the very first sample), so a cold node that took
  * work is never mistaken for a 1.0 ns node and cannot become a black hole once samples flow (H1). The
@@ -954,8 +981,12 @@ export class NqBalancer extends BalancerBase {
  * answer to a request that never returns is a per-attempt TIMEOUT: the attempt throws, and the caller
  * (or @zakkster/lite-pick/pool) records `max(elapsed, penalty)` as a peak sample.
  *
- * Contract: `now` (in `pick(now)` / `recordRtt`) and `sampleNs` MUST be FINITE numbers. `recordRtt`
- * throws on a non-finite argument (the warm path); `pick(now)` never throws (the fail-closed
+ * Contract: `now` (in `pick(now)` / `recordRtt`) and `sampleNs` MUST be FINITE numbers. `now` may be ANY
+ * finite value, negative included (1.2.0, K6): only differences of `now` are read, so an offset clock
+ * (e.g. `hrtime - start`, or one that crosses 0) learns as its translate by a constant C would: bit-identically
+ * when every shifted reading `now - C` is exact (integer clocks and offsets below 2^53), to rounding level
+ * otherwise (a fractional clock's differences can round differently).
+ * `recordRtt` throws on a non-finite argument (the warm path); `pick(now)` never throws (the fail-closed
  * contract), so a non-finite `now` yields P2C-random selection rather than an error.
  *
  * Anti-flap (ADR 0002, ADR 0009): the EWMA time constant IS the smoothing -- a single slow sample
@@ -1009,21 +1040,30 @@ export class PeakEwmaBalancer extends BalancerBase {
         this._rng = new Prng(seed);
         this._ewma = new Float64Array(capacity);
         this._stamp = new Float64Array(capacity);
+        // K6 (1.2.0): 1 once node i has its first sample. The "unsampled" marker is this bitmap, not a
+        // negative _stamp, so ANY finite clock (negative / offset included) learns; _stamp is read only
+        // where _sampled[i] === 1. Cold-path maintained (recordRtt); pick() does one byte test per candidate (the
+        // `_stamp` load moved into the sampled arm).
+        this._sampled = new Uint8Array(capacity);
         // Decaying pool mean of ALL rtt samples (1.1.0, D4; O(1), warm-path maintained in recordRtt): the
         // price an unsampled-but-BUSY node pays, so a cold node is not mistaken for a 1.0 ns node once it
         // has work in flight. [0] decayed sum, [1] decayed count, [2] time of the newest sample. Both sums
         // decay by the same factor, so mean = _samp[0] / _samp[1] needs no decay on read; count 0 (no
         // sample yet) -> 1.0. Held in a pre-allocated Float64Array (the hot-path law: pre-allocate
         // typed-array scalars, never a per-op object). Never NaN: the count is >= 1 after any sample.
+        // [2] is a running MAX, so it seeds to -Number.MAX_VALUE (its identity, finite): with a 0 seed a
+        // negative clock read `pdt < 0` forever and the mean never decayed (K6). Before the first sample
+        // [0] = [1] = 0, so the first decay factor multiplies 0 either way -- byte-identical for now >= 0.
         this._samp = new Float64Array(3);
+        this._samp[2] = -Number.MAX_VALUE;
         // B6 (1.1.0): the slots pick(now) / recordRtt(i, sampleNs, now) write their numbers into, so the shared
         // bodies (_pickAt / _recordAt) read every double from a typed array and none crosses a call boxed.
         this._arg = new Float64Array(2);
-        // Cold start: _ewma seeds to 1.0 and _stamp to a NEGATIVE "unsampled" sentinel (-1). The
-        // sentinel makes ewmaAt read the baseline UNDECAYED (graceful LeastConn) regardless of the
-        // caller's clock magnitude -- a plain _stamp=0 would decay as exp(-now/tau) -> 0 under a
+        // Cold start: _ewma seeds to 1.0; _sampled stays 0 (and _stamp 0, never read while unsampled). The
+        // bitmap makes ewmaAt read the baseline UNDECAYED (graceful LeastConn) regardless of the caller's
+        // clock magnitude or sign -- decaying from a _stamp of 0 would give exp(-now/tau) -> 0 under a
         // real large-magnitude clock and collapse a cold pool to random selection.
-        for (let i = 0; i < capacity; i++) { this._ewma[i] = 1.0; this._stamp[i] = -1; }
+        for (let i = 0; i < capacity; i++) this._ewma[i] = 1.0;
     }
 
     /**
@@ -1038,29 +1078,29 @@ export class PeakEwmaBalancer extends BalancerBase {
 
     /**
      * The decayed EWMA rtt estimate for endpoint i at time `now` (ns). Pure READ -- exponential
-     * decay applied on read, never written. An UNSAMPLED node (`_stamp < 0`) reads its baseline
+     * decay applied on read, never written. An UNSAMPLED node (`_sampled[i] === 0`) reads its baseline
      * 1.0 UNDECAYED (graceful LeastConn), so a cold pool never underflows to 0 under a real
-     * large-magnitude clock. `now` must be finite. Zero-alloc.
+     * large-magnitude clock. `now` must be finite (any sign). Zero-alloc.
      * @param {number} i
      * @param {number} now  caller-supplied nanoseconds
      * @returns {number}
      */
     ewmaAt(i, now) {
-        const s = this._stamp[i];
-        if (s < 0) return this._ewma[i]; // unsampled: undecayed baseline, clock-magnitude-independent
-        let dt = now - s;
+        if (this._sampled[i] === 0) return this._ewma[i]; // unsampled: undecayed baseline, clock-independent
+        let dt = now - this._stamp[i];
         if (dt < 0) dt = 0;              // L6: clamp a non-monotonic clock -- exp(+x) must never inflate
         return this._ewma[i] * Math.exp(-dt / this._tau);
     }
 
     /**
      * Record an rtt SAMPLE for endpoint i at time `now` (the warm feedback path -- NOT the hot
-     * pick path). The FIRST sample (an unsampled node, `_stamp < 0`) initializes the EWMA EXACTLY
+     * pick path). The FIRST sample (an unsampled node, `_sampled[i] === 0`) initializes the EWMA EXACTLY
      * to the sample, clock-magnitude-independent. Thereafter Finagle's peak rule (1.1.0, L4): a
      * sample above the STORED estimate replaces it (a spike is felt instantly), else
      * `ewma x w + sample x (1 - w)` with `w = exp(-dt/tau)` (it eases back over ~tau). Every sample
      * also feeds the decaying pool mean. The balancer is the SOLE writer of `_ewma` / `_stamp` /
-     * `_samp`. Zero-alloc on the success path.
+     * `_sampled` / `_samp`. `now` may be any finite value, negative included (1.2.0, K6). Zero-alloc on
+     * the success path.
      * @param {number} i  endpoint index
      * @param {number} sampleNs  observed rtt in nanoseconds (finite, >= 0)
      * @param {number} now  caller-supplied nanoseconds (finite), consistent with pick(now)
@@ -1109,7 +1149,7 @@ export class PeakEwmaBalancer extends BalancerBase {
         }
         if (!Number.isFinite(now)) throw _err(RangeError, 'LITE_PICK_ARGUMENT', '[lite-pick] now must be a finite number');
         const v = this._ewma[i];
-        if (this._stamp[i] < 0 || sampleNs > v) {
+        if (this._sampled[i] === 0 || sampleNs > v) {
             this._ewma[i] = sampleNs;   // first sample: exact init (clock-independent); else the PEAK: snap up
         } else {
             // L4 (1.1.0): Finagle's observe() exactly -- value x w + sample x (1 - w), the peak compared
@@ -1120,6 +1160,7 @@ export class PeakEwmaBalancer extends BalancerBase {
             this._ewma[i] = v * w + sampleNs * (1 - w);
         }
         this._stamp[i] = now;
+        this._sampled[i] = 1;
         // O(1) warm DECAYING pool mean (1.1.0, D4): the sum and the count both decay by exp(-dt/tau) since
         // the newest sample from ANY node, then take this one at weight 1, so mean = sum / count weights
         // every sample by exp(-age/tau). Unboxed Float64Array (see the ctor). An overflowed (+Infinity) sum
@@ -1184,29 +1225,29 @@ export class PeakEwmaBalancer extends BalancerBase {
         let b = this._draw();
         for (let t = 0; b === a && t < 32; t++) b = this._draw();
         if (b < 0 || b === a) return a;       // astronomically rare: fall back to the first draw
-        const inf = this._inflight, ewma = this._ewma, stamp = this._stamp, tau = this._tau;
+        const inf = this._inflight, ewma = this._ewma, stamp = this._stamp, sm = this._sampled, tau = this._tau;
         // Per-candidate cost (pure READ, scalar-only, 0 B/op). See the class JSDoc for the three cases.
         //   unsampled + idle -> 0 (costs 0 while idle until its first recordRtt; NOT a one-shot probe).
         //   unsampled + busy -> (inf+1) x pool mean  (the mean DIVISION runs ONLY here -- never in
         //                       the both-sampled steady state -- priced at the pool mean, not 1.0 ns).
         //   sampled          -> (inf+1) x base, base = decayed EWMA, floored at dt WHILE BUSY so a hung
         //                       node (dt grows, no completion) gets MORE expensive, not less.
-        const sa = stamp[a];
         let costA;
-        if (sa < 0) {
+        if (sm[a] === 0) {
             costA = inf[a] === 0 ? 0 : (inf[a] + 1) * (this._samp[1] > 0 ? this._samp[0] / this._samp[1] : 1.0);
         } else {
+            const sa = stamp[a];
             let dtA = now - sa;
             if (dtA < 0) dtA = 0;             // L6: clamp non-monotonic clock
             const decA = ewma[a] * Math.exp(-dtA / tau);
             const baseA = inf[a] > 0 ? (decA > dtA ? decA : dtA) : decA;   // busy floor: >= time since last sample
             costA = (inf[a] + 1) * baseA;
         }
-        const sb = stamp[b];
         let costB;
-        if (sb < 0) {
+        if (sm[b] === 0) {
             costB = inf[b] === 0 ? 0 : (inf[b] + 1) * (this._samp[1] > 0 ? this._samp[0] / this._samp[1] : 1.0);
         } else {
+            const sb = stamp[b];
             let dtB = now - sb;
             if (dtB < 0) dtB = 0;             // L6: clamp non-monotonic clock
             const decB = ewma[b] * Math.exp(-dtB / tau);
@@ -1224,10 +1265,33 @@ export class PeakEwmaBalancer extends BalancerBase {
         d.tauNs = this._tau;
         d.inflight = _sum(this._inflight, this._cap);
         let sampled = 0;
-        for (let i = 0; i < this._cap; i++) if (this._stamp[i] >= 0) sampled++;
+        for (let i = 0; i < this._cap; i++) sampled += this._sampled[i];
         d.sampled = sampled;
         d.poolMeanNs = this._samp[1] > 0 ? this._samp[0] / this._samp[1] : null;
         return d;
+    }
+
+    /**
+     * Cold, opt-in (1.2.0, K6): the base check, then the sampled bitmap -- every `_sampled[i]` is 0 or 1
+     * (recordRtt writes only 1), and the pool mean has a sample iff some node does (`_samp[1] > 0` exactly
+     * when a `_sampled[i]` is 1). Throws LITE_PICK_INCONSISTENT naming the first offender. O(cap).
+     */
+    assertConsistent() {
+        super.assertConsistent();
+        const cap = this._cap, sm = this._sampled;
+        let any = false;
+        for (let i = 0; i < cap; i++) {
+            const v = sm[i];
+            if (v > 1) {
+                throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] _sampled[' + i + '] is ' + v +
+                    ': recordRtt() writes only 1, so the balancer-owned bitmap was written directly');
+            }
+            if (v === 1) any = true;
+        }
+        if ((this._samp[1] > 0) !== any) {
+            throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] the pool-mean sample count is ' + this._samp[1] +
+                ' but ' + (any ? 'a' : 'no') + ' node is marked sampled: the balancer-owned _sampled / _samp were written directly');
+        }
     }
 }
 
@@ -1298,8 +1362,9 @@ function chIsPrime(n) {
  * 1, h1/h2 from a deterministic integer mix of the index -- no string hashing). Because the
  * permutation covers ALL M slots, a backend with remaining quota can always reach an empty slot
  * while one exists, so the O(M x N) COLD build never stalls. BUILD-COST GUARD (fail closed): the
- * ctor requires `capacity <= M` (more members than slots would overfill M / starve backends) and
- * M prime > 1.
+ * ctor requires `capacity <= M` (more members than slots would overfill M / starve backends), M
+ * prime > 1, and M <= 2^31 - 1 (K9, 1.1.1: the Int32 build indices). M <= 2^24 is RECOMMENDED (the
+ * build is O(M x N) and the table M x 4 bytes); a hard 2^24 cap is a 2.0 candidate (ROADMAP).
  *
  * DEFERRED optional-peer seam (ADR 0010 / llms.txt, never on the pick path): a `@zakkster/lite-filter`
  * hot-key / known-key oracle (BlockedBloom etc.) for warm-affinity + admission at the KEY-routing
@@ -1308,8 +1373,10 @@ function chIsPrime(n) {
  *
  * Bound: O(1) per pick, 0 B/op (integer ops over the prebuilt table -- no allocation). Fails closed
  * (PICK_NONE) only when no eligible backend owns a table slot (the whole pool down, or only weight-0
- * backends up). Past the 64-slot probe window a cold O(M) sweep finds a far eligible slot (L3, 1.1.0 --
- * 1.0.x returned PICK_NONE there; ADR 0010 amendment).
+ * backends up). ALL-ZERO weights (K8, 1.2.0) mean every backend is removed: pick() returns PICK_NONE in
+ * O(1) and never throws (1.1.x fell back to equal quotas and routed everywhere). Past the 64-slot probe
+ * window a cold O(M) sweep finds a far eligible slot (L3, 1.1.0 -- 1.0.x returned PICK_NONE there; ADR
+ * 0010 amendment).
  */
 export class ConsistentHashBalancer extends BalancerBase {
     /**
@@ -1324,7 +1391,8 @@ export class ConsistentHashBalancer extends BalancerBase {
      * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param {Uint32Array|null} [weights=null]  optional per-backend weights (length >= capacity);
      *   the values are COPIED into the balancer-owned weights at construction. null = equal weight.
-     * @param {number} [m=CH_DEFAULT_M]  the Maglev table size: a prime, > 1, and >= capacity.
+     * @param {number} [m=CH_DEFAULT_M]  the Maglev table size: a prime, > 1, >= capacity, and <= 2^31 - 1
+     *   (2^24 or below recommended: the build is O(M x N)).
      * @param {number} [seed=0x9e3779b9]  deterministic salt for the permutation mix (reproducible).
      */
     constructor(capacity, eligible, weights = null, m = CH_DEFAULT_M, seed = 0x9e3779b9) {
@@ -1340,7 +1408,8 @@ export class ConsistentHashBalancer extends BalancerBase {
         // table size above 2^31 - 1 wraps those indices negative and silently corrupts the lookup table
         // (backfilled to backend 0). Cap M at the positive-int32 ceiling; fail closed before allocating.
         // Checked BEFORE the primality test: a huge prime M (near 2^53) would otherwise run ~sqrt(M)
-        // (~3e7) trial divisions in chIsPrime before rejection.
+        // (~3e7) trial divisions in chIsPrime before rejection. (A hard 2^24 cap is deferred to 2.0:
+        // 1.1.1 documented M valid up to 2^31 - 1, so rejecting more in a minor would break SemVer.)
         if (m > 2147483647) {
             throw _err(RangeError, 'LITE_PICK_OPTION',
                 '[lite-pick] table size M must be <= 2147483647 (2^31 - 1): ' + m);
@@ -1364,6 +1433,10 @@ export class ConsistentHashBalancer extends BalancerBase {
         else this._weights.fill(1);
         // The prebuilt lookup table (slot -> backend index). M x 4 bytes; the COLD build fills it.
         this._lookup = new Uint32Array(m);
+        // K8 (1.2.0): the all-zero-weights mask, folded into the hot `_live` guard (`_live & _wmask`).
+        // -1 = a normal table; 0 = every weight is 0 (every backend removed) -> pick() is PICK_NONE.
+        // _build is its sole writer; declared before it so the field shape is fixed.
+        this._wmask = -1;
         this._build();
     }
 
@@ -1395,18 +1468,19 @@ export class ConsistentHashBalancer extends BalancerBase {
         let total = 0;
         for (let b = 0; b < N; b++) total += wt[b];
         if (total <= 0) {
-            // Degenerate all-zero weights: equal quota so the table is still fully, validly populated.
-            const base = Math.floor(M / N);
-            for (let b = 0; b < N; b++) quota[b] = base;
-            let leftover = M - base * N;
-            for (let b = 0; leftover > 0; b = (b + 1) % N) { quota[b]++; leftover--; }
-        } else {
-            let assigned = 0;
-            for (let b = 0; b < N; b++) { const q = Math.floor(wt[b] / total * M); quota[b] = q; assigned += q; }
-            let leftover = M - assigned;
-            // Hand the rounding leftover to positive-weight backends in index order (deterministic).
-            for (let b = 0; leftover > 0; b = (b + 1) % N) { if (wt[b] > 0) { quota[b]++; leftover--; } }
+            // K8 (1.2.0): all-zero weights = every backend removed. No backend owns a slot: the mask makes
+            // pick() return PICK_NONE in O(1) (1.1.x fell back to equal quotas and routed everywhere). The
+            // table is zeroed so it still holds only in-range indices.
+            this._wmask = 0;
+            lookup.fill(0);
+            return;
         }
+        this._wmask = -1;
+        let assigned = 0;
+        for (let b = 0; b < N; b++) { const q = Math.floor(wt[b] / total * M); quota[b] = q; assigned += q; }
+        let leftover = M - assigned;
+        // Hand the rounding leftover to positive-weight backends in index order (deterministic).
+        for (let b = 0; leftover > 0; b = (b + 1) % N) { if (wt[b] > 0) { quota[b]++; leftover--; } }
         // Maglev populate honoring the quota. The permutation is surjective over all M slots, so a
         // backend with remaining quota always reaches an empty slot while one exists -> no stall.
         // L7 (1.1.0): ADDITIVE stepping. Backend b's permutation is offset, offset+skip, offset+2skip, ...
@@ -1462,15 +1536,20 @@ export class ConsistentHashBalancer extends BalancerBase {
      * COLD (1.1.0): replace ALL backend weights at once and rebuild the table ONCE. Per-backend `setWeight`
      * rebuilds on every call (N rebuilds to retune N backends); this is the batch form. `weights` is COPIED
      * into the balancer-owned weights (indices [0, capacity)); validated before any write, so a bad call
-     * changes nothing.
+     * changes nothing. 1.2.0: weights EQUAL to the current ones skip the rebuild entirely (no build, no
+     * STAT_REBUILDS) -- the owned weights are the built snapshot (every writer rebuilds), the build reads
+     * nothing else that changes, and eligibility is not a build input. `rebuild()` stays unconditional.
      * @param {Uint32Array} weights  new per-backend weights (length >= capacity)
      */
     setWeights(weights) {
         if (!(weights instanceof Uint32Array) || weights.length < this._cap) {
             throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] weights must be a Uint32Array of length >= capacity');
         }
-        const wt = this._weights;
-        for (let i = 0; i < this._cap; i++) wt[i] = weights[i];
+        const wt = this._weights, cap = this._cap;
+        let i = 0;
+        while (i < cap && weights[i] === wt[i]) i++;
+        if (i === cap) return;   // equal to the built snapshot: nothing to rebuild (1.2.0)
+        for (i = 0; i < cap; i++) wt[i] = weights[i];
         this._build();
     }
 
@@ -1485,7 +1564,8 @@ export class ConsistentHashBalancer extends BalancerBase {
      * slot = (keyHash >>> 0) % M; if `lookup[slot]` is eligible return it, else forward-probe up to
      * CH_PROBE_LIMIT (64) slots for the next eligible backend. `keyHash` is coerced `>>> 0` (NaN -> 0
      * deterministically) and pick NEVER throws (the fail-closed contract). Past the window a cold
-     * full-table sweep (`_sweep`, L3); PICK_NONE only when no eligible backend owns a table slot.
+     * full-table sweep (`_sweep`, L3); PICK_NONE only when no eligible backend owns a table slot (all-zero
+     * weights included: K8, 1.2.0).
      * @param {number} keyHash  a caller-supplied integer key hash (coerced to uint32)
      * @returns {number}
      */
@@ -1515,7 +1595,9 @@ export class ConsistentHashBalancer extends BalancerBase {
      * @returns {number}
      */
     _pickSlot(slot) {
-        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        // Whole pool down, or all-zero weights (K8: _wmask 0): fail closed. One AND on the existing guard,
+        // exact because _live <= capacity <= M <= 2^31 - 1 (a non-negative int32).
+        if ((this._live & this._wmask) === 0) return PICK_NONE;
         const M = this._m, el = this._eligible, lookup = this._lookup;
         let i = lookup[slot];
         if (el[i]) return i;
@@ -1548,6 +1630,18 @@ export class ConsistentHashBalancer extends BalancerBase {
             if (el[i]) return i;
         }
         return PICK_NONE;
+    }
+
+    /** Cold, opt-in (1.2.0): the base recount, then the all-zero-weights mask must agree with the owned weights
+     *  the table was built from (every writer rebuilds): _wmask is 0 iff they sum to 0, else -1. */
+    assertConsistent() {
+        super.assertConsistent();
+        const want = _sum(this._weights, this._cap) === 0 ? 0 : -1;
+        if (this._wmask !== want) {
+            throw _err(Error, 'LITE_PICK_INCONSISTENT', '[lite-pick] the all-zero-weights mask is ' + this._wmask +
+                ' but the built weights ' + (want === 0 ? 'are all 0' : 'are not all 0') +
+                ': the balancer-owned _wmask / _weights were written directly');
+        }
     }
 
     /** Cold snapshot (1.1.0): the base fields plus the table size M and the weights. */
@@ -1602,7 +1696,8 @@ export class ConsistentHashBalancer extends BalancerBase {
  *
  * Bound: O(1) per pick (modulo + table read + bounded cap-aware probe), 0 B/op on BOTH `pick()` and
  * `note()` (torture + PerfGate). Fails closed (PICK_NONE) ONLY when no eligible backend owns a table
- * slot (M8's contract, with the L3 sweep) -- NEVER merely because backends are over cap.
+ * slot (M8's contract, with the L3 sweep; all-zero weights -- K8, 1.2.0 -- own none) -- NEVER merely
+ * because backends are over cap.
  */
 export class BoundedLoadBalancer extends ConsistentHashBalancer {
     /**
@@ -1614,7 +1709,8 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
      * @param {number} [eps=0.25]  the bounded-load slack over the mean: finite, > 0. cap =
      *   (1 + eps) x mean occupancy. Default 0.25 (Vimeo).
      * @param {Uint32Array|null} [weights=null]  optional per-backend weights (COPIED); null = equal.
-     * @param {number} [m=CH_DEFAULT_M]  the Maglev table size: a prime, > 1, and >= capacity.
+     * @param {number} [m=CH_DEFAULT_M]  the Maglev table size: a prime, > 1, >= capacity, and <= 2^31 - 1
+     *   (2^24 or below recommended: the build is O(M x N)).
      * @param {number} [seed=0x9e3779b9]  deterministic salt for the permutation mix (reproducible).
      * @param {number} [minCap=0]  OPT-IN floor on the per-backend cap (N4, 1.1.0): cap = max(minCap,
      *   ceil((1+eps)(T+1)/live)). 0 (default) is the paper's / HAProxy's capacity exactly. At low load
@@ -1692,7 +1788,8 @@ export class BoundedLoadBalancer extends ConsistentHashBalancer {
      * @returns {number}
      */
     _pickSlot(slot) {
-        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        // Whole pool down, or all-zero weights (K8: _wmask 0): fail closed -- the inherited guard.
+        if ((this._live & this._wmask) === 0) return PICK_NONE;
         const M = this._m, el = this._eligible, lookup = this._lookup, inf = this._inflight;
         const total = this._total;
         // cap is only meaningful once occupancy is known; _total === 0 -> pure ConsistentHash.
@@ -1930,15 +2027,23 @@ export class WeightedRandomBalancer extends BalancerBase {
         _vIdx(i, this._cap);
         const nw = w >>> 0;
         if (nw !== w) throw _err(RangeError, 'LITE_PICK_WEIGHT', '[lite-pick] weight must be a uint32: ' + w);
-        if (nw === this._weights[i]) return;
+        // 1.2.0: compare against the BUILT value, like setWeights -- the caller's shared array may already
+        // hold `nw` (an in-place edit), so a compare against _weights would skip a needed rebuild.
         this._weights[i] = nw;
+        // The skip ignores in-place edits to OTHER indices of a shared array (the documented UB of sharing it):
+        // call rebuild() / setWeights after such an edit.
+        if (nw === this._built[i]) return;
         this._build();
     }
 
     /**
      * COLD (1.1.0): replace ALL weights at once and rebuild the alias table ONCE -- the batch form of
      * `setWeight` (which rebuilds per call). The values are COPIED into the weights array this balancer was
-     * built with (the caller's array, indices [0, capacity)); validated before any write.
+     * built with (the caller's array, indices [0, capacity)); validated before any write. 1.2.0: when the
+     * copied weights equal the BUILT snapshot the rebuild is skipped (no build, no STAT_REBUILDS) -- the
+     * alias table and weight sum are pure functions of that snapshot, and setEligible keeps the
+     * eligible-weight cache exact. A direct `eligible[i]` write (UB) is therefore no longer re-synced by a
+     * same-weights call; assertConsistent still names it, and `rebuild()` stays unconditional.
      * @param {Uint32Array} weights  new per-endpoint weights (length >= capacity)
      */
     setWeights(weights) {
@@ -1948,7 +2053,13 @@ export class WeightedRandomBalancer extends BalancerBase {
         // K5: TypedArray.prototype.set copies correctly even when `weights` is a view OVERLAPPING the
         // balancer's own array (e.g. a subarray of it) -- an index-ascending element copy would smear
         // a right-shifted source. Cold; the ConsistentHash owned-copy precedent (Pick.js set() at 1350).
-        this._weights.set(weights.subarray(0, this._cap));
+        // The copy runs FIRST (it repairs a drifted shared array), then the compare is against _built --
+        // never against a pre-copy _weights: a caller often passes the very array it mutated in place.
+        const wt = this._weights, built = this._built, cap = this._cap;
+        wt.set(weights.subarray(0, cap));
+        let i = 0;
+        while (i < cap && wt[i] === built[i]) i++;
+        if (i === cap) return;   // equal to the built snapshot: nothing to rebuild (1.2.0)
         this._build();
     }
 

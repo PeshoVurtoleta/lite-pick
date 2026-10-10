@@ -427,6 +427,20 @@ all 63 others (the largest share 2.9%). BoundedLoad inherits both; its drain als
   `setWeights(weights)` removes several with one rebuild.
 - **Weight 0 means the opposite of IPVS.** In IPVS, weight 0 drains (the table keeps the last non-zero
   weight). Here weight 0 removes: the backend gets no slots. Keep the old weight if you will restore it.
+- **Removing EVERY backend is pool-down (1.2.0).** All-zero weights -- `setWeights(new Uint32Array(N))`,
+  or the last `setWeight(i, 0)` -- leave no backend with a slot, so `pick()` returns `PICK_NONE` for every
+  key (O(1), never a throw) and a `pool.run` that starts then rejects with `LITE_PICK_NONE` on attempt 0,
+  as a whole pool marked down does. 1.1.x fell back to equal shares and kept routing everywhere, against the
+  documented weight-0-removes rule (a fix, not a breaking change). Restoring
+  any positive weight rebuilds the same table a fresh constructor would.
+- **`/pool` failover does not see weight 0 yet (known, pre-existing).** With `tries > 1`, a failover
+  attempt that cannot re-pick a distinct backend falls back to a scan of ELIGIBLE untried backends, and
+  that scan ignores weights -- so it can dispatch to a removed (weight-0, still eligible) backend, and a run
+  already failing over when the last weight drops to 0 is not pool-down. Until the fix (ROADMAP 4b, with
+  K10), pair a remove that `/pool` failover must never reach with `setEligible(i, false)`.
+- **Re-applying the same weights is free (1.2.0).** `setWeights(weights)` with the values the table was
+  built on skips the rebuild (no `STAT_REBUILDS`), so a config reload can call it unconditionally;
+  `rebuild()` always rebuilds.
 
 ---
 

@@ -34,7 +34,9 @@ sentinel `PICK_NONE` (-1), a deterministic `Prng` (xorshift32), `BalancerBase` (
 read-only eligibility seam + O(1) live count), `RoundRobinBalancer`, `SmoothWRRBalancer`,
 `P2cBalancer`, `LeastConnBalancer`, `SedBalancer`, `NqBalancer`, `PeakEwmaBalancer`,
 `ConsistentHashBalancer`, `BoundedLoadBalancer`, `WeightedRandomBalancer`, and the ConsistentHash
-constants `CH_DEFAULT_M` (65537) / `CH_PROBE_LIMIT` (64). Roster complete FOR NOW, not closed:
+constants `CH_DEFAULT_M` (65537) / `CH_PROBE_LIMIT` (64); later releases add the stats-slab indices
+`STAT_FALLBACK_SCANS` / `STAT_REBUILDS` / `STAT_DISPLACED` / `STAT_COUNT` (1.1.0) and the error-code map
+`CODES` (1.2.0), each with its own entry below. Roster complete FOR NOW, not closed:
 AZ-aware routing, the lite-await hedging combinator, and subsetting are queued post-1.0 (ROADMAP.md).
 GUIDE.md is the "which of the ten strategies do I pick?" decision guide. The EXACT-O(log n)
 fewest-in-flight variant is a deferred @zakkster/lite-logn `BinaryHeap` optional-peer seam
@@ -141,10 +143,14 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   balancer, liteQueryFetcher args), `LITE_PICK_ABSTRACT`, `LITE_PICK_INCONSISTENT` (assertConsistent);
   /pool adds `LITE_PICK_KEY_REQUIRED`, `LITE_PICK_CLOCK_REQUIRED`, `LITE_PICK_CLOCK_INVALID`,
   `LITE_PICK_ABORTED`, `LITE_PICK_NONE`, `LITE_PICK_FEEDBACK`. Type: `LitePickErrorCode`.
+- `CODES` (1.2.0) -- a FROZEN runtime map of those 14 codes, value === key (`CODES.LITE_PICK_INDEX ===
+  'LITE_PICK_INDEX'`): match `e.code === CODES.LITE_PICK_NONE` instead of a string literal. Type
+  `{ readonly [K in LitePickErrorCode]: K }`. /pool re-exports the SAME object.
 - `STAT_FALLBACK_SCANS` (0), `STAT_REBUILDS` (1), `STAT_DISPLACED` (2), `STAT_COUNT` (3 in 1.1.0) --
   stats slab indices (1.1.0). FALLBACK_SCANS: the P2C / PeakEWMA / WeightedRandom very-sparse fallback
-  or the ConsistentHash / BoundedLoad full-table sweep ran. REBUILDS: a CH / BL / WR table build (the
-  constructor's too). DISPLACED: a CH / BL keyed pick did not return its home backend (home down, or BL
+  or the ConsistentHash / BoundedLoad full-table sweep ran. REBUILDS: a CH / BL / WR table build actually
+  PERFORMED (the constructor's too; 1.2.0: a `setWeights` equal to the built snapshot performs none and
+  counts nothing, `rebuild()` always builds). DISPLACED: a CH / BL keyed pick did not return its home backend (home down, or BL
   over cap). Counted only off the healthy pick path (a per-pick counter cost RoundRobin 2.1 -> 5.7 ns,
   and the caller already sees every pick / PICK_NONE); a displaced pick pays ~0.5 ns. Never reset by the
   library -- read deltas; Float64 is exact to 2^53. Indices are only ever APPENDED: size slabs with
@@ -181,7 +187,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     `eligible[]` (and reject a byte other than 0/1), SmoothWRR's eligible-weight total, WeightedRandom's
     weights ELEMENT BY ELEMENT against the snapshot the alias table was built from (naming the first
     mismatched index) plus an eligible-weight-sum recount, BoundedLoad's noted total vs the inflight
-    sum; THROWS Error `LITE_PICK_INCONSISTENT` on a mismatch (a direct `eligible[i]` / `weights[i]`
+    sum, PeakEWMA's sampled bitmap (0 / 1 only, and set iff the pool mean has a sample; 1.2.0), and
+    ConsistentHash / BoundedLoad's all-zero-weights mask vs the built weights (1.2.0); THROWS Error `LITE_PICK_INCONSISTENT` on a mismatch (a direct `eligible[i]` / `weights[i]`
     write, a weight write without rebuild(), an inflight change without note()). For tests and debug
     builds. (Through 1.1.0 WeightedRandom checked only the weight SUM, so `[1,2,3,4]`->`[4,2,3,1]`
     without rebuild() slipped past; the element-wise check closes that.)
@@ -249,9 +256,10 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - `new PeakEwmaBalancer(capacity, eligible, inflight, tauNs, seed?=0x9e3779b9)` -- `inflight` is a
     caller-owned Uint32Array (length >= capacity) read LIVE; `tauNs` is the EWMA TIME CONSTANT in
     nanoseconds (finite, > 0; half-life = tauNs x ln2). The per-endpoint EWMA state (`_ewma` /
-    `_stamp`, Float64) plus a decaying pool mean (`_samp`: decayed sum, decayed count, newest-sample
-    time; 1.1.0) are BALANCER-OWNED and written
-    ONLY by `recordRtt`. Cold start seeds `_ewma` to 1.0 with an UNSAMPLED sentinel (`_stamp = -1`).
+    `_stamp`, Float64; `_sampled`, a Uint8Array bitmap, 1.2.0) plus a decaying pool mean (`_samp`: decayed
+    sum, decayed count, newest-sample time; 1.1.0) are BALANCER-OWNED and written
+    ONLY by `recordRtt`. Cold start seeds `_ewma` to 1.0 with every node UNSAMPLED (`_sampled[i] = 0`; 1.2.0,
+    K6 -- through 1.1.1 the marker was a negative `_stamp = -1` sentinel).
     LATENCY marker (`static LATENCY = true`): /pool REQUIRES `opts.clock` for this strategy.
   - `pick(now)` -> number. Draws two DISTINCT eligible endpoints (ADR 0005's rejection sampling,
     reused), lower COST wins; a tie goes to the first draw. Per-candidate cost (pure read, 0 B/op):
@@ -261,10 +269,13 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     cold-but-busy node is NOT the old 1.0 ns black hole); a sampled node costs
     `(inflight+1) x max(decayedEWMA, dt)` while busy (a hung node -- dt grows, no completion -- gets
     MORE expensive), else `(inflight+1) x decayedEWMA`. `dt = max(now - stamp, 0)` (clamped, L6).
-    `now` is caller-supplied nanoseconds and MUST be finite and `>= 0`: the "never sampled" marker is a
-    negative `_stamp`, so a finite NEGATIVE `now` reads as unsampled and silently disables the latency
-    learning (no blend, no busy floor, no pool-mean decay -- plain in-flight P2C). Use a `>= 0` clock origin
-    (`Number(process.hrtime.bigint())` / `performance.now()` / `Date.now()`). Decays ON READ -> O(d)=O(1), 0 B/op. `PICK_NONE` when the
+    `now` is caller-supplied nanoseconds and MUST be finite -- any finite `now`, negative included (1.2.0,
+    K6): only differences of `now` are read, so an offset clock (`hrtime - start`, or one that crosses 0)
+    learns like its translate by a constant C -- bit-identically when every shifted reading `now - C` is
+    exact (integer clocks and offsets below 2^53), to rounding level otherwise (a fractional clock's
+    differences can round differently). (Through 1.1.1 the "never sampled" marker was a negative
+    `_stamp`, so a negative `now` silently disabled the latency learning; 1.1.1 documented `now >= 0`.)
+    (`Number(process.hrtime.bigint())` is already ns. `performance.now()` / `Date.now()` work as ORIGINS (any offset is fine, K6) but return ms: scale them to ns (`performance.now() * 1e6`, `Date.now() * 1e6`) or give tau / samples / penalty in the clock's unit.) Decays ON READ -> O(d)=O(1), 0 B/op. `PICK_NONE` when the
     whole pool is down. CAVEAT: an idle-then-busy node is priced by time-since-last-response until
     that response completes; there is NO busy-since stamp, by decision (1.1.0 D5: Finagle/tower/
     Linkerd keep none) -- a request that never returns is handled by a PER-ATTEMPT TIMEOUT inside
@@ -272,7 +283,7 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     the run's own `signal` is a caller cancel and records nothing). A node that fails fast and
     records nothing keeps winning while idle -- record failures (the /pool failure penalty does).
   - `ewmaAt(i, now)` -> number. The decayed EWMA rtt estimate for endpoint i at `now`. Pure read. An
-    unsampled node (`_stamp < 0`) returns the baseline 1.0 undecayed; otherwise
+    unsampled node (`_sampled[i] === 0`) returns the baseline 1.0 undecayed, at any clock; otherwise
     `_ewma[i] x exp(-max(now - stamp, 0)/tau)`.
   - `recordRtt(i, sampleNs, now)` -> void. WARM feedback path (not the hot pick path): the FIRST
     sample initializes the EWMA EXACTLY to `sampleNs` (clock-magnitude-independent); thereafter
@@ -308,15 +319,19 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     weights (null = equal). `m` is the table size: a PRIME, > 1, >= capacity, and <= 2^31 - 1
     (the guard: capacity > m throws -- it would overfill / starve backends; m > 2147483647 throws
     RangeError `LITE_PICK_OPTION` -- an Int32Array populate offset would wrap and silently corrupt the
-    table; K9, 1.1.1). m <= 2^24 is RECOMMENDED because the build is O(M x N). Validates typeof-first
-    BEFORE allocating the table. Builds the table COLD (O(M x N) weighted Maglev populate; the M
-    x 4-byte table is ~256KB at the 65537 default -- disclosed cold cost, M configurable down for small
-    pools). (A dedicated 2^24 HARD allocation cap is a 1.2.0 item.)
+    table; K9, 1.1.1, checked before the primality test). m <= 2^24 is RECOMMENDED because the build is
+    O(M x N). Validates typeof-first BEFORE allocating the table. Builds the table COLD (O(M x N)
+    weighted Maglev populate; the M x 4-byte table is ~256KB at the 65537 default, ~64MB at 2^24 --
+    disclosed cold cost, M configurable down for small pools). (A HARD 2^24 cap is deferred to 2.0:
+    rejecting an M that 1.1.1 accepted would break SemVer.) ALL-ZERO weights (1.2.0, K8 -- a fix, not a
+    break: weight 0 always meant removed) = every backend removed: `pick` / `pickFrom` return PICK_NONE
+    for every key in O(1) and never throw (1.1.x fell back to equal quotas and routed everywhere,
+    against its own docs -- PICK_NONE is the answer WeightedRandom always gave).
   - `pick(keyHash)` -> number. Maps an INTEGER key: slot = (keyHash >>> 0) % M, read `lookup[slot]`,
     and if down forward-probe up to CH_PROBE_LIMIT (64) slots for the next eligible backend. O(1),
     0 B/op. `keyHash` is coerced `>>> 0` (NaN -> 0) and pick NEVER throws. Past the 64-slot window a
     COLD full-table sweep finds a far eligible backend (1.1.0, L3; 1.0.x returned PICK_NONE there), so
-    `PICK_NONE` ONLY when no eligible backend owns a table slot. KEY IS A CALLER INTEGER -- no per-pick string
+    `PICK_NONE` ONLY when no eligible backend owns a table slot (all-zero weights own none). KEY IS A CALLER INTEGER -- no per-pick string
     hashing (the one zero-GC hazard); hash string keys yourself, cold. No hashing dependency added.
   - `pickFrom(buf, i)` -> number (1.1.0, ZERO-BOX). The key is `buf[i]`, read INSIDE and reduced to its
     slot at once, so a 32-bit hash >= 2^31 (not a small integer on Node; >= 2^30 on Chrome / Electron)
@@ -328,6 +343,7 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - `setWeight(i, w)` -> void. COLD. Set backend i's weight (uint32) and REBUILD the table.
   - `setWeights(weights)` -> void. COLD (1.1.0). Replace ALL weights (a Uint32Array, length >= capacity,
     COPIED) and rebuild ONCE -- the batch form of setWeight. Validated before any write (RangeError).
+    1.2.0: weights EQUAL to the current ones skip the rebuild (no build, no STAT_REBUILDS).
     The table is built by additive Maglev stepping (1.1.0, L7): identical tables to 1.0.x, ~8x faster
     at the default M.
   - `rebuild()` -> void. COLD. Rebuild the table from the current owned weights (e.g. after a
@@ -339,7 +355,7 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     move, `setEligible(i, true)` restores every key. `setWeight(i, 0)` REMOVES -- a cold rebuild that
     also moves ~0.5% of other keys at M = 65537 (~2.5% at M = 4099); restoring the weight rebuilds the
     same table. Unlike IPVS, weight 0 removes. Drain for temporary outages; remove for good, or when
-    many are down (a drained backend's keys probe past its slots). RECIPES.md section 9.
+    many are down (a drained backend's keys probe past its slots). RECIPES.md section 9. KNOWN (ROADMAP 4b, phase 2): /pool failover (tries > 1) ignores weights; pair a remove with `setEligible(i, false)`.
   - vs-AWS: NLB flow-hash (5-tuple) is a Maglev consistent hash -- this is that family at the
     in-process hop. DEFERRED optional-peer seams (import nothing, peerDependencies STAYS `{}`): a
     @zakkster/lite-filter hot-key oracle at the key-routing layer (warm/cold only), and a
@@ -363,8 +379,9 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     (a hot home OVERFLOWS to a neighbour). If none in the window is under cap, fall back to the FIRST
     eligible seen (sticky wins; the cap is a soft preference). `_total === 0` skips the cap -> pure
     ConsistentHash. O(1), 0 B/op, NEVER throws. Nothing eligible in the window -> the cold full-table
-    sweep (1.1.0, L3), cap ignored. `PICK_NONE` ONLY when no eligible backend owns a table slot -- NEVER
-    merely because backends are over cap (fail OPEN on overload).
+    sweep (1.1.0, L3), cap ignored. `PICK_NONE` ONLY when no eligible backend owns a table slot (all-zero
+    weights own none -- 1.2.0, K8, the inherited O(1) guard) -- NEVER merely because backends are over
+    cap (fail OPEN on overload).
   - `pickFrom(buf, i)` -> number (1.1.0, ZERO-BOX). Inherited from ConsistentHash: the key is `buf[i]`,
     read inside; identical to `pick(buf[i])` WITH the cap. 0 B/op even with V8 inlining off.
   - `note(i, delta)` -> void. WARM feedback path (not the hot pick path): the SOLE writer of `_total`
@@ -379,7 +396,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     home, home, then overflow at minCap 2), at the price of a looser bound while the pool is nearly idle.
     lite-pick's own extension (no reference implementation has the knob). Integer in [0, 2^32 - 1].
   - `setWeight(i, w)` / `setWeights(weights)` / `rebuild()` / `tableSize` -- inherited from ConsistentHashBalancer (COLD
-    rebuild of the Maglev table; the readonly prime table size).
+    rebuild of the Maglev table; the readonly prime table size; the m <= 2^31 - 1 bound, the all-zero PICK_NONE
+    and the equal-weights setWeights skip -- 1.2.0 -- apply unchanged).
   - THE PIVOT (decisions/0011): P2C-over-inflight with a `(1+eps) x mean` cap is byte-identical to
     plain P2C (an under-cap draw always has lower inflight than an over-cap one), so the cap is only
     LOAD-BEARING when the primary choice is a HASH -- CHBL is that. The hotspot anchor
@@ -407,8 +425,11 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     0 B/op, NEVER throws. `PICK_NONE` IFF live === 0 OR no eligible node has a positive weight. NEVER a
     dead pick, a weight-0 return, or an out-of-range index.
   - `setWeight(i, w)` -> void. COLD. Set endpoint i's weight (uint32) and REBUILD the alias table (the
-    SmoothWRR sole-writer precedent). `setWeights(weights)` -> void. COLD (1.1.0): copy ALL weights into
-    the array the balancer was built with, rebuild ONCE. `rebuild()` -> void. COLD. Re-derive the table from the current
+    SmoothWRR sole-writer precedent); 1.2.0: a weight equal to the BUILT value skips the rebuild (no build, no STAT_REBUILDS). `setWeights(weights)` -> void. COLD (1.1.0): copy ALL weights into
+    the array the balancer was built with, rebuild ONCE; 1.2.0: when the copied weights equal the BUILT
+    snapshot the rebuild is skipped (no build, no STAT_REBUILDS) -- an in-place edit of your own array is
+    still seen, but a direct `eligible[i]` write (UB) is no longer re-synced by a same-weights call
+    (assertConsistent names it). `rebuild()` -> void. COLD. Re-derive the table from the current
     caller weights. An eligibility flap NEVER rebuilds (anti-flap; only setWeight/rebuild/membership).
   - vs SmoothWRR: SmoothWRR is deterministic/smooth/low-variance but O(cap)/pick and owns accumulator
     state; WeightedRandom is a STATELESS O(1) sample (no accumulator to desync) with sampling variance --
@@ -430,6 +451,7 @@ It is a SEPARATE subpath file (the lite-query /stream + /await precedent), NOT p
 duck-typed and imports NOTHING from lite-query.
 
 - `VERSION` -- string. Re-exported from the core (same three-place stamp).
+- `CODES` -- the frozen error-code map (1.2.0), re-exported from the core: the SAME object.
 - `Pool` -- class. Wraps a balancer + the caller-owned in-flight view.
   - `new Pool(balancer, inflight)` -- `balancer` is duck-typed (any `{ pick(): number, capacity,
     live }` -- every lite-pick strategy qualifies); `inflight` is the SAME caller-owned Uint32Array
@@ -443,7 +465,7 @@ duck-typed and imports NOTHING from lite-query.
     cursor-rotated otherwise). It STOPS with the last error as soon as no untried eligible endpoint
     remains -- so a 1-node pool with `tries: 3` makes ONE attempt (Pool owns SPATIAL failover, not
     temporal retry). `opts.tries` default 1 = no failover. Rejects `code:'LITE_PICK_NONE'` when no
-    endpoint is eligible.
+    endpoint is eligible. KNOWN (ROADMAP 4b, phase 2): /pool failover (tries > 1) ignores weights; pair a remove with `setEligible(i, false)`.
     ABORT (M-Item5): `opts.signal` is checked before EVERY attempt -- an already-aborted signal
     dispatches NOTHING and rejects with the signal's `reason`, else `code:'LITE_PICK_ABORTED'`; an
     abort after a failure stops failover and propagates.

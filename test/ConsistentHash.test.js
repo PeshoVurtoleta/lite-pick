@@ -20,7 +20,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ConsistentHashBalancer, BoundedLoadBalancer, BalancerBase, PICK_NONE, CH_DEFAULT_M, CH_PROBE_LIMIT } from '../Pick.js';
+import v8 from 'node:v8';
+import vm from 'node:vm';
+import {
+    ConsistentHashBalancer, BoundedLoadBalancer, BalancerBase, PICK_NONE, CH_DEFAULT_M, CH_PROBE_LIMIT,
+    STAT_COUNT, STAT_REBUILDS, STAT_DISPLACED, STAT_FALLBACK_SCANS,
+} from '../Pick.js';
+import { Pool } from '../Pool.js';
 
 const up = (n) => { const e = new Uint8Array(n); e.fill(1); return e; };
 const M = 8191; // a prime table size, large enough for smooth distribution at n<=64
@@ -227,36 +233,111 @@ test('A8: constructor validates typeof-first (before building the table)', () =>
     assert.throws(() => new ConsistentHashBalancer(0, new Uint8Array(1), null, M), RangeError); // base: bad capacity
 });
 
-test('all-zero weights -> equal-quota fallback (valid, fully populated table)', () => {
-    const w = new Uint32Array(4); // all zero
-    const b = new ConsistentHashBalancer(4, up(4), w, M);
-    const counts = new Uint32Array(4);
-    for (let s = 0; s < M; s++) { assert.ok(b._lookup[s] < 4); counts[b._lookup[s]]++; }
-    for (let i = 0; i < 4; i++) assert.ok(counts[i] > 0, 'backend ' + i + ' still represented');
+test('K8 (1.2.0): all-zero weights -> PICK_NONE for pick and pickFrom (ctor AND setWeights), never throws; re-weight = a fresh table (CH + BL)', async () => {
+    // 1.1.x fell back to EQUAL quotas on all-zero weights and routed every key (HEAD: 0/1000 PICK_NONE).
+    // 1.2.0: weight 0 = removed, so all-zero = every backend removed = PICK_NONE, answered by the O(1)
+    // `_live & _wmask` guard -- never the probe (STAT_DISPLACED +0) nor the O(M) sweep (STAT_FALLBACK_SCANS +0).
+    const N = 8, m = 257;
+    const makers = [
+        ['ConsistentHash', (w) => { const inf = new Uint32Array(N); return { b: new ConsistentHashBalancer(N, up(N), w, m, 7), inf }; }],
+        ['BoundedLoad', (w) => { const inf = new Uint32Array(N); return { b: new BoundedLoadBalancer(N, up(N), inf, 0.25, w, m, 7), inf }; }],
+    ];
+    const keys = makeKeys(1000, 0xBEEF);
+    const ones = new Uint32Array(N).fill(1);
+    for (const [name, make] of makers) {
+        const viaCtor = make(new Uint32Array(N));
+        const viaSet = make(null);
+        viaSet.b.setWeights(new Uint32Array(N));
+        const viaSetWeight = make(ones);
+        for (let i = 0; i < N; i++) viaSetWeight.b.setWeight(i, 0);   // the per-backend path to all-zero
+        for (const [how, { b, inf }] of [['ctor', viaCtor], ['setWeights', viaSet], ['setWeight', viaSetWeight]]) {
+            const tag = name + ' via ' + how + ': ';
+            const slab = new Float64Array(STAT_COUNT);
+            b.attachStats(slab);
+            const buf = new Uint32Array(1);
+            let none = 0;
+            for (let k = 0; k < keys.length; k++) {
+                if (b.pick(keys[k]) === PICK_NONE) none++;
+                buf[0] = keys[k];
+                assert.equal(b.pickFrom(buf, 0), PICK_NONE, tag + 'pickFrom key ' + keys[k]);
+            }
+            assert.equal(none, 1000, tag + '1000/1000 keys -> PICK_NONE');
+            for (const k of [NaN, undefined, -1, 0, 0xFFFFFFFF, 1.5]) assert.equal(b.pick(k), PICK_NONE, tag + 'pick(' + k + ')');
+            assert.equal(slab[STAT_DISPLACED], 0, tag + 'the O(1) guard answers: no probe (STAT_DISPLACED +0)');
+            assert.equal(slab[STAT_FALLBACK_SCANS], 0, tag + 'the O(1) guard answers: no O(M) sweep (STAT_FALLBACK_SCANS +0)');
+            for (let s2 = 0; s2 < m; s2++) assert.ok(b._lookup[s2] < N, tag + 'the zeroed table stays in range');
+            b.assertConsistent();
+            // Pool rejects with LITE_PICK_NONE and never calls fn.
+            const pool = new Pool(b, inf);
+            let called = 0;
+            await assert.rejects(pool.run(async () => { called++; }, { key: 0xABCD }), (e) => e.code === 'LITE_PICK_NONE');
+            assert.equal(called, 0, tag + 'fn never runs');
+            // Re-weight: the table equals a fresh ctor's on the same weights, and keys route again.
+            b.setWeights(ones);
+            assert.deepEqual(b._lookup, make(ones).b._lookup, tag + 're-weighted table == a fresh constructor table');
+            for (let k = 0; k < 100; k++) assert.notEqual(b.pick(keys[k]), PICK_NONE, tag + 're-weighted key routes');
+        }
+        // A single positive weight brings back exactly that backend (the mask is per-build, not sticky).
+        const one = make(new Uint32Array(N)).b;
+        one.setWeight(5, 3);
+        for (let k = 0; k < 200; k++) assert.equal(one.pick(keys[k]), 5, name + ': lone positive weight owns every key');
+    }
 });
 
-test('K9: M <= 2^31-1 passes validation (reaches allocation); M > 2^31-1 is rejected BEFORE it (CH + BL)', () => {
-    // The K9 bound must be EXACTLY the positive-int32 ceiling 2^31-1 = 2147483647 (above it the Int32Array
-    // slot positions in _build wrap negative and silently corrupt the table). Two cases pin that boundary:
-    //
-    //   M_OK  = 2147483647  (2^31-1, PRIME): the LEGAL maximum. It must pass every validation check and
-    //           REACH the lookup allocation -- proven by the Uint32Array stub tripping its SENTINEL. A
-    //           too-tight mutant (`m > 1073741824` or `m >= 2147483647`) would reject it with
-    //           LITE_PICK_OPTION, never reaching allocation, so this case FAILS under those mutants.
-    //   M_BIG = 2147483659  (PRIME, 12 above the ceiling): it passes the prime/> 1 checks but must be
-    //           rejected with LITE_PICK_OPTION BEFORE the allocation (no SENTINEL). On HEAD (no bound) it
-    //           reaches allocation and trips SENTINEL, so this case FAILS on HEAD.
-    const M_OK = 2147483647, M_BIG = 2147483659;
-    assert.ok(chIsPrimeLocal(M_OK), 'test prerequisite: M_OK (2^31-1) is prime');
-    assert.ok(chIsPrimeLocal(M_BIG), 'test prerequisite: M_BIG is prime');
+test('setWeights (1.2.0): weights equal to the built snapshot skip the rebuild; the last index alone, and rebuild(), still build (CH + BL)', () => {
+    const N = 6, m = 101;
+    const cases = [
+        ['ConsistentHash', () => new ConsistentHashBalancer(N, up(N), Uint32Array.from([1, 2, 3, 4, 5, 6]), m)],
+        ['BoundedLoad', () => new BoundedLoadBalancer(N, up(N), new Uint32Array(N), 0.25, Uint32Array.from([1, 2, 3, 4, 5, 6]), m)],
+    ];
+    for (const [name, make] of cases) {
+        const b = make(), slab = new Float64Array(STAT_COUNT);
+        b.attachStats(slab);
+        const table = Uint32Array.from(b._lookup);
+        b.setWeights(Uint32Array.from([1, 2, 3, 4, 5, 6]));
+        assert.equal(slab[STAT_REBUILDS], 0, name + ': setWeights(same) -> STAT_REBUILDS +0');
+        assert.deepEqual(b._lookup, table, name + ': the table is untouched');
+        b.setEligible(2, false); b.setEligible(2, true);                 // a flap is not a build input
+        b.setWeights(Uint32Array.from([1, 2, 3, 4, 5, 6, 99]));        // longer array, same first cap values
+        assert.equal(slab[STAT_REBUILDS], 0, name + ': only [0, capacity) is compared');
+        b.setWeights(Uint32Array.from([1, 2, 3, 4, 5, 7]));            // ONLY index cap-1 differs
+        assert.equal(slab[STAT_REBUILDS], 1, name + ': the last index alone -> +1 (a `i < cap - 1` compare misses it)');
+        assert.equal(b._weights[N - 1], 7);
+        b.setWeights(Uint32Array.from([9, 2, 3, 4, 5, 7]));            // ONLY index 0 differs
+        assert.equal(slab[STAT_REBUILDS], 2, name + ': the first index alone -> +1');
+        b.rebuild();
+        assert.equal(slab[STAT_REBUILDS], 3, name + ': rebuild() is unconditional -> +1');
+        b.assertConsistent();
+    }
+});
 
-    // A Uint32Array stub that throws a SENTINEL for any length > 2^30: the lookup table (M slots) trips
+test('K9 (1.1.1, restored in 1.2.0): M <= 2^31-1 passes validation (reaches allocation); M >= 2^31 is rejected BEFORE it; primes just above 2^24 are ACCEPTED (CH + BL)', () => {
+    // The bound is EXACTLY the positive-int32 ceiling 2^31-1 = 2147483647 (above it the Int32Array slot
+    // positions in _build wrap negative). A hard 2^24 cap is deferred to 2.0: 1.1.1 documented M valid up to
+    // 2^31 - 1, so rejecting (2^24, 2^31-1] in a minor would break SemVer. Pinned from both sides:
+    //   ACCEPTED (reach the lookup allocation -- the Uint32Array stub trips its SENTINEL; never 8 GB):
+    //     16777213 (the largest prime <= 2^24), the smallest prime > 2^24 (computed here), and 2^31-1 (prime,
+    //     the legal maximum). MUST-FAIL CONTROL: the capped tree (1.2.0 draft, `m > 16777216` rejected) throws
+    //     LITE_PICK_OPTION for the > 2^24 prime and for 2^31-1 before allocation, so this test FAILS there;
+    //     a too-tight mutant (`m >= 2147483647`) fails on 2^31-1.
+    //   REJECTED with LITE_PICK_OPTION BEFORE allocation, by the K9 bound (the message names 2147483647, not
+    //     the prime check): 2^31 (composite -- the bound runs before chIsPrime), 2147483659 (prime, 12 above
+    //     the ceiling), and 2^53-1 (the largest safe integer; composite = 6361 x 69431 x 20394401, so it pins
+    //     the K9 message at the far end of the range -- the bound-before-prime ORDER is pinned by 2^31 above).
+    const M_OK = 2147483647, M_2_31 = 2147483648, M_BIG = 2147483659;
+    assert.ok(chIsPrimeLocal(M_OK), 'prerequisite: 2^31-1 is prime');
+    assert.ok(chIsPrimeLocal(M_BIG), 'prerequisite: 2147483659 is prime');
+    assert.ok(chIsPrimeLocal(16777213), 'prerequisite: 16777213 is prime');
+    let above24 = 16777217;
+    while (!chIsPrimeLocal(above24)) above24++;
+
+    // A Uint32Array stub that throws a SENTINEL for any length > 2^23: the lookup table (M slots) trips
     // it, the small owned-weights / inflight arrays (capacity) do not.
-    const SENTINEL = Symbol('ch-m-overflow');
+    const SENTINEL = Symbol('ch-m-alloc');
     const RealU32 = globalThis.Uint32Array;
     class U32Stub extends RealU32 {
         constructor(arg) {
-            if (typeof arg === 'number' && arg > 0x40000000) {
+            if (typeof arg === 'number' && arg > 0x800000) {
                 const e = new Error('SENTINEL: refused to allocate a ' + arg + '-element Uint32Array');
                 e.sentinel = SENTINEL;
                 throw e;
@@ -264,9 +345,6 @@ test('K9: M <= 2^31-1 passes validation (reaches allocation); M > 2^31-1 is reje
             super(arg);
         }
     }
-    // BoundedLoad validates `inflight instanceof Uint32Array` before super(), so inflight is allocated
-    // INSIDE the ctor closure (under the stub) as a small (capacity-sized) array -- a stub instance that
-    // passes the instanceof check; only the M-sized lookup trips the SENTINEL.
     const ctors = [
         ['ConsistentHash', (m) => new ConsistentHashBalancer(4, up(4), null, m)],
         ['BoundedLoad', (m) => new BoundedLoadBalancer(4, up(4), new Uint32Array(4), 0.25, null, m)],
@@ -274,32 +352,79 @@ test('K9: M <= 2^31-1 passes validation (reaches allocation); M > 2^31-1 is reje
     globalThis.Uint32Array = U32Stub;
     try {
         for (const [name, make] of ctors) {
-            // M_OK (2^31-1): validation passes, the lookup allocation is REACHED -> SENTINEL fires.
-            assert.throws(
-                () => make(M_OK),
-                (err) => {
-                    assert.equal(err.sentinel, SENTINEL,
-                        name + ': M = 2^31-1 must pass validation and REACH the lookup allocation (got ' +
-                        (err && err.code ? err.code : err) + ')');
+            for (const m of [16777213, above24, M_OK]) {
+                assert.throws(() => make(m), (err) => {
+                    assert.equal(err.sentinel, SENTINEL, name + ': M = ' + m + ' must pass validation and REACH the lookup ' +
+                        'allocation (got ' + (err && err.code ? err.code + ' ' + err.message : err) + ')');
                     return true;
-                },
-                name + ': M = 2^31-1 is the legal maximum and must not be rejected by the bound'
-            );
-            // M_BIG (> 2^31-1): rejected with LITE_PICK_OPTION BEFORE allocation (no SENTINEL).
-            assert.throws(
-                () => make(M_BIG),
-                (err) => {
-                    assert.notEqual(err.sentinel, SENTINEL,
-                        name + ': M > 2^31-1 must be rejected BEFORE the lookup allocation (no SENTINEL)');
+                });
+            }
+            for (const m of [M_2_31, M_BIG, Number.MAX_SAFE_INTEGER]) {
+                assert.throws(() => make(m), (err) => {
+                    assert.notEqual(err.sentinel, SENTINEL, name + ': M = ' + m + ' must be rejected BEFORE allocation');
                     assert.ok(err instanceof RangeError, name + ': wrong error type: ' + err);
-                    assert.equal(err.code, 'LITE_PICK_OPTION', name + ': wrong error code: ' + err.code);
+                    assert.equal(err.code, 'LITE_PICK_OPTION');
+                    assert.match(err.message, /2147483647/, name + ': M = ' + m + ' is rejected by the K9 bound');
                     return true;
-                }
-            );
+                });
+            }
         }
     } finally {
         globalThis.Uint32Array = RealU32;
     }
+});
+
+test('assertConsistent (1.2.0): the all-zero-weights mask must agree with the built weights (CH + BL)', () => {
+    const N = 4, m = 101;
+    const makers = [
+        ['ConsistentHash', (w) => new ConsistentHashBalancer(N, up(N), w, m)],
+        ['BoundedLoad', (w) => new BoundedLoadBalancer(N, up(N), new Uint32Array(N), 0.25, w, m)],
+    ];
+    const bad = (e) => e.code === 'LITE_PICK_INCONSISTENT' && /all-zero-weights mask/.test(e.message);
+    for (const [name, make] of makers) {
+        const normal = make(null);
+        normal.assertConsistent();
+        normal._wmask = 0;                       // corrupt: weighted table, mask says all-zero
+        assert.throws(() => normal.assertConsistent(), bad, name + ': _wmask 0 over nonzero weights');
+        const zero = make(new Uint32Array(N));
+        zero.assertConsistent();
+        zero._wmask = -1;                        // corrupt: all-zero weights, mask says routable
+        assert.throws(() => zero.assertConsistent(), bad, name + ': _wmask -1 over all-zero weights');
+        const drift = make(new Uint32Array(N));
+        drift._weights[2] = 5;                   // a direct owned-weight write without a rebuild (UB)
+        assert.throws(() => drift.assertConsistent(), bad, name + ': owned weights written without a rebuild');
+    }
+});
+
+test('K8 retention: 200 cycles CH(64, M=65537) -> zero weights -> ones -> drop; every instance is finalized', async () => {
+    // Without --expose-gc, expose it at runtime (the flag must be set before the context that reads it).
+    let gc = globalThis.gc;
+    if (typeof gc !== 'function') {
+        v8.setFlagsFromString('--expose-gc');
+        gc = vm.runInNewContext('gc');
+    }
+    let live = 0;
+    // The held value is the cycle number (a primitive): the registry never closes over the balancer.
+    const reg = new FinalizationRegistry(() => { live--; });
+    const zeros = new Uint32Array(64), ones = new Uint32Array(64).fill(1), el = up(64);
+    function churn() {
+        for (let c = 0; c < 200; c++) {
+            const b = new ConsistentHashBalancer(64, el, null, 65537, c);
+            b.setWeights(zeros);
+            if (b.pick(c) !== PICK_NONE) throw new Error('all-zero pick routed');
+            b.setWeights(ones);
+            if (b.pick(c) === PICK_NONE) throw new Error('re-weighted pick failed closed');
+            reg.register(b, c);
+            live++;
+        }
+    }
+    churn();
+    assert.equal(live, 200);
+    for (let r = 0; r < 50 && live > 0; r++) {
+        gc();
+        await new Promise((res) => setTimeout(res, 10));
+    }
+    assert.equal(live, 0, 'every CH instance finalized after gc() (tracker size -> 0)');
 });
 
 test('M2 (kill): setWeights copies the LAST weight w[cap-1] -- the rebuild honours it (CH + BL)', () => {
@@ -324,7 +449,7 @@ test('M2 (kill): setWeights copies the LAST weight w[cap-1] -- the rebuild honou
     }
 });
 
-// Local prime check for the K9 prerequisite (independent of the kernel's internal chIsPrime).
+// Local prime check for the K9 prerequisites (independent of the kernel's internal chIsPrime).
 function chIsPrimeLocal(n) {
     if (!Number.isInteger(n) || n < 2) return false;
     if (n % 2 === 0) return n === 2;

@@ -53,6 +53,9 @@ queue between visits, so its in-flight looks attractive again). Several forks ha
 
 ## Fork 4b -- Cold start: an UNSAMPLED sentinel, not `_stamp = 0` (ratified, 0.7.1 fix)
 
+> Amended 2026-10-10 (1.2.0, K6): the negative `_stamp` sentinel is replaced by a `_sampled` bitmap -- see the
+> last amendment below. The cold-start semantics (undecayed 1.0 baseline, exact first sample) are unchanged.
+
 - The original 0.7.0 seeded `_ewma = 1.0`, `_stamp = 0`. Under a REAL large-magnitude clock
   (`now` in the 1e12+ range) an unsampled node then decays as `exp(-(now - 0) / tau) -> 0`, so its
   cost collapses to ~0 and a COLD pool degrades to RANDOM selection instead of the documented
@@ -180,3 +183,36 @@ interleaved path pays ~8-12%. `_recordAt` is
 therefore left **byte-identical to 1.1.0** (confirmed by the prototype-`toString` diff: PeakEWMA is absent
 from the changed-method set). The single-`exp` idea is not re-queued; a cheaper decaying mean would need a
 different structure, not a reordering.
+
+## Amendment 2026-10-10 (1.2.0, audit 2026-10-05 K6): a sampled BITMAP replaces Fork 4b's sentinel; offset clocks accepted
+
+Fork 4b used `_stamp[i] < 0` as the "never sampled" marker. That overloaded the clock: `now` is caller-supplied
+and the contract only says "finite", so a NEGATIVE `now` (an offset clock such as `hrtime - start`, or one that
+crosses 0) stored a negative stamp and the node read as unsampled forever -- every sample re-initialized the
+EWMA (no blend), the busy floor never applied, and the pick fell back to plain in-flight P2C. 1.1.1 documented
+`now >= 0` (the K7 treatment). The two options were validating `now >= 0` (a throw on the warm path, and still
+P2C-random on `pick`) or separating the marker from the clock; the user chose the bitmap.
+
+- `_sampled` (`Uint8Array(capacity)`, balancer-owned) is 1 once node i has a sample. `_recordAt` tests
+  `_sampled[i] === 0 || sampleNs > v` for the exact first-sample init and sets `_sampled[i] = 1` beside
+  `_stamp[i] = now`. `_stamp` keeps its 0 seed and is read ONLY where `_sampled[i] === 1`.
+- Hot path: `_pickAt` reads `sm[x] === 0` instead of `stamp[x] < 0` -- one typed-array load and compare per
+  candidate, as before; the `_stamp` load moves into the sampled arm. No new branch. `ewmaAt` and `describe()`
+  read the bitmap; a new `assertConsistent()` override checks every `_sampled[i]` is 0 / 1 and that the pool
+  mean has a sample iff some node does.
+- The pool stamp `_samp[2]` is a running MAX and now seeds to `-Number.MAX_VALUE` (its identity, finite).
+  With the old 0 seed a negative clock read `pdt < 0` on every sample, so `_samp[2]` never advanced and the pool
+  mean never decayed. Parity for `now >= 0`: before the first sample `_samp[0] = _samp[1] = 0`, so the first
+  decay factor multiplies 0 either way (`pdt` is huge but finite, or `+Infinity` past ~1e292: `exp(-Infinity)`
+  is 0, never NaN) and the state is `[sample, 1, now]` in both.
+- Result: only differences of `now` are read, so on an INTEGER clock (every `now - 2^40` exact, below 2^53) a run
+  at `now - 2^40` is bit-identical to the run at `now` (picks, `_ewma`, `_samp[0..1]`, `ewmaAt`; `_samp[2]`
+  differs by exactly 2^40) -- test K6-translate. A fractional clock learns the same to rounding level only: its
+  differences `now - stamp` can round differently once shifted (review N3, 2026-10-10). For
+  `now >= 0` the kernel is byte-identical to 1.1.1: the five StreamParity PeakEWMA digests are unchanged, and a
+  per-step fixture cut from `git show HEAD:Pick.js` (sampled flags, stamps, `ewmaAt`, `describe().sampled`)
+  matches (`test/fixtures/peak-k6-head.json`).
+- Cost: 0 B/op on every PeakEWMA PerfGate lane under `test:perf` and `test:perf:noinline`, including two new
+  lanes on a -1.7e15 clock (`pickFrom`, `recordRttFrom`). Timing, darwin / arm64 Node 26.8.2, separate processes,
+  min of 7, load ~3.3 (new vs 1.1.1): `pickFrom` 33.9 vs 33.7-33.8 ns (noise); `recordRttFrom` 9.0 vs 8.1-8.8 ns
+  (the extra byte store). x64 / Node 22 not measured.

@@ -314,14 +314,66 @@ test('K5: setWeights snapshots a source that OVERLAPS the balancer array (no for
     assert.deepEqual(Array.from(owned2), [6, 7, 8, 42], 'the non-smearing overlap direction must also match');
 });
 
-test('K5/no-op: setWeights with the SAME values still rebuilds (+1 STAT_REBUILDS; no short-circuit)', () => {
+test('1.2.0 no-op skip: setWeights equal to the BUILT snapshot does not rebuild (STAT_REBUILDS +0)', () => {
     const slab = new Float64Array(STAT_COUNT);
     const b = new WeightedRandomBalancer(4, up(4), w([1, 2, 3, 4]));
     b.attachStats(slab);
     const before = slab[STAT_REBUILDS], builds = b._builds;
-    b.setWeights(w([1, 2, 3, 4]));                     // identical values -- no-op short-circuit is 1.2.0
-    assert.equal(slab[STAT_REBUILDS], before + 1, 'setWeights always rebuilds, even with unchanged values');
-    assert.equal(b._builds, builds + 1);
+    const prob = Float64Array.from(b._prob), alias = Int32Array.from(b._alias);
+    b.setWeights(w([1, 2, 3, 4]));                     // identical values -> skipped (HEAD 1.1.x: +1)
+    assert.equal(slab[STAT_REBUILDS], before, 'setWeights(same) performs no build');
+    assert.equal(b._builds, builds);
+    assert.deepEqual(b._prob, prob, 'alias table untouched');
+    assert.deepEqual(b._alias, alias);
+    b.rebuild();                                       // rebuild() stays unconditional
+    assert.equal(slab[STAT_REBUILDS], before + 1, 'rebuild() always builds');
+});
+
+test('1.2.0 no-op skip compares against _built: an IN-PLACE mutation then setWeights(sameArray) rebuilds (+1)', () => {
+    // The caller often mutates the very array the balancer was built with and hands it back. A compare
+    // against a pre-copy _weights (== the argument) would see "equal" and skip -- a stale alias table.
+    const slab = new Float64Array(STAT_COUNT);
+    const arr = w([1, 2, 3, 4]);
+    const b = new WeightedRandomBalancer(4, up(4), arr);
+    b.attachStats(slab);
+    arr[2] = 9;                                        // in place, on the balancer's own array
+    b.setWeights(arr);
+    assert.equal(slab[STAT_REBUILDS], 1, 'the in-place change is seen against the built snapshot');
+    assert.equal(b._psum, 1 + 2 + 9 + 4);
+    b.assertConsistent();
+    b.setWeights(w([1, 2, 9, 5]));                     // ONLY index cap-1 differs
+    assert.equal(slab[STAT_REBUILDS], 2, 'the last index alone -> +1 (a `i < cap - 1` compare misses it)');
+    assert.equal(b._psum, 1 + 2 + 9 + 5);
+    b.setWeights(w([7, 2, 9, 5]));                     // ONLY index 0 differs
+    assert.equal(slab[STAT_REBUILDS], 3, 'the first index alone -> +1');
+});
+
+test('1.2.0 setWeight(i, sameValue) after an IN-PLACE drift of index i rebuilds (compares _built, not _weights)', () => {
+    // The single-index form must follow setWeights: the caller's own array can already hold the new value
+    // (written in place), so `nw === _weights[i]` says "equal" while the alias table was built on the old one.
+    const slab = new Float64Array(STAT_COUNT);
+    const arr = w([1, 2, 3, 4]);
+    const b = new WeightedRandomBalancer(4, up(4), arr);
+    b.attachStats(slab);
+    arr[1] = 7;                                        // drift in place
+    b.setWeight(1, 7);                                 // the value is already there -- must still rebuild
+    assert.equal(slab[STAT_REBUILDS], 1, 'setWeight saw the drift against the built snapshot');
+    assert.equal(b._built[1], 7);
+    assert.equal(b._psum, 1 + 7 + 3 + 4);
+    b.assertConsistent();
+    b.setWeight(1, 7);                                 // now genuinely equal to the built value -> skipped
+    assert.equal(slab[STAT_REBUILDS], 1, 'a setWeight equal to the built value performs no build');
+});
+
+test('1.2.0 no-op skip: assertConsistent passes after flaps + a skipped setWeights; the pick stream is unchanged', () => {
+    const mk = () => new WeightedRandomBalancer(8, up(8), w([1, 2, 3, 4, 5, 6, 7, 8]), 0xC0FFEE);
+    const a = mk(), b = mk(), slab = new Float64Array(STAT_COUNT);
+    b.attachStats(slab);
+    for (const [i, on] of [[1, false], [5, false], [1, true], [7, false]]) { a.setEligible(i, on); b.setEligible(i, on); }
+    b.setWeights(w([1, 2, 3, 4, 5, 6, 7, 8]));         // skipped: the _ew cache was kept exact by setEligible
+    assert.equal(slab[STAT_REBUILDS], 0);
+    b.assertConsistent();
+    for (let k = 0; k < 2000; k++) assert.equal(b.pick(), a.pick(), 'skip leaves the PRNG / table stream untouched');
 });
 
 test('K2: a direct eligible[] SWAP (live preserved) is caught by the _ew recount in assertConsistent', () => {

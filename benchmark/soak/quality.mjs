@@ -83,9 +83,10 @@ export class QualityWindow {
     record(node) {
         if (node < 0) return;
         // per-pick H3 guard: a weighted lane must NEVER return a weight-0 node. NIT C(a): the "all-zero
-        // fallback, not H3" excuse is scoped to ConsistentHash/BoundedLoad ONLY -- their documented
-        // all-zero-weights contract is equal distribution. SmoothWRR/WeightedRandom/SED/NQ fail CLOSED on
-        // all-zero (PICK_NONE), so a weight-0 pick there is ALWAYS a real violation, never a fallback.
+        // fallback, not H3" excuse is scoped to ConsistentHash/BoundedLoad ONLY -- their 1.1.x all-zero-weights
+        // contract is equal distribution (1.2.0 K8 fails closed instead, so the excuse never fires there; it
+        // stays for the soak:ab A side, which runs the 1.1.x registry kernel). SmoothWRR/WeightedRandom/SED/NQ
+        // fail CLOSED on all-zero (PICK_NONE), so a weight-0 pick there is ALWAYS a real violation.
         if (this.weighted && this.weights[node] === 0) {
             if (this.chbl) {
                 const wt = this.weights, el = this.eligible, cap = this.cap;

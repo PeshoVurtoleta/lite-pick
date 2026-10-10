@@ -137,4 +137,38 @@ A **hard** allocation cap is still wanted: even a legal `M` near 2^31 asks for a
 and an over-large typed array is an uncatchable V8 fatal, not a `RangeError` (packaging law). The decision is
 to ship only the correctness bound in 1.1.1 and defer the ergonomic `M <= 2^24` HARD cap (with a
 `LITE_PICK_OPTION` did-you-mean) to 1.2.0; the docs already RECOMMEND `M <= 2^24` because the build is
-`O(M x N)`. Recorded in the ROADMAP 1.2.0 queue.
+`O(M x N)`. Recorded in the ROADMAP 1.2.0 queue. (1.2.0 deferred it again, to 2.0: see the next amendment.)
+
+## Amendment 2026-10-10 (1.2.0, audit 2026-10-05 K8 + the 2^24 cap): all-zero weights fail closed; the 2^24 cap deferred to 2.0
+
+**K8 -- all-zero weights are every backend removed.** Through 1.1.x the build's degenerate branch gave every
+backend an EQUAL quota when the weights summed to 0, so `setWeights(all 0)` routed every key everywhere -- the
+opposite of "weight 0 removes" (the 2026-10-05 drain-vs-remove amendment) and of WeightedRandom, which has
+always returned `PICK_NONE` there. Decision (user, binding): all-zero -> `PICK_NONE` everywhere, never a throw.
+The build now sets a balancer-owned mask `_wmask = 0` (else -1), zero-fills the table (still only in-range
+indices) and returns; `_pickSlot` folds the mask into its existing guard: `(this._live & this._wmask) === 0`
+-- one field load and one AND, no new branch. The AND is exact because `_live <= capacity <= M <= 2^31 - 1`
+(K9), so `_live` is a non-negative int32.
+So the answer comes from the O(1) guard: no probe (`STAT_DISPLACED` +0) and no O(M) sweep
+(`STAT_FALLBACK_SCANS` +0). Restoring any positive weight rebuilds the table a fresh constructor would build.
+A non-degenerate table is byte-identical (StreamParity `consistenthash` / `boundedload` unchanged). This is a
+behaviour change that is a FIX, not a breaking change: 1.1.1 already documented weight 0 as a remove and promised
+fail closed when every eligible node has weight 0 (a weight-0 node is never returned); the equal-quota fallback
+violated that and was undocumented (ROADMAP K8). The CHANGELOG keeps a migration note: whoever relied on
+all-zero routing sets nonzero weights, or drains with `setEligible` instead. `assertConsistent()` (CH / BL
+override, 1.2.0) cross-checks the mask against the built weights: `_wmask` is 0 iff they sum to 0.
+
+**The 2^24 HARD cap: deferred to 2.0.** A draft of 1.2.0 rejected `M > 2^24`. Decision (user, binding):
+reverted, because 1.1.1 documented `M` valid up to `2^31 - 1` (K9; `2^24` only recommended), so rejecting
+`(2^24, 2^31 - 1]` in a minor release breaks SemVer -- the CHANGELOG precedent "a breaking change deferred to
+2.0". 1.2.0 keeps K9 exactly: `M > 2147483647` throws `RangeError` / `LITE_PICK_OPTION` before the primality
+test and before any allocation; `M <= 2^24` stays the recommendation (the build is `O(M x N)`, the table `M x 4`
+bytes). The boundary test is K9's: `2^31 - 1` (prime) and the primes just above `2^24` reach the allocation (a
+`Uint32Array` stub sentinel; it fails against the capped draft), `2^31`, `2147483659` and `2^53 - 1` are rejected
+by the bound. The hard cap is listed under ROADMAP "2.0 candidates".
+
+**`setWeights` equal-weights skip.** `setWeights(w)` compares `w[i]` against the owned weights for
+`i < capacity` and returns without building when all are equal (no `STAT_REBUILDS`). Sufficient because the
+owned weights ARE the built snapshot (balancer-owned; every writer rebuilds), `_build` reads only the weights,
+`M`, the capacity and the seed, and eligibility is not a build input (a flap never rebuilds). `rebuild()`
+stays unconditional.

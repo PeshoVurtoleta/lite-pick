@@ -7,7 +7,8 @@
  */
 
 import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT,
-    STAT_FALLBACK_SCANS, STAT_REBUILDS, STAT_DISPLACED, STAT_COUNT } from '../../Pick.js';
+    STAT_FALLBACK_SCANS, STAT_REBUILDS, STAT_DISPLACED, STAT_COUNT, CODES } from '../../Pick.js';
+import { CODES as POOL_CODES } from '../../Pool.js';
 import type { LitePickErrorCode, LitePickError, BalancerDescription, BalancerStats } from '../../Pick.js';
 
 // VERSION is a string.
@@ -282,6 +283,17 @@ const liteErrAsError: Error = liteErr;
 const liteErrCode: LitePickErrorCode = (caught as LitePickError).code;
 const liteErrCodeSat = (caught as LitePickError).code satisfies LitePickErrorCode;
 void liteErrAsError; void liteErrCode; void liteErrCodeSat;
+// 1.2.0: CODES is the runtime map; each value is its own key's literal type.
+const codeIdx: 'LITE_PICK_INDEX' = CODES.LITE_PICK_INDEX;
+const codeAny: LitePickErrorCode = CODES.LITE_PICK_FEEDBACK;
+const codeKey: keyof typeof CODES = 'LITE_PICK_NONE';
+const codeKeyIsCode: LitePickErrorCode = codeKey;
+const poolCodes: typeof CODES = POOL_CODES;
+void codeIdx; void codeAny; void codeKeyIsCode; void poolCodes;
+// @ts-expect-error -- not a lite-pick code
+void CODES.ERR_LITE_PICK_INDEX;
+// @ts-expect-error -- CODES is readonly
+CODES.LITE_PICK_INDEX = 'LITE_PICK_INDEX';
 const obsSlab = new Float64Array(STAT_COUNT);
 const obsCh = new ConsistentHashBalancer(4, new Uint8Array(4), null, 257);
 obsCh.attachStats(obsSlab);

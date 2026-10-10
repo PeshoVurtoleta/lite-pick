@@ -96,14 +96,20 @@ test('D-lit (K7): README and llms.txt teach Number(process.hrtime.bigint()) as t
     assert.ok(llms.includes(CLOCK), 'llms.txt passes the hrtime clock through Number(...), not a raw BigInt');
 });
 
-test('D-lit (K6): README and llms.txt require the PeakEWMA clock `now` to be >= 0', () => {
-    const PHRASE = 'no busy floor, no pool-mean decay';
+test('D-lit (K6, 1.2.0): README and llms.txt accept a negative / offset PeakEWMA clock; the 1.1.1 caveat is gone', () => {
+    const ACCEPT = 'negative included';
+    const STALE = 'no busy floor, no pool-mean decay';
     const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
     const llms = readFileSync(join(ROOT, 'llms.txt'), 'utf8');
-    assert.ok(readme.includes('`>= 0`') && readme.includes(PHRASE),
-        'README.md must state `now` >= 0 and that a negative clock disables PeakEWMA learning');
-    assert.ok(llms.includes('`>= 0`') && llms.includes(PHRASE),
-        'llms.txt must state `now` >= 0 and that a negative clock disables PeakEWMA learning');
+    const dts = readFileSync(join(ROOT, 'Pick.d.ts'), 'utf8');
+    assert.ok(readme.includes(ACCEPT) && readme.includes('offset'),
+        'README.md must state that any finite `now`, negative / offset included, is accepted');
+    assert.ok(llms.includes(ACCEPT) && llms.includes('offset'),
+        'llms.txt must state that any finite `now`, negative / offset included, is accepted');
+    assert.ok(!readme.includes(STALE), 'README.md still claims a negative clock disables PeakEWMA learning');
+    assert.ok(!llms.includes(STALE), 'llms.txt still claims a negative clock disables PeakEWMA learning');
+    assert.ok(!dts.includes('1.2.0 will reject'), 'Pick.d.ts still promises that 1.2.0 rejects a negative now');
+    assert.ok(dts.includes(ACCEPT), 'Pick.d.ts must state the clock contract: any finite now, negative included');
 });
 
 test('D-lit (K23): Pool.d.ts documents a throwing subscriber as an uncaughtException', () => {

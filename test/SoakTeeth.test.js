@@ -19,9 +19,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import {
     checks, covers, validSpec, GAPS, UNREACHABLE, BREACH_FAMILIES, POOL_ASSERTIONS, QUALITY_KINDS, INCONCLUSIVE_CAUSES, NOTE_GATES,
@@ -188,3 +189,92 @@ test('validSpec: bop>= accepts only a plain non-negative decimal, only on gate=h
     assert.match(String(validSpec(head + 'xyz>=1')), /unknown >= key xyz/);
     assert.match(String(validSpec('gate=gcMajor lane=RoundRobin bop>=0.3')), /bop>= only valid on gate=hotAlloc/);
 });
+
+// --- cross-version lanes (1.2.0 review B1 / B4) -------------------------------------------------------------
+// soak:ab drives the IN-TREE lanes.mjs against the REGISTRY release on side A (SOAK_KERNEL), `--aa` on both
+// sides, and soak:ab:teeth against 1.1.0 on both sides. So every lane invariant must hold on the kernel that
+// is LOADED, not only on the in-tree one: the PeakEWMA invariant may read the K6 `_sampled` bitmap only where
+// it exists, and the CH / BL fail-closed mass must follow the loaded kernel's all-zero-weights rule (1.1.x
+// routes everywhere on equal quotas; 1.2.0 K8 returns PICK_NONE). The soak's chaos `allZero` phase reaches
+// all-zero weights on the keyed lanes via setWeights, so this is a real soak state, not a hypothetical.
+// Each kernel runs in a child process because kernel.mjs resolves SOAK_KERNEL at import time.
+const LANE_PROBE = `
+import { KERNEL_LANES, checkLane, CAP, KEYS } from ${JSON.stringify(pathToFileURL(join(ROOT, 'benchmark', 'soak', 'lanes.mjs')).href)};
+const out = {};
+const lane = (n) => KERNEL_LANES.find((l) => l.name === n);
+try {
+    const L = lane('PeakEWMA');
+    const { b, eligible, inflight } = L.make(0xC0FFEE, CAP, L.m);
+    let now = 0;
+    for (let t = 0; t < 600; t++) {
+        const p = b.pick(now);
+        if (p >= 0) b.recordRtt(p, 1000 + (t & 63) * 37, now);
+        if ((t & 31) === 5) b.setEligible(t & (CAP - 1), false);
+        now += 1000;
+    }
+    const lastPick = b.pick(now);
+    out.PeakEWMA = checkLane(L, { b, cap: CAP, eligible, inflight, weights: null, lastPick });
+    // 1.2.0 review nit: the lane skips its bitmap check when _sampled is undefined, so a renamed field would
+    // silently disable it. Report whether the loaded kernel HAS it, and a must-fail control: _sampled[i] = 2.
+    out.sampledIsU8 = b._sampled instanceof Uint8Array;
+    out.sampledCtl = null;
+    if (b._sampled !== undefined) {
+        b._sampled[3] = 2;
+        out.sampledCtl = checkLane(L, { b, cap: CAP, eligible, inflight, weights: null, lastPick });
+    }
+} catch (e) { out.PeakEWMA = 'THREW ' + e.message; }
+for (const n of ['ConsistentHash', 'BoundedLoad']) {
+    try {
+        const L = lane(n);
+        const { b, eligible, inflight, weights } = L.make(0xC0FFEE, CAP, L.m);
+        weights.fill(0);
+        b.setWeights(weights);                       // the soak's chaos allZero phase, verbatim
+        let bad = null;
+        for (let k = 0; k < 64 && bad === null; k++) {
+            const lastPick = b.pick(KEYS[k] >>> 0);
+            bad = checkLane(L, { b, cap: CAP, eligible, inflight, weights, lastPick });
+        }
+        out[n] = bad;
+    } catch (e) { out[n] = 'THREW ' + e.message; }
+}
+console.log(JSON.stringify(out));
+`;
+function probeLanes(kernelPath) {
+    const env = Object.assign({}, process.env);
+    if (kernelPath) env.SOAK_KERNEL = kernelPath; else delete env.SOAK_KERNEL;
+    delete env.SOAK_POOL;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', LANE_PROBE], { cwd: ROOT, env, encoding: 'utf8', timeout: 60000 });
+    assert.equal(r.status, 0, 'lane probe crashed: ' + r.stderr);
+    return JSON.parse(r.stdout.trim().split('\n').pop());
+}
+// 8c1ecc7 is the pre-1.0.1 kernel soak:teeth's REVERT control drives through these lanes: it predates the
+// 1.0.1 `_samp` pool mean as well as K6, and has no setWeights (the control shims it), so only its PeakEWMA
+// lane is probed here -- the CH / BL all-zero path is the control's own job.
+for (const [label, rev] of [['1.0.0 (8c1ecc7)', '8c1ecc7'], ['1.1.0 (2a08567)', '2a08567'], ['1.1.1 (7ff60f5)', '7ff60f5'], ['in-tree', null]]) {
+    test('soak lanes hold on the ' + label + ' kernel: PeakEWMA + all-zero CH/BL checkLane -> null, never throws', () => {
+        let dir = null, path = null;
+        if (rev !== null) {
+            const g = spawnSync('git', ['show', rev + ':Pick.js'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 });
+            assert.equal(g.status, 0, 'git show ' + rev + ':Pick.js failed (CI needs fetch-depth 0): ' + g.stderr);
+            dir = mkdtempSync(join(tmpdir(), 'lanes-xver-'));
+            path = join(dir, 'Pick.js');
+            writeFileSync(path, g.stdout);
+        }
+        try {
+            const got = probeLanes(path);
+            if (rev === '8c1ecc7') assert.equal(got.PeakEWMA, null, label + ': the PeakEWMA lane check must not throw');
+            else assert.deepEqual({ PeakEWMA: got.PeakEWMA, ConsistentHash: got.ConsistentHash, BoundedLoad: got.BoundedLoad },
+                { PeakEWMA: null, ConsistentHash: null, BoundedLoad: null });
+            if (rev === null) {
+                // The in-tree kernel HAS the K6 bitmap (a renamed field would make lanes.mjs skip the check), and
+                // the lane check has teeth: a _sampled byte of 2 is a non-null violation.
+                assert.equal(got.sampledIsU8, true, 'in-tree PeakEWMA must have a Uint8Array _sampled');
+                assert.match(String(got.sampledCtl), /_sampled\[3\] is 2/, 'must-fail control: _sampled[3] = 2 is caught');
+            } else {
+                assert.deepEqual([got.sampledIsU8, got.sampledCtl], [false, null], label + ' predates K6: no _sampled, check skipped');
+            }
+        } finally {
+            if (dir !== null) rmSync(dir, { recursive: true, force: true });
+        }
+    });
+}

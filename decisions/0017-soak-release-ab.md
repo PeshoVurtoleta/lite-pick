@@ -1,7 +1,7 @@
 # 0017 -- Release-time relative soak A/B (#8b)
 
 - Status: Accepted
-- Package: @zakkster/lite-pick (benchmark-only; first gates 1.1.1)
+- Package: @zakkster/lite-pick (benchmark-only; first gates 1.2.0 -- 1.1.1 got a post-publish record, Amendment 1)
 - Builds on: ADR 0014 (the soak redesign -- reused unchanged for both sides; see its 2026-10-06 amendment
   for the two selector knobs and three exports this ADR needs).
 - Research: `research/soak-release-ab.md` (decisions R1-R9 section 8; user decisions section 10, 2026-10-06).

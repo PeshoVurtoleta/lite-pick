@@ -36,6 +36,8 @@ const POOL = readFileSync(join(ROOT, 'Pool.js'), 'utf8');
 const REAL_PICK_URL = pathToFileURL(join(ROOT, 'Pick.js')).href;   // scratch Pool imports the REAL kernel
 const TMP = mkdtempSync(join(tmpdir(), 'litepick-mutant-'));
 process.on('exit', () => { try { rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ } });
+// The mutant kernels / pools below are plain .js: Node 18 has no module-type detection, so mark TMP as ESM.
+writeFileSync(join(TMP, 'package.json'), '{"type":"module"}');
 // Children run on THIS node binary (so `PATH=<node22>/bin node _mustfail.mjs` tests node 22 end to end),
 // each bounded by a timeout (a hung child is a MISS, never a hung battery). PL/ML take ~16 min each.
 const NODE = process.execPath;

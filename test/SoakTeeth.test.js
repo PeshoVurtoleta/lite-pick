@@ -257,6 +257,8 @@ for (const [label, rev] of [['1.0.0 (8c1ecc7)', '8c1ecc7'], ['1.1.0 (2a08567)', 
             const g = spawnSync('git', ['show', rev + ':Pick.js'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 });
             assert.equal(g.status, 0, 'git show ' + rev + ':Pick.js failed (CI needs fetch-depth 0): ' + g.stderr);
             dir = mkdtempSync(join(tmpdir(), 'lanes-xver-'));
+            // Node 18 has no module-type detection: without this a temp-dir Pick.js parses as CommonJS.
+            writeFileSync(join(dir, 'package.json'), '{"type":"module"}');
             path = join(dir, 'Pick.js');
             writeFileSync(path, g.stdout);
         }

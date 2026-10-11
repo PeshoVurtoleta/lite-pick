@@ -112,6 +112,8 @@ async function kernelAt(rev) {
     assert.equal(g.status, 0, 'git show ' + rev + ':Pick.js failed (CI needs fetch-depth 0): ' + g.stderr);
     const dir = mkdtempSync(join(tmpdir(), 'oracle-xver-'));
     try {
+        // Node 18 has no module-type detection: without this a temp-dir Pick.js parses as CommonJS.
+        writeFileSync(join(dir, 'package.json'), '{"type":"module"}');
         writeFileSync(join(dir, 'Pick.js'), g.stdout);
         return await import(pathToFileURL(join(dir, 'Pick.js')).href);
     } finally { rmSync(dir, { recursive: true, force: true }); }

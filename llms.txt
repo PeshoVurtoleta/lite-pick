@@ -1,6 +1,6 @@
 # @zakkster/lite-pick
 
-Version: 1.1.1
+Version: 1.2.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,6 +14,10 @@ reading pre-allocated views that siblings or the caller write, and returning an 
 The complementary evidence lite-pick ships is a measured balance-quality anchor (peak-to-
 average load vs the strategy's theoretical ceiling) alongside the 0 B/op pick witness.
 
+1.2.0 -- opt-in random ties for LeastConn/SED/NQ (`{ ties: 'random', seed }`), `weightOf(i)`, a frozen
+runtime `CODES` map, PeakEWMA on any finite (negative / offset) clock (K6), all-zero CH/BL weights fail closed
+(K8), /pool failover by weight among untried backends (K10), coded errors for non-number indices on the
+throwing APIs, setWeights no-op skip -- CHANGELOG [1.2.0], no breaking change -- on top of
 1.1.1 -- kernel correctness pass (WeightedRandom cached eligible-weight sum + element-wise assertConsistent,
 overlap-safe setWeights, ConsistentHash/BoundedLoad table-size bound m <= 2^31-1), type/doc fixes, StreamParity
 goldens, and the release-time soak A/B gate (decisions/0017) -- CHANGELOG [1.1.1] -- on top of
@@ -139,8 +143,10 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   with keeps its class (TypeError / RangeError / Error) and carries `code`: `LITE_PICK_CAPACITY`,
   `LITE_PICK_ARRAY` (wrong typed array / too short / bad stats slab), `LITE_PICK_INDEX`,
   `LITE_PICK_WEIGHT`, `LITE_PICK_OPTION` (constructor / run option: tauNs, M, eps, minCap,
-  failurePenaltyNs), `LITE_PICK_ARGUMENT` (recordRtt sample / now, note delta, Pool.run fn, Pool's
-  balancer, liteQueryFetcher args), `LITE_PICK_ABSTRACT`, `LITE_PICK_INCONSISTENT` (assertConsistent);
+  failurePenaltyNs; the 1.2.0 LeastConn / SED / NQ `TieOptions`: a bad `ties` or `seed` VALUE is a
+  RangeError, a non-plain options object, an unknown key or an accessor key is a TypeError),
+  `LITE_PICK_ARGUMENT` (recordRtt sample / now, note delta, Pool.run fn, Pool's balancer,
+  liteQueryFetcher args), `LITE_PICK_ABSTRACT`, `LITE_PICK_INCONSISTENT` (assertConsistent);
   /pool adds `LITE_PICK_KEY_REQUIRED`, `LITE_PICK_CLOCK_REQUIRED`, `LITE_PICK_CLOCK_INVALID`,
   `LITE_PICK_ABORTED`, `LITE_PICK_NONE`, `LITE_PICK_FEEDBACK`. Type: `LitePickErrorCode`.
 - `CODES` (1.2.0) -- a FROZEN runtime map of those 14 codes, value === key (`CODES.LITE_PICK_INDEX ===

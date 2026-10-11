@@ -20,7 +20,9 @@ export const PICK_NONE: -1;
  * The stable `code` on every error lite-pick throws or rejects with (1.1.0). Messages may change in any
  * release; codes are semver API. The error CLASS is stable: `TypeError` ONLY when a required numeric option
  * or argument is not a number (tauNs / table size M / eps / minCap / note's delta / recordRtt's sample or
- * clock), and when `Pool` / `liteQueryFetcher` get a non-function or a structurally-invalid balancer;
+ * clock), when a LeastConn / SED / NQ `TieOptions` argument is not a plain object, has an unknown key or an
+ * accessor key (`LITE_PICK_OPTION`; a bad `ties` / `seed` VALUE is a RangeError), and when `Pool` /
+ * `liteQueryFetcher` get a non-function or a structurally-invalid balancer;
  * `RangeError` for an out-of-range or out-of-domain VALUE (index -- an index of ANY non-number type, BigInt and
  * Symbol included, is a RangeError `LITE_PICK_INDEX`, never a TypeError; capacity, weight, a non-finite or negative
  * number, an option outside its domain) AND for a typed-array argument of the wrong type or too short

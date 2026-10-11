@@ -6,11 +6,15 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
-Shipped kernel changes -- 1.2.0 material (Pick.js, Pool.js, Pick.d.ts, Pool.d.ts; soak parity.json hashes re-pinned; StreamParity unchanged).
-1.2.0 has NO breaking change. Two behaviour changes, both fixes: K8 (ConsistentHash / BoundedLoad all-zero weights
-now return `PICK_NONE`, as the documented weight-0 rule always said; see "Weights, CODES") and /pool failover (K10 + weight 0:
+## [1.2.0] - 2026-10-11
+
+Shipped kernel changes (Pick.js, Pool.js, Pick.d.ts, Pool.d.ts; soak parity.json hashes re-pinned; StreamParity unchanged).
+1.2.0 has NO breaking change. Three behaviour changes, all fixes: K8 (ConsistentHash / BoundedLoad all-zero weights
+now return `PICK_NONE`, as the documented weight-0 rule always said; see "Weights, CODES"), /pool failover (K10 + weight 0:
 the failover target is now one weighted choice among untried backends, and a run with no positive-weight untried
-backend stops with the last error instead of dispatching to an eligible weight-0 backend; see Fixed). The hard
+backend stops with the last error instead of dispatching to an eligible weight-0 backend; see Fixed) and non-number
+indices (a BigInt / Symbol index now throws the coded `RangeError` `LITE_PICK_INDEX` instead of V8's uncoded
+`TypeError`, `isEligible` returns `false` instead of throwing, `ewmaAt` returns `NaN`; see Fixed). The hard
 `M <= 2^24` table-size cap is deferred to 2.0 (SemVer: 1.1.1 documented `M <= 2^31 - 1`). The soak:ab entries
 under Changed and Fixed are benchmark / CI only and touch no shipped file.
 
@@ -51,7 +55,7 @@ under Changed and Fixed are benchmark / CI only and touch no shipped file.
   backend's neighbour no longer takes ~2x the spill (measured 1.75x at cap 8, ~2x at cap 64 before), and a removed
   (weight-0) backend is never chosen; with no positive-weight untried backend left the run stops and surfaces the
   last error (same rule as K8). Measured before -> after: the failed backend's neighbour took 1.75x of uniform at
-  cap 8 and ~2x at cap 64, now 1.01x and ~1.0x; weight-0 dispatches on attempt 1 were 100% / 52.6%, now 0%. Replaces the phase-1 KNOWN note. ADR 0007 Fork 2 / ADR 0013 M2 amendments 2026-10-11.
+  cap 8 and ~2x at cap 64, now ~1.0x at both (re-measured at release, 8 homes x 20000 keys: 1.00x / 0.98x); weight-0 dispatches on attempt 1 were 100% / 52.6%, now 0%. ADR 0007 Fork 2 / ADR 0013 M2 amendments 2026-10-11.
 - **A BigInt / Symbol index now throws the coded `RangeError` `LITE_PICK_INDEX`.** `_vIdx` (shared by
   `setEligible`, `setWeight`, `weightOf`, `recordRtt`, `recordRttFrom`, `note`) ran `i >>> 0` first, so `0n` threw
   V8's uncoded `TypeError` ('Cannot mix BigInt and other types'), a Symbol threw 'Cannot convert a Symbol value to
@@ -88,7 +92,6 @@ under Changed and Fixed are benchmark / CI only and touch no shipped file.
   coverage tests. `_mustfail.mjs` and `_ab-teeth.mjs` now write once and exit from the write callback, and
   both listings end with a `{"end":true,"count":N}` sentinel that `SoakTeeth` / `SoakAB` require, so a
   truncated list fails as truncated.
-
 - **The soak lanes now hold on the kernel they LOAD, not only the in-tree one** (benchmark-only). soak:ab
   runs the in-tree `lanes.mjs` against the registry release on side A (and on both sides for `--aa` and
   soak:ab:teeth), but the K6 PeakEWMA invariant read the 1.2.0-only `_sampled` bitmap (a TypeError at the
@@ -126,9 +129,6 @@ under Changed and Fixed are benchmark / CI only and touch no shipped file.
   `recordRttFrom` lanes on a -1.7e15 clock and gates the `_sampled` buffer identity.
 
 ### Weights, CODES
-
-Shipped-code changes (Pick.js, Pool.js, Pick.d.ts, Pool.d.ts; soak parity.json hashes re-pinned; StreamParity unchanged). Minor-bump material: one
-new runtime export and one behaviour change that is a fix (K8). No breaking change.
 
 - **Behaviour change (fix, K8): ConsistentHash / BoundedLoad all-zero weights now fail closed.** Weight 0 removes
   a backend (README "Drain vs remove", decisions/0010), and the 1.1.1 docs promised fail closed when every

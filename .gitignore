@@ -5,3 +5,6 @@
 # `npm run bench:report`. Only the per-run generated logs below are ignored.
 /benchmark/report.html
 /benchmark/out
+
+# Burst-session handoff (local only; see ~/.claude/CLAUDE.md "Burst sessions")
+/.handoff/

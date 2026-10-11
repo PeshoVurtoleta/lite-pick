@@ -182,6 +182,12 @@ export class SmoothWRRBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, weights: Uint32Array);
     /** Cold path: reconfigure endpoint `i`'s weight, keeping the eligible-weight total exact. */
     setWeight(i: number, w: number): void;
+    /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the live caller-owned `weights[i]`.
+     * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     */
+    weightOf(i: number): number;
     /** Next endpoint by smooth weighting, or `PICK_NONE` when the eligible-weight sum is 0. */
     pick(): number;
     /** Snapshot: plus the weights (a copy) and the cached eligible-weight total. */
@@ -209,11 +215,30 @@ export class P2cBalancer extends BalancerBase {
 }
 
 /**
+ * Trailing options of LeastConnBalancer / SedBalancer / NqBalancer (1.2.0). Validated fail-closed
+ * (`LITE_PICK_OPTION`): a plain object only (null / undefined = defaults), each key an OWN DATA property read
+ * once (inherited values are ignored, accessors throw), an unknown key throws with a did-you-mean hint.
+ */
+export interface TieOptions {
+    /**
+     * 'rotate' (default): the 1.1.0 rotating cursor -- deterministic, byte-identical to 1.1.x.
+     * 'random' (opt-in): a seeded UNIFORM draw among the tied minima (a skip-based reservoir, ~ln k PRNG
+     * steps per k-way tie, 0 B/op; uniform up to the 2^-32 draw grid, max abs error ~5e-10 at k = 128) --
+     * removes the cursor's small positional bias under load (K3). A 'random' instance carries an own `pick`
+     * (a different hidden class from a default instance): do not mix modes at one hot call site.
+     */
+    ties?: 'rotate' | 'random';
+    /** PRNG seed for 'random' (integer in [0, 2^32 - 1], default 0x9e3779b9; 0 maps to the default, as Prng); unused by 'rotate'. */
+    seed?: number;
+}
+
+/**
  * LeastConnBalancer -- EXACT fewest-in-flight (M4, IPVS `lc`). A full O(cap) scan of the
  * caller-owned in-flight view returning the eligible node with the lowest count -- the deterministic
  * complement to P2C's O(1) approximation. Ties ROTATE (1.1.0): a cursor moves past each pick, so tied
  * nodes take turns (1.0.x gave every tie to the lowest index -- at low load one node took all traffic);
- * do not depend on WHICH tied node wins. In-flight counts are
+ * do not depend on WHICH tied node wins. Opt-in `{ ties: 'random', seed }` (1.2.0) makes ties a seeded
+ * uniform draw instead (see `TieOptions`). In-flight counts are
  * caller-owned and read LIVE (no `setWeight`, no derived aggregate). 0 B/op. Fails closed
  * (`PICK_NONE`) when the whole pool is down.
  */
@@ -222,19 +247,21 @@ export class LeastConnBalancer extends BalancerBase {
      * @param capacity endpoint count (fixed).
      * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read live.
+     * @param opts 1.2.0 `{ ties?, seed? }` -- see `TieOptions` (undefined / null: rotating ties).
      */
-    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array);
+    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, opts?: TieOptions | null);
     /** The eligible node with the fewest in-flight requests, or `PICK_NONE`. O(cap). */
     pick(): number;
-    /** Snapshot: plus the total in flight and the tie cursor. */
-    describe(): BalancerDescription & { strategy: 'LeastConn'; inflight: number; tieCursor: number };
+    /** Snapshot: plus the total in flight, the tie mode (1.2.0) and the tie cursor (-1 = not applicable in 'random' mode). */
+    describe(): BalancerDescription & { strategy: 'LeastConn'; inflight: number; ties: 'rotate' | 'random'; tieCursor: number };
 }
 
 /**
  * SedBalancer -- shortest-expected-delay (M4, IPVS `sed`). Returns the eligible, positive-weight
  * node minimizing `(inflight + 1) / weight`; converges to load proportional-to-weight. BOTH
  * inflight and weights are caller-owned Uint32Arrays, read LIVE (no `setWeight`, no derived
- * aggregate). A weight-0 eligible node is not a candidate. Ties among equal scores rotate (1.1.0).
+ * aggregate). A weight-0 eligible node is not a candidate. Ties among equal scores rotate (1.1.0), or are
+ * a seeded uniform draw with the opt-in `{ ties: 'random' }` (1.2.0, `TieOptions`).
  * O(cap), 0 B/op. Fails closed (`PICK_NONE`) when no eligible node has a positive weight.
  */
 export class SedBalancer extends BalancerBase {
@@ -243,18 +270,27 @@ export class SedBalancer extends BalancerBase {
      * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read live.
      * @param weights per-endpoint weights (length >= capacity), caller-owned, read live.
+     * @param opts 1.2.0 `{ ties?, seed? }` -- see `TieOptions` (undefined / null: rotating ties).
      */
-    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array);
+    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array, opts?: TieOptions | null);
     /** The eligible node minimizing (inflight+1)/weight, or `PICK_NONE`. O(cap). */
     pick(): number;
-    /** Snapshot: plus the total in flight, the weights (a copy) and the tie cursor. */
-    describe(): BalancerDescription & { strategy: 'SED'; inflight: number; weights: number[]; tieCursor: number };
+    /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the live caller-owned `weights[i]`.
+     * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     */
+    weightOf(i: number): number;
+    /** Snapshot: plus the total in flight, the weights (a copy), the tie mode (1.2.0) and the tie cursor (-1 in 'random' mode). */
+    describe(): BalancerDescription & { strategy: 'SED'; inflight: number; weights: number[]; ties: 'rotate' | 'random'; tieCursor: number };
 }
 
 /**
  * NqBalancer -- never-queue (M4, IPVS `nq`). Returns an idle eligible positive-weight node
  * (in-flight 0) if one exists -- idle nodes take turns (1.1.0 rotating cursor) -- else the SED minimum
- * (ties rotate) -- the worker-pool fit. BOTH inflight and weights are caller-owned, read LIVE. O(cap)
+ * (ties rotate) -- the worker-pool fit. Opt-in `{ ties: 'random' }` (1.2.0, `TieOptions`): a uniformly random
+ * idle node (up to 4 uniform draws, then the scan), else a uniform draw among the SED minima. BOTH inflight
+ * and weights are caller-owned, read LIVE. O(cap)
  * worst case, 0 B/op. Fails closed (`PICK_NONE`) when no eligible node has a positive weight.
  */
 export class NqBalancer extends BalancerBase {
@@ -263,12 +299,19 @@ export class NqBalancer extends BalancerBase {
      * @param eligible shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param inflight per-endpoint in-flight counts (length >= capacity), caller-owned, read live.
      * @param weights per-endpoint weights (length >= capacity), caller-owned, read live.
+     * @param opts 1.2.0 `{ ties?, seed? }` -- see `TieOptions` (undefined / null: rotating ties).
      */
-    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array);
-    /** The first idle eligible node, else the SED minimum, or `PICK_NONE`. O(cap). */
+    constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, weights: Uint32Array, opts?: TieOptions | null);
+    /** An idle eligible node (rotate: the next after the cursor; random: uniform), else the SED minimum, or `PICK_NONE`. O(cap). */
     pick(): number;
-    /** Snapshot: plus the total in flight, the weights (a copy) and the tie cursor. */
-    describe(): BalancerDescription & { strategy: 'NQ'; inflight: number; weights: number[]; tieCursor: number };
+    /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the live caller-owned `weights[i]`.
+     * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     */
+    weightOf(i: number): number;
+    /** Snapshot: plus the total in flight, the weights (a copy), the tie mode (1.2.0) and the tie cursor (-1 in 'random' mode). */
+    describe(): BalancerDescription & { strategy: 'NQ'; inflight: number; weights: number[]; ties: 'rotate' | 'random'; tieCursor: number };
 }
 
 /**
@@ -382,6 +425,12 @@ export class ConsistentHashBalancer extends BalancerBase {
     readonly tableSize: number;
     /** Cold path: reconfigure backend `i`'s weight (uint32) and rebuild the table. */
     setWeight(i: number, w: number): void;
+    /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the balancer-owned copy the table routes on (BoundedLoad inherits it).
+     * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     */
+    weightOf(i: number): number;
     /**
      * Cold path (1.1.0): replace ALL weights (copied, length >= capacity) and rebuild the table ONCE --
      * the batch form of `setWeight`. Validated before any write; throws RangeError on a bad array.
@@ -501,6 +550,12 @@ export class WeightedRandomBalancer extends BalancerBase {
     constructor(capacity: number, eligible: Uint8Array, weights: Uint32Array, seed?: number);
     /** Cold path: reconfigure endpoint `i`'s weight (uint32) and rebuild the alias table. */
     setWeight(i: number, w: number): void;
+    /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the live caller-owned `weights[i]`. The alias table routes on the last build.
+     * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     */
+    weightOf(i: number): number;
     /**
      * Cold path (1.1.0): replace ALL weights (copied into the weights array this balancer was built with,
      * length >= capacity) and rebuild the alias table ONCE. Validated before any write. 1.2.0: when the copied

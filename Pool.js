@@ -10,13 +10,14 @@
  * this separate subpath file (the lite-query precedent: /stream, /await are subpath entries).
  *
  * BOUNDARY (decisions/0007): Pool owns SPATIAL failover -- try up to `tries` DISTINCT endpoints,
- * once each, on a thrown error. It does NOT own TEMPORAL retry (backoff, staleness) -- that
+ * once each, on a thrown error (1.2.0: a fallback failover target is a WEIGHTED choice among the untried,
+ * eligible, positive-weight endpoints -- never a weight-0 one, no neighbour preference). It does NOT own TEMPORAL retry (backoff, staleness) -- that
  * belongs to the caller / a query cache (lite-query's `retry`). The two never double-own: Pool
  * moves ACROSS the pool once; the caller retries the whole operation over TIME.
  *
  * ZERO-GC boundary: the kernel `pick()` is 0 B/op. Pool.run is a normal async function and is NOT. A run
- * that SETTLES ON ATTEMPT 0 (any `tries` value) costs ~900 B/run (Node 22 v22.23.3, Pool's own share
- * above the bare-await driver floor, by scavenge count; `npm run bench:pool`), gated <= 912 B/run; each
+ * that SETTLES ON ATTEMPT 0 (any `tries` value) costs ~888 B/run (Node 22 v22.23.3, Pool's own share
+ * above the bare-await driver floor, by scavenge count; `npm run bench:pool`), gated <= 896.3 B/run; each
  * extra failover attempt adds ~375 B/run and is gated too (test/perf/PoolCost.test.mjs). A latency-aware
  * balancer (PeakEWMA) driven by an epoch-ns `clock` costs ~32 B/run more per attempt (Node 22; the clock
  * reading boxes, read twice per successful attempt) and is gated on its own `clocked` row. (Abort before
@@ -116,32 +117,75 @@ function _pubSettleAbort(pool, endpoint, attempt, error) { _pubSettle(pool, endp
 
 /**
  * Distinct-endpoint re-pick bound (M2): after a failed attempt Pool re-picks up to this many times
- * while the strategy keeps returning an already-tried endpoint, before falling back to a linear scan
- * for an eligible UNTRIED endpoint. Small: `tries` is small, and a keyed/deterministic strategy that
- * always returns the same backend hits the scan after this bound rather than spinning.
+ * while the strategy keeps returning an already-tried endpoint, before falling back to a weighted
+ * choice among the UNTRIED endpoints (`_chooseUntried`). Small: `tries` is small, and a keyed/deterministic
+ * strategy that always returns the same backend reaches the fallback after this bound rather than spinning.
  */
 const REPICK_LIMIT = 8;
 
 /**
- * Cold failover fallback (M2): the first ELIGIBLE endpoint NOT already tried this run, scanning the
- * capacity from a rotating start (`from`) so failover does not always favour low indices. Uses the
- * balancer's own `isEligible` (duck-typed; if absent, no scan is possible -> PICK_NONE). Returns
- * PICK_NONE when every eligible endpoint has already been tried -- the caller then stops failing over
- * rather than re-dispatching to an endpoint that already failed this run.
- * @param {{ capacity: number, isEligible?(i: number): boolean }} b
- * @param {number[]} tried  endpoints already dispatched this run
- * @param {number} from  rotating scan start
+ * Cold failover fallback (M2; 1.2.0 K10 + weight 0): ONE weighted choice among the endpoints that are
+ * ELIGIBLE (`balancer.isEligible`), NOT already tried this run (`held`), and of POSITIVE weight
+ * (`balancer.weightOf(i)`, duck-typed: a balancer without it counts every endpoint as weight 1; a
+ * result that is not a finite number > 0 -- 0, negative, NaN, Infinity, a non-number -- is not a
+ * candidate). Pass 1 sums the candidates' weights W; pass 2 walks the SAME order and returns the
+ * candidate whose running sum first exceeds the target t = (h / 2^32) x W, falling back to the last
+ * candidate (a duck-typed weightOf that changes between the passes). So the spill is weight-
+ * proportional over the survivors with no neighbour preference (the 1.1.x linear scan handed the failed
+ * node's next neighbour a double share -- K10), and a weight-0 (removed, K8) endpoint is never chosen.
+ *
+ * TARGET: h = fmix32(k32 ^ imul(attempt, 0x9e3779b9)) -- MurmurHash3's finalizer, a bijection on 32 bits
+ * and a different mixer from ConsistentHash's key hash. k32 = key >>> 0 for a numeric key (stable per
+ * key and attempt -> a key's failover target is cache-friendly while the pool is unchanged, and spread
+ * ACROSS keys) and the per-Pool `_failSeq` counter otherwise (an unkeyed run; a fresh Pool replays the
+ * same sequence). Over uniform k32, |P(i) - w_i / W| <= 2^-30 for integer weights with W <= 2^53 (the
+ * comparison t < running-sum equals floor(t) < running-sum for integer sums, and stays exact-in-
+ * proportion for fractional weights where a floor would not).
+ *
+ * Returns PICK_NONE when W is 0 (no positive-weight untried eligible endpoint), when W is not finite,
+ * or when the balancer has no `isEligible` -- the run then stops failing over and surfaces the last
+ * error (the same fail-closed rule K8 applies to the first pick). Two O(cap) passes on the COLD
+ * failover path only; zero allocation (no array, no closure): every argument is a tagged value and h,
+ * W, t and the running sum are locals. A weightOf result crossing the non-inlined call may box (~16 B
+ * HeapNumber): a value >= 2^31 on 64-bit Node without pointer compression, >= 2^30 on Chrome / Electron
+ * (31-bit Smis); a fractional duck weight is a HeapNumber too -- on this cold path only, never on a
+ * successful run. A THROWING weightOf (or isEligible) propagates: the run rejects with THAT error, not
+ * attempt 0's, and every in-flight count it raised is released (net-zero, the finally block).
+ * @param {{ capacity: number, isEligible?(i: number): boolean, weightOf?(i: number): number }} b
+ * @param {number[]} held  endpoints already dispatched this run
+ * @param {unknown} key  the run's routing key (a number keys the target; anything else uses `seq`)
+ * @param {number} seq  the advanced per-Pool `_failSeq` (Smi) for an unkeyed run, else 0
+ * @param {number} attempt  the attempt being chosen (>= 1)
  * @returns {number}
  */
-function _scanUntried(b, tried, from) {
+function _chooseUntried(b, held, key, seq, attempt) {
     if (typeof b.isEligible !== 'function') return PICK_NONE;
-    const cap = b.capacity;
-    for (let s = 0; s < cap; s++) {
-        let idx = from + s;
-        if (idx >= cap) idx -= cap;
-        if (b.isEligible(idx) && tried.indexOf(idx) < 0) return idx;
+    const cap = b.capacity, hasW = typeof b.weightOf === 'function';
+    let W = 0;
+    for (let i = 0; i < cap; i++) {
+        if (b.isEligible(i) && held.indexOf(i) < 0) {
+            const w = hasW ? b.weightOf(i) : 1;
+            if (typeof w === 'number' && w > 0 && w < Infinity) W += w;
+        }
     }
-    return PICK_NONE;
+    if (!(W > 0 && W < Infinity)) return PICK_NONE;   // nothing positive left (or a non-finite sum): stop
+    let h = (typeof key === 'number' ? key >>> 0 : seq) ^ Math.imul(attempt, 0x9e3779b9);
+    h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b);
+    h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
+    h ^= h >>> 16;
+    const t = ((h >>> 0) / 4294967296) * W;
+    let run = 0, last = PICK_NONE;
+    for (let i = 0; i < cap; i++) {
+        if (b.isEligible(i) && held.indexOf(i) < 0) {
+            const w = hasW ? b.weightOf(i) : 1;
+            if (typeof w === 'number' && w > 0 && w < Infinity) {
+                run += w;
+                last = i;
+                if (t < run) return i;
+            }
+        }
+    }
+    return last;
 }
 
 /**
@@ -209,7 +253,7 @@ export class Pool {
         }
         this._b = balancer;
         this._inflight = inflight;
-        this._scanCursor = 0;   // rotating failover-scan start for UNKEYED runs (spreads across runs)
+        this._failSeq = 0;   // 1.2.0: unkeyed failover target sequence (Smi; advanced per fallback choice)
     }
 
     /** The wrapped balancer. */
@@ -231,12 +275,13 @@ export class Pool {
      *
      * DISTINCT FAILOVER (M2): the endpoints already tried this run are tracked; after a failure Pool
      * re-picks while the strategy repeats a tried endpoint (bounded by REPICK_LIMIT), then falls back
-     * to a scan for an eligible UNTRIED endpoint (`balancer.isEligible`). The scan start is derived
-     * from the KEY for a keyed run (deterministic per key -> a key's failover target is stable and
-     * cache-friendly, but spread ACROSS keys so one failing backend does not funnel every key onto a
-     * single neighbour) and from a rotating per-Pool cursor for an unkeyed run. If no untried eligible
-     * endpoint exists it stops failing over -- never re-dispatching to an endpoint that already failed
-     * this run.
+     * to ONE weighted choice among the UNTRIED endpoints that are eligible (`balancer.isEligible`) and of
+     * positive weight (`balancer.weightOf`, 1.2.0; absent -> weight 1). The choice's target is derived
+     * from (KEY, attempt) for a keyed run (deterministic -> a key's failover target is stable and
+     * cache-friendly, spread weight-proportionally ACROSS keys with no neighbour preference) and from
+     * (a per-Pool sequence, attempt) for an unkeyed run. If no untried eligible positive-weight endpoint
+     * exists it stops failing over and surfaces the last error -- never re-dispatching to an endpoint
+     * that already failed this run, never dispatching to a weight-0 (removed) one.
      *
      * CHANNELS (M3), read off the strategy's static markers so Pool stays duck-typed:
      *   - A KEYED balancer (`constructor.KEYED === true`: ConsistentHash / BoundedLoad) REQUIRES a
@@ -390,17 +435,16 @@ export class Pool {
                     // 1 and reallocate on the first failover push, costing MORE than the pre-F1 [] + push.
                     if (held === null) { held = []; held.push(e0); noteApplied = []; noteApplied.push(n0); }
                     // M2: genuinely DISTINCT failover. Re-pick while the result repeats a tried
-                    // endpoint (bounded), then a scan for an eligible UNTRIED endpoint from a start that
-                    // is key-derived (keyed: stable per key, spread across keys) or cursor-rotated.
+                    // endpoint (bounded), then ONE weighted choice among the untried, eligible, positive-
+                    // weight endpoints, targeted by (key, attempt) or (per-Pool sequence, attempt).
                     for (let g = 0; i !== PICK_NONE && held.indexOf(i) >= 0 && g < REPICK_LIMIT; g++) {
                         i = useKey ? b.pick(key) : (useNow ? b.pick(now) : b.pick());
                     }
                     if (i === PICK_NONE || held.indexOf(i) >= 0) {
-                        const cap = b.capacity;
-                        const from = typeof key === 'number'
-                            ? (Math.imul(key >>> 0, 0x9e3779b1) >>> 0) % cap
-                            : (this._scanCursor = (this._scanCursor + 1) & 0x3fffffff) % cap;   // stays an SMI
-                        i = _scanUntried(b, held, from);
+                        // seq: the advanced per-Pool _failSeq (stays a Smi) for an unkeyed run, else 0. Passed
+                        // INLINE, not via a block-scoped const: the const measured +11.2 B/run on the attempt-0
+                        // path (L3, Node 26.8.2) although this branch never runs there.
+                        i = _chooseUntried(b, held, key, typeof key === 'number' ? 0 : (this._failSeq = (this._failSeq + 1) & 0x3fffffff), attempt);
                     }
                 }
                 if (i === PICK_NONE) {
@@ -409,7 +453,7 @@ export class Pool {
                         e.code = 'LITE_PICK_NONE';
                         throw e;
                     }
-                    break;   // no distinct untried endpoint left: surface the last error
+                    break;   // no untried eligible positive-weight endpoint left: surface the last error
                 }
 
                 inflight[i] = (inflight[i] + 1) >>> 0;

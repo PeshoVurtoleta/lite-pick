@@ -569,6 +569,108 @@ process.stdout.write('lite-pick balance (M10: WeightedRandom -- weighted-random 
     }
 }
 
+// --- TIE FAIRNESS (1.2.0, K3): the rotating cursor's positional bias vs `ties: 'random'` ---------------
+// Model c (M/M/w): a node of weight w has w parallel slots of service rate 1; Poisson arrivals at 0.9 of
+// total capacity; a seeded xorshift32 discrete-event sim (the repro/sim.mjs model, ported). Layouts
+// [1,1,1,1,4,4,4,4] and its reverse. Metric = within-group spread = max - min share (pp) inside each
+// equal-weight group, mean over 4 seeds (sd*7919+11), worst group reported. Nodes in a group are
+// statistically identical, so ANY spread beyond noise is tie-break bias.
+//   Noise: a node share has seed-to-seed sd ~0.02 pp at 2e6 arrivals; a 4-node spread of 4-seed means
+//   has expected noise ~0.03-0.05 pp. GATE 'random' <= 0.12 pp (>= 2x the noise ceiling).
+//   MUST-FAIL CONTROL: the default 'rotate' must show worst spread >= 0.18 pp for each strategy in at
+//   least one layout (repro: NQ ~0.35, LC ~0.25, SED ~0.24) -- else the gate FAILS (no vacuous pass).
+process.stdout.write("lite-pick balance (K3: tie fairness -- 'rotate' control vs 'random')\n");
+{
+    const TF_ARR = 2_000_000, TF_WARM = 20000, TF_SEEDS = 4, TF_GATE = 0.12, TF_CTRL = 0.18;
+    const tfLayouts = [[1, 1, 1, 1, 4, 4, 4, 4], [4, 4, 4, 4, 1, 1, 1, 1]];
+    const tfNames = ['LeastConn', 'SED', 'NQ'];
+    let tfState = 1;
+    const tfRnd = () => { let s = tfState; s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; tfState = s; return s; };
+    const tfSeed = (x) => { tfState = (Math.imul(x, 0x9e3779b1) ^ 0x85ebca6b) >>> 0 || 1; for (let i = 0; i < 8; i++) tfRnd(); };
+    const tfU = () => (tfRnd() + 0.5) / 4294967296;
+
+    // One run -> per-node shares (Float64Array). Allocation-light: typed arrays only, no per-event objects.
+    function tfRun(name, mode, W, sd) {
+        const cap = W.length;
+        tfSeed(sd * 7919 + 11);
+        const el = new Uint8Array(cap).fill(1), inf = new Uint32Array(cap), wt = Uint32Array.from(W);
+        // Balancer seed is MIXED (a raw small seed gives weak first draws); the sim stream keeps the repro seed.
+        const opts = mode === 'random' ? { ties: 'random', seed: (Math.imul(sd * 7919 + 11, 0x9e3779b1) ^ 0x85ebca6b) >>> 0 } : undefined;
+        const b = name === 'NQ' ? new NqBalancer(cap, el, inf, wt, opts)
+            : name === 'SED' ? new SedBalancer(cap, el, inf, wt, opts)
+            : new LeastConnBalancer(cap, el, inf, opts);
+        let totCap = 0; for (let i = 0; i < cap; i++) totCap += W[i];
+        const lambda = 0.9 * totCap;
+        const cnt = new Float64Array(cap);
+        let arr = 0, measured = 0, bad = 0;
+        while (arr < TF_ARR + TF_WARM) {
+            let tot = lambda;
+            for (let i = 0; i < cap; i++) tot += (inf[i] < W[i] ? inf[i] : W[i]);
+            let x = tfU() * tot;
+            if (x < lambda) {
+                const i = b.pick();
+                arr++;
+                // Fail closed: PICK_NONE / out-of-range is counted, never silently dropped (typed-array
+                // writes at -1 are no-ops, which would otherwise read as a perfect 0.000 spread).
+                if (!(i >= 0 && i < cap)) { bad++; continue; }
+                if (arr > TF_WARM) { cnt[i]++; measured++; }
+                inf[i]++;
+            } else {
+                x -= lambda;
+                for (let i = 0; i < cap; i++) {
+                    const r = inf[i] < W[i] ? inf[i] : W[i];
+                    if (x < r) { inf[i]--; break; }
+                    x -= r;
+                }
+            }
+        }
+        let sum = 0;
+        for (let i = 0; i < cap; i++) { cnt[i] /= measured; sum += cnt[i]; }
+        tfBad += bad;
+        if (!(measured === TF_ARR) || !(Math.abs(sum - 1) < 1e-9)) tfBad += 1e9;   // not measured -> fail
+        return cnt;
+    }
+
+    let tfBad = 0;
+    const t0 = performance.now();
+    const res = {};   // res[name][mode] = [worst spread pp per layout]
+    for (const name of tfNames) {
+        res[name] = { rotate: [], random: [] };
+        for (const mode of ['rotate', 'random']) {
+            for (let L = 0; L < tfLayouts.length; L++) {
+                const W = tfLayouts[L], cap = W.length;
+                const mean = new Float64Array(cap);
+                for (let sd = 1; sd <= TF_SEEDS; sd++) {
+                    const sh = tfRun(name, mode, W, sd);
+                    for (let i = 0; i < cap; i++) mean[i] += sh[i] / TF_SEEDS;
+                }
+                let worst = 0;
+                for (const w of [1, 4]) {
+                    let mx = -Infinity, mn = Infinity;
+                    for (let i = 0; i < cap; i++) if (W[i] === w) { if (mean[i] > mx) mx = mean[i]; if (mean[i] < mn) mn = mean[i]; }
+                    const sp = (mx - mn) * 100;
+                    if (!(sp <= worst) && worst === worst) worst = sp;   // fail closed: NaN and +Infinity replace worst (NaN sticks); -Infinity is caught by the sum-to-1 check
+                }
+                res[name][mode].push(worst);
+            }
+        }
+    }
+    process.stdout.write('  worst within-group spread (pp), mean of ' + TF_SEEDS + ' seeds, ' + TF_ARR + ' arrivals (' +
+        ((performance.now() - t0) / 1000).toFixed(1) + ' s)\n');
+    process.stdout.write('  strategy   mode    [1x4,4x4]  [4x4,1x4]\n');
+    for (const name of tfNames) for (const mode of ['rotate', 'random']) {
+        process.stdout.write('  ' + name.padEnd(10) + ' ' + mode.padEnd(7) + ' ' +
+            res[name][mode][0].toFixed(3).padStart(9) + '  ' + res[name][mode][1].toFixed(3).padStart(9) + '\n');
+    }
+    check(tfBad === 0, 'tie-fairness sim measured every arrival: invalid picks / unmeasured runs = ' + tfBad);
+    for (const name of tfNames) {
+        const rw = Math.max(res[name].random[0], res[name].random[1]);
+        const cw = Math.max(res[name].rotate[0], res[name].rotate[1]);
+        check(rw <= TF_GATE, name + " ties:'random' worst spread " + rw.toFixed(3) + ' pp <= ' + TF_GATE + ' pp (both layouts)');
+        check(cw >= TF_CTRL, name + " CONTROL default 'rotate' worst spread " + cw.toFixed(3) + ' pp >= ' + TF_CTRL + ' pp (gate is not vacuous)');
+    }
+}
+
 if (failed) {
     process.stderr.write('balance: FAIL\n');
     process.exit(1);

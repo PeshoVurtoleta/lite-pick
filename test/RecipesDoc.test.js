@@ -140,3 +140,19 @@ test('R3 (D1/N1): a caller abort feeds no penalty -- the node keeps its estimate
     for (let k = 0; k < 1000; k++) await r.handle({});
     assert.ok(r.stats.served[victim] - base >= 200, 'the aborted node keeps a fair share (' + (r.stats.served[victim] - base) + '/1000)');
 });
+
+test('D-lit (1.2.0 phase 2): tie-bias and failover notes carry the corrected / FIXED wording, no stale copy', () => {
+    // Regression pin on the docs: these phrases were the phase-1 caveats and must not return.
+    const STALE = ['1.2.0 fix queued', 'fix is queued', 'KNOWN (ROADMAP 4b, phase 2)', 'ignores weights', '~1 pp'];
+    for (const f of ['README.md', 'llms.txt', 'GUIDE.md', 'RECIPES.md', 'ROADMAP.md']) {
+        const txt = readFileSync(join(ROOT, f), 'utf8');
+        for (const p of STALE) assert.ok(!txt.includes(p), f + ' still carries the stale phrase: ' + p);
+    }
+    for (const f of ['README.md', 'llms.txt', 'GUIDE.md', 'RECIPES.md']) {
+        const txt = readFileSync(join(ROOT, f), 'utf8');
+        assert.ok(txt.includes("ties: 'random'"), f + ' must point at ties: \'random\'');
+        assert.ok(txt.includes('3.66'), f + ' must carry the corrected SED bias numbers');
+    }
+    const llms = readFileSync(join(ROOT, 'llms.txt'), 'utf8');
+    assert.ok(llms.includes('weightOf(i)') && llms.includes('TieOptions'), 'llms.txt documents weightOf and TieOptions');
+});

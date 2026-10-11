@@ -316,6 +316,30 @@ const nqPick = {
     statsOf(s) { return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.weights.buffer) }; },
 };
 
+/** 1.2.0 opt-in `ties: 'random'` lanes: the seeded skip-reservoir bodies over the SAME tied scan pools (LeastConn
+ *  ties at every 16th eligible index, SED / NQ at every 16th), and NQ's idle-draw fast path over an all-idle pool. */
+const RANDOM_TIES = { ties: 'random', seed: 0x5EED };
+function randomTiesLane(name, mk) {
+    return {
+        name,
+        setup() {
+            const { el, inflight, weights } = makeScanPool(true);
+            return { el, inflight, weights, b: mk(el, inflight, weights), acc: 0 };
+        },
+        hot(s, n) {
+            const b = s.b;
+            let acc = s.acc | 0;
+            for (let i = 0; i < n; i++) acc = (acc + b.pick()) | 0;
+            s.acc = acc | 0;
+        },
+        statsOf(s) { return { grows: bufIds(s.el.buffer, s.inflight.buffer, s.weights.buffer) }; },
+    };
+}
+const leastConnPickRandom = randomTiesLane('LeastConnBalancer.pick() ties:random', (el, inf) => new LeastConnBalancer(SCAN_CAP, el, inf, RANDOM_TIES));
+const sedPickRandom = randomTiesLane('SedBalancer.pick() ties:random', (el, inf, w) => new SedBalancer(SCAN_CAP, el, inf, w, RANDOM_TIES));
+const nqPickRandom = randomTiesLane('NqBalancer.pick() ties:random (busy: draws miss, scan)', (el, inf, w) => new NqBalancer(SCAN_CAP, el, inf, w, RANDOM_TIES));
+const nqPickRandomIdle = randomTiesLane('NqBalancer.pick() ties:random (idle: fast path)', (el, inf, w) => new NqBalancer(SCAN_CAP, el, new Uint32Array(SCAN_CAP), w, RANDOM_TIES));
+
 /**
  * peakewma-pick: reused PeakEwmaBalancer over a half-eligible pool + a caller-owned inflight
  * array; each op two rejection draws + two decay-on-read exp() + a compare (a PURE read -- pick
@@ -735,7 +759,7 @@ const recipe17FenwickPick = {
 
 const scenarios = [
     prngDraw, eligibleRead, setChurn, roundRobinPick, smoothWrrPick, p2cPick,
-    leastConnPick, sedPick, nqPick, peakEwmaPick, peakEwmaRecord, consistentHashPick,
+    leastConnPick, sedPick, nqPick, leastConnPickRandom, sedPickRandom, nqPickRandom, nqPickRandomIdle, peakEwmaPick, peakEwmaRecord, consistentHashPick,
     boundedLoadPick, boundedLoadNote, weightedRandomPick, weightedRandomPickFallback,
     peakEwmaPickFrom, peakEwmaRecordFrom, peakEwmaRecordFromBlend, peakEwmaRecordMod, peakEwmaPickFromNeg, peakEwmaRecordFromNeg, consistentHashPickFrom, boundedLoadPickFrom,
     recipe17FenwickPick,

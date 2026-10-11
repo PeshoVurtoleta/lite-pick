@@ -221,7 +221,7 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     `PICK_NONE` when the whole pool is down. This IS the O(1) least-connections APPROXIMATION;
     `LeastConnBalancer` below is the exact-O(cap) complement.
 - `LeastConnBalancer extends BalancerBase` -- class. EXACT fewest-in-flight (M4, IPVS `lc`).
-  - `new LeastConnBalancer(capacity, eligible, inflight)` -- `inflight` a caller-owned Uint32Array
+  - `new LeastConnBalancer(capacity, eligible, inflight, opts?)` (1.2.0 `opts` = `TieOptions`, below) -- `inflight` a caller-owned Uint32Array
     (length >= capacity), read LIVE each pick. No `setWeight`, no derived aggregate: the caller may
     mutate inflight directly between picks (that is the shared-counter seam).
   - `pick()` -> number. Full O(cap) scan returning the eligible node with the fewest in-flight
@@ -232,7 +232,7 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     load stays within 1 (balance.mjs). Without feedback the tied lowest-load nodes take turns --
     correct by contract; the M5 lite-query adapter provides the increment/decrement.
 - `SedBalancer extends BalancerBase` -- class. Shortest-expected-delay (M4, IPVS `sed`).
-  - `new SedBalancer(capacity, eligible, inflight, weights)` -- `inflight` AND `weights` are
+  - `new SedBalancer(capacity, eligible, inflight, weights, opts?)` (1.2.0 `opts` = `TieOptions`) -- `inflight` AND `weights` are
     caller-owned Uint32Arrays (length >= capacity), read LIVE (no `setWeight`, no derived total --
     the caller may retune weights directly, UNLIKE SmoothWRR).
   - `pick()` -> number. O(cap) scan returning the eligible, positive-weight node minimizing
@@ -241,17 +241,29 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     or `PICK_NONE` when no eligible node has a positive weight. A weight-0 eligible node is NOT a
     candidate. Converges to load proportional-to-weight (balance.mjs). 0 B/op.
 - `NqBalancer extends BalancerBase` -- class. Never-queue (M4, IPVS `nq`); the worker-pool fit.
-  - `new NqBalancer(capacity, eligible, inflight, weights)` -- same caller-owned, read-live
+  - `new NqBalancer(capacity, eligible, inflight, weights, opts?)` (1.2.0 `opts` = `TieOptions`) -- same caller-owned, read-live
     inflight + weights contract as SED.
   - `pick()` -> number. Returns an idle eligible positive-weight node (in-flight 0) if one exists --
     never queueing while a server is free; idle nodes take turns (1.1.0 rotating cursor: the first idle
     node at or after it) -- else the SED minimum (ties rotate), else `PICK_NONE`. O(cap) worst case,
-    O(distance to the next idle node) when one is idle. 0 B/op. KNOWN positional tie bias (1.2.0 fix
-    queued): idle-first + the single cursor leaves a small position skew under MIXED weights -- audit
-    Poisson sim, weights [1,1,1,1,4,4,4,4] at load 0.9, the four weight-4 nodes took 20.6/20.1/19.8/
-    19.6% (ideal 20% each), lower index favoured, stable across seeds; LeastConn/SED are fair. <= ~1
-    pp; the fail-closed / exact-optimum contract holds. Fix = a seeded uniform reservoir pick among
-    tied minima (0 B/op). Do NOT depend on exact within-tie fairness in NQ under mixed weights.
+    O(distance to the next idle node) when one is idle. 0 B/op. Tie bias (MEASURED, 1.2.0; default rotation): in-repo seeded sim, weights [1,1,1,1,4,4,4,4], rate = weight, load 0.9 --
+    SED is the WORST (weight-1 group 3.66/3.49/3.31/3.14 %, ~17% relative first vs last); NQ and LeastConn
+    ~1% relative (0.16-0.18 pp); follows position, vanishes for interleaved layouts (the audit's "about 1 percentage point, NQ only"
+    was wrong). Use `ties: 'random'` when exact tie fairness matters (opt-in, see TieOptions below).
+- `TieOptions` (1.2.0; trailing ctor arg of LeastConn / SED / NQ) -- `{ ties?: 'rotate' | 'random', seed?: number }`.
+  Plain object only; an unknown key throws `LITE_PICK_OPTION` with a did-you-mean. `'rotate'` (default) = the
+  1.1.0 rotating cursor, unchanged. `'random'` = uniform up to the 2^-32 draw grid (max abs error ~5e-10 at k = 128) among the tied minima via a seeded skip-based
+  reservoir (~ln k PRNG draws for a k-way tie, 0 B/op); `seed` integer in [0, 2^32 - 1], default 0x9e3779b9
+  (`seed: 0` maps to the default). NQ 'random' first tries up to 4 random draws for an idle node. A 'random'
+  instance carries its OWN `pick` (a different hidden class than 'rotate': do not mix modes at one hot call
+  site). `describe()` gains `ties`; `tieCursor` is -1 in random mode. Cost of 'random' (report only, ns/pick vs
+  the default at cap 64): LeastConn 1.3-2.3x, SED 1.3-1.8x, NQ 1.26x all-busy, ~5.7 ns all-idle (vs 2.1), up to
+  5.5x half-busy. An ADDED option, not a behaviour change: default-on missed the 1.25x bar (1.4-8.6x).
+- `weightOf(i)` (1.2.0) -- public read-only on SmoothWRR, ConsistentHash (BoundedLoad inherits), WeightedRandom,
+  SED, NQ. RangeError `LITE_PICK_INDEX` on a bad index. Returns the live caller weight (SmoothWRR / SED / NQ /
+  WeightedRandom, which read the caller's array) or the owned table copy (ConsistentHash / BoundedLoad). `/pool`
+  failover reads it via the optional `weightOf?(i)` on the Pool `Balancer` type; a non-finite or <= 0 weight is not
+  a candidate. Keyed target = fmix32(key ^ imul(attempt, 0x9e3779b9)); unkeyed = the per-Pool `_failSeq`.
 - `PeakEwmaBalancer extends BalancerBase` -- class. Latency-aware P2C (M7, Finagle peak-EWMA).
   - `new PeakEwmaBalancer(capacity, eligible, inflight, tauNs, seed?=0x9e3779b9)` -- `inflight` is a
     caller-owned Uint32Array (length >= capacity) read LIVE; `tauNs` is the EWMA TIME CONSTANT in
@@ -355,7 +367,7 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     move, `setEligible(i, true)` restores every key. `setWeight(i, 0)` REMOVES -- a cold rebuild that
     also moves ~0.5% of other keys at M = 65537 (~2.5% at M = 4099); restoring the weight rebuilds the
     same table. Unlike IPVS, weight 0 removes. Drain for temporary outages; remove for good, or when
-    many are down (a drained backend's keys probe past its slots). RECIPES.md section 9. KNOWN (ROADMAP 4b, phase 2): /pool failover (tries > 1) ignores weights; pair a remove with `setEligible(i, false)`.
+    many are down (a drained backend's keys probe past its slots). RECIPES.md section 9. /pool failover (tries > 1) never picks a weight-0 backend (FIXED 1.2.0); it stops with the last error when no positive-weight untried backend is left.
   - vs-AWS: NLB flow-hash (5-tuple) is a Maglev consistent hash -- this is that family at the
     in-process hop. DEFERRED optional-peer seams (import nothing, peerDependencies STAYS `{}`): a
     @zakkster/lite-filter hot-key oracle at the key-routing layer (warm/cold only), and a
@@ -461,11 +473,14 @@ duck-typed and imports NOTHING from lite-query.
     in-flight on DISPATCH, awaits `fn(endpoint, signal)`, decrements on SETTLE (in a finally --
     net-zero per run, even on throw). On a thrown error it keeps the failed endpoint's count ELEVATED
     and fails over to a GENUINELY DISTINCT endpoint (M2): re-pick while the strategy repeats a tried
-    endpoint (bounded), then scan for an eligible UNTRIED one (key-derived start for a keyed run,
-    cursor-rotated otherwise). It STOPS with the last error as soon as no untried eligible endpoint
-    remains -- so a 1-node pool with `tries: 3` makes ONE attempt (Pool owns SPATIAL failover, not
+    endpoint (bounded); if that repeats a tried endpoint, make ONE weighted choice among untried, eligible,
+    weight > 0 backends (1.2.0: keyed = derived from (key, attempt), stable per key, different per attempt; unkeyed =
+    a per-Pool sequence; weights via the balancer's `weightOf(i)`, a balancer without it counts each backend as 1).
+    No neighbour double share (K10: the failed backend's neighbour got ~2x the spill), and a removed (weight-0)
+    backend is never chosen. It STOPS with the last error as soon as no untried eligible POSITIVE-WEIGHT
+    endpoint remains -- so a 1-node pool with `tries: 3` makes ONE attempt (Pool owns SPATIAL failover, not
     temporal retry). `opts.tries` default 1 = no failover. Rejects `code:'LITE_PICK_NONE'` when no
-    endpoint is eligible. KNOWN (ROADMAP 4b, phase 2): /pool failover (tries > 1) ignores weights; pair a remove with `setEligible(i, false)`.
+    endpoint is eligible. FIXED (1.2.0, K10 + weight 0): failover is weight-aware -- see the failover note above.
     ABORT (M-Item5): `opts.signal` is checked before EVERY attempt -- an already-aborted signal
     dispatches NOTHING and rejects with the signal's `reason`, else `code:'LITE_PICK_ABORTED'`; an
     abort after a failure stops failover and propagates.
@@ -489,9 +504,9 @@ duck-typed and imports NOTHING from lite-query.
     backwards-stepping finite reading records NO sample and resolves normally. `opts.failurePenaltyNs`
     (finite > 0, default 1e9) is the minimum penalty rtt; a penalized node is re-probed roughly every
     `tauNs x ln(failurePenaltyNs / healthyRttNs)`. NOT a 0 B/op path (the kernel `pick()` is): a normal
-    async function. A run that settles on ATTEMPT 0 (any `tries`) costs ~900 B/run (Node 22 v22.23.3,
+    async function. A run that settles on ATTEMPT 0 (any `tries`) costs ~888 B/run (Node 22 v22.23.3,
     Pool's own share above the bare-await driver floor, by scavenge count; `npm run bench:pool`), gated
-    <= 912 B/run; each extra failover attempt adds ~375 B/run (gated too); a latency-aware balancer
+    <= 896.3 B/run; each extra failover attempt adds ~375 B/run (gated too); a latency-aware balancer
     (PeakEWMA) driven by an epoch-ns clock adds ~32 B/run more per attempt (Node 22; the clock boxes) and
     is gated on its own `clocked` row. Abort-before-dispatch is NOT cheaper than a successful run
     (ungated, above L3). Your fn's closure, promise and I/O come on top -- a submit-shaped fn adds ~310

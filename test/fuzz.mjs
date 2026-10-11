@@ -120,8 +120,9 @@ const SPECS = {
         extra: (b, ctx, p) => {
             if (p === PICK_NONE) return null;
             if (ctx.weights[p] === 0) return 'NQ picked a weight-0 node ' + p;
-            // An idle eligible node (weight > 0, inflight 0) wins outright. WHICH idle node is the rotating
-            // cursor's business (1.1.0, M5 -- idle nodes take turns), so any idle node is correct.
+            // An idle eligible node (weight > 0, inflight 0) wins outright. WHICH idle node is the tie mode's
+            // business (1.1.0 rotate: idle nodes take turns; 1.2.0 opt-in random: a uniform draw), so any idle
+            // node is correct.
             let firstIdle = -1;
             for (let i = 0; i < ctx.cap; i++) {
                 if (ctx.el[i] && ctx.weights[i] > 0 && ctx.inflight[i] === 0) { firstIdle = i; break; }
@@ -196,6 +197,11 @@ const SPECS = {
         extra: (b, ctx, p) => checkConsistentHash(b, ctx.el, ctx.cap, p),
     },
 };
+// 1.2.0 opt-in `ties: 'random'` (K3): the same invariants and argmin checks, through the seeded reservoir body.
+const TIES_RANDOM = { ties: 'random', seed: 0xF00D };
+SPECS.LeastConnRandom = { ...SPECS.LeastConn, make: (cap, el, inf) => new LeastConnBalancer(cap, el, inf, TIES_RANDOM) };
+SPECS.SEDRandom = { ...SPECS.SED, make: (cap, el, inf, w) => new SedBalancer(cap, el, inf, w, TIES_RANDOM) };
+SPECS.NQRandom = { ...SPECS.NQ, make: (cap, el, inf, w) => new NqBalancer(cap, el, inf, w, TIES_RANDOM) };
 
 /**
  * One fuzz run: build the shared arrays + the balancer, then STEPS times perform one optional

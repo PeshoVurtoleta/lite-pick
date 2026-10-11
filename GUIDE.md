@@ -68,12 +68,13 @@ Is routing decided by a KEY (same key -> same backend, for cache/session affinit
 | **ConsistentHash** | key hash (Maglev) | **O(1)** | a Maglev lookup table | **sticky** cache/session affinity; minimal disruption on scale events (~1/N keys move) |
 | **BoundedLoad** | key hash + occupancy cap | **O(1)** | Maglev table + a running `_total` | sticky routing **and** a few hot keys would otherwise overload one backend |
 
-> **NQ tie-fairness caveat (known, 1.2.0 fix queued).** NQ's idle-first grab plus its single rotating
-> cursor leaves a small positional tie bias under **mixed weights**: in the audit's Poisson run with
-> weights `[1,1,1,1,4,4,4,4]` at load 0.9, the four weight-4 endpoints took 20.6 / 20.1 / 19.8 / 19.6%
-> instead of a flat 20% (lower index slightly favoured; LeastConn and SED are fair). It is at most
-> ~1 percentage point and never breaks the fail-closed / exact-optimum contract. If you need exact
-> within-tie fairness under heterogeneous weights today, prefer SED.
+> **Tie-fairness caveat (measured, 1.2.0).** The default rotating cursor leaves a small positional tie bias
+> under **mixed weights**. In-repo seeded simulation, weights `[1,1,1,1,4,4,4,4]`, rate = weight, load 0.9:
+> SED is the WORST -- its weight-1 group took 3.66 / 3.49 / 3.31 / 3.14 % (about 17% relative, first vs last);
+> NQ and LeastConn skew about 1% relative (0.16-0.18 pp). The bias follows position and vanishes for
+> interleaved layouts. (The audit's "about 1 percentage point, NQ only" was wrong.) Use `ties: 'random'` when exact tie
+> fairness matters: `new SedBalancer(cap, el, inflight, weights, { ties: 'random', seed })` picks uniformly (up to the 2^-32 draw grid; max abs error ~5e-10 at k = 128)
+> among tied minima (opt-in; costs LeastConn 1.3-2.3x, SED 1.3-1.8x, NQ 1.26x all-busy, ~5.7 ns all-idle (vs 2.1), up to 5.5x half-busy (ns/pick vs the default, cap 64)).
 
 ## SmoothWRR vs WeightedRandom -- the weighted fork, made explicit
 

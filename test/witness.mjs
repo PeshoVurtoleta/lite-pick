@@ -100,6 +100,47 @@ const SUBJECTS = [
         },
     },
     {
+        name: 'LeastConn ties:random',
+        complexity: 'linear', // 1.2.0 opt-in: the same O(cap) scan + ~ln k PRNG steps per k-way tie
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            for (let i = 0; i < n; i++) inflight[i] = i & 15;
+            const lc = new LeastConnBalancer(n, el, inflight, { ties: 'random' });
+            return () => lc.pick();
+        },
+    },
+    {
+        name: 'SED ties:random',
+        // 1.2.0 opt-in: the SED O(cap) scan + ~ln k PRNG steps per k-way tie. Same tie SHAPE as the LeastConn
+        // subject (k = n / 16, a uniform weight): the plain SED layout (w = 1 + (i & 7)) ties ALL 8 nodes at n = 8
+        // but only n / 16 above, so its per-node work changes with the tie density, not the complexity (0.285).
+        complexity: 'linear',
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) { inflight[i] = i & 15; w[i] = 2; }
+            const sed = new SedBalancer(n, el, inflight, w, { ties: 'random' });
+            return () => sed.pick();
+        },
+    },
+    {
+        name: 'NQ ties:random (idle)',
+        // 1.2.0 opt-in: an all-idle pool -> the first uniform draw hits -> expected O(1), flat with n. (The busy
+        // case is the O(cap) scan plus a CONSTANT NQ_IDLE_TRIES draws; that additive constant dominates at n = 8,
+        // which the linear flatness series cannot model -- its scan is the LeastConn ties:random subject above.)
+        complexity: 'const',
+        make(n) {
+            const el = new Uint8Array(n); el.fill(1);
+            const inflight = new Uint32Array(n);
+            const w = new Uint32Array(n);
+            for (let i = 0; i < n; i++) w[i] = 1 + (i & 7);
+            const nq = new NqBalancer(n, el, inflight, w, { ties: 'random' });
+            return () => nq.pick();
+        },
+    },
+    {
         name: 'PeakEWMA',
         complexity: 'const', // two O(1)-expected rejection draws + two decay exp() + a compare -> flat with n
         make(n) {

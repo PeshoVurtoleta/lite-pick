@@ -14,6 +14,9 @@
  *   C1. assertConsistent() passes on a clean balancer of every strategy, and throws LITE_PICK_INCONSISTENT
  *       on a direct eligible write, a non-0/1 eligible byte, a direct SmoothWRR / WeightedRandom weight
  *       write, and a BoundedLoad inflight change without note().
+ *   W1. weightOf(i) (1.2.0) on SmoothWRR / SED / NQ / WeightedRandom returns the LIVE caller weight, on
+ *       ConsistentHash / BoundedLoad the owned copy the table routes on; a bad index throws
+ *       RangeError LITE_PICK_INDEX; the unweighted strategies have no weightOf (Pool counts them as weight 1).
  */
 
 import { test } from 'node:test';
@@ -173,6 +176,29 @@ test('S2: a healthy pick counts nothing; each internal event counts once', () =>
     assert.equal(shared[STAT_REBUILDS], 3);
 });
 
+test('D1b (1.2.0): LeastConn / SED / NQ describe() carry the tie mode; tieCursor is -1 under ties random', () => {
+    const n = 5;
+    const mk = (o) => [
+        new LeastConnBalancer(n, up(n), u32(n, 0), o),
+        new SedBalancer(n, up(n), u32(n, 0), u32(n, 3), o),
+        new NqBalancer(n, up(n), u32(n, 0), u32(n, 3), o),
+    ];
+    for (const b of mk()) {
+        b.pick(); b.pick();
+        const d = b.describe();
+        assert.equal(d.ties, 'rotate', d.strategy);
+        assert.equal(d.tieCursor, 2, d.strategy + ': the rotate cursor (1.1.0 meaning, unchanged)');
+        assert.deepEqual(JSON.parse(JSON.stringify(d)), d);
+    }
+    for (const b of mk({ ties: 'random', seed: 3 })) {
+        b.pick();
+        const d = b.describe();
+        assert.equal(d.ties, 'random', d.strategy);
+        assert.equal(d.tieCursor, -1, d.strategy + ': not applicable in random mode');
+        assert.ok(inspect(b).includes("ties: 'random'"), d.strategy + ' inspect shows the mode');
+    }
+});
+
 test('D1: describe() for every strategy -- name, base fields, JSON-safe, a snapshot', () => {
     for (const [name, b] of all(8)) {
         const d = b.describe();
@@ -249,4 +275,47 @@ test('C1: assertConsistent passes clean, throws LITE_PICK_INCONSISTENT on each m
     bl.note(2, 1);
     assert.doesNotThrow(() => bl.assertConsistent());
     assert.notEqual(bl.pick(1), PICK_NONE);
+});
+
+test('W1: weightOf(i) reads the routed weight; a bad index throws LITE_PICK_INDEX', () => {
+    const live = (n) => {
+        const w = Uint32Array.from([0, 1, 4, 2 ** 31 + 5]);
+        return [
+            ['SmoothWRR', new SmoothWRRBalancer(4, up(4), w), w],
+            ['SED', new SedBalancer(4, up(4), u32(4, 0), w), w],
+            ['NQ', new NqBalancer(4, up(4), u32(4, 0), w), w],
+            ['WeightedRandom', new WeightedRandomBalancer(4, up(4), w), w],
+        ];
+    };
+    for (const [name, b, w] of live()) {
+        for (let i = 0; i < 4; i++) assert.equal(b.weightOf(i), w[i], name + ' weightOf(' + i + ')');
+        w[1] = 7;                                    // the caller array is read live (an in-place edit shows)
+        assert.equal(b.weightOf(1), 7, name + ' reads the live caller array');
+        if (typeof b.setWeight === 'function') { b.setWeight(2, 9); assert.equal(b.weightOf(2), 9, name + ' after setWeight'); }
+    }
+    const src = Uint32Array.from([3, 0, 5, 1]);
+    const ch = new ConsistentHashBalancer(4, up(4), src, 257);
+    const bl = new BoundedLoadBalancer(4, up(4), u32(4, 0), 0.25, src, 257);
+    const chEq = new ConsistentHashBalancer(4, up(4), null, 257);
+    for (const [name, b] of [['ConsistentHash', ch], ['BoundedLoad', bl]]) {
+        assert.equal(b.weightOf, ConsistentHashBalancer.prototype.weightOf, name + ' shares the CH method');
+        assert.deepEqual([0, 1, 2, 3].map((i) => b.weightOf(i)), [3, 0, 5, 1], name + ' owned copy');
+    }
+    src[0] = 99;                                     // the owned copy does NOT follow the caller's array
+    assert.equal(ch.weightOf(0), 3, 'CH routes on its copy');
+    ch.setWeight(0, 6);
+    assert.equal(ch.weightOf(0), 6, 'CH setWeight shows');
+    bl.setWeights(Uint32Array.from([1, 2, 3, 4]));
+    assert.equal(bl.weightOf(3), 4, 'BL setWeights shows');
+    assert.equal(chEq.weightOf(2), 1, 'null weights = equal weight 1');
+    const all6 = [...live().map((r) => r[1]), ch, bl];
+    for (const b of all6) {
+        for (const bad of [-1, 4, 1.5, NaN, '1', 2 ** 32, undefined]) {
+            code(() => b.weightOf(bad), RangeError, 'LITE_PICK_INDEX');
+        }
+    }
+    for (const [name, b] of all(4)) {
+        const weighted = ['SmoothWRR', 'SED', 'NQ', 'ConsistentHash', 'BoundedLoad', 'WeightedRandom'].includes(name);
+        assert.equal(typeof b.weightOf === 'function', weighted, name + (weighted ? ' has' : ' has no') + ' weightOf');
+    }
 });

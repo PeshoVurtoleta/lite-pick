@@ -304,7 +304,7 @@ it false-FAILs a correct kernel. Two decisions change:
 - **New assertions.** A8 (S10): no dispatch to a down node (fn checks `eligible[i]` at dispatch). A9:
   Little's law as an identity -- integral of sum(inflight) dt == sum over runs of (run end - attempt start)
   for every attempt (Pool holds a failed attempt's slot until its run settles). Teeth: MP8 (`_scanUntried`
-  ignores eligibility), MP9 (in-flight double-counted and double-released: A2-blind, A9 trips).
+  ignores eligibility; 2026-10-11: that scan is gone in 1.2.0 -- MP8 is now "the fallback ignores isEligible", anchored on the isEligible check in both passes of `_chooseUntried`), MP9 (in-flight double-counted and double-released: A2-blind, A9 trips).
 - **Self-check by mean and identity, not median**: the fix plan's "p50 ~ mean service x slowdown" was
   dropped -- under processor sharing the median is not that (research note); the per-dispatch slowdown is
   an approximation of processor sharing, documented as such. RTT p50/p99/mean and mean service are

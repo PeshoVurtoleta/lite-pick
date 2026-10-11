@@ -6,7 +6,7 @@
  * a smoke of its new export here (accounting site 7).
  */
 
-import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT,
+import { VERSION, PICK_NONE, Prng, BalancerBase, RoundRobinBalancer, SmoothWRRBalancer, P2cBalancer, LeastConnBalancer, SedBalancer, NqBalancer, TieOptions, PeakEwmaBalancer, ConsistentHashBalancer, BoundedLoadBalancer, WeightedRandomBalancer, CH_DEFAULT_M, CH_PROBE_LIMIT,
     STAT_FALLBACK_SCANS, STAT_REBUILDS, STAT_DISPLACED, STAT_COUNT, CODES } from '../../Pick.js';
 import { CODES as POOL_CODES } from '../../Pool.js';
 import type { LitePickErrorCode, LitePickError, BalancerDescription, BalancerStats } from '../../Pick.js';
@@ -128,6 +128,26 @@ void nqPick;
 
 // @ts-expect-error -- weights arg is required.
 new NqBalancer(4, new Uint8Array(4), new Uint32Array(4));
+
+// 1.2.0 TieOptions: an optional trailing { ties?, seed? } on LeastConn / SED / NQ; describe() carries `ties`.
+const tieOpts: TieOptions = { ties: 'random', seed: 42 };
+new LeastConnBalancer(4, new Uint8Array(4), new Uint32Array(4), tieOpts);
+new SedBalancer(4, new Uint8Array(4), new Uint32Array(4), new Uint32Array(4), { ties: 'rotate' });
+new NqBalancer(4, new Uint8Array(4), new Uint32Array(4), new Uint32Array(4), {});
+new LeastConnBalancer(4, new Uint8Array(4), new Uint32Array(4), null);
+const lcTies: 'rotate' | 'random' = lc.describe().ties;
+const nqCursor: number = nq.describe().tieCursor;
+const sedTies: 'rotate' | 'random' = sed.describe().ties;
+void lcTies; void nqCursor; void sedTies;
+
+// @ts-expect-error -- ties is 'rotate' | 'random' only.
+new LeastConnBalancer(4, new Uint8Array(4), new Uint32Array(4), { ties: 'lowest' });
+
+// @ts-expect-error -- unknown option key (the runtime also throws LITE_PICK_OPTION with a did-you-mean).
+new SedBalancer(4, new Uint8Array(4), new Uint32Array(4), new Uint32Array(4), { tie: 'random' });
+
+// @ts-expect-error -- the 1.2.0 trailing arg is an options object, not a positional seed.
+new NqBalancer(4, new Uint8Array(4), new Uint32Array(4), new Uint32Array(4), 42);
 
 // PeakEwmaBalancer: capacity + eligibility + inflight + tauNs + optional seed; a BalancerBase subclass.
 const pe: PeakEwmaBalancer = new PeakEwmaBalancer(4, new Uint8Array(4), new Uint32Array(4), 1e6);
@@ -334,3 +354,15 @@ void zbK;
 const zbBl = new BoundedLoadBalancer(4, new Uint8Array(4), new Uint32Array(4), 0.25);
 const zbB: number = zbBl.pickFrom(zbKeys, 0);
 void zbB;
+
+// 1.2.0 weightOf(i): a cold read-only number on the six weighted strategies (BoundedLoad inherits it from CH).
+const woSum: number = wrr.weightOf(0) + sed.weightOf(1) + nq.weightOf(2) + ch.weightOf(3) + bl.weightOf(0) + wr.weightOf(1);
+void woSum;
+// @ts-expect-error -- the index is a number
+wrr.weightOf('0');
+// @ts-expect-error -- weightOf needs an index
+ch.weightOf();
+// @ts-expect-error -- LeastConn has no weights, so no weightOf
+new LeastConnBalancer(4, new Uint8Array(4), new Uint32Array(4)).weightOf(0);
+// @ts-expect-error -- RoundRobin has no weights, so no weightOf
+new RoundRobinBalancer(4, new Uint8Array(4)).weightOf(0);

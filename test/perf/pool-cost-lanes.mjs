@@ -34,7 +34,7 @@ const POOL_URL = process.env.LITE_POOL_IMPL
 const PICK_URL = new URL('../../Pick.js', import.meta.url).href;
 
 const { Pool, POOL_CHANNEL_DISPATCH, POOL_CHANNEL_SETTLE } = await import(POOL_URL);
-const { PICK_NONE, P2cBalancer, PeakEwmaBalancer } = await import(PICK_URL);
+const { PICK_NONE, P2cBalancer, PeakEwmaBalancer, ConsistentHashBalancer } = await import(PICK_URL);
 
 // ---------------------------------------------------------------------------
 // Shared, HOISTED fixtures (nothing per-run unless a lane's shape demands it).
@@ -50,6 +50,21 @@ function peakPool() {
     const inflight = new Uint32Array(CAP);
     return new Pool(new PeakEwmaBalancer(CAP, el, inflight, 1e6, 0x55), inflight);
 }
+
+// L6CH (1.2.0): weighted ConsistentHash, cap 64, weights 1..4 -- a keyed pick always repeats the failed home,
+// so attempt 1 exhausts the re-picks and takes the weighted fallback (two O(cap) passes over isEligible /
+// weightOf). Small table (M = 257) keeps the cold build quick; the fallback never reads the table.
+function chPool() {
+    const el = new Uint8Array(CAP).fill(1);
+    const inflight = new Uint32Array(CAP);
+    const w = new Uint32Array(CAP);
+    for (let i = 0; i < CAP; i++) w[i] = 1 + (i & 3);
+    return new Pool(new ConsistentHashBalancer(CAP, el, w, 257, 0x2b), inflight);
+}
+// Smi keys (< 2^30) so the lane driver itself never boxes a key; ONE hoisted opts object, key rewritten per run.
+const CH_KEYS = new Int32Array(1024);
+for (let i = 0, x = 0x9e3779b9 | 0; i < 1024; i++) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; CH_KEYS[i] = x & 0x3fffffff; }
+const OPTS_CH = { key: 0, tries: 2 };
 
 const RESOLVED = Promise.resolve(0);
 const SYNC_FN = (ep) => ep;
@@ -94,6 +109,7 @@ const __promote = new Array(PROMOTE_SIZE).fill(null);
 // ---------------------------------------------------------------------------
 function buildLanes() {
     const p2c = p2cPool();
+    const chp = chPool();
     const peakA = peakPool();
     const peakB = peakPool();
     const b = p2c.balancer, inflight = p2c.inflight;
@@ -116,6 +132,9 @@ function buildLanes() {
         L5: { run: () => p2c.run(FN_RESOLVED, OPTS_P2C) },
         // L6: tries 2, attempt 0 throws a preallocated error, attempt 1 succeeds (the ACTUAL-failover cost).
         L6: { run: () => { l6attempt = 0; return p2c.run(L6_FN, OPTS_TRIES2); } },
+        // L6CH (1.2.0): L6 on a weighted ConsistentHash (cap 64) -- attempt 1 reaches the weighted fallback
+        // (_chooseUntried). Gated under the SAME failover ceiling as L6: the fallback allocates nothing.
+        L6CH: { run: (i) => { OPTS_CH.key = CH_KEYS[i & 1023]; l6attempt = 0; return chp.run(L6_FN, OPTS_CH); } },
         // L6S: tries 2 but fn SUCCEEDS on attempt 0 (a failover-configured pool's common path). Reported
         // only -- shows that F1's scalar fast path keeps this cheap (~L3), which an arrays-upfront variant
         // would not.

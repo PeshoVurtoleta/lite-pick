@@ -58,10 +58,10 @@ allocates a promise and a frame and one await per attempt. The ladder in
 `test/perf/pool-cost-lanes.mjs` (one lane per child, FIXED 3,000,000-run warm-up, young gen pinned to
 1 MiB, allocation RATE by scavenge count -- `npm run bench:pool`) attributes Pool's OWN share as the
 lane delta above the bare-`await` driver floor L1:
-- a run that SETTLES ON ATTEMPT 0 (any `tries`): **L3 - L1 = ~900 B/run** (Node 22 v22.23.3 904.0;
-  Node 26 v26.8.2 865.9);
+- a run that SETTLES ON ATTEMPT 0 (any `tries`): **L3 - L1 = ~888 B/run** (1.2.0: Node 22 v22.23.3 888.3;
+  Node 26 v26.8.2 850.1; 1.1.x: 904.0 / 865.9);
 - each extra FAILOVER attempt: **L6 - L3 = ~375 B/run** (Node 22), so the one-failover share
-  **L6 - L1 = ~1280 B/run**.
+  **L6 - L1 = ~1263 B/run** (1.2.0, Node 22: 1262.8; 1.1.x: ~1280).
 
 ADR 0015's **~1331 B/run** was a FULL-run P2C figure (4443 scavenges / 3.5M runs) that counts `fn` AND
 the driver's own await loop -- NOT Pool's own share; the like-for-like comparison is HEAD's Pool-own
@@ -71,9 +71,11 @@ The claim is now **gated** by `test/perf/PoolCost.test.mjs` at **`CEIL = measure
 by EXACT `process.version` (V8 fixes the per-run byte cost; under the fixed warm-up + 1 MiB pin the
 scavenge counts are stable to +/-1, ~0.7 B/run; 8 B is below one boxed double so a single boxed value
 crossing a call trips the gate yet never flakes -- except the Node-26 failover lane L6, bimodal under
-CPU contention, whose row pins the UPPER mode so the low mode only passes): attempt-0 `<= 912 B`/run,
-failover `<= 1288 B`/run and clocked `<= 944.2 B`/run on Node 22 (the CI perf job, pinned to node
-22.23.3); attempt-0 `<= 873.9 B`, failover `<= 1284.3 B` and clocked `<= 936.8 B` on Node 26 (v26.8.2).
+CPU contention before the 1.2.0 re-pin -- upper-mode share 1276.3 (lane 1324.2), a lower mode in a
+minority of runs; after it the lane read 1266.5, share 1218.6, in 6/6 contended runs with no low mode
+seen, and the row pins that share): attempt-0 `<= 896.3 B`/run,
+failover `<= 1270.8 B`/run and clocked `<= 929.2 B`/run on Node 22 (the CI perf job, pinned to node
+22.23.3); attempt-0 `<= 858.1 B`, failover `<= 1226.6 B` and clocked `<= 920.3 B` on Node 26 (v26.8.2).
 The **clocked** row gates a latency-aware balancer (PeakEWMA) driven by a 1.7e15 epoch-ns clock, which
 V8 boxes at the non-inlined `pick()`/`recordRtt` boundary (read twice per successful attempt): ~32 B/run
 more than L3 on Node 22, ~63 on Node 26. (Abort BEFORE dispatch, lane L7 ~1374 B/run on Node 22, is
@@ -134,3 +136,19 @@ wiring measured ~2.9 KB/request end to end on 1.1.0, before this change. For 0 B
 - M5 is an ADAPTER session, not a strategy append: it does NOT add a row to the s0 single-file
   strategy-accounting table (that table governs Pick.js strategies); it touches Pool.js/.d.ts,
   package.json (exports/files), llms.txt, test/Pool.test.js + the type test, the demo, and the docs.
+
+## Amendment 2026-10-11 (1.2.0, Fork 2): the failover fallback is a weighted choice
+
+Fork 2's distinct-endpoint mechanism is unchanged up to the re-picks. What changed is the fallback after a re-pick
+repeats a tried endpoint: instead of a linear first-hit scan of eligible untried backends, Pool makes ONE weighted
+choice among untried, eligible, weight > 0 backends (keyed: derived from (key, attempt), stable per key, different per
+attempt; unkeyed: a per-Pool sequence), reading weights through the balancer's new optional `weightOf(i)` (a balancer without it
+counts each backend as weight 1). This removes the neighbour double share (K10) and the weight-0 dispatch bug. When no
+positive-weight untried backend remains, the run stops and surfaces the last error (the ratified boundary, and the K8
+rule). Still SPATIAL failover only. Research: research/1.2.0-phase2-ties-failover.md.
+
+Verified against the code (2026-10-11): `_chooseUntried` skips any weight that is not a finite number > 0; the keyed target
+is fmix32(key ^ imul(attempt, 0x9e3779b9)), the unkeyed one uses the per-Pool `_failSeq`; with no candidate, attempt 0
+rejects `LITE_PICK_NONE` and a later attempt stops with the last error. Pool cost ceilings re-pinned LOWER (every Pool
+path ~16 B/run cheaper on Node 22, run() register count 60 -> 59; on Node 26 the failover share fell 57.7 B, 1276.3 -> 1218.6): the quoted attempt-0 / failover / clocked ceilings above are the new values
+(were 912 / 1288 / 944.2 on Node 22; 873.9 / 1284.3 / 936.8 on Node 26).

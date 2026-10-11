@@ -73,8 +73,19 @@ export interface Balancer {
     pick(arg?: number): number;
     readonly capacity: number;
     readonly live: number;
-    /** True iff endpoint `i` is currently pickable (used by distinct failover's untried scan). */
+    /**
+     * True iff endpoint `i` is currently pickable. Distinct failover's fallback choice needs it: without
+     * it no fallback is possible and the run surfaces the last error once the re-picks repeat.
+     */
     isEligible?(i: number): boolean;
+    /**
+     * Optional (1.2.0): endpoint `i`'s weight. Distinct failover's fallback is ONE weighted choice among
+     * the untried, eligible endpoints whose weight is a finite number > 0 (a weight-0 endpoint is never
+     * chosen); without `weightOf` every endpoint counts as weight 1. The six weighted strategies expose it.
+     * Must not throw: a throwing `weightOf` rejects the run with that error (not attempt 0's error); every
+     * in-flight count the run raised is still released.
+     */
+    weightOf?(i: number): number;
     /** Optional latency-feedback sink (PeakEwmaBalancer); fed on settle when a clock is in use. */
     recordRtt?(i: number, sampleNs: number, now: number): void;
     /** Optional occupancy sink (BoundedLoadBalancer); fed +1 on dispatch, -1 on settle. */
@@ -85,7 +96,12 @@ export interface Balancer {
 export interface RunOptions {
     /** Passed to `fn`; when already aborted, stops dispatch/failover (the abort propagates). */
     signal?: AbortLike;
-    /** Max distinct-endpoint attempts (default 1 = no failover). */
+    /**
+     * Max distinct-endpoint attempts (default 1 = no failover). After a thrown attempt Pool re-picks (up to
+     * 8 times) while the strategy repeats a tried endpoint, then makes one weighted choice among the
+     * untried, eligible, positive-weight endpoints -- targeted by (key, attempt) for a keyed run (stable per
+     * key), by a per-Pool sequence otherwise. No candidate left -> the run rejects with the last error.
+     */
     tries?: number;
     /**
      * A caller-owned nanosecond clock. REQUIRED for a latency-aware balancer (PeakEWMA): `run`
@@ -137,8 +153,12 @@ export class Pool {
     readonly inflight: Uint32Array;
     /**
      * Run `fn` against a chosen endpoint (in-flight incremented on dispatch, decremented on settle),
-     * with up to `opts.tries` genuinely DISTINCT-endpoint failover attempts on a throw (failover
-     * targets are spread across keys for a keyed run and cursor-rotated for an unkeyed run). A keyed
+     * with up to `opts.tries` genuinely DISTINCT-endpoint failover attempts on a throw. Pool first
+     * re-picks (up to 8 times) while the strategy repeats a tried endpoint, then makes ONE weighted choice
+     * among the untried, eligible endpoints whose weight (`balancer.weightOf`, absent -> 1) is a finite
+     * number > 0 -- targeted by (key, attempt) for a keyed run (stable per key), by a per-Pool sequence
+     * for an unkeyed run; no such endpoint left -> the run rejects with the last error. A throwing
+     * `weightOf` / `isEligible` rejects the run with THAT error (in-flight still released). A keyed
      * balancer requires `opts.key` and a latency balancer requires `opts.clock` (a `LITE_PICK_KEY_REQUIRED`
      * / `LITE_PICK_CLOCK_REQUIRED`-coded error otherwise); a non-finite clock reading rejects with a
      * `LITE_PICK_CLOCK_INVALID`-coded error before dispatch.

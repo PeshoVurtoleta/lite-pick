@@ -101,3 +101,20 @@ HAProxy `leastconn` serves equal keys first-in-first-out, Envoy samples among ti
 Rejected shapes, measured at 256 endpoints: one loop with a wrapped index (+55-85%); one forward pass that
 tracks the first tie after the cursor (fine for LeastConn/SED, but NQ then scans every endpoint before the
 cursor on its way to an idle one: 6.8 -> 247 ns). Chosen: two loops, +5-8% LeastConn, +2-7% SED.
+
+## Amendment 2026-10-11 (1.2.0, K3): random ties are OPT-IN, rotation stays the default
+
+Added: a trailing `{ ties?: 'rotate' | 'random', seed?: number }` (`TieOptions`). `'random'` is uniform up to the 2^-32 draw grid (max abs error ~5e-10 at k = 128) among
+the tied minima (a seeded skip-based reservoir, Vitter 1985: ~ln k draws for a k-way tie; NQ first tries up to 4
+random draws for an idle node). Unknown keys throw `LITE_PICK_OPTION` with a did-you-mean.
+
+Why NOT the default: the first design (a reservoir draw per tied node) was measured against the pre-change time at
+cap 64 and missed the user's 1.25x bar in 8 of 9 cells (1.4-8.6x; 63 draws per pick when 64 nodes tie, and NQ's
+all-idle cells cost 2-3 ns before any draw). The default therefore stays the rotating cursor: no slowdown, no
+behaviour change. The opt-in cost (report only, cap 64, ns/pick vs default): LeastConn 1.3-2.3x, SED 1.3-1.8x, NQ
+1.26x all-busy, ~5.7 ns all-idle (vs 2.1), up to 5.5x half-busy.
+
+Corrected bias numbers for the rotation (in-repo seeded sim, load 0.9, weights [1,1,1,1,4,4,4,4], rate = weight): SED
+is the worst (weight-1 group 3.66 / 3.49 / 3.31 / 3.14 %, ~17% relative); NQ and LeastConn ~1% relative (0.16-0.18
+pp); the bias follows position and vanishes for interleaved layouts. The audit's "about 1 percentage point NQ, others fair" was wrong.
+Research: research/1.2.0-phase2-ties-failover.md.

@@ -112,6 +112,12 @@ async function main() {
             const nq = new NqBalancer(CAP, el, inflight, weights);
             nq.pick();
             tracker.track(nq, noop, 'nq', { audit: true });
+            const nqr = new NqBalancer(CAP, el, inflight, weights, { ties: 'random', seed: c });
+            nqr.pick();
+            tracker.track(nqr, noop, 'nq-random', { audit: true });
+            const lcr = new LeastConnBalancer(CAP, el, inflight, { ties: 'random' });
+            lcr.pick();
+            tracker.track(lcr, noop, 'leastconn-random', { audit: true });
             const pe = new PeakEwmaBalancer(CAP, el, inflight, 1e6, c);
             pe.pick(c);
             pe.recordRtt(c & (CAP - 1), 1000, c);
@@ -292,6 +298,19 @@ async function main() {
     const nqAllocBytes = retainedBytes(measureAllocs(nqStep, { iterations: 100000, batches: 8 }));
     const nqAllocOk = nqAllocBytes === 0;
 
+    // ---- phase 8b (1.2.0): opt-in ties 'random' picks -- 0 retained B/op -----------
+    // LeastConn / SED / NQ with { ties: 'random' }: the seeded skip-reservoir body (int32 xorshift local,
+    // stored back once) over the tied pools above, and NQ's idle-draw fast path over an all-idle pool.
+    const RANDOM_TIES = { ties: 'random', seed: 0xBEEF };
+    const lcR = new LeastConnBalancer(CAP, el, inflight, RANDOM_TIES);
+    const sedR = new SedBalancer(CAP, el, inflight, weights, RANDOM_TIES);
+    const nqR = new NqBalancer(CAP, el, busy, weights, RANDOM_TIES);
+    const nqRIdle = new NqBalancer(CAP, el, new Uint32Array(CAP), weights, RANDOM_TIES);
+    let tiesSink = 0;
+    const tiesStep = () => { tiesSink = (tiesSink + lcR.pick() + sedR.pick() + nqR.pick() + nqRIdle.pick()) | 0; };
+    const tiesAllocBytes = retainedBytes(measureAllocs(tiesStep, { iterations: 100000, batches: 8 }));
+    const tiesAllocOk = tiesAllocBytes === 0;
+
     // ---- phase 9: PeakEWMA.pick(now) -- 0 retained B/op --------------------
     // One reused PeakEwmaBalancer over a half-eligible pool + caller-owned inflight: pick(now)
     // is two rejection draws + two decay-on-read exp() + a compare -- a PURE read (no write),
@@ -393,7 +412,7 @@ async function main() {
 
     // ---- verdict ----------------------------------------------------------
     const retentionOk = live === 0 && findings.length === 0 && warns.length === 0;
-    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void peSink; void chSink; void blSink; void wrandSink; void wrandFbSink;
+    void sink; void rrSink; void wrrSink; void p2cSink; void lcSink; void sedSink; void nqSink; void tiesSink; void peSink; void chSink; void blSink; void wrandSink; void wrandFbSink;
 
     process.stdout.write('lite-pick torture (M10: substrate + RoundRobin + SmoothWRR + P2C + LeastConn + SED + NQ + PeakEWMA + ConsistentHash + BoundedLoad + WeightedRandom)\n');
     process.stdout.write('  retention: tracker.size()=' + live +
@@ -419,6 +438,8 @@ async function main() {
         (sedAllocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  NQ.pick() retained: ' + showBytes(nqAllocBytes) + ' B/op -> ' +
         (nqAllocOk ? 'PASS' : 'FAIL') + '\n');
+    process.stdout.write('  LC/SED/NQ ties:random pick() retained: ' + showBytes(tiesAllocBytes) + ' B/op -> ' +
+        (tiesAllocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  PeakEWMA.pick() retained: ' + showBytes(peAllocBytes) + ' B/op -> ' +
         (peAllocOk ? 'PASS' : 'FAIL') + '\n');
     process.stdout.write('  PeakEWMA.recordRtt() retained: ' + showBytes(rttAllocBytes) + ' B/op -> ' +
@@ -437,7 +458,7 @@ async function main() {
         ' B/op -> ' + (mustFailTrips ? 'TRIPPED (lane has teeth)' : 'BLIND -- gate is broken') + '\n');
 
     if (!retentionOk || !allocOk || !rrAllocOk || !wrrAllocOk || !p2cAllocOk ||
-        !lcAllocOk || !sedAllocOk || !nqAllocOk || !peAllocOk || !rttAllocOk || !chAllocOk ||
+        !lcAllocOk || !sedAllocOk || !nqAllocOk || !tiesAllocOk || !peAllocOk || !rttAllocOk || !chAllocOk ||
         !blAllocOk || !noteAllocOk || !wrandAllocOk || !wrandFbAllocOk || !mustFailTrips || !wrCtrlTrips) {
         process.stderr.write('torture: FAIL\n');
         if (!wrCtrlTrips) {

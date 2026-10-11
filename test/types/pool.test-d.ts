@@ -132,3 +132,11 @@ void poolCodeIdx; void poolCodeAny; void poolCodeKeyIsCode; void poolCodesAsCore
 void POOL_CODES.ERR_LITE_PICK_INDEX;
 // @ts-expect-error -- CODES is readonly
 POOL_CODES.LITE_PICK_INDEX = 'LITE_PICK_INDEX';
+
+// 1.2.0: a duck-typed balancer may expose weightOf(i) (failover's weighted fallback); it stays optional.
+const duckW = { capacity: 2, live: 2, pick: (): number => 0, isEligible: (i: number): boolean => i >= 0, weightOf: (i: number): number => i + 1 };
+const duckWPool: Pool = new Pool(duckW, new Uint32Array(2));
+const duckNoW: Pool = new Pool({ capacity: 2, live: 2, pick: (): number => 0 }, new Uint32Array(2));
+void duckWPool; void duckNoW;
+// @ts-expect-error -- weightOf returns a number
+new Pool({ capacity: 2, live: 2, pick: (): number => 0, weightOf: (i: number): string => String(i) }, new Uint32Array(2));

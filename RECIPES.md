@@ -172,9 +172,10 @@ const body = await pool.run((i, signal) => fetchFrom(endpoints[i], { signal }));
 
 Set `tries > 1`. On a thrown error, Pool keeps the failed node's in-flight count
 elevated and fails over to a genuinely DIFFERENT endpoint: it re-picks while the
-strategy repeats an already-tried endpoint (bounded), then scans for an eligible untried
-one (spread across keys for a keyed run, cursor-rotated otherwise). It stops -- surfacing
-the last error -- as soon as no untried eligible endpoint remains, so a 1-node pool with
+strategy repeats an already-tried endpoint (bounded), then makes ONE weighted choice among untried,
+eligible, weight > 0 backends (1.2.0: stable per key and different per attempt for a keyed run, a
+per-Pool sequence otherwise). It stops -- surfacing
+the last error -- as soon as no untried eligible positive-weight endpoint remains, so a 1-node pool with
 `tries: 3` makes exactly **one** attempt (Pool owns spatial failover, never temporal
 retry against the same node).
 
@@ -391,7 +392,7 @@ Notes:
   const pool = new Pool(lb, new Uint32Array(CAP));   // CH does not read inflight; any view works
   const body = await pool.run(
     (endpoint, signal) => fetchFrom(endpoints[endpoint], { signal }),
-    { key: fnv1a(sessionId), tries: 2 }              // same key -> same backend; failover overflows to a neighbour
+    { key: fnv1a(sessionId), tries: 2 }              // same key -> same backend; failover makes one weighted choice among the untried backends (stable per key)
   );
   ```
 - **Zero-box keys (1.1.0).** A key `>= 2^31` (about half of a 32-bit FNV-1a output) boxes
@@ -433,11 +434,12 @@ all 63 others (the largest share 2.9%). BoundedLoad inherits both; its drain als
   as a whole pool marked down does. 1.1.x fell back to equal shares and kept routing everywhere, against the
   documented weight-0-removes rule (a fix, not a breaking change). Restoring
   any positive weight rebuilds the same table a fresh constructor would.
-- **`/pool` failover does not see weight 0 yet (known, pre-existing).** With `tries > 1`, a failover
-  attempt that cannot re-pick a distinct backend falls back to a scan of ELIGIBLE untried backends, and
-  that scan ignores weights -- so it can dispatch to a removed (weight-0, still eligible) backend, and a run
-  already failing over when the last weight drops to 0 is not pool-down. Until the fix (ROADMAP 4b, with
-  K10), pair a remove that `/pool` failover must never reach with `setEligible(i, false)`.
+- **`/pool` failover never picks a weight-0 backend (FIXED, 1.2.0).** With `tries > 1`, a failover attempt
+  first re-picks (as before); if that repeats a tried endpoint, Pool makes ONE weighted choice among untried,
+  eligible, weight > 0 backends (via the balancer's `weightOf`; a balancer without it counts each backend as
+  weight 1). A removed backend is never chosen, and when no positive-weight untried backend is left the run
+  stops and surfaces the last error (the same rule as all-zero weights). 1.1.x scanned eligible backends and
+  ignored weights, so it could land on a weight-0 one; the `setEligible(i, false)` workaround is no longer needed.
 - **Re-applying the same weights is free (1.2.0).** `setWeights(weights)` with the values the table was
   built on skips the rebuild (no `STAT_REBUILDS`), so a config reload can call it unconditionally;
   `rebuild()` always rebuilds.
@@ -528,8 +530,8 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
   a major GC). The 1.1.0 `pickFrom` / `recordRttFrom` siblings read those numbers from your
   typed-array slots and are 0 B/op even when V8 does not inline them. See section 8/9.
 - `Pool.run` is a normal async function. A run that settles on **attempt 0** (any `tries`) costs
-  ~900 B/run (Node 22 v22.23.3, Pool's own share above the bare-await driver floor, by scavenge
-  count; `npm run bench:pool`), gated <= 912 B/run; each extra failover attempt adds ~375 B/run
+  ~888 B/run (Node 22 v22.23.3, Pool's own share above the bare-await driver floor, by scavenge
+  count; `npm run bench:pool`), gated <= 896.3 B/run; each extra failover attempt adds ~375 B/run
   (gated too); a latency-aware balancer (PeakEWMA) driven by an epoch-ns `clock` adds ~32 B/run more
   per attempt (Node 22; the clock boxes) and is gated on its own row. Abort-before-dispatch is **not**
   cheaper than a successful run (ungated, above L3). Your `fn`'s closure, promise and I/O come on top --
@@ -560,9 +562,13 @@ None is required; the kernel runs over raw TypedArrays with nothing installed.
 - **Eligibility flips go through `setEligible`** -- it is the only supported writer and
   keeps `live` exact; a direct byte write desyncs the cached count (recipe 3). Each
   balancer needs its own eligibility array.
-- **Ties rotate, but WHICH tied node wins is not a contract** -- since 1.1.0 LeastConn/SED/NQ hand
+- **Ties rotate by default, but WHICH tied node wins is not a contract** -- since 1.1.0 LeastConn/SED/NQ hand
   exact ties to the first tied node after a moving cursor, so tied nodes take turns (1.0.x: always the
-  lowest index). Do not depend on a particular index.
+  lowest index). The rotation has a small positional bias under mixed weights (in-repo sim, weights
+  [1,1,1,1,4,4,4,4], load 0.9: SED's weight-1 group 3.66 / 3.49 / 3.31 / 3.14 %, about 17% relative; NQ and
+  LeastConn about 1% relative; vanishes for interleaved layouts). Use `ties: 'random'` when exact tie fairness
+  matters: `new NqBalancer(cap, eligible, inflight, weights, { ties: 'random', seed: 7 })` (opt-in, costs
+  LeastConn 1.3-2.3x, SED 1.3-1.8x, NQ 1.26x all-busy, ~5.7 ns all-idle (vs 2.1), up to 5.5x half-busy (ns/pick vs the default, cap 64)).
 - **lite-pick is not a proxy** -- it returns an index; you own transport, retries/backoff
   (temporal), health checking, and the socket.
 

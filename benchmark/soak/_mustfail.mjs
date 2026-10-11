@@ -354,9 +354,10 @@ control('M15 BoundedLoad _total desync',
 // M21: SED goes weight-blind (score = in-flight + 1, the LeastConn rule) -> the SED argmin oracle, which
 // recomputes (inflight + 1) / weight independently, disagrees whenever weights differ. The score line is
 // shared verbatim with NQ; the mutant runs on the SED lane only. (Renumbered from M17, which is now the
-// 2-field-object/pick alloc FAIL control above.)
+// 2-field-object/pick alloc FAIL control above.) 5 sites since 1.2.0: SED + NQ default bodies (2 each) + SED's
+// opt-in `ties: 'random'` body (1); the soak lane runs the default body, so the extra patch is inert.
 control('M21 SED weight-blind score',
-    patchAll(PICK, '                    const score = (inf[i] + 1) / w;', '                    const score = inf[i] + 1;', 4),
+    patchAll(PICK, '                    const score = (inf[i] + 1) / w;', '                    const score = inf[i] + 1;', 5),
     { SOAK_CYCLES: CYC, SOAK_PICKS: String(A), SOAK_LANES: 'SED' }, 1, 'quality lane=SED kind=oracle');
 // M18: NQ loses its never-queue shortcut (an idle node no longer wins outright) -> it degenerates to SED and
 // queues on a busy node while an idle one exists -> the NQ oracle (first idle, else SED min) trips.
@@ -424,11 +425,12 @@ poolControl('MP6 pool-retains-self (A6 retention)',
 poolControl('MP7 pool-unhandled (A7)',
     patchPool('        const o = opts != null ? opts : undefined;', '        const o = opts != null ? opts : undefined; if (((this.__ur = (this.__ur | 0) + 1) % 1000) === 0) Promise.reject(new Error("pool unhandled"));'),
     { ...PA, SOAK_LANES: 'PoolP2C' }, 1, 'pool=A7');
-// A8 (S10): Pool's failover scan ignores eligibility -> an attempt lands on a DOWN node. Keyed lanes re-pick
-// the same home, so every keyed failover goes through _scanUntried; the audit's mutant exited 0 on all four
-// pool lanes before fn checked eligible[i] at dispatch.
-poolControl('MP8 scan ignores isEligible (A8 down-dispatch)',
-    patchPool('        if (b.isEligible(idx) && tried.indexOf(idx) < 0) return idx;', '        if (tried.indexOf(idx) < 0) return idx;'),
+// A8 (S10): Pool's failover fallback ignores eligibility -> an attempt lands on a DOWN node. Keyed lanes re-pick
+// the same home, so every keyed failover goes through the fallback (_chooseUntried, 1.2.0: a weighted choice;
+// the isEligible check sits in BOTH passes -- the weight sum and the walk -- so both are patched); the audit's
+// mutant exited 0 on all four pool lanes before fn checked eligible[i] at dispatch.
+poolControl('MP8 fallback ignores isEligible (A8 down-dispatch)',
+    patchPool('        if (b.isEligible(i) && held.indexOf(i) < 0) {', '        if (held.indexOf(i) < 0) {', 2),
     { ...PA, SOAK_LANES: 'PoolConsistentHash' }, 1, 'pool=A8 lane=PoolConsistentHash');
 // A9 (S9): Pool counts every dispatch TWICE in flight and releases it twice -- nets to zero at quiescence
 // (A2 blind), but the time-integral of inflight is double the attempt time -> Little's-law identity breaks.

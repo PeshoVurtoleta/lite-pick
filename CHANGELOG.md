@@ -7,13 +7,35 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 ## [Unreleased]
 
 Shipped kernel changes -- 1.2.0 material (Pick.js, Pool.js, Pick.d.ts, Pool.d.ts; soak parity.json hashes re-pinned; StreamParity unchanged).
-1.2.0 has NO breaking change. One behaviour change is a fix: K8, ConsistentHash / BoundedLoad all-zero weights
-now return `PICK_NONE`, as the documented weight-0 rule always said (see "Weights, CODES"). The hard
+1.2.0 has NO breaking change. Two behaviour changes, both fixes: K8 (ConsistentHash / BoundedLoad all-zero weights
+now return `PICK_NONE`, as the documented weight-0 rule always said; see "Weights, CODES") and /pool failover (K10 + weight 0:
+the failover target is now one weighted choice among untried backends, and a run with no positive-weight untried
+backend stops with the last error instead of dispatching to an eligible weight-0 backend; see Fixed). The hard
 `M <= 2^24` table-size cap is deferred to 2.0 (SemVer: 1.1.1 documented `M <= 2^31 - 1`). The soak:ab entries
 under Changed and Fixed are benchmark / CI only and touch no shipped file.
 
+### Added
+
+- **Opt-in random ties for LeastConn / SED / NQ (K3).** A trailing options object `{ ties?: 'rotate' | 'random',
+  seed?: number }` (type `TieOptions`). `'random'` is uniform up to the 2^-32 draw grid (max abs error ~5e-10 at k = 128) among the tied minima via a seeded
+  skip-based reservoir (~ln k PRNG draws for a k-way tie, 0 B/op); NQ 'random' tries up to 4 random draws for an
+  idle node first. An unknown key fails closed with a did-you-mean (`LITE_PICK_OPTION`). `describe()` gains
+  `ties`; `tieCursor` is -1 in random mode. The default stays the rotating cursor, unchanged: this is an ADDED
+  feature, not a behaviour change (default-on missed the 1.25x bar at cap 64, 1.4-8.6x). Cost of 'random' (ns/pick
+  vs the default, cap 64, reported not gated): LeastConn 1.3-2.3x, SED 1.3-1.8x, NQ 1.26x all-busy, ~5.7 ns all-idle
+  (vs 2.1), up to 5.5x half-busy. ADR 0006 amendment 2026-10-11; research/1.2.0-phase2-ties-failover.md.
+- **`weightOf(i)`** -- public read-only on SmoothWRR, ConsistentHash (BoundedLoad inherits), WeightedRandom, SED,
+  NQ. Returns the live caller weight (SmoothWRR / SED / NQ / WeightedRandom) or the owned table copy
+  (ConsistentHash / BoundedLoad); RangeError `LITE_PICK_INDEX` on a bad index. `/pool` failover reads it through a new
+  optional `weightOf?(i)` on the Pool `Balancer` type (absent = weight 1; a non-finite or <= 0 result is not a candidate).
+  `seed: 0` of `TieOptions` maps to the default seed; a 'random' instance carries its own `pick` (a different hidden
+  class: do not mix modes at one hot call site).
+
 ### Changed
 
+- **Pool cost gates tightened (not widened).** On Node 22 every Pool path is ~16 B/run cheaper (the `run()` register count fell
+  60 -> 59; on Node 26 the failover share fell 57.7 B, 1276.3 -> 1218.6); the PoolCost SHARES were re-pinned LOWER so the must-fail controls trip again. Node 22 ceilings:
+  attempt-0 `<= 896.3 B` (was 912), failover `<= 1270.8 B` (was 1288), clocked `<= 929.2 B` (was 944.2).
 - **soak:ab: K = 16 on hosted runners** (decisions/0017 Amendment 1; benchmark-only, no shipped file). The first hosted A/A dispatch passed
   20/20 at K = 10; its worst lane's process-to-process CV (SmoothWRR sparse, 8.1%) puts the runner in the
   > 6% row of the research table, so `soak-ab.yml`'s `rounds` default is now 16 (10.5 min measured). The
@@ -22,6 +44,19 @@ under Changed and Fixed are benchmark / CI only and touch no shipped file.
 
 ### Fixed
 
+- **`/pool` failover spreads by weight (K10) and never picks a weight-0 backend.** Attempt n > 0 still re-picks first;
+  if that repeats a tried endpoint, Pool now makes ONE weighted choice among untried, eligible, weight > 0
+  backends (keyed: derived from (key, attempt), stable per key, different per attempt; unkeyed: a per-Pool
+  sequence) via the balancer's `weightOf` (a balancer without it counts each backend as weight 1). The failed
+  backend's neighbour no longer takes ~2x the spill (measured 1.75x at cap 8, ~2x at cap 64 before), and a removed
+  (weight-0) backend is never chosen; with no positive-weight untried backend left the run stops and surfaces the
+  last error (same rule as K8). Measured before -> after: the failed backend's neighbour took 1.75x of uniform at
+  cap 8 and ~2x at cap 64, now 1.01x and ~1.0x; weight-0 dispatches on attempt 1 were 100% / 52.6%, now 0%. Replaces the phase-1 KNOWN note. ADR 0007 Fork 2 / ADR 0013 M2 amendments 2026-10-11.
+- **Docs: the tie-bias numbers were wrong and are corrected** (README, GUIDE, llms.txt, RECIPES). Default rotation,
+  in-repo seeded simulation, weights `[1,1,1,1,4,4,4,4]`, rate = weight, load 0.9: SED is the WORST (weight-1
+  group 3.66 / 3.49 / 3.31 / 3.14 %, ~17% relative first vs last); NQ and LeastConn ~1% relative (0.16-0.18 pp);
+  the bias follows position and vanishes for interleaved layouts. The 1.1.1 audit's "about 1 percentage point NQ, LeastConn and SED
+  fair" is superseded. Use `ties: 'random'` when exact tie fairness matters.
 - **soak:ab -- a relative `--out-dir` failed closed before measuring.** `fetchRelease` runs `npm pack` inside
   the scratch directory, so the workflow's relative `--out-dir benchmark/out/soak-ab` was resolved twice
   (`.../scratch/benchmark/out/soak-ab/scratch/*.tgz`, ENOENT) and the first hosted A/A run exited 3
@@ -92,7 +127,7 @@ new runtime export and one behaviour change that is a fix (K8). No breaking chan
   byte-identical (StreamParity digests unchanged). **Migration:** 1.1.x fell back to EQUAL quotas on
   all-zero weights and routed every key everywhere; if you relied on that, keep at least one positive weight
   (or use `setEligible` to drain instead of weight 0 to remove).
-  KNOWN (ROADMAP 4b, phase 2): /pool failover (tries > 1) ignores weights; pair a remove with `setEligible(i, false)`.
+  The /pool failover half of this rule is FIXED in this release (see Fixed below).
 - **ConsistentHash / BoundedLoad table size: unchanged, `M <= 2^31 - 1` (K9, 1.1.1).** The planned hard
   `M <= 2^24` cap is deferred to 2.0: 1.1.1 documented `M` valid up to `2^31 - 1`, so rejecting
   `(2^24, 2^31 - 1]` in a minor would break SemVer (ROADMAP "2.0 candidates"). `M <= 2^24` stays the

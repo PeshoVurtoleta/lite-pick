@@ -540,6 +540,20 @@ export class SmoothWRRBalancer extends BalancerBase {
     }
 
     /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the LIVE caller-owned `weights[i]` (what pick() reads).
+     * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
+     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
+     * Electron) -- a cold-path read, not a hot one.
+     * @param {number} i
+     * @returns {number}
+     */
+    weightOf(i) {
+        _vIdx(i, this._cap);
+        return this._weights[i];
+    }
+
+    /**
      * Next endpoint by smooth weighting, or PICK_NONE (fail closed). O(cap), zero-alloc.
      * @returns {number}
      */
@@ -666,6 +680,77 @@ export class P2cBalancer extends BalancerBase {
     }
 }
 
+/** The two `ties` modes of LeastConn / SED / NQ (1.2.0) and their option keys. */
+const _TIE_MODES = ['rotate', 'random'];
+const _TIE_KEYS = ['ties', 'seed'];
+
+/** Levenshtein distance for the did-you-mean hint (cold: an option error only). */
+function _lev(a, b) {
+    const m = a.length, n = b.length, row = [];
+    for (let j = 0; j <= n; j++) row.push(j);
+    for (let i = 1; i <= m; i++) {
+        let prev = row[0];
+        row[0] = i;
+        for (let j = 1; j <= n; j++) {
+            const t = row[j];
+            row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+            prev = t;
+        }
+    }
+    return row[n];
+}
+
+/**
+ * Validate the trailing `{ ties?, seed? }` options of LeastConn / SED / NQ (1.2.0) and return the VALIDATED
+ * values -- the ctors use only these, never the caller's object again. Fail closed (cold, BEFORE any state
+ * write; all LITE_PICK_OPTION): undefined / null = defaults; anything else must be a PLAIN object (prototype
+ * Object.prototype or null, no Symbol keys, not an array). Each key is read ONCE, as an OWN DATA property:
+ * an inherited value (a polluted Object.prototype.ties) is ignored, and an accessor property throws (a getter
+ * could return one value to validation and another to the ctor). An unknown key throws with a did-you-mean;
+ * `ties` must be 'rotate' or 'random'; `seed` an integer in [0, 2^32) (0 maps to the default seed, as Prng).
+ * Allocates the small result object (cold ctor path only).
+ * @param {unknown} opts
+ * @returns {{ ties: 'rotate' | 'random', seed: number }}
+ */
+function _tieOpts(opts) {
+    if (opts === undefined || opts === null) return { ties: 'rotate', seed: 0x9e3779b9 };
+    const proto = typeof opts === 'object' ? Object.getPrototypeOf(opts) : undefined;
+    if ((proto !== Object.prototype && proto !== null) || Object.getOwnPropertySymbols(opts).length !== 0) {
+        throw _err(TypeError, 'LITE_PICK_OPTION', '[lite-pick] options must be a plain object { ties?, seed? }');
+    }
+    const keys = Object.getOwnPropertyNames(opts);
+    let ties = 'rotate', seed = 0x9e3779b9;
+    for (let k = 0; k < keys.length; k++) {
+        const key = keys[k];
+        if (_TIE_KEYS.indexOf(key) < 0) {
+            let hint = '', bestD = 3;
+            for (let j = 0; j < _TIE_KEYS.length; j++) {
+                const d = _lev(key.toLowerCase(), _TIE_KEYS[j]);
+                if (d < bestD) { bestD = d; hint = "; did you mean '" + _TIE_KEYS[j] + "'?"; }
+            }
+            throw _err(TypeError, 'LITE_PICK_OPTION', "[lite-pick] unknown option '" + key + "'" + hint);
+        }
+        const desc = Object.getOwnPropertyDescriptor(opts, key);
+        if (desc === undefined || !('value' in desc)) {
+            throw _err(TypeError, 'LITE_PICK_OPTION', "[lite-pick] option '" + key + "' must be a data property, not an accessor");
+        }
+        const v = desc.value;   // the ONE read of this key
+        if (v === undefined) continue;
+        if (key === 'seed') {
+            if (!(Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF)) {
+                throw _err(RangeError, 'LITE_PICK_OPTION', '[lite-pick] seed must be an integer in [0, 2^32 - 1]: ' + String(v));
+            }
+            seed = v;
+        } else {
+            if (_TIE_MODES.indexOf(v) < 0) {
+                throw _err(RangeError, 'LITE_PICK_OPTION', "[lite-pick] ties must be 'rotate' or 'random': " + String(v));
+            }
+            ties = v;
+        }
+    }
+    return { ties, seed };
+}
+
 /**
  * LeastConnBalancer -- EXACT fewest-in-flight (M4), IPVS `lc` made zero-GC.
  *
@@ -687,6 +772,15 @@ export class P2cBalancer extends BalancerBase {
  * callers still must not depend on WHICH tied node wins). Fails
  * closed (PICK_NONE) when the whole pool is down.
  *
+ * Opt-in `{ ties: 'random', seed }` (1.2.0, K3): the rotating cursor leaves a small positional bias under
+ * load (the node after a busy run wins more ties). 'random' replaces it with a SEEDED UNIFORM draw among
+ * the tied minima -- one [0, cap) scan with a skip-based size-1 reservoir (Vitter): ~ln k PRNG steps for a
+ * k-way tie, each tied node 1/k up to the 2^-32 draw grid (max abs error ~5e-10 at k = 128). It runs in
+ * its own method body (`_pickRandom`, bound over `pick` by the ctor), so the default rotate body is
+ * byte-identical to 1.1.x. Reproducible from `seed` (`seed: 0` maps to the default 0x9e3779b9, as Prng).
+ * A 'random' instance carries an OWN `pick` property, so it has a different hidden class from a default
+ * instance: do not mix the two modes at one hot call site (it goes polymorphic / megamorphic).
+ *
  * NOTE: without a feedback loop (inflight never changes) LeastConn returns the same lowest-load
  * index every call -- correct by contract (it IS the least-loaded), but the caller must feed
  * load back for it to distribute. The M5 lite-query adapter provides that increment/decrement.
@@ -697,14 +791,25 @@ export class LeastConnBalancer extends BalancerBase {
      * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param {Uint32Array} inflight  per-endpoint in-flight counts (length >= capacity),
      *   caller-owned and only READ here.
+     * @param {{ ties?: 'rotate' | 'random', seed?: number }} [opts]  1.2.0: `ties` 'rotate' (default, the
+     *   1.1.0 cursor) or 'random' (a seeded uniform draw); `seed` (default 0x9e3779b9; 0 maps to it, as Prng) is used by
+     *   'random' only. A 'random' instance has an OWN `pick` (another hidden class).
+     *   Validated fail-closed (LITE_PICK_OPTION; unknown key -> did-you-mean; own data properties only,
+     *   each read once; null = defaults).
      */
-    constructor(capacity, eligible, inflight) {
+    constructor(capacity, eligible, inflight, opts) {
+        const o = _tieOpts(opts);   // validated once; the ctor never re-reads `opts`
         super(capacity, eligible);
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
             throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
         }
         this._inflight = inflight;
         this._cur = 0;   // rotating tie-break cursor (M5, 1.1.0): the next scan's preferred start
+        // 1.2.0 opt-in ties (cold; same fields in both modes): 'random' binds its own pick body, so the default
+        // pick() stays byte-identical and pays nothing.
+        this._ties = o.ties;
+        this._rng = new Prng(o.seed);
+        if (o.ties === 'random') this.pick = this._pickRandom;
     }
 
     /**
@@ -739,12 +844,42 @@ export class LeastConnBalancer extends BalancerBase {
         return best;
     }
 
-    /** Cold snapshot (1.1.0): the base fields plus the total in flight and the tie cursor. */
+    /**
+     * pick() under `ties: 'random'` (1.2.0) -- the ctor binds it over pick(), so the default body pays nothing.
+     * ONE [0, cap) scan with a skip-based size-1 reservoir (Vitter): a strictly lower load restarts the tie
+     * count c (and clears the skip r); at an equal one, r (unset = 0) is drawn as floor(c / u) + 1 for
+     * u = Prng.next() / 2^32 in (0, 1) -- the index of the next tie that replaces -- and the c-th tie replaces
+     * iff c === r (then r clears and is drawn lazily at the next tie). P(the k-th of K ties wins) = 1/K
+     * in exact arithmetic (u on the 2^-32 grid: max abs error ~5e-10 at K = 128); ~ln K draws per K-way tie. The xorshift runs on an INT32 local (bit-identical to
+     * Prng.next(); a double-typed local measured 2.8x slower per step) and is stored back once.
+     * Zero-alloc. Internal: call pick().
+     * @returns {number}
+     */
+    _pickRandom() {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const cap = this._cap, el = this._eligible, inf = this._inflight, rng = this._rng;
+        let best = -1, bestLoad = 0, c = 0, r = 0, x = rng._s | 0;
+        for (let i = 0; i < cap; i++) {
+            if (el[i]) {
+                const v = inf[i];
+                if (best < 0 || v < bestLoad) { best = i; bestLoad = v; c = 1; r = 0; }
+                else if (v === bestLoad) {
+                    if (r === 0) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; r = Math.floor(c / ((x >>> 0) / 4294967296)) + 1; }
+                    if (++c === r) { best = i; r = 0; }
+                }
+            }
+        }
+        rng._s = x >>> 0;
+        return best;                              // best >= 0 guaranteed while _live > 0
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus the total in flight, the tie mode (1.2.0) and the tie cursor (-1 when 'random'). */
     describe() {
         const d = super.describe();
         d.strategy = 'LeastConn';
         d.inflight = _sum(this._inflight, this._cap);
-        d.tieCursor = this._cur;
+        d.ties = this._ties;
+        d.tieCursor = this._ties === 'random' ? -1 : this._cur;   // -1: not applicable in 'random' mode
         return d;
     }
 }
@@ -766,7 +901,8 @@ export class LeastConnBalancer extends BalancerBase {
  * has weight 0, `pick()` fails closed.
  *
  * Bound: O(cap) per pick (one scan, one Float64 division per eligible node), 0 B/op. Ties among
- * equal scores rotate (1.1.0, as LeastConn). Fails closed (PICK_NONE) when no eligible endpoint has a
+ * equal scores rotate (1.1.0, as LeastConn), or -- opt-in `{ ties: 'random', seed }` (1.2.0) -- are a
+ * seeded uniform draw (as LeastConnBalancer). Fails closed (PICK_NONE) when no eligible endpoint has a
  * positive weight.
  */
 export class SedBalancer extends BalancerBase {
@@ -775,8 +911,14 @@ export class SedBalancer extends BalancerBase {
      * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param {Uint32Array} inflight  per-endpoint in-flight counts (length >= capacity), caller-owned.
      * @param {Uint32Array} weights  per-endpoint weights (length >= capacity), caller-owned; read live.
+     * @param {{ ties?: 'rotate' | 'random', seed?: number }} [opts]  1.2.0: `ties` 'rotate' (default, the
+     *   1.1.0 cursor) or 'random' (a seeded uniform draw); `seed` (default 0x9e3779b9; 0 maps to it, as Prng) is used by
+     *   'random' only. A 'random' instance has an OWN `pick` (another hidden class).
+     *   Validated fail-closed (LITE_PICK_OPTION; unknown key -> did-you-mean; own data properties only,
+     *   each read once; null = defaults).
      */
-    constructor(capacity, eligible, inflight, weights) {
+    constructor(capacity, eligible, inflight, weights, opts) {
+        const o = _tieOpts(opts);   // validated once; the ctor never re-reads `opts`
         super(capacity, eligible);
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
             throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
@@ -787,6 +929,11 @@ export class SedBalancer extends BalancerBase {
         this._inflight = inflight;
         this._weights = weights;
         this._cur = 0;   // rotating tie-break cursor (M5, 1.1.0): the next scan's preferred start
+        // 1.2.0 opt-in ties (cold; same fields in both modes): 'random' binds its own pick body, so the default
+        // pick() stays byte-identical and pays nothing.
+        this._ties = o.ties;
+        this._rng = new Prng(o.seed);
+        if (o.ties === 'random') this.pick = this._pickRandom;
     }
 
     /**
@@ -824,16 +971,71 @@ export class SedBalancer extends BalancerBase {
         return best;
     }
 
-    /** Cold snapshot (1.1.0): the base fields plus the total in flight, the weights and the tie cursor. */
+    /**
+     * pick() under `ties: 'random'` (1.2.0) -- the ctor binds it over pick(), so the default body pays nothing.
+     * ONE [0, cap) scan with a skip-based size-1 reservoir (Vitter): a strictly lower score restarts the tie
+     * count c (and clears the skip r); at an equal one, r (unset = 0) is drawn as floor(c / u) + 1 for
+     * u = Prng.next() / 2^32 in (0, 1) -- the index of the next tie that replaces -- and the c-th tie replaces
+     * iff c === r (then r clears and is drawn lazily at the next tie). P(the k-th of K ties wins) = 1/K
+     * in exact arithmetic (u on the 2^-32 grid: max abs error ~5e-10 at K = 128); ~ln K draws per K-way tie. The xorshift runs on an INT32 local (bit-identical to
+     * Prng.next(); a double-typed local measured 2.8x slower per step) and is stored back once.
+     * Zero-alloc. Internal: call pick().
+     * @returns {number}
+     */
+    _pickRandom() {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const cap = this._cap, el = this._eligible, inf = this._inflight, wt = this._weights, rng = this._rng;
+        let best = -1, bestScore = Infinity, c = 0, r = 0, x = rng._s | 0;
+        for (let i = 0; i < cap; i++) {
+            if (el[i]) {
+                const w = wt[i];
+                if (w > 0) {
+                    const score = (inf[i] + 1) / w;
+                    if (score < bestScore) { bestScore = score; best = i; c = 1; r = 0; }
+                    else if (score === bestScore) {
+                        if (r === 0) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; r = Math.floor(c / ((x >>> 0) / 4294967296)) + 1; }
+                        if (++c === r) { best = i; r = 0; }
+                    }
+                }
+            }
+        }
+        rng._s = x >>> 0;
+        return best;                              // -1 === PICK_NONE: every eligible node has weight 0
+    }
+
+    /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the LIVE caller-owned `weights[i]` (what pick() reads).
+     * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
+     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
+     * Electron) -- a cold-path read, not a hot one.
+     * @param {number} i
+     * @returns {number}
+     */
+    weightOf(i) {
+        _vIdx(i, this._cap);
+        return this._weights[i];
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus the total in flight, the weights, the tie mode (1.2.0) and the tie cursor (-1 when 'random'). */
     describe() {
         const d = super.describe();
         d.strategy = 'SED';
         d.inflight = _sum(this._inflight, this._cap);
         d.weights = Array.from(this._weights.subarray(0, this._cap));
-        d.tieCursor = this._cur;
+        d.ties = this._ties;
+        d.tieCursor = this._ties === 'random' ? -1 : this._cur;   // -1: not applicable in 'random' mode
         return d;
     }
 }
+
+/**
+ * NQ `ties: 'random'` never-queue fast path (1.2.0): up to this many uniform draws over [0, cap) before the
+ * full scan; the first that lands on an idle candidate wins. Measured (1.2.0, cap 8/64/1024): no fast path is
+ * 8-340x slower than 1.1.x on idle-heavy pools; 2 / 4 / 8 tries trade the all-busy cost (W1 cap 64: 1.22 / 1.25 /
+ * 1.68x) against the half-idle miss (W3 cap 1024: 60 / 18 / 6x). 4 is the balance.
+ */
+const NQ_IDLE_TRIES = 4;
 
 /**
  * NqBalancer -- never-queue (M4), IPVS `nq` made zero-GC.
@@ -849,6 +1051,9 @@ export class SedBalancer extends BalancerBase {
  *
  * Bound: O(cap) worst case (no idle node -> a full SED scan); O(1) when a low-index endpoint is
  * idle. 0 B/op. Fails closed (PICK_NONE) when no eligible endpoint has a positive weight.
+ *
+ * Opt-in `{ ties: 'random', seed }` (1.2.0, as LeastConnBalancer): a uniformly random idle node, else a
+ * uniform draw among the SED minima -- see `_pickRandom` for the idle fast path.
  */
 export class NqBalancer extends BalancerBase {
     /**
@@ -856,8 +1061,14 @@ export class NqBalancer extends BalancerBase {
      * @param {Uint8Array} eligible  shared view: 1 = pickable, 0 = down (length >= capacity).
      * @param {Uint32Array} inflight  per-endpoint in-flight counts (length >= capacity), caller-owned.
      * @param {Uint32Array} weights  per-endpoint weights (length >= capacity), caller-owned; read live.
+     * @param {{ ties?: 'rotate' | 'random', seed?: number }} [opts]  1.2.0: `ties` 'rotate' (default, the
+     *   1.1.0 cursor) or 'random' (a seeded uniform draw); `seed` (default 0x9e3779b9; 0 maps to it, as Prng) is used by
+     *   'random' only. A 'random' instance has an OWN `pick` (another hidden class).
+     *   Validated fail-closed (LITE_PICK_OPTION; unknown key -> did-you-mean; own data properties only,
+     *   each read once; null = defaults).
      */
-    constructor(capacity, eligible, inflight, weights) {
+    constructor(capacity, eligible, inflight, weights, opts) {
+        const o = _tieOpts(opts);   // validated once; the ctor never re-reads `opts`
         super(capacity, eligible);
         if (!(inflight instanceof Uint32Array) || inflight.length < capacity) {
             throw _err(RangeError, 'LITE_PICK_ARRAY', '[lite-pick] inflight must be a Uint32Array of length >= capacity');
@@ -868,6 +1079,11 @@ export class NqBalancer extends BalancerBase {
         this._inflight = inflight;
         this._weights = weights;
         this._cur = 0;   // rotating tie-break cursor (M5, 1.1.0): the next scan's preferred start
+        // 1.2.0 opt-in ties (cold; same fields in both modes): 'random' binds its own pick body, so the default
+        // pick() stays byte-identical and pays nothing.
+        this._ties = o.ties;
+        this._rng = new Prng(o.seed);
+        if (o.ties === 'random') this.pick = this._pickRandom;
     }
 
     /**
@@ -908,13 +1124,66 @@ export class NqBalancer extends BalancerBase {
         return best;
     }
 
-    /** Cold snapshot (1.1.0): the base fields plus the total in flight, the weights and the tie cursor. */
+    /**
+     * pick() under `ties: 'random'` (1.2.0) -- the ctor binds it over pick(), so the default body pays nothing.
+     * ONE [0, cap) scan with a skip-based size-1 reservoir (Vitter): a strictly lower score restarts the tie
+     * count c (and clears the skip r); at an equal one, r (unset = 0) is drawn as floor(c / u) + 1 for
+     * u = Prng.next() / 2^32 in (0, 1) -- the index of the next tie that replaces -- and the c-th tie replaces
+     * iff c === r (then r clears and is drawn lazily at the next tie). P(the k-th of K ties wins) = 1/K
+     * in exact arithmetic (u on the 2^-32 grid: max abs error ~5e-10 at K = 128); ~ln K draws per K-way tie. The xorshift runs on an INT32 local (bit-identical to
+     * Prng.next(); a double-typed local measured 2.8x slower per step) and is stored back once.
+     * NQ: first up to NQ_IDLE_TRIES uniform draws over [0, cap) -- the first idle candidate wins, uniform over
+     * the idle set by symmetry -- then the scan with an idle node scored 0 (below any (inf + 1) / w).
+     * Zero-alloc. Internal: call pick().
+     * @returns {number}
+     */
+    _pickRandom() {
+        if (this._live === 0) return PICK_NONE;   // whole pool down: fail closed
+        const cap = this._cap, el = this._eligible, inf = this._inflight, wt = this._weights, rng = this._rng;
+        for (let t = 0; t < NQ_IDLE_TRIES; t++) {  // never-queue fast path (FASTPATH)
+            const j = rng.nextBelow(cap);
+            if (inf[j] === 0 && el[j] && wt[j] > 0) return j;
+        }
+        let best = -1, bestScore = Infinity, c = 0, r = 0, x = rng._s | 0;
+        for (let i = 0; i < cap; i++) {
+            if (el[i]) {
+                const w = wt[i];
+                if (w > 0) {
+                    const score = inf[i] === 0 ? 0 : (inf[i] + 1) / w;
+                    if (score < bestScore) { bestScore = score; best = i; c = 1; r = 0; }
+                    else if (score === bestScore) {
+                        if (r === 0) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; r = Math.floor(c / ((x >>> 0) / 4294967296)) + 1; }
+                        if (++c === r) { best = i; r = 0; }
+                    }
+                }
+            }
+        }
+        rng._s = x >>> 0;
+        return best;                              // -1 === PICK_NONE: every eligible node has weight 0
+    }
+
+    /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the LIVE caller-owned `weights[i]` (what pick() reads).
+     * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
+     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
+     * Electron) -- a cold-path read, not a hot one.
+     * @param {number} i
+     * @returns {number}
+     */
+    weightOf(i) {
+        _vIdx(i, this._cap);
+        return this._weights[i];
+    }
+
+    /** Cold snapshot (1.1.0): the base fields plus the total in flight, the weights, the tie mode (1.2.0) and the tie cursor (-1 when 'random'). */
     describe() {
         const d = super.describe();
         d.strategy = 'NQ';
         d.inflight = _sum(this._inflight, this._cap);
         d.weights = Array.from(this._weights.subarray(0, this._cap));
-        d.tieCursor = this._cur;
+        d.ties = this._ties;
+        d.tieCursor = this._ties === 'random' ? -1 : this._cur;   // -1: not applicable in 'random' mode
         return d;
     }
 }
@@ -1533,6 +1802,21 @@ export class ConsistentHashBalancer extends BalancerBase {
     }
 
     /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the balancer-OWNED weight copy (what the built table routes on;
+     *   BoundedLoad inherits it).
+     * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
+     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
+     * Electron) -- a cold-path read, not a hot one.
+     * @param {number} i
+     * @returns {number}
+     */
+    weightOf(i) {
+        _vIdx(i, this._cap);
+        return this._weights[i];
+    }
+
+    /**
      * COLD (1.1.0): replace ALL backend weights at once and rebuild the table ONCE. Per-backend `setWeight`
      * rebuilds on every call (N rebuilds to retune N backends); this is the batch form. `weights` is COPIED
      * into the balancer-owned weights (indices [0, capacity)); validated before any write, so a bad call
@@ -2034,6 +2318,21 @@ export class WeightedRandomBalancer extends BalancerBase {
         // call rebuild() / setWeights after such an edit.
         if (nw === this._built[i]) return;
         this._build();
+    }
+
+    /**
+     * Cold, read-only (1.2.0): endpoint `i`'s weight -- the LIVE caller-owned `weights[i]` (an in-place edit shows here before
+     *   rebuild(); the alias table routes on the last build).
+     * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
+     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
+     * Electron) -- a cold-path read, not a hot one.
+     * @param {number} i
+     * @returns {number}
+     */
+    weightOf(i) {
+        _vIdx(i, this._cap);
+        return this._weights[i];
     }
 
     /**

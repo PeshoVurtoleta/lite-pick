@@ -297,7 +297,10 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     records nothing keeps winning while idle -- record failures (the /pool failure penalty does).
   - `ewmaAt(i, now)` -> number. The decayed EWMA rtt estimate for endpoint i at `now`. Pure read. An
     unsampled node (`_sampled[i] === 0`) returns the baseline 1.0 undecayed, at any clock; otherwise
-    `_ewma[i] x exp(-max(now - stamp, 0)/tau)`.
+    `_ewma[i] x exp(-max(now - stamp, 0)/tau)`. A query: NEVER throws -- any `i` that is not an integer
+    in [0, capacity) (out of range, fractional, or a non-number) returns NaN, and so does a non-number
+    `now` (BigInt / Symbol / string / object: never coerced, no user toPrimitive / valueOf / toString
+    runs). A number non-finite `now` is not checked (it reads like any other number).
   - `recordRtt(i, sampleNs, now)` -> void. WARM feedback path (not the hot pick path): the FIRST
     sample initializes the EWMA EXACTLY to `sampleNs` (clock-magnitude-independent); thereafter
     Finagle's observe() exactly (1.1.0, L4): a sample ABOVE THE STORED estimate replaces it (snaps up
@@ -311,9 +314,11 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   - `pickFrom(buf, i)` -> number (1.1.0, ZERO-BOX). `now = buf[i]` read INSIDE from a caller-owned
     `Float64Array`, so a nanosecond clock (~1.7e18, never a small integer) never crosses a call boxed --
     `pick(now)` boxes it (~16 B) whenever V8 does not inline the call. Identical selection to
-    `pick(buf[i])`. NEVER throws for any value or index (past the end reads undefined -> like a non-finite
-    `now`: P2C-random); no per-pick type check -- a null / undefined `buf` is a programming error the engine
-    reports as TypeError. 0 B/op even with V8 inlining OFF (gated: `npm run test:perf:noinline`).
+    `pick(buf[i])`. NEVER throws for any value or any NUMBER index (past the end reads undefined -> like a
+    non-finite `now`: P2C-random). A non-number `i` (BigInt / string / Symbol / object) is UNSPECIFIED --
+    not validated (no per-pick type check); today it is a property key, so `0n` / `'0'` alias slot 0, a
+    Symbol reads undefined, and an object runs its own toPrimitive / toString (which may throw). A null / undefined `buf`
+    is a programming error the engine reports as TypeError. 0 B/op even with V8 inlining OFF (gated: `npm run test:perf:noinline`).
   - `recordRttFrom(i, buf, j)` -> void (1.1.0, ZERO-BOX). `sampleNs = buf[j]`, `now = buf[j + 1]` (recordRtt's
     argument order) read INSIDE a caller-owned `Float64Array`. Same semantics / errors as recordRtt, plus
     RangeError `LITE_PICK_ARRAY` unless `buf` is a Float64Array with slots j and j + 1 (a non-number j,
@@ -351,8 +356,11 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     slot at once, so a 32-bit hash >= 2^31 (not a small integer on Node; >= 2^30 on Chrome / Electron)
     never crosses a call boxed -- `pick(keyHash)` boxes it whenever V8 does not inline the call.
     Identical selection to `pick(buf[i])`: any typed array, normalized by `>>> 0` (a Uint32Array is the
-    natural home of a 32-bit hash). NEVER throws for any value or index (past the end -> key 0, like
-    pick(NaN)); a null / undefined `buf` is a programming error (engine TypeError). 0 B/op, gated with
+    natural home of a 32-bit hash). NEVER throws for any value or any NUMBER index (past the end -> key 0,
+    like pick(NaN)). A non-number `i` (BigInt / string / Symbol / object) is UNSPECIFIED -- not validated
+    (no per-pick type check); today it is a property key, so `0n` / `'0'` alias slot 0, a Symbol reads
+    undefined, and an object runs its own toPrimitive / toString (which may throw). A null / undefined `buf` is a
+    programming error (engine TypeError). 0 B/op, gated with
     V8 inlining on and off. BoundedLoad inherits it (cap-aware).
   - `setWeight(i, w)` -> void. COLD. Set backend i's weight (uint32) and REBUILD the table.
   - `setWeights(weights)` -> void. COLD (1.1.0). Replace ALL weights (a Uint32Array, length >= capacity,
@@ -397,7 +405,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     weights own none -- 1.2.0, K8, the inherited O(1) guard) -- NEVER merely because backends are over
     cap (fail OPEN on overload).
   - `pickFrom(buf, i)` -> number (1.1.0, ZERO-BOX). Inherited from ConsistentHash: the key is `buf[i]`,
-    read inside; identical to `pick(buf[i])` WITH the cap. 0 B/op even with V8 inlining off.
+    read inside; identical to `pick(buf[i])` WITH the cap, same index contract (a non-number `i` is
+    unspecified). 0 B/op even with V8 inlining off.
   - `note(i, delta)` -> void. WARM feedback path (not the hot pick path): the SOLE writer of `_total`
     (dispatch note(i,+1) / settle note(i,-1)), so the cap's mean stays O(1)-current without a scan.
     `i` is validated in range (RangeError), `delta` typeof-first as an integer; `_total` clamps at 0.

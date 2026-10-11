@@ -1356,12 +1356,16 @@ export class PeakEwmaBalancer extends BalancerBase {
      * The decayed EWMA rtt estimate for endpoint i at time `now` (ns). Pure READ -- exponential
      * decay applied on read, never written. An UNSAMPLED node (`_sampled[i] === 0`) reads its baseline
      * 1.0 UNDECAYED (graceful LeastConn), so a cold pool never underflows to 0 under a real
-     * large-magnitude clock. `now` must be finite (any sign). Zero-alloc.
+     * large-magnitude clock. `now` must be finite (any sign). Zero-alloc. A query: NEVER throws. Any `i`
+     * that is not an integer in [0, capacity) -- out of range, fractional, or a non-number -- returns NaN, and
+     * so does a non-number `now` (BigInt / Symbol / string / object: never coerced, no user toPrimitive /
+     * valueOf / toString runs). A NUMBER non-finite `now` is not checked: it reads like any other number.
      * @param {number} i
      * @param {number} now  caller-supplied nanoseconds
      * @returns {number}
      */
     ewmaAt(i, now) {
+        if (typeof i !== 'number' || typeof now !== 'number') return NaN; // query contract: never coerce, never throw
         if (this._sampled[i] === 0) return this._ewma[i]; // unsampled: undecayed baseline, clock-independent
         let dt = now - this._stamp[i];
         if (dt < 0) dt = 0;              // L6: clamp a non-monotonic clock -- exp(+x) must never inflate
@@ -1472,10 +1476,12 @@ export class PeakEwmaBalancer extends BalancerBase {
     /**
      * The ZERO-BOX sibling of pick(now) (1.1.0, B6; research/1.1.0-buffer-apis.md): `now = buf[i]`, read
      * inside, so a nanosecond clock (~1.7e18, never a small integer) never crosses a call boxed. Identical
-     * selection to `pick(buf[i])`. NEVER throws for any value or index: an index past the end reads undefined,
-     * which behaves like a non-finite `now` (P2C-random). `buf` must be indexable (a Float64Array; an integer
-     * typed array would truncate the clock) -- null / undefined is a programming error the engine reports as a
-     * TypeError; there is no per-pick type check. 0 B/op.
+     * selection to `pick(buf[i])`. NEVER throws for any value or any NUMBER index: an index past the end reads
+     * undefined, which behaves like a non-finite `now` (P2C-random). A non-number `i` (BigInt / string / Symbol /
+     * object) is UNSPECIFIED -- not validated (no per-pick type check); today it is a property key, so `0n` /
+     * `'0'` alias slot 0, a Symbol reads undefined, and an object runs its own toPrimitive / toString (which may throw).
+     * `buf` must be indexable (a Float64Array; an integer typed array would truncate the clock) -- null /
+     * undefined is a programming error the engine reports as a TypeError. 0 B/op.
      * @param {Float64Array} buf  caller-owned clock slot(s)
      * @param {number} i  slot index
      * @returns {number}
@@ -1868,9 +1874,12 @@ export class ConsistentHashBalancer extends BalancerBase {
      * The ZERO-BOX sibling of pick(keyHash) (1.1.0, B6; research/1.1.0-buffer-apis.md): the key is `buf[i]`,
      * read inside and reduced to its slot at once, so a 32-bit hash >= 2^31 (not a small integer) never crosses
      * a call boxed. Identical selection to `pick(buf[i])` -- any typed array, normalized by `>>> 0` as pick
-     * does; a Uint32Array is the natural home of a 32-bit hash. NEVER throws for any value or index (past the
-     * end reads undefined -> key 0, like pick(NaN)); null / undefined `buf` is a programming error the engine
-     * reports as a TypeError (no per-pick type check). BoundedLoad inherits it. 0 B/op.
+     * does; a Uint32Array is the natural home of a 32-bit hash. NEVER throws for any value or any NUMBER index
+     * (past the end reads undefined -> key 0, like pick(NaN)). A non-number `i` (BigInt / string / Symbol /
+     * object) is UNSPECIFIED -- not validated (no per-pick type check); today it is a property key, so `0n` /
+     * `'0'` alias slot 0, a Symbol reads undefined, and an object runs its own toPrimitive / toString (which may throw).
+     * Null / undefined `buf` is a programming error the engine reports as a TypeError. BoundedLoad inherits
+     * it. 0 B/op.
      * @param {Uint32Array} buf  caller-owned key slot(s)
      * @param {number} i  slot index
      * @returns {number}

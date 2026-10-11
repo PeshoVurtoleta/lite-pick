@@ -61,7 +61,11 @@ under Changed and Fixed are benchmark / CI only and touch no shipped file.
   (`j >>> 0` on a BigInt / Symbol / object): a non-number `j` now throws the coded `RangeError`
   `LITE_PICK_ARRAY`, uncoerced. Measured on the pre-fix `_vIdx`: 120 of 240 class x
   API x bad-index cases threw the wrong error and 55 of 110 `isEligible` calls threw; now 0 / 0
-  (`test/IndexType.test.js`). Pick.d.ts / llms.txt / README document the non-number case.
+  (`test/IndexType.test.js`). Pick.d.ts / llms.txt / README document the non-number case. PeakEWMA `ewmaAt`
+  returns `NaN` for a non-number index or a non-number `now` (was: `0n` / `'0'` aliased slot 0, an object
+  ran its `toPrimitive` / `toString`, and a BigInt / Symbol `now` threw an uncoded `TypeError`);
+  `pickFrom`'s never-throws promise now covers number indices only -- a non-number index is documented
+  unspecified (no hot-path type check).
 - **Docs: the tie-bias numbers were wrong and are corrected** (README, GUIDE, llms.txt, RECIPES). Default rotation,
   in-repo seeded simulation, weights `[1,1,1,1,4,4,4,4]`, rate = weight, load 0.9: SED is the WORST (weight-1
   group 3.66 / 3.49 / 3.31 / 3.14 %, ~17% relative first vs last); NQ and LeastConn ~1% relative (0.16-0.18 pp);

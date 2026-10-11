@@ -24,6 +24,8 @@ report-only CH / BL lanes read 0 on one run and 24 scavenges on the next.
 - **E3 -- `pickFrom` keeps `pick`'s never-throw contract.** Any value, any index: past the end reads undefined,
   which behaves like `pick(NaN)`. No per-pick type check; a null / undefined buffer is a programming error the
   engine reports. (The suite's other `From` methods validate, but none is a never-throw hot path.)
+  > Amended 2026-10-11 (1.2.0): never-throw covers NUMBER indices only; a non-number index is unspecified --
+  > see the amendment below.
 - **E4 -- `recordRttFrom` validates like `recordRtt`** (warm path) plus `LITE_PICK_ARRAY` for anything but a
   Float64Array with both slots, before any write.
 - **One body, no duplication.** PeakEWMA's pick body is `_pickAt(buf, at)` and its feedback body
@@ -49,3 +51,14 @@ report-only CH / BL lanes read 0 on one run and 24 scavenges on the next.
   (`npm run test:perf:noinline`, in `verify` and CI). On the pre-B6 kernel that run fails 12 lanes.
 - The 1.0.1 "recordRtt in isolation" FINDINGS is closed with an established root cause (a Maglev merge of a
   tagged argument with a double in the 1.0.x blend, removed by B3; research section 6).
+
+## Amendment 2026-10-11 (1.2.0): E3's never-throw contract covers NUMBER indices only
+
+E3 said `pickFrom` never throws for "any value, any index". That holds for any value in the buffer and any NUMBER
+index (past the end, negative or fractional reads undefined, which behaves like `pick(NaN)`), but not for every
+index: `buf[i]` runs ToPropertyKey, so an object index runs its own `Symbol.toPrimitive` / `toString` / `valueOf`,
+which may throw. The contract is narrowed, not the code: `pickFrom` stays the gated 0 B/op hot path with no per-pick
+type check. A non-number `i` (BigInt / string / Symbol / object) is UNSPECIFIED -- today it is used as a property key,
+so `0n` / `'0'` alias slot 0, a Symbol reads undefined, and an object's `Symbol.toPrimitive` / `toString` / `valueOf`
+runs. No test pins that behaviour. The cold query `PeakEwmaBalancer.ewmaAt(i, now)`, which has no PerfGate lane, does
+check: a non-number `i` or `now` returns NaN, never coerced (test/IndexType.test.js).

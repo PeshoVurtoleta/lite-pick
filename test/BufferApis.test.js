@@ -10,7 +10,7 @@
  *       `recordRtt(i, buf[j], buf[j + 1])`, for fractional samples and large clocks.
  *   Z3. `recordRttFrom` rejects a bad endpoint (LITE_PICK_INDEX), a non-Float64Array / missing slot
  *       (LITE_PICK_ARRAY), a non-finite or negative sample / non-finite now (LITE_PICK_ARGUMENT) -- with no write.
- *   Z4. `pickFrom` never throws for any value or index: past the end it behaves like pick(NaN).
+ *   Z4. `pickFrom` never throws for any value or any number index: past the end it behaves like pick(NaN).
  *   Z5. ConsistentHash / BoundedLoad `pickFrom(buf, i)` == `pick(buf[i])` for keys >= 2^31, negative Int32Array
  *       keys and Float64Array keys (fractions, 2^40, NaN), BoundedLoad also under load.
  *   Z6. The PRNG change is invisible: nextBelow, P2C, WeightedRandom (fast and very-sparse paths) and
@@ -83,7 +83,7 @@ test('Z3: recordRttFrom rejects with a code and writes nothing', () => {
     assert.deepEqual({ e: Array.from(b._ewma), s: Array.from(b._stamp), sm: Array.from(b._sampled), m: Array.from(b._samp) }, snap, 'no write');
 });
 
-test('Z4: pickFrom never throws for any value or index (past the end == pick(NaN))', () => {
+test('Z4: pickFrom never throws for any value or any number index (past the end == pick(NaN))', () => {
     const [a, b] = twinsPe(16, 7);
     const clk = new Float64Array([5e14]);
     for (let k = 0; k < 500; k++) {

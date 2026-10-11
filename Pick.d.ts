@@ -354,7 +354,12 @@ export class PeakEwmaBalancer extends BalancerBase {
      * @param seed deterministic PRNG seed (default 0x9e3779b9); reproducible benches.
      */
     constructor(capacity: number, eligible: Uint8Array, inflight: Uint32Array, tauNs: number, seed?: number);
-    /** The decayed EWMA rtt estimate for endpoint `i` at time `now` (ns). Pure read, zero-alloc. */
+    /**
+     * The decayed EWMA rtt estimate for endpoint `i` at time `now` (ns). Pure read, zero-alloc, never throws:
+     * any `i` that is not an integer in [0, capacity) -- out of range, fractional, or a non-number -- returns
+     * NaN, and so does a non-number `now` (BigInt / Symbol / string / object; never coerced, no user
+     * toPrimitive / valueOf / toString runs). A number non-finite `now` is not checked.
+     */
     ewmaAt(i: number, now: number): number;
     /**
      * Warm feedback path: record an rtt sample (ns) for endpoint `i` at time `now` (ns). The first sample
@@ -381,7 +386,10 @@ export class PeakEwmaBalancer extends BalancerBase {
     /**
      * The ZERO-BOX sibling of `pick(now)` (1.1.0): `now = buf[i]`, read inside, so a nanosecond clock (never a
      * small integer) never crosses a call boxed. Identical selection to `pick(buf[i])`. Never throws for any
-     * value or index (past the end behaves like a non-finite `now`). 0 B/op, even when V8 does not inline it.
+     * value or any NUMBER index (past the end behaves like a non-finite `now`). A non-number `i` (BigInt /
+     * string / Symbol / object) is UNSPECIFIED -- not validated (no per-pick type check); today it is a property
+     * key, so `0n` / `'0'` alias slot 0, a Symbol reads undefined, and an object runs its own toPrimitive /
+     * toString (which may throw). 0 B/op, even when V8 does not inline it.
      */
     pickFrom(buf: Float64Array, i: number): number;
     /** Snapshot: plus tau, the total in flight, the sampled-node count and the decaying pool mean (null before any sample). */
@@ -452,8 +460,11 @@ export class ConsistentHashBalancer extends BalancerBase {
     /**
      * The ZERO-BOX sibling of `pick(keyHash)` (1.1.0): the key is `buf[i]`, read inside and reduced to its table
      * slot at once, so a 32-bit hash >= 2^31 never crosses a call boxed. Identical selection to
-     * `pick(buf[i])` (any typed array, normalized by `>>> 0`). Never throws for any value or index (past the
-     * end is key 0). BoundedLoad inherits it, with its cap. 0 B/op, even when V8 does not inline it.
+     * `pick(buf[i])` (any typed array, normalized by `>>> 0`). Never throws for any value or any NUMBER index
+     * (past the end is key 0). A non-number `i` (BigInt / string / Symbol / object) is UNSPECIFIED -- not
+     * validated (no per-pick type check); today it is a property key, so `0n` / `'0'` alias slot 0, a Symbol
+     * reads undefined, and an object runs its own toPrimitive / toString (which may throw). BoundedLoad inherits it, with
+     * its cap. 0 B/op, even when V8 does not inline it.
      */
     pickFrom(buf: Uint32Array | Int32Array | Float64Array, i: number): number;
     /** Snapshot: plus the table size M and the weights (a copy). */

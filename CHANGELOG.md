@@ -18,6 +18,11 @@ indices (a BigInt / Symbol index now throws the coded `RangeError` `LITE_PICK_IN
 `M <= 2^24` table-size cap is deferred to 2.0 (SemVer: 1.1.1 documented `M <= 2^31 - 1`). The soak:ab entries
 under Changed and Fixed are benchmark / CI only and touch no shipped file.
 
+**Release gate (decisions/0017 Amendment 2):** soak-ab run 38110280947, commit 45178b4, release mode, published
+1.1.1 vs the 1.2.0 candidate, K = 16, 16/16 valid rounds: **PASS 20/20** (T = 0.05, R = 0.15, alpha = 0.05).
+Worst upper bound P2C dense sU +0.0373 (s +0.0175); ConsistentHash dense s +0.0171, sU +0.0258 (the K8
+`_live & _wmask` guard; the local PRELIMINARY K = 10 run on Node 26.8.2 read s +0.0236). No lane near T.
+
 ### Added
 
 - **Opt-in random ties for LeastConn / SED / NQ (K3).** A trailing options object `{ ties?: 'rotate' | 'random',
@@ -104,6 +109,17 @@ under Changed and Fixed are benchmark / CI only and touch no shipped file.
   bitmap check), and runs a must-fail control (`_sampled[i] = 2` is a lane violation). `SoakOracles` now
   asserts the ConsistentHash oracle's all-zero check count: > 0 on 1.1.x, and `insufficient` (0 checks) on the
   in-tree kernel, where every home is `PICK_NONE`.
+- **CI `test-node18` failed 5 tests at 1bc5eec** (test-only; Pick.js unchanged). The cross-version kernel loaders
+  (`SoakOracles` `kernelAt`, `SoakTeeth` lane probe) and the soak:teeth mutant dir (`_mustfail.mjs`) wrote
+  `git show <rev>:Pick.js` into a bare temp dir; Node 18 has no module-type detection, so it parsed as CommonJS
+  ("Unexpected token 'export'"). Each temp dir now gets a `{"type":"module"}` package.json (45178b4): Node 18.20.8
+  431 pass / 5 fail (CI run 38109020575 at 43c9aa7) -> 436 pass / 0 fail.
+- **PoolCost L9 gate: one-sided, one scavenge quantum** (test-only). `L9 (both channels subscribed) == L3` was
+  an exact equality on scavenge-quantised B/run and failed on CI run 38110241059 (attempt 1) with L9 one quantum CHEAPER
+  (1092 vs 1092.8 B/run; ADR 0007: +/-1 scavenge). It is now `L9 <= L3 + Q`, Q = one scavenge in B/run derived
+  from the lane's own windows and semi-space pin (~0.75 B/run), compared in exact scavenge counts; the test
+  fails closed if the lanes' count-to-bytes conversion changes. New must-fail control: L9 over a Pool.js mutant
+  that builds a fresh message object per publish must exceed L3 + Q by more than 8 B/run.
 
 ### K6 -- PeakEWMA offset clocks
 

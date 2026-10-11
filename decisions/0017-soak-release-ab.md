@@ -125,3 +125,16 @@ the first release that this gate blocks is the next one. That record (soak-ab ru
 K = 16, published 1.1.0 vs the packed tree == 1.1.1 by parity): **PASS 20/20**, 16/16 valid rounds, worst sU
 +0.0459 (SmoothWRR sparse); WeightedRandom sparse s = -0.0233 (sU -0.0188: faster with the whole interval
 below 0; p99 983 -> 889 ns) -- the K2 cached eligible-weight sum, as the local K = 10 run showed (-0.0341).
+
+## Amendment 2 (2026-10-11): 1.2.0 release gate -- PASS
+
+The first release this gate blocks. soak-ab run 38110280947 (workflow_dispatch, mode = release, ubuntu-latest,
+Node 22.23.3), commit 45178b4 (the Node-18 test-loader fix on top of the 1.2.0 commit 43c9aa7; Pick.js
+byte-identical, sha256 66302491a164), K = 16, published 1.1.1 vs the 1.2.0 candidate: **PASS 20/20**,
+16/16 valid rounds, 10 lanes x {dense, sparse} (T = 0.05, R = 0.15, alpha = 0.05, Holm over 20).
+
+Worst upper bound: P2C dense sU +0.0373 (s +0.0175, cvA/B 4.03% / 3.11%). The lane to watch,
+ConsistentHash dense (the K8 `(this._live & this._wmask) === 0` guard in `_pickSlot`): s +0.0171, sU +0.0258,
+consistent with the local PRELIMINARY K = 10 run on Node 26.8.2 (s +0.0236, the only Holm-significant
+comparison there, still below T). Every other lane: s in [-0.0062, +0.0129], sU <= +0.0238. Nothing near T;
+no ab-accept.json entry. The decision rule, K and the windows were not moved.

@@ -23,7 +23,11 @@
  *     CTRL_OBJ (+{a:i}), PLANT (+[]+push); the failover ceiling: PL_BOX6 (L6 + boxed double),
  *     CTRL_OBJ6 (+{a:i}); the clocked ceiling: PL_BOX8b (L8b + boxed double). CEIL = measured-share + 8
  *     B, below one boxed double, so even a single boxed value crossing a call trips it;
- *   - L9 (both diagnostics channels subscribed) == L3 -- the reused-message publish path is free;
+ *   - L9 (both diagnostics channels subscribed) <= L3 + ONE scavenge quantum (one-sided; the quantum is
+ *     derived from runLane's own window/semi-space configuration) -- the reused-message publish path is
+ *     free; three checks hold the tolerance (L9_TOL): TEETH -- L9 over a Pool.js mutant that builds a FRESH
+ *     message object per publish MUST exceed it; BOUND -- PL_BOX (L3 + one boxed double/run) MUST also
+ *     exceed it, so the tolerance stays below one boxed double; PIN -- L9_TOL is asserted to be exactly 1;
  *   - OLD-GEN is 0 in every measured window. This catches a transient per-run allocation but NOT a
  *     RETAINED, pretenured one: an object that survives into old_space does not raise the young-gen
  *     scavenge RATE (B/run) and is only caught by the PROMOTE control, whose old-gen count MUST be > 0
@@ -268,13 +272,112 @@ test('pool-cost: the teeth -- CTRL_OBJ/PLANT trip attempt0, CTRL_OBJ6 trips fail
     }
 });
 
-test('pool-cost: L9 (both channels subscribed) == L3 -- the unsubscribed-publish guard is free', () => {
+/**
+ * ONE scavenge quantum in B/run, derived from runLane's own measurement configuration -- never typed in.
+ * pool-cost-lanes.mjs counts minor GCs over a window of N runs and one of 8N runs (its main(): lo = N,
+ * hi = 8 * N) under the young generation pinned by CHILD_FLAGS, and converts the count difference as
+ *     B/run = (S_8N - S_N) x semiBytes / ((8 - 1) x N)
+ * so one scavenge more or less moves B/run by semiBytes / (7 N) (~0.75 B/run at 1 MiB, N = 200000).
+ * `checkQuantum` proves this is the lane's real conversion: each lane's reported bytesPerRun must equal
+ * its own scavenge counts times Q (rounded to 0.1 as the lane rounds); if the lane formula, the windows
+ * or the pin ever change, that check fails closed instead of the quantum silently going stale.
+ */
+const LANE_WIN_LO = 1;   // countWindow(drive, lane, N, ...)      -- pool-cost-lanes.mjs main()
+const LANE_WIN_HI = 8;   // countWindow(drive, lane, 8 * N, ...)  -- pool-cost-lanes.mjs main()
+// The ONE L9 tolerance, in scavenges (Q each): exactly one quantum (ADR 0007, +/-1 scavenge). Three checks
+// hold it, none of them by itself: (a) the gate and the fresh-message control share l9Within, which proves
+// the gate trips on the mutant (that mutant clears the bound by ~185-200 scavenges, so it alone does NOT bound
+// the tolerance); (b) PL_BOX (L3 + one boxed double per run: measured 23 scavenges above L3 on v22.23.3, the
+// pinned CI perf job, and 61 on v26.8.2) must ALSO fall outside
+// l9Within, so any tolerance wide enough to hide one boxed double fails; (c) the literal is pinned to 1 in the
+// L9 test, which catches every other change. NEVER raise it to pass.
+const L9_TOL = 1;
+function l9Within(d9, d3) { return d9 <= d3 + L9_TOL; }
+function childSemiBytes() {
+    let max = NaN, min = NaN;
+    for (const f of CHILD_FLAGS) {
+        if (f.startsWith('--max-semi-space-size=')) max = Number(f.slice('--max-semi-space-size='.length));
+        if (f.startsWith('--min-semi-space-size=')) min = Number(f.slice('--min-semi-space-size='.length));
+    }
+    assert.ok(max > 0 && min === max, 'CHILD_FLAGS must pin min == max semi-space (got min ' + min + ', max ' + max +
+        ') -- without both, one scavenge is not a fixed number of bytes and the quantum is undefined');
+    return max * 1048576;
+}
+function quantumOf(d) {
+    assert.equal(d.N, N, 'lane ' + d.lane + ' measured N = ' + d.N + ', expected ' + N);
+    return childSemiBytes() / ((LANE_WIN_HI - LANE_WIN_LO) * d.N);
+}
+function checkQuantum(d, q) {
+    assert.equal(quantumOf(d), q, 'lane ' + d.lane + ' does not share the measurement configuration of Q');
+    // Same operation order as the lane (count x semiBytes / (span x N), then 0.1 rounding), so an equal
+    // formula can never differ here by a float ulp.
+    const fromCounts = Math.round(((d.s8N - d.sN) * childSemiBytes()) / ((LANE_WIN_HI - LANE_WIN_LO) * d.N) * 10) / 10;
+    assert.equal(d.bytesPerRun, fromCounts,
+        'lane ' + d.lane + ' reported ' + d.bytesPerRun + ' B/run but its scavenge counts (' + d.sN + ', ' + d.s8N +
+        ') x Q = ' + fromCounts + ' -- pool-cost-lanes.mjs no longer converts counts the way Q assumes; re-derive Q.');
+}
+
+/**
+ * The allocating mutant of Pool's publish path: every dispatch / settle publish builds a FRESH message
+ * object instead of reusing _dMsg / _sMsg (the design research 7.2 measured at 315-458 scavenges / 10M
+ * runs). Written to a scratch dir with a copy of Pick.js beside it, as allocatingFallbackPool does.
+ */
+function freshMessagePool(dir) {
+    const src = readFileSync(ROOT + 'Pool.js', 'utf8');
+    const anchors = ['_dDepth === 0 ? _dMsg : ', '_sDepth === 0 ? _sMsg : '];
+    let out = src;
+    for (const a of anchors) {
+        assert.equal(out.split(a).length - 1, 1, 'mutant anchor "' + a + '" must be found once in Pool.js');
+        out = out.split(a).join('');
+    }
+    writeFileSync(join(dir, 'package.json'), '{"type":"module"}');
+    copyFileSync(ROOT + 'Pick.js', join(dir, 'Pick.js'));
+    writeFileSync(join(dir, 'Pool.js'), out);
+    return join(dir, 'Pool.js');
+}
+
+test('pool-cost: L9 (both channels subscribed) <= L3 + one scavenge quantum; a fresh-message publish trips it', () => {
     if (!HAVE_ROW) return;
     const l3 = runLane('L3');
     const l9 = runLane('L9');
-    assert.equal(l9.bytesPerRun, l3.bytesPerRun,
-        'L9 (both diagnostics channels subscribed) = ' + l9.bytesPerRun + ' B/run != L3 = ' + l3.bytesPerRun +
-        ' -- with the reused message object a subscribed dispatch/settle must cost the same as L3 (Pool.js:70-73).');
+    const q = quantumOf(l3);
+    checkQuantum(l3, q);
+    checkQuantum(l9, q);
+    assert.equal(L9_TOL, 1, 'L9_TOL = ' + L9_TOL + ': the L9 tolerance is exactly one scavenge quantum (ADR 0007, ' +
+        'lanes stable to +/-1 scavenge); changing it is a gate change that needs a maintainer decision.');
+    // ONE-SIDED, one quantum. B/run is scavenge-QUANTISED and each lane is stable only to +/-1 scavenge
+    // (ADR 0007), so an exact L9 == L3 flaked (CI 38110241059 attempt 1: L9 1092 vs L3 1092.8, L9 one quantum
+    // CHEAPER). L9 may be any amount cheaper and at most ONE scavenge dearer. Compared in the integer
+    // scavenge counts that bytesPerRun is made of -- the same test as l9 <= l3 + Q in B/run, exactly,
+    // without the lanes' 0.1 B rounding or a float ulp deciding it.
+    const d3 = l3.s8N - l3.sN;
+    const d9 = l9.s8N - l9.sN;
+    const bound = l3.bytesPerRun + L9_TOL * q;
+    const tolText = 'L3 + ' + L9_TOL + ' x Q = ' + bound.toFixed(2);
+    assert.ok(l9Within(d9, d3),
+        'L9 (both diagnostics channels subscribed) = ' + l9.bytesPerRun + ' B/run exceeds ' + tolText +
+        ' (Q = one scavenge = ' + q.toFixed(3) + ' B/run; scavenges ' + d9 + ' vs ' + d3 +
+        ') -- a subscribed dispatch/settle allocated per run; the reused message objects (Pool.js _dMsg / _sMsg) ' +
+        'must keep it within ' + L9_TOL + ' scavenge(s) of L3. Fix the code, never widen Q or L9_TOL.');
+    // TOLERANCE BOUND: PL_BOX is L3 + ONE escaped boxed double per run (already run and cached by the teeth
+    // test). It must fall OUTSIDE l9Within, so the tolerance stays below one boxed double.
+    const pb = runLane('PL_BOX');
+    checkQuantum(pb, q);
+    const dpb = pb.s8N - pb.sN;
+    assert.ok(!l9Within(dpb, d3),
+        'PL_BOX (L3 + one boxed double/run) = ' + pb.bytesPerRun + ' B/run (scavenges ' + dpb + ' vs L3 ' + d3 +
+        ') is within ' + tolText + ' -- L9_TOL = ' + L9_TOL + ' would hide a boxed double per run.');
+    // TEETH: the same lane over a Pool.js that allocates a fresh message per publish MUST fall outside
+    // l9Within, and exceed the bound by more than SLACK (below one boxed double).
+    const dir = mkdtempSync(join(tmpdir(), 'litepick-poolcost-'));
+    try {
+        const m = runLane('L9', freshMessagePool(dir));
+        checkQuantum(m, q);
+        const dm = m.s8N - m.sN;
+        assert.ok(!l9Within(dm, d3) && m.bytesPerRun - bound > SLACK,
+            'L9 over the fresh-message mutant = ' + m.bytesPerRun + ' B/run (scavenges ' + dm + ') did NOT exceed ' +
+            tolText + ' by more than SLACK = ' + SLACK + ' B -- the L9 gate has no teeth.');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('pool-cost: the old-gen teeth -- PROMOTE forces an old-gen collection', () => {

@@ -39,7 +39,7 @@ const DESC = {
     L8a: 'PeakEWMA, small-int clock (== L3)',
     L8b: 'PeakEWMA, 1.7e15 epoch-ns clock (clocked row)',
     PL_BOX8b: 'L8b + one escaped boxed double (clocked teeth)',
-    L9: 'L3 + both channels subscribed (== L3)',
+    L9: 'L3 + both channels subscribed (<= L3 + 1 scavenge)',
     L10: 'submit-shaped fn + per-run { signal }',
     CTRL_OBJ: 'L3 + one escaped {a:i} (attempt0 teeth)',
     CTRL_OBJ6: 'L6 + one escaped {a:i} (failover teeth)',

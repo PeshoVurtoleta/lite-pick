@@ -242,14 +242,20 @@ export class Prng {
 
 /**
  * Validate an endpoint index for a COLD/WARM mutator (never the hot pick path): it must be an
- * in-range, non-negative INTEGER. `(i >>> 0) !== i` rejects NaN, fractions (1.5), negatives (-1),
- * and non-numbers (a string like '2' coerces to a different value under `>>> 0`); `i >= cap`
- * rejects out-of-range. Fails closed with the same RangeError style as the pre-existing range
- * checks -- invalid input is an error, never a silent typed-array no-op that desyncs `_live`.
+ * in-range, non-negative INTEGER. A non-number of ANY type (BigInt, Symbol, string, object, null,
+ * undefined, boolean) is rejected FIRST by `typeof`, before any coercion: `>>> 0` on a BigInt or a
+ * Symbol throws V8's uncoded TypeError, and on an object it runs user valueOf. That message names
+ * only `typeof i`, so it never coerces the index either. Then `(i >>> 0) !== i` rejects NaN,
+ * fractions (1.5), negatives (-1) and values >= 2^32; `i >= cap` rejects out-of-range. Every case
+ * fails closed with the same coded RangeError (`LITE_PICK_INDEX`) -- invalid input is an error,
+ * never a silent typed-array no-op that desyncs `_live`.
  * @param {number} i
  * @param {number} cap
  */
 function _vIdx(i, cap) {
+    if (typeof i !== 'number') {
+        throw _err(RangeError, 'LITE_PICK_INDEX', '[lite-pick] index must be a number, got ' + typeof i);
+    }
     if ((i >>> 0) !== i || i >= cap) {
         throw _err(RangeError, 'LITE_PICK_INDEX', '[lite-pick] index out of range: ' + i);
     }
@@ -372,10 +378,11 @@ export class BalancerBase {
         return this._live;
     }
 
-    /** True iff endpoint i is currently pickable. O(1), zero-alloc. A non-integer (1.5, NaN)
-     *  is never pickable -> false (isEligible NEVER throws; it is a pure predicate). */
+    /** True iff endpoint i is currently pickable. O(1), zero-alloc. A non-number (BigInt, Symbol,
+     *  string, object), a non-integer (1.5, NaN) or an out-of-range i is never pickable -> false
+     *  (isEligible NEVER throws and never coerces i; it is a pure predicate). */
     isEligible(i) {
-        return (i >>> 0) === i && i < this._cap && this._eligible[i] !== 0;
+        return typeof i === 'number' && (i >>> 0) === i && i < this._cap && this._eligible[i] !== 0;
     }
 
     /**
@@ -542,9 +549,9 @@ export class SmoothWRRBalancer extends BalancerBase {
     /**
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the LIVE caller-owned `weights[i]` (what pick() reads).
      * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
-     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
-     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
-     * Electron) -- a cold-path read, not a hot one.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or
+     * out-of-range `i`. A weight outside the Smi range returned across a non-inlined call boxes (~16 B:
+     * >= 2^31 on 64-bit Node, >= 2^30 on Chrome / Electron) -- a cold-path read, not a hot one.
      * @param {number} i
      * @returns {number}
      */
@@ -1006,9 +1013,9 @@ export class SedBalancer extends BalancerBase {
     /**
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the LIVE caller-owned `weights[i]` (what pick() reads).
      * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
-     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
-     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
-     * Electron) -- a cold-path read, not a hot one.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or
+     * out-of-range `i`. A weight outside the Smi range returned across a non-inlined call boxes (~16 B:
+     * >= 2^31 on 64-bit Node, >= 2^30 on Chrome / Electron) -- a cold-path read, not a hot one.
      * @param {number} i
      * @returns {number}
      */
@@ -1165,9 +1172,9 @@ export class NqBalancer extends BalancerBase {
     /**
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the LIVE caller-owned `weights[i]` (what pick() reads).
      * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
-     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
-     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
-     * Electron) -- a cold-path read, not a hot one.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or
+     * out-of-range `i`. A weight outside the Smi range returned across a non-inlined call boxes (~16 B:
+     * >= 2^31 on 64-bit Node, >= 2^30 on Chrome / Electron) -- a cold-path read, not a hot one.
      * @param {number} i
      * @returns {number}
      */
@@ -1389,15 +1396,15 @@ export class PeakEwmaBalancer extends BalancerBase {
      * The ZERO-BOX sibling of recordRtt (1.1.0, B6; research/1.1.0-buffer-apis.md): `sampleNs = buf[j]`,
      * `now = buf[j + 1]`, read inside, so a fractional sample or a large clock never crosses a call boxed
      * (recordRtt boxes them, ~16 B each, when V8 does not inline it). Same semantics and errors as recordRtt,
-     * plus RangeError LITE_PICK_ARRAY unless `buf` is a Float64Array with slots j and j + 1 -- all checked
-     * before any write. 0 B/op.
+     * plus RangeError LITE_PICK_ARRAY unless `buf` is a Float64Array and `j` a number with slots j and j + 1
+     * (a BigInt / Symbol / object `j` is never coerced) -- all checked before any write. 0 B/op.
      * @param {number} i  endpoint index
      * @param {Float64Array} buf  caller-owned: [sampleNs, now] at j, j + 1
      * @param {number} j  slot index
      */
     recordRttFrom(i, buf, j) {
         _vIdx(i, this._cap);
-        if (!(buf instanceof Float64Array) || (j >>> 0) !== j || j + 1 >= buf.length) {
+        if (!(buf instanceof Float64Array) || typeof j !== 'number' || (j >>> 0) !== j || j + 1 >= buf.length) {
             throw _err(RangeError, 'LITE_PICK_ARRAY',
                 '[lite-pick] recordRttFrom(i, buf, j) needs a Float64Array with slots j and j + 1');
         }
@@ -1805,9 +1812,9 @@ export class ConsistentHashBalancer extends BalancerBase {
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the balancer-OWNED weight copy (what the built table routes on;
      *   BoundedLoad inherits it).
      * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
-     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
-     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
-     * Electron) -- a cold-path read, not a hot one.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or
+     * out-of-range `i`. A weight outside the Smi range returned across a non-inlined call boxes (~16 B:
+     * >= 2^31 on 64-bit Node, >= 2^30 on Chrome / Electron) -- a cold-path read, not a hot one.
      * @param {number} i
      * @returns {number}
      */
@@ -2324,9 +2331,9 @@ export class WeightedRandomBalancer extends BalancerBase {
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the LIVE caller-owned `weights[i]` (an in-place edit shows here before
      *   rebuild(); the alias table routes on the last build).
      * Pool's failover reads it (duck-typed) to spill weight-proportionally and never onto a weight-0 node.
-     * Throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`. A weight outside the Smi
-     * range returned across a non-inlined call boxes (~16 B: >= 2^31 on 64-bit Node, >= 2^30 on Chrome /
-     * Electron) -- a cold-path read, not a hot one.
+     * Throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or
+     * out-of-range `i`. A weight outside the Smi range returned across a non-inlined call boxes (~16 B:
+     * >= 2^31 on 64-bit Node, >= 2^30 on Chrome / Electron) -- a cold-path read, not a hot one.
      * @param {number} i
      * @returns {number}
      */

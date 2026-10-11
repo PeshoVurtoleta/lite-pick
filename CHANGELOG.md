@@ -52,6 +52,16 @@ under Changed and Fixed are benchmark / CI only and touch no shipped file.
   (weight-0) backend is never chosen; with no positive-weight untried backend left the run stops and surfaces the
   last error (same rule as K8). Measured before -> after: the failed backend's neighbour took 1.75x of uniform at
   cap 8 and ~2x at cap 64, now 1.01x and ~1.0x; weight-0 dispatches on attempt 1 were 100% / 52.6%, now 0%. Replaces the phase-1 KNOWN note. ADR 0007 Fork 2 / ADR 0013 M2 amendments 2026-10-11.
+- **A BigInt / Symbol index now throws the coded `RangeError` `LITE_PICK_INDEX`.** `_vIdx` (shared by
+  `setEligible`, `setWeight`, `weightOf`, `recordRtt`, `recordRttFrom`, `note`) ran `i >>> 0` first, so `0n` threw
+  V8's uncoded `TypeError` ('Cannot mix BigInt and other types'), a Symbol threw 'Cannot convert a Symbol value to
+  a number', and an object index ran its `valueOf`. A `typeof` check now rejects every non-number first, and the
+  message names only `typeof i` (it no longer coerces the index). `isEligible` returns `false` for a non-number
+  instead of throwing, as its never-throws contract says. `recordRttFrom`'s slot `j` had the same hole
+  (`j >>> 0` on a BigInt / Symbol / object): a non-number `j` now throws the coded `RangeError`
+  `LITE_PICK_ARRAY`, uncoerced. Measured on the pre-fix `_vIdx`: 120 of 240 class x
+  API x bad-index cases threw the wrong error and 55 of 110 `isEligible` calls threw; now 0 / 0
+  (`test/IndexType.test.js`). Pick.d.ts / llms.txt / README document the non-number case.
 - **Docs: the tie-bias numbers were wrong and are corrected** (README, GUIDE, llms.txt, RECIPES). Default rotation,
   in-repo seeded simulation, weights `[1,1,1,1,4,4,4,4]`, rate = weight, load 0.9: SED is the WORST (weight-1
   group 3.66 / 3.49 / 3.31 / 3.14 %, ~17% relative first vs last); NQ and LeastConn ~1% relative (0.16-0.18 pp);

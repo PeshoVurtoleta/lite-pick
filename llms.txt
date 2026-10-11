@@ -166,10 +166,11 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     undersized / non-Uint8Array view. Flip it ONLY through `setEligible` after construction.
   - `capacity` -- readonly number. Fixed endpoint count.
   - `live` -- readonly number. Currently eligible endpoints (O(1), cold-path maintained).
-  - `isEligible(i)` -> boolean. O(1); out-of-range OR a non-integer (1.5, NaN) is `false`, never a throw.
+  - `isEligible(i)` -> boolean. O(1); out-of-range, a non-integer (1.5, NaN) OR a non-number (BigInt,
+    Symbol, string, object) is `false`, never a throw, and `i` is never coerced.
   - `setEligible(i, up)` -> void. Cold path; the ONLY supported eligibility writer -- keeps `live`
-    exact and is idempotent; throws `RangeError` on a non-integer or out-of-range index (incl. a
-    numeric string like '2'). A direct `eligible[i]` write desyncs `live` (UB).
+    exact and is idempotent; throws `RangeError` (`LITE_PICK_INDEX`) on a non-number (incl. a numeric
+    string like '2', a BigInt, a Symbol), non-integer or out-of-range index. A direct `eligible[i]` write desyncs `live` (UB).
   - `pick()` -> number. ABSTRACT in the base (throws); overridden by each strategy.
   - `attachStats(slab)` -> void (1.1.0). Cold. `slab` is a caller-owned `Float64Array` of length >=
     STAT_COUNT, or `null` to detach; several balancers may share one (counts add). Without a slab the
@@ -260,7 +261,7 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
   the default at cap 64): LeastConn 1.3-2.3x, SED 1.3-1.8x, NQ 1.26x all-busy, ~5.7 ns all-idle (vs 2.1), up to
   5.5x half-busy. An ADDED option, not a behaviour change: default-on missed the 1.25x bar (1.4-8.6x).
 - `weightOf(i)` (1.2.0) -- public read-only on SmoothWRR, ConsistentHash (BoundedLoad inherits), WeightedRandom,
-  SED, NQ. RangeError `LITE_PICK_INDEX` on a bad index. Returns the live caller weight (SmoothWRR / SED / NQ /
+  SED, NQ. RangeError `LITE_PICK_INDEX` on a bad index (non-number, BigInt included / non-integer / out-of-range). Returns the live caller weight (SmoothWRR / SED / NQ /
   WeightedRandom, which read the caller's array) or the owned table copy (ConsistentHash / BoundedLoad). `/pool`
   failover reads it via the optional `weightOf?(i)` on the Pool `Balancer` type; a non-finite or <= 0 weight is not
   a candidate. Keyed target = fmix32(key ^ imul(attempt, 0x9e3779b9)); unkeyed = the per-Pool `_failSeq`.
@@ -303,8 +304,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     instantly), else `ewma x w + sample x (1 - w)`, `w = exp(-max(now - stamp, 0)/tau)` (eases down
     over ~tau; 1.0.x decayed twice, `ewma x w^2 + ...`). It also folds the sample into the decaying
     pool mean (sum and count decay by exp(-dt/tau) since the newest sample). `now` / `sampleNs` are caller-supplied
-    nanoseconds, consistent with `pick(now)`. THROWS `RangeError` on a non-integer / out-of-range
-    index (incl. a numeric string like '2' -- which used to work; a string index now throws
+    nanoseconds, consistent with `pick(now)`. THROWS `RangeError` on a non-number (BigInt / Symbol
+    included) / non-integer / out-of-range index (incl. a numeric string like '2' -- which used to work; a string index now throws
     RangeError, not TypeError) or a non-finite/negative `sampleNs`; 0 B/op on the success path.
     Anti-flap = the time constant, no extra dwell (ADR 0002, ADR 0009).
   - `pickFrom(buf, i)` -> number (1.1.0, ZERO-BOX). `now = buf[i]` read INSIDE from a caller-owned
@@ -315,7 +316,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     reports as TypeError. 0 B/op even with V8 inlining OFF (gated: `npm run test:perf:noinline`).
   - `recordRttFrom(i, buf, j)` -> void (1.1.0, ZERO-BOX). `sampleNs = buf[j]`, `now = buf[j + 1]` (recordRtt's
     argument order) read INSIDE a caller-owned `Float64Array`. Same semantics / errors as recordRtt, plus
-    RangeError `LITE_PICK_ARRAY` unless `buf` is a Float64Array with slots j and j + 1 -- all before any write.
+    RangeError `LITE_PICK_ARRAY` unless `buf` is a Float64Array with slots j and j + 1 (a non-number j,
+    BigInt / Symbol included, is never coerced) -- all before any write.
     0 B/op. (Idiom: `fb[0] = done - start; fb[1] = done; lb.recordRttFrom(i, fb, 0)`.)
   - CONTRACT: `now` and `sampleNs` MUST be FINITE numbers. `recordRtt` THROWS on a non-finite
     argument (warm path); `pick(now)` NEVER throws (fail-closed contract), so a non-finite `now`

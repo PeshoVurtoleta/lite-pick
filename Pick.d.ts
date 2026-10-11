@@ -21,7 +21,8 @@ export const PICK_NONE: -1;
  * release; codes are semver API. The error CLASS is stable: `TypeError` ONLY when a required numeric option
  * or argument is not a number (tauNs / table size M / eps / minCap / note's delta / recordRtt's sample or
  * clock), and when `Pool` / `liteQueryFetcher` get a non-function or a structurally-invalid balancer;
- * `RangeError` for an out-of-range or out-of-domain VALUE (index, capacity, weight, a non-finite or negative
+ * `RangeError` for an out-of-range or out-of-domain VALUE (index -- an index of ANY non-number type, BigInt and
+ * Symbol included, is a RangeError `LITE_PICK_INDEX`, never a TypeError; capacity, weight, a non-finite or negative
  * number, an option outside its domain) AND for a typed-array argument of the wrong type or too short
  * (`LITE_PICK_ARRAY` -- a wrong CONTAINER type is a RangeError, never a TypeError); `Error` otherwise. Kernel:
  * CAPACITY, ARRAY (a typed array of the wrong type or too short, or a bad stats slab), INDEX, WEIGHT, OPTION
@@ -116,10 +117,12 @@ export class BalancerBase {
     readonly capacity: number;
     /** Number of currently eligible endpoints (O(1)). */
     readonly live: number;
-    /** True iff endpoint `i` is currently pickable; a non-integer or out-of-range `i` is `false` (never throws). */
+    /** True iff endpoint `i` is currently pickable; a non-number (BigInt, Symbol, string, object), non-integer or
+     *  out-of-range `i` is `false` (never throws, never coerces `i`). */
     isEligible(i: number): boolean;
     /** Cold path: the only supported eligibility writer -- flips `i` up/down and keeps the live count exact.
-     *  Throws `RangeError` on a non-integer or out-of-range index (incl. a numeric string like '2'). */
+     *  Throws `RangeError` (`LITE_PICK_INDEX`) on a non-number (incl. a numeric string like '2', a BigInt, a
+     *  Symbol), non-integer or out-of-range index. */
     setEligible(i: number, up: boolean): void;
     /**
      * Cold (1.1.0): count this balancer's internal events (`STAT_*`) into a caller-owned slab; `null`
@@ -185,7 +188,7 @@ export class SmoothWRRBalancer extends BalancerBase {
     /**
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the live caller-owned `weights[i]`.
      * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
-     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or out-of-range `i`.
      */
     weightOf(i: number): number;
     /** Next endpoint by smooth weighting, or `PICK_NONE` when the eligible-weight sum is 0. */
@@ -278,7 +281,7 @@ export class SedBalancer extends BalancerBase {
     /**
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the live caller-owned `weights[i]`.
      * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
-     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or out-of-range `i`.
      */
     weightOf(i: number): number;
     /** Snapshot: plus the total in flight, the weights (a copy), the tie mode (1.2.0) and the tie cursor (-1 in 'random' mode). */
@@ -307,7 +310,7 @@ export class NqBalancer extends BalancerBase {
     /**
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the live caller-owned `weights[i]`.
      * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
-     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or out-of-range `i`.
      */
     weightOf(i: number): number;
     /** Snapshot: plus the total in flight, the weights (a copy), the tie mode (1.2.0) and the tie cursor (-1 in 'random' mode). */
@@ -365,7 +368,8 @@ export class PeakEwmaBalancer extends BalancerBase {
     /**
      * The ZERO-BOX sibling of `recordRtt` (1.1.0): `sampleNs = buf[j]`, `now = buf[j + 1]`, read inside, so a
      * fractional sample or a large clock never crosses a call boxed. Same semantics and errors as `recordRtt`,
-     * plus RangeError `LITE_PICK_ARRAY` unless `buf` is a `Float64Array` with slots `j` and `j + 1`. 0 B/op.
+     * plus RangeError `LITE_PICK_ARRAY` unless `buf` is a `Float64Array` with slots `j` and `j + 1` (a non-number
+     * `j` -- BigInt / Symbol / string / object -- included, never coerced). 0 B/op.
      */
     recordRttFrom(i: number, buf: Float64Array, j: number): void;
     /**
@@ -428,7 +432,7 @@ export class ConsistentHashBalancer extends BalancerBase {
     /**
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the balancer-owned copy the table routes on (BoundedLoad inherits it).
      * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
-     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or out-of-range `i`.
      */
     weightOf(i: number): number;
     /**
@@ -553,7 +557,7 @@ export class WeightedRandomBalancer extends BalancerBase {
     /**
      * Cold, read-only (1.2.0): endpoint `i`'s weight -- the live caller-owned `weights[i]`. The alias table routes on the last build.
      * Pool's failover reads it to spill weight-proportionally and never onto a weight-0 node.
-     * @throws RangeError (`LITE_PICK_INDEX`) on a non-integer or out-of-range `i`.
+     * @throws RangeError (`LITE_PICK_INDEX`) on a non-number (BigInt / Symbol included), non-integer or out-of-range `i`.
      */
     weightOf(i: number): number;
     /**

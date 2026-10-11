@@ -330,9 +330,14 @@ test('B4: weightOf -- live (SmoothWRR / WR / SED / NQ) vs owned copy (CH / BL); 
         for (const i of [-1, cap, cap + 1, 1.5, NaN, Infinity, -Infinity, '0', '1', null, undefined, true, P30, P31 - 1, P31, P32 - 1, P32, P53 - 1, P53, [0], {}]) {
             assert.throws(() => b.weightOf(i), (e) => e instanceof RangeError && e.code === 'LITE_PICK_INDEX', name + ' weightOf(' + String(i) + ')');
         }
-        // QA finding (pre-existing _vIdx, shared by every index API): a BigInt index fails closed but as the
-        // engine's TypeError ('Cannot mix BigInt'), WITHOUT the LITE_PICK_INDEX code. Pinned as observed.
-        assert.throws(() => b.weightOf(0n), (e) => e instanceof TypeError && e.code === undefined, name + ' weightOf(0n)');
+        // Fixed in 1.2.0: a BigInt / Symbol index used to escape _vIdx as V8's uncoded TypeError ('Cannot mix
+        // BigInt'); every non-number now throws the coded RangeError, without running a hostile valueOf.
+        let coerced = 0;
+        const hostile = { valueOf() { coerced++; throw new Error('coerced'); } };
+        for (const i of [0n, 1n, Symbol('x'), hostile]) {
+            assert.throws(() => b.weightOf(i), (e) => e instanceof RangeError && e.code === 'LITE_PICK_INDEX', name + ' weightOf(' + typeof i + ')');
+        }
+        assert.equal(coerced, 0, name + ' weightOf must never invoke the index valueOf');
     }
 });
 

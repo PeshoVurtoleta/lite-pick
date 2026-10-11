@@ -69,7 +69,7 @@ through `pick()`. Flip a node **only** through `setEligible`:
 lb.setEligible(2, false);        // COLD path; idempotent; keeps `live` exact
 lb.setEligible(2, true);         // back up
 
-lb.isEligible(2);                // -> boolean, HOT, out-of-range (or non-integer) is false, never throws
+lb.isEligible(2);                // -> boolean, HOT, out-of-range / non-integer / non-number is false, never throws
 ```
 
 - **`setEligible()` is the only supported writer.** It flips the byte AND keeps the

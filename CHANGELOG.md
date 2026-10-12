@@ -12,12 +12,15 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   quantum `quantumOf` / `checkQuantum`, `childSemiBytes`, `L9_TOL` / `l9Within`, and runLane's result parse
   `parseLaneResult`) moved from `test/perf/PoolCost.test.mjs` to `test/perf/pool-cost-gate.mjs`, with the child
   flags and N passed in; `CHILD_FLAGS` and `N` now live there too (single source). `checkQuantum` now asserts both
-  scavenge counts are integers before its count re-derivation (a null count coerced to 0 could reproduce the
-  reported bytesPerRun and pass). The new `test/PoolCostGate.test.js` (in `npm test`, no GC flags, no real lanes)
-  proves every fail-closed path throws: non-integer (null / missing / NaN / fractional / string) scavenge counts,
-  including the coerced-consistent shape, a lane N mismatch, an unpinned or malformed semi-space pin, a
-  bytesPerRun 0.1 off its counts, and a lane child that exits 1, is SIGKILLed, or exits 0 with empty or non-JSON
-  stdout; plus the `l9Within` boundary and the lane-formula equality for 0..4000 scavenges.
+  scavenge counts are safe integers before its count re-derivation (a null count coerced to 0 could reproduce the
+  reported bytesPerRun and pass; from |count| >= 2^53 a count, and so its difference, is no longer guaranteed
+  exact), and `childSemiBytes` now also requires a finite pin (`=Infinity` on both flags passed `min === max`).
+  The new `test/PoolCostGate.test.js` (in `npm test`, no GC flags, no real lanes) proves every fail-closed path
+  throws: non-safe-integer (null / missing / NaN / fractional / string / >= 2^53 / <= -2^53) scavenge counts,
+  including the coerced- and float-consistent shapes, a lane N mismatch, an unpinned or malformed
+  semi-space pin (including `=Infinity`), a bytesPerRun 0.1 off its counts, and a lane child that exits 1, is
+  SIGKILLed, or exits 0 with empty or non-JSON stdout; plus the `l9Within` boundary, the `Number.MAX_SAFE_INTEGER`
+  boundary and the lane-formula equality for 0..4000 scavenges.
 
 ## [1.2.0] - 2026-10-11
 

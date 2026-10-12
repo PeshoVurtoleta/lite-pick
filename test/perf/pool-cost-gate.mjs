@@ -43,7 +43,9 @@ export function childSemiBytes(flags) {
         if (f.startsWith('--max-semi-space-size=')) max = Number(f.slice('--max-semi-space-size='.length));
         if (f.startsWith('--min-semi-space-size=')) min = Number(f.slice('--min-semi-space-size='.length));
     }
-    assert.ok(max > 0 && min === max, 'CHILD_FLAGS must pin min == max semi-space (got min ' + min + ', max ' + max +
+    // Number.isFinite: `=Infinity` on both flags would otherwise pass (Infinity === Infinity) and make Q infinite.
+    assert.ok(Number.isFinite(max) && max > 0 && min === max,
+        'CHILD_FLAGS must pin min == max semi-space (got min ' + min + ', max ' + max +
         ') -- without both, one scavenge is not a fixed number of bytes and the quantum is undefined');
     return max * 1048576;
 }
@@ -54,10 +56,12 @@ export function quantumOf(d, N, flags) {
 }
 export function checkQuantum(d, q, N, flags) {
     assert.equal(quantumOf(d, N, flags), q, 'lane ' + d.lane + ' does not share the measurement configuration of Q');
-    // null / missing / NaN / fractional / string counts must not reach the arithmetic below: null coerces to 0
-    // and a string to its number, so a coerced count can still reproduce the reported bytesPerRun.
-    assert.ok(Number.isInteger(d.sN) && Number.isInteger(d.s8N), 'lane ' + d.lane +
-        ' scavenge counts must be integers (got sN ' + d.sN + ', s8N ' + d.s8N + ')');
+    // null / missing / NaN / fractional / string counts and integers with |count| >= 2^53 must not reach the
+    // arithmetic below: null coerces to 0 and a string to its number, so a coerced count can still reproduce the
+    // reported bytesPerRun; from 2^53 up a count is no longer guaranteed exact (2^53 + 3 is stored as 2^53 + 4),
+    // nor is its difference.
+    assert.ok(Number.isSafeInteger(d.sN) && Number.isSafeInteger(d.s8N), 'lane ' + d.lane +
+        ' scavenge counts must be safe integers (got sN ' + d.sN + ', s8N ' + d.s8N + ')');
     // Same operation order as the lane (count x semiBytes / (span x N), then 0.1 rounding), so an equal
     // formula can never differ here by a float ulp.
     const fromCounts = Math.round(((d.s8N - d.sN) * childSemiBytes(flags)) / ((LANE_WIN_HI - LANE_WIN_LO) * d.N) * 10) / 10;

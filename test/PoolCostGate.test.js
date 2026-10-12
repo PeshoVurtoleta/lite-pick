@@ -14,11 +14,17 @@
  * REVERT CONTROLS (each must turn this suite RED -- the reviewer can apply them to pool-cost-gate.mjs):
  *   (a) checkQuantum WITHOUT its count re-derivation (drop the `fromCounts` assert): the bytesPerRun 0.1-off
  *       cases stop throwing;
- *   (a2) checkQuantum WITHOUT its integer-count assert: the coerced-consistent cases (sN null with bytesPerRun
- *       = s8N x Q, s8N null with bytesPerRun = -sN x Q, fractional and string counts) stop throwing, and the
- *       s8N / sN null, missing and NaN cases throw the fromCounts message instead of the integer one;
+ *   (a2) checkQuantum WITHOUT its safe-integer-count assert: the coerced-consistent cases (sN null with
+ *       bytesPerRun = s8N x Q, s8N null with bytesPerRun = -sN x Q, fractional and string counts) and the
+ *       float-consistent |count| >= 2^53 cases stop throwing, and the s8N / sN null, missing and NaN cases throw the
+ *       fromCounts message instead of the safe-integer one;
+ *   (a3) checkQuantum with Number.isSafeInteger reverted to Number.isInteger: the |count| >= 2^53 cases (1e300,
+ *       s8N = 2^53, s8N = 2^53 + 3 stored as 2^53 + 4, and sN = -2^53 alone) stop throwing. The sN-only row
+ *       (s8N safe) also catches a revert on the sN half alone, and a one-sided upper bound
+ *       (`Number.isInteger(x) && x <= Number.MAX_SAFE_INTEGER`) on both counts;
  *   (b) childSemiBytes WITHOUT `min === max` (keep only `max > 0`): the min != max case (and min missing)
  *       stops throwing;
+ *   (b2) childSemiBytes WITHOUT `Number.isFinite(max)`: the both-flags `=Infinity` case stops throwing;
  *   (c) parseLaneResult IGNORING r.status: the exit 1 and SIGKILL children print a VALID lane line before
  *       dying, so the exit cases parse cleanly and stop throwing.
  */
@@ -62,18 +68,18 @@ test('pool-cost-gate: checkQuantum re-derivation equals the lane formula for eve
     }
 });
 
-// ---- checkQuantum: malformed scavenge counts (revert controls a, a2) ------------------------------------
+// ---- checkQuantum: malformed scavenge counts (revert controls a, a2, a3) --------------------------------
 
 test('pool-cost-gate: s8N / sN null, missing or NaN fail checkQuantum', () => {
-    // The integer-count assert fires first. (Without it, these fakes would still throw the fromCounts message:
+    // The safe-integer-count assert fires first. (Without it, these fakes would still throw the fromCounts message:
     // they keep bytesPerRun at the TRUE count difference, which the coerced difference does not reproduce.)
     const cases = [
-        ['s8N', null, /lane LF scavenge counts must be integers \(got sN 1000, s8N null\)/],
-        ['s8N', undefined, /lane LF scavenge counts must be integers \(got sN 1000, s8N undefined\)/],
-        ['s8N', NaN, /lane LF scavenge counts must be integers \(got sN 1000, s8N NaN\)/],
-        ['sN', null, /lane LF scavenge counts must be integers \(got sN null, s8N 2459\)/],
-        ['sN', undefined, /lane LF scavenge counts must be integers \(got sN undefined, s8N 2459\)/],
-        ['sN', NaN, /lane LF scavenge counts must be integers \(got sN NaN, s8N 2459\)/],
+        ['s8N', null, /lane LF scavenge counts must be safe integers \(got sN 1000, s8N null\)/],
+        ['s8N', undefined, /lane LF scavenge counts must be safe integers \(got sN 1000, s8N undefined\)/],
+        ['s8N', NaN, /lane LF scavenge counts must be safe integers \(got sN 1000, s8N NaN\)/],
+        ['sN', null, /lane LF scavenge counts must be safe integers \(got sN null, s8N 2459\)/],
+        ['sN', undefined, /lane LF scavenge counts must be safe integers \(got sN undefined, s8N 2459\)/],
+        ['sN', NaN, /lane LF scavenge counts must be safe integers \(got sN NaN, s8N 2459\)/],
     ];
     for (const [key, value, re] of cases) {
         const d = fake(C);
@@ -85,7 +91,7 @@ test('pool-cost-gate: s8N / sN null, missing or NaN fail checkQuantum', () => {
 test('pool-cost-gate: a non-integer count whose COERCED difference matches bytesPerRun fails checkQuantum', () => {
     // The fail-open shape: null coerces to 0 and a string to its number in (s8N - sN), so a bytesPerRun computed
     // from the coerced difference (by the lane's own formula, laneBpr) passes the fromCounts compare. Only the
-    // integer-count assert catches these.
+    // safe-integer-count assert catches these.
     const cases = [
         ['sN', null, (d) => laneBpr(d.s8N), 'got sN null, s8N 2459'],             // bytesPerRun = s8N x Q
         ['s8N', null, (d) => laneBpr(0 - d.sN), 'got sN 1000, s8N null'],         // bytesPerRun = -sN x Q
@@ -99,9 +105,44 @@ test('pool-cost-gate: a non-integer count whose COERCED difference matches bytes
         d.bytesPerRun = bpr(d);
         // The shape really is consistent under coercion: the fromCounts compare alone would accept it.
         assert.equal(d.bytesPerRun, laneBpr(Number(d.s8N) - Number(d.sN)), key + ' = ' + String(value));
-        const re = new RegExp('lane LF scavenge counts must be integers \\(' + got.replace('.', '\\.') + '\\)');
+        const re = new RegExp('lane LF scavenge counts must be safe integers \\(' + got.replace('.', '\\.') + '\\)');
         assert.throws(() => checkQuantum(d, Q, N, FLAGS), re, key + ' = ' + String(value) + ' must fail closed');
     }
+});
+
+test('pool-cost-gate: a |count| >= 2^53 integer with a float-consistent bytesPerRun fails checkQuantum', () => {
+    // Number.isInteger accepts these (|count| >= 2^53, i.e. beyond +/-Number.MAX_SAFE_INTEGER), and bytesPerRun
+    // is the lane formula (laneBpr) on the STORED float difference, so the fromCounts compare alone would accept
+    // every one; the lane-formula equality test above covers laneBpr vs checkQuantum's re-derivation. From 2^53
+    // up a count is no longer guaranteed exact: 2^53 + 3 is stored as 2^53 + 4, so the difference reads 4 for a
+    // true 3. Only the safe-integer assert catches these.
+    const cases = [
+        [1e300, 1e300, 'got sN 1e+300, s8N 1e+300'],                                        // diff 0
+        [2 ** 53 - 5, 2 ** 53, 'got sN 9007199254740987, s8N 9007199254740992'],            // s8N = MAX_SAFE + 1
+        [2 ** 53, 2 ** 53 + 3, 'got sN 9007199254740992, s8N 9007199254740996'],            // diff stored as 4
+        // ONLY sN unsafe (s8N safe), negative: catches a revert of the sN half alone and a one-sided upper bound.
+        [-(2 ** 53), C - 2 ** 53, 'got sN -9007199254740992, s8N -9007199254739533'],       // diff C exact
+    ];
+    assert.equal(2 ** 53 + 3, 2 ** 53 + 4);   // the third shape really is inexact
+    assert.ok(!Number.isSafeInteger(-(2 ** 53)) && Number.isSafeInteger(C - 2 ** 53));   // the fourth: sN only
+    assert.equal((C - 2 ** 53) - -(2 ** 53), C);
+    for (const [sN, s8N, got] of cases) {
+        const d = fake(C);
+        d.sN = sN;
+        d.s8N = s8N;
+        d.bytesPerRun = laneBpr(s8N - sN);
+        // Both counts really are integers, so the shape reaches the safe-integer assert, not a NaN/type path.
+        assert.ok(Number.isInteger(d.sN) && Number.isInteger(d.s8N), got);
+        const re = new RegExp('lane LF scavenge counts must be safe integers \\(' + got.replace(/\+/g, '\\+') + '\\)');
+        assert.throws(() => checkQuantum(d, Q, N, FLAGS), re, got + ' must fail closed');
+    }
+});
+
+test('pool-cost-gate: counts ending at Number.MAX_SAFE_INTEGER pass checkQuantum (boundary control)', () => {
+    const d = fake(C, Number.MAX_SAFE_INTEGER - C);
+    assert.equal(d.s8N, Number.MAX_SAFE_INTEGER);
+    assert.equal(d.bytesPerRun, laneBpr(C));
+    assert.doesNotThrow(() => checkQuantum(d, Q, N, FLAGS));
 });
 
 test('pool-cost-gate: a bytesPerRun 0.1 off its own counts fails checkQuantum', () => {
@@ -135,7 +176,7 @@ test('pool-cost-gate: lane N 100000, the string "200000" or missing fails quantu
     }
 });
 
-// ---- childSemiBytes: the child's semi-space pin (revert control b) --------------------------------------
+// ---- childSemiBytes: the child's semi-space pin (revert controls b, b2) ---------------------------------
 
 test('pool-cost-gate: childSemiBytes reads a min == max pin', () => {
     assert.equal(childSemiBytes(FLAGS), 1048576);
@@ -151,6 +192,8 @@ test('pool-cost-gate: childSemiBytes fails closed on every unpinned or malformed
         [['--min-semi-space-size=0', '--max-semi-space-size=0'], 'got min 0, max 0'],         // zero pin
         [['--min-semi-space-size=-1', '--max-semi-space-size=-1'], 'got min -1, max -1'],     // negative pin
         [['--min-semi-space-size=x', '--max-semi-space-size=x'], 'got min NaN, max NaN'],     // non-numeric
+        [['--min-semi-space-size=Infinity', '--max-semi-space-size=Infinity'], 'got min Infinity, max Infinity'],
+        [['--min-semi-space-size=-Infinity', '--max-semi-space-size=-Infinity'], 'got min -Infinity, max -Infinity'],
         // Only the `--flag=value` form is parsed. The space-separated form -- one string, or the two argv
         // elements V8 itself would accept -- is NOT read: both values stay NaN, so it fails closed.
         [['--min-semi-space-size 1', '--max-semi-space-size 1'], 'got min NaN, max NaN'],

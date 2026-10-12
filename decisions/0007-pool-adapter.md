@@ -152,3 +152,23 @@ is fmix32(key ^ imul(attempt, 0x9e3779b9)), the unkeyed one uses the per-Pool `_
 rejects `LITE_PICK_NONE` and a later attempt stops with the last error. Pool cost ceilings re-pinned LOWER (every Pool
 path ~16 B/run cheaper on Node 22, run() register count 60 -> 59; on Node 26 the failover share fell 57.7 B, 1276.3 -> 1218.6): the quoted attempt-0 / failover / clocked ceilings above are the new values
 (were 912 / 1288 / 944.2 on Node 22; 873.9 / 1284.3 / 936.8 on Node 26).
+
+## Amendment 2026-10-12 (test-only): PoolCost gate re-pin history, moved from the test header
+
+`test/perf/PoolCost.test.mjs` used to carry its release history in comments; it lives here now and the test keeps only
+what is needed to run and trust the gate (current SHARES rows, CEIL = share + 8 B keyed by exact `process.version`,
+fail-closed missing row, never widen). The 1.2.0 re-pin itself is recorded in the Fork 3 amendment and the 2026-10-11
+amendment above; this adds only what they omit and points there for the rest.
+
+- **Pre-re-pin lanes** (B/run, before 1.2.0). 1bc5eec on v22.23.3: L3 1108.5, L6 1484.5, L8b 1140.7. On v26.8.2:
+  L3 913.8, L6 1324.2, L8b 976.7. Against the 1.2.0 lanes (L3 1092.8 / L6 1467.3 / L8b 1125.7 on v22.23.3; L3 898.0 /
+  L6 1266.5 / L8b 960.2 on v26.8.2) every lane is ~15-17 B/run cheaper (v22: L3 -15.7, L6 -17.2, L8b -15.0; v26: L3 -15.8,
+  L8b -16.5) EXCEPT v26.8.2 L6, which fell 57.7 B (1324.2 -> 1266.5; the failover share 1276.3 -> 1218.6, see the
+  2026-10-11 amendment). The old rows left the one-box teeth (PL_BOX, PL_BOX6, PL_BOX8b on v22; PL_BOX6 on v26) UNDER
+  their ceilings, so every row was re-pinned tighter: a stale ceiling is a blunt gate.
+- **Contention detail for L6** (the bimodal story itself is in Fork 3 above). The 1.2.0 v26.8.2 reading of 1266.5 came
+  from 6/6 runs under 6-way contention. attempt0 and clocked were deterministic over 5 runs on both Nodes, and failover
+  is deterministic on v22.23.3.
+- **Stale figure fixed in the test header.** The "NOT gated" note quoted L7 (~1374 B/run on Node 22) as "above L3's
+  ~1108"; 1108 was the pre-re-pin L3 (L3 is 1092.8 on v22.23.3). The comment now says "above a successful run's L3" and
+  keeps ~1374 attributed as last measured; no fresh L7 figure was taken.

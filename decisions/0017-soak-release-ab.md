@@ -138,3 +138,7 @@ ConsistentHash dense (the K8 `(this._live & this._wmask) === 0` guard in `_pickS
 consistent with the local PRELIMINARY K = 10 run on Node 26.8.2 (s +0.0236, the only Holm-significant
 comparison there, still below T). Every other lane: s in [-0.0062, +0.0129], sU <= +0.0238. Nothing near T;
 no ab-accept.json entry. The decision rule, K and the windows were not moved.
+
+Same release, test-only (not a soak change): the PoolCost L9 gate (both diagnostics channels subscribed vs L3) became
+one-sided, `L9 <= L3 + Q` with Q = one scavenge quantum (~0.75 B/run), after the exact equality flaked on CI run
+38110241059 (attempt 1): L9 1092 vs L3 1092.8 B/run, one quantum cheaper. See CHANGELOG [1.2.0].

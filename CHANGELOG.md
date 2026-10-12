@@ -21,11 +21,23 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   semi-space pin (including `=Infinity`), a bytesPerRun 0.1 off its counts, and a lane child that exits 1, is
   SIGKILLed, or exits 0 with empty or non-JSON stdout; plus the `l9Within` boundary, the `Number.MAX_SAFE_INTEGER`
   boundary and the lane-formula equality for 0..4000 scavenges.
-- **Three-place version sync gate (test-only, no shipped file).** `test/Base.test.js` now asserts `Pick.js` `VERSION`
-  === `package.json` `version` === the `llms.txt` `Version:` stamp, fail-closed: a missing or non-`X.Y.Z` package.json
+- **Four-place version sync gate (test-only, no shipped file).** `test/Base.test.js` now asserts `Pick.js` `VERSION`
+  === `package.json` `version` === `package-lock.json` root `version` AND `packages[""].version` === the `llms.txt`
+  `Version:` stamp, fail-closed: each lock field must be a string (missing or not a string fails; a missing
+  `packages[""]` fails with an assertion, not a TypeError); a missing or non-`X.Y.Z` package.json
   version fails, `llms.txt` must carry exactly one `version:` line (case-insensitive; zero = stamp removed, two = an
   ambiguous duplicate, both fail) and it must read exactly `Version: X.Y.Z` (`v1.2.0`, `Version:1.2.0`, `1.2` or
-  trailing text fail). Before this only the semver shape of `VERSION` was checked; nothing compared the three sites.
+  trailing text fail). Before this only the semver shape of `VERSION` was checked; nothing compared the sites.
+
+### Changed
+
+- **Docs and test-comment housekeeping (no shipped code change).** The README `VERSION` example no longer hard-codes a
+  version (it cannot go stale again). The 2026-10-05 audit's tie-bias finding is quoted exactly and identically at six
+  sites (README, GUIDE, llms.txt, ADR 0006, ROADMAP, and this file's [1.2.0] entry). ADR 0017 Amendment 2 notes the
+  PoolCost L9 gate became one-sided, within one scavenge quantum (test-only; CI run 38110241059 attempt 1,
+  1092 vs 1092.8 B/run). The `test/perf/PoolCost.test.mjs` header release history (re-pin numbers, the Node-26
+  bimodal-L6 story) moved to an ADR 0007 amendment: comment-only, code byte-identical. The live "three-place" version-sync mentions
+  (llms.txt, ROADMAP) now say four places (package.json, package-lock.json, Pick.js VERSION, llms.txt stamp).
 
 ## [1.2.0] - 2026-10-11
 
@@ -99,8 +111,7 @@ Worst upper bound P2C dense sU +0.0373 (s +0.0175); ConsistentHash dense s +0.01
 - **Docs: the tie-bias numbers were wrong and are corrected** (README, GUIDE, llms.txt, RECIPES). Default rotation,
   in-repo seeded simulation, weights `[1,1,1,1,4,4,4,4]`, rate = weight, load 0.9: SED is the WORST (weight-1
   group 3.66 / 3.49 / 3.31 / 3.14 %, ~17% relative first vs last); NQ and LeastConn ~1% relative (0.16-0.18 pp);
-  the bias follows position and vanishes for interleaved layouts. The 1.1.1 audit's "about 1 percentage point NQ, LeastConn and SED
-  fair" is superseded. Use `ties: 'random'` when exact tie fairness matters.
+  the bias follows position and vanishes for interleaved layouts. The 2026-10-05 audit's "Rotating ties leave a positional bias in NQ. ... LeastConn and SED are fair." is superseded. Use `ties: 'random'` when exact tie fairness matters.
 - **soak:ab -- a relative `--out-dir` failed closed before measuring.** `fetchRelease` runs `npm pack` inside
   the scratch directory, so the workflow's relative `--out-dir benchmark/out/soak-ab` was resolved twice
   (`.../scratch/benchmark/out/soak-ab/scratch/*.tgz`, ENOENT) and the first hosted A/A run exited 3

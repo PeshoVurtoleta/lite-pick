@@ -116,5 +116,5 @@ behaviour change. The opt-in cost (report only, cap 64, ns/pick vs default): Lea
 
 Corrected bias numbers for the rotation (in-repo seeded sim, load 0.9, weights [1,1,1,1,4,4,4,4], rate = weight): SED
 is the worst (weight-1 group 3.66 / 3.49 / 3.31 / 3.14 %, ~17% relative); NQ and LeastConn ~1% relative (0.16-0.18
-pp); the bias follows position and vanishes for interleaved layouts. The audit's "about 1 percentage point NQ, others fair" was wrong.
+pp); the bias follows position and vanishes for interleaved layouts. The 2026-10-05 audit's "Rotating ties leave a positional bias in NQ. ... LeastConn and SED are fair." was wrong about LeastConn and SED.
 Research: research/1.2.0-phase2-ties-failover.md.

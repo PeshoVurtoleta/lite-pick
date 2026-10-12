@@ -4,8 +4,9 @@
  *     node --test test/Base.test.js
  *
  * Covers the seams every strategy (M1+) rides: VERSION/PICK_NONE constants (plus the
- * three-place version sync: Pick.js VERSION === package.json version === llms.txt
- * stamp), the deterministic xorshift32 Prng, and BalancerBase's shared eligibility
+ * four-place version sync: Pick.js VERSION === package.json version ===
+ * package-lock.json version + packages[""].version === llms.txt stamp), the
+ * deterministic xorshift32 Prng, and BalancerBase's shared eligibility
  * view + O(1) live count + fail-closed abstract pick().
  */
 
@@ -21,10 +22,17 @@ test('VERSION is a non-empty semver-shaped string', () => {
 
 const readSibling = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
 
-test('three-place version sync: Pick.js VERSION === package.json === llms.txt stamp', () => {
+test('four-place version sync: Pick.js VERSION === package.json === package-lock.json === llms.txt stamp', () => {
     const pkgVersion = JSON.parse(readSibling('../package.json')).version;
     assert.equal(typeof pkgVersion, 'string', 'package.json version is missing or not a string');
     assert.match(pkgVersion, /^\d+\.\d+\.\d+$/, 'package.json version is not X.Y.Z');
+
+    const lock = JSON.parse(readSibling('../package-lock.json'));
+    const lockVersion = lock.version;
+    assert.equal(typeof lockVersion, 'string', 'package-lock.json version is missing or not a string');
+    const lockRootVersion = lock.packages?.['']?.version;
+    assert.equal(typeof lockRootVersion, 'string',
+        'package-lock.json packages[""].version is missing or not a string');
 
     const stamps = readSibling('../llms.txt').split(/\r?\n/).filter((l) => /^\s*version\s*:/i.test(l));
     assert.equal(stamps.length, 1, 'llms.txt must have exactly one "Version:" line, found ' + stamps.length);
@@ -32,6 +40,8 @@ test('three-place version sync: Pick.js VERSION === package.json === llms.txt st
     assert.ok(m, 'llms.txt stamp is malformed (want "Version: X.Y.Z"): ' + JSON.stringify(stamps[0]));
 
     assert.equal(VERSION, pkgVersion, 'Pick.js VERSION != package.json version');
+    assert.equal(VERSION, lockVersion, 'Pick.js VERSION != package-lock.json version');
+    assert.equal(VERSION, lockRootVersion, 'Pick.js VERSION != package-lock.json packages[""].version');
     assert.equal(VERSION, m[1], 'Pick.js VERSION != llms.txt Version stamp');
 });
 

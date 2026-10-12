@@ -255,8 +255,8 @@ the contract + balance + tail -- never an "N times faster" headline (decisions/0
     node at or after it) -- else the SED minimum (ties rotate), else `PICK_NONE`. O(cap) worst case,
     O(distance to the next idle node) when one is idle. 0 B/op. Tie bias (MEASURED, 1.2.0; default rotation): in-repo seeded sim, weights [1,1,1,1,4,4,4,4], rate = weight, load 0.9 --
     SED is the WORST (weight-1 group 3.66/3.49/3.31/3.14 %, ~17% relative first vs last); NQ and LeastConn
-    ~1% relative (0.16-0.18 pp); follows position, vanishes for interleaved layouts (the audit's "about 1 percentage point, NQ only"
-    was wrong). Use `ties: 'random'` when exact tie fairness matters (opt-in, see TieOptions below).
+    ~1% relative (0.16-0.18 pp); follows position, vanishes for interleaved layouts (the 2026-10-05 audit's "Rotating ties leave a positional bias in NQ. ... LeastConn and SED are fair."
+    was wrong about LeastConn and SED). Use `ties: 'random'` when exact tie fairness matters (opt-in, see TieOptions below).
 - `TieOptions` (1.2.0; trailing ctor arg of LeastConn / SED / NQ) -- `{ ties?: 'rotate' | 'random', seed?: number }`.
   Plain object only; an unknown key throws `LITE_PICK_OPTION` with a did-you-mean. `'rotate'` (default) = the
   1.1.0 rotating cursor, unchanged. `'random'` = uniform up to the 2^-32 draw grid (max abs error ~5e-10 at k = 128) among the tied minima via a seeded skip-based
@@ -479,7 +479,7 @@ It is a SEPARATE subpath file (the lite-query /stream + /await precedent), NOT p
 0 B/op single-file kernel (decisions/0007). Zero HARD deps, zero peers: the fetcher adapter is
 duck-typed and imports NOTHING from lite-query.
 
-- `VERSION` -- string. Re-exported from the core (same three-place stamp).
+- `VERSION` -- string. Re-exported from the core (same four-place stamp: package.json, package-lock.json, Pick.js VERSION, llms.txt).
 - `CODES` -- the frozen error-code map (1.2.0), re-exported from the core: the SAME object.
 - `Pool` -- class. Wraps a balancer + the caller-owned in-flight view.
   - `new Pool(balancer, inflight)` -- `balancer` is duck-typed (any `{ pick(): number, capacity,

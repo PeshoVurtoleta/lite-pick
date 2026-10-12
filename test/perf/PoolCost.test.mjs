@@ -13,8 +13,8 @@
  *   - L0 (bare pick + inflight ++/--) is 0 B/run -- the floor really is free;
  *   - attempt-0 share L3 - L1 <= CEIL.attempt0;
  *   - failover share  L6 - L1 <= CEIL.failover (one extra, re-picked attempt) -- so failover can never
- *     silently regress (on Node 26 L6 was bimodal under contention before 1.2.0; see SHARES);
- *   - weighted-fallback share L6CH - L1 <= the SAME CEIL.failover (1.2.0: a weighted ConsistentHash, cap 64,
+ *     silently regress;
+ *   - weighted-fallback share L6CH - L1 <= the SAME CEIL.failover (a weighted ConsistentHash, cap 64,
  *     whose attempt 1 always reaches Pool's weighted fallback `_chooseUntried`) -- the fallback allocates
  *     nothing; TEETH: the same lane over a Pool.js mutant whose fallback builds a candidate array MUST trip it;
  *   - clocked share   L8b - L1 <= CEIL.clocked (PeakEWMA + a 1.7e15 epoch-ns clock, which V8 boxes at
@@ -39,14 +39,14 @@
  *
  * CEIL = (measured share) + 8 B, keyed by EXACT process.version (NOT major): V8 fixes the per-run byte
  * cost, and under the fixed warm-up + 1 MiB pin the attempt-0 and clocked shares are stable to +/-1
- * (~0.7 B/run), so 8 B of slack trips on one boxed double yet never flakes. The one exception was the
- * Node-26 failover lane (L6), bimodal under contention before 1.2.0 (see SHARES): a row pins the upper
- * observed mode, so a lower mode only passes. Rows below were measured with `npm run bench:pool` (darwin arm64). A process.version with
+ * (~0.7 B/run), so 8 B of slack trips on one boxed double yet never flakes. The v26.8.2 failover row pins
+ * the upper observed mode, so a lower mode can only pass (history: decisions/0007 amendment 2026-10-12).
+ * Rows below were measured with `npm run bench:pool` (darwin arm64). A process.version with
  * no row FAILS CLOSED, printing the measured shares so a row can be added. NEVER widen a ceiling to pass
  * -- if a share rose, find the regression; if a change is intended, re-measure and re-pin in the same change.
  *
  * NOT gated (reported by `npm run bench:pool`, above a successful run -- never quote these as cheap):
- * the abort-before-dispatch path (L7, ~1374 B/run on Node 22, above L3's ~1108).
+ * the abort-before-dispatch path (L7, ~1374 B/run on Node 22 as last measured, above a successful run's L3).
  */
 
 import { test } from 'node:test';
@@ -79,16 +79,9 @@ const SLACK = 8;
  * N=200000, young gen pinned to 1 MiB, FIXED 3,000,000-run warm-up:
  *   v22.23.3: L1 204.5  L3 1092.8 (attempt0 888.3)  L6 1467.3 (failover 1262.8)  L8b 1125.7 (clocked 921.2)
  *   v26.8.2:  L1  47.9  L3  898.0 (attempt0 850.1)  L6 1266.5 (failover 1218.6)  L8b  960.2 (clocked 912.3)
- *   Re-pinned 1.2.0 (TIGHTER, every row): Pool's failover fallback became a weighted choice and run()'s
- *   interpreter frame lost a register (60 -> 59), so EVERY path got ~16 B/run cheaper (1bc5eec on v22.23.3:
- *   L3 1108.5, L6 1484.5, L8b 1140.7; on v26.8.2: L3 913.8, L6 1324.2, L8b 976.7). The old rows left the
- *   one-box teeth (PL_BOX, PL_BOX6, PL_BOX8b on v22; PL_BOX6 on v26) UNDER their ceilings -- a stale ceiling
- *   is a blunt gate. L6 on v26.8.2 read 1266.5 in 6/6 runs under 6-way contention (no low mode seen).
- * attempt0 / clocked are deterministic 5x on both Nodes; failover (L6) is DETERMINISTIC on v22.23.3. On
- * v26.8.2 it was BIMODAL before 1.2.0 (upper mode: lane 1324.2 = share 1276.3; a lower mode appeared in a
- * minority of contended runs; the row pinned the upper-mode share). After the 1.2.0 re-pin the lane read
- * 1266.5 (share 1218.6) in 6/6 contended runs with no low mode seen, and the row pins that share -- if
- * a lower mode reappears it can only pass; a higher one fails.
+ * attempt0 / clocked are deterministic 5x on both Nodes; failover (L6) is deterministic on v22.23.3. The
+ * v26.8.2 failover row pins the upper observed mode, so a lower mode can only pass; a higher one fails.
+ * History: decisions/0007 amendment 2026-10-12.
  * `clocked` = a latency-aware balancer (PeakEWMA) driven by a 1.7e15 epoch-ns clock, which V8 boxes at
  * the non-inlined pick()/recordRtt boundary (read twice per successful attempt) -- ~32 B/run more than
  * L3 on v22.23.3, ~63 on v26.8.2. CEIL = share + SLACK. A version absent here fails closed (see the test).
@@ -99,7 +92,7 @@ const SHARES = {
 };
 const VER = process.version;
 const HAVE_ROW = Object.prototype.hasOwnProperty.call(SHARES, VER);
-// The docs quote the v22.23.3 attempt-0 ceiling (the pinned CI perf job). 888.3 + 8 = 896.3 (1.2.0; was 912).
+// The docs quote the v22.23.3 attempt-0 ceiling (the pinned CI perf job). 888.3 + 8 = 896.3.
 const DOC_CEIL = SHARES['v22.23.3'].attempt0 + SLACK;
 
 function ceilOf(kind) { return SHARES[VER][kind] + SLACK; }

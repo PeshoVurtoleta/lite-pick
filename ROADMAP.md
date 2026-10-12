@@ -51,9 +51,9 @@ witnessed-but-unbenchmarked, or typed-but-untortured.
 | --- | --- | --- |
 | 1 | `Pick.js` | the appended `export class <Strategy>Balancer` (+ any module-level `const`) |
 | 2 | `Pick.js` header comment | the strategy-count word + roster list |
-| 3 | `Pick.js` `VERSION` | bump (one of three version sites) |
-| 4 | `package.json` `version` | bump (site two) + `description` roster + `keywords` |
-| 5 | `llms.txt` | API surface + version stamp (site three -- three-place sync) |
+| 3 | `Pick.js` `VERSION` | bump (site one of four version places) |
+| 4 | `package.json` `version` | bump (site two; `package-lock.json` root `version` and `packages[""].version` are site three and move with it) + `description` roster + `keywords` |
+| 5 | `llms.txt` | API surface + version stamp (site four -- four-place sync) |
 | 6 | `Pick.d.ts` | the typed export |
 | 7 | `test/types/pick.test-d.ts` | a type-level smoke of the new export |
 | 8 | `test/<Strategy>.test.js` | the boundary + behaviour suite |
@@ -258,7 +258,7 @@ The zero-GC proof is TWO complementary tools, kept separate exactly as lite-o1 d
   fuzz test (RESEARCH section 3). Complements -- never replaces -- the balance/anchor gate: the
   fuzzer proves no state corruption, the anchor proves the algorithm does the right thing.
 - **Pipeline:** planner -> coder -> reviewer -> qa. Reviewer REJECTED goes back to coder.
-- **Release:** `/release <semver>` -- version-site sync (three places), changelog, prepublish
+- **Release:** `/release <semver>` -- version-site sync (four places: package.json, package-lock.json, Pick.js VERSION, llms.txt stamp), changelog, prepublish
   gate; card sync after. User commits/publishes.
 
 ---
@@ -316,7 +316,7 @@ the code fix; each open item still wants its own pass.
 
 | Item | What | Why deferred |
 | --- | --- | --- |
-| K3 | **Tie fairness for LeastConn / SED / NQ** -- a seeded uniform reservoir pick among the tied minima. | **DONE as OPT-IN (1.2.0):** `{ ties: 'random', seed }` (`TieOptions`), a skip-based reservoir (~ln k draws, 0 B/op). The rotation stays the DEFAULT: default-on missed the 1.25x bar at cap 64 in 8 of 9 cells (1.4-8.6x). The bias was re-measured in-repo: SED is the worst (weight-1 group 3.66 / 3.49 / 3.31 / 3.14 %, ~17% relative), NQ / LeastConn ~1% relative -- not the audit's "about 1 percentage point NQ". ADR 0006 amendment 2026-10-11; research/1.2.0-phase2-ties-failover.md. |
+| K3 | **Tie fairness for LeastConn / SED / NQ** -- a seeded uniform reservoir pick among the tied minima. | **DONE as OPT-IN (1.2.0):** `{ ties: 'random', seed }` (`TieOptions`), a skip-based reservoir (~ln k draws, 0 B/op). The rotation stays the DEFAULT: default-on missed the 1.25x bar at cap 64 in 8 of 9 cells (1.4-8.6x). The bias was re-measured in-repo: SED is the worst (weight-1 group 3.66 / 3.49 / 3.31 / 3.14 %, ~17% relative), NQ / LeastConn ~1% relative -- not the 2026-10-05 audit's "Rotating ties leave a positional bias in NQ. ... LeastConn and SED are fair." ADR 0006 amendment 2026-10-11; research/1.2.0-phase2-ties-failover.md. |
 | K6 | **DONE (1.2.0).** ~~A negative `now` silently disables PeakEWMA (fails open).~~ `_stamp < 0` doubled as the "never sampled" marker, so a finite `now < 0` left every node "unsampled". Fixed with a separate `_sampled` bitmap (the user's choice over validating `now >= 0`) plus a `-Number.MAX_VALUE` seed for the pool stamp: any finite `now`, negative / offset included, learns like its translate (bit-identical when every shifted reading is exact, e.g. integer clocks below 2^53; rounding-level otherwise); `now >= 0` is byte-identical to 1.1.1 (StreamParity + `test/fixtures/peak-k6-head.json`). ADR 0009 amendment 2026-10-10. | Shipped with two new PerfGate lanes on a -1.7e15 clock (0 B/op, inlining on and off). |
 | K8 | **All-zero weights mean different things per strategy, undocumented.** ConsistentHash / BoundedLoad `setWeights(all 0)` fell back (1.1.x) to equal quotas and routed everywhere (even though "weight 0 = remove"); WeightedRandom returns `PICK_NONE`. | **DONE (1.2.0):** all-zero -> `PICK_NONE` everywhere, never a throw; the CH / BL guard folds a build-time mask (`_live & _wmask`, one AND, no new branch). ADR 0010 / 0011 amendments 2026-10-10. A behaviour change that is a FIX, not a breaking change (1.1.1 documented weight 0 as a remove and all-weight-0 as fail closed); CHANGELOG migration note. |
 | K10 | **Failover neighbour double share (N6 residual).** The keyed failover start landed on the failed node and the linear scan gave the next node ~2x the spill. | **DONE (1.2.0):** one weighted choice among untried, eligible, weight > 0 backends, keyed by (key, attempt); measured 1.75x at cap 8, ~2x at cap 64 before. Uses the new `weightOf(i)`. ADR 0007 Fork 2 / ADR 0013 M2 amendments 2026-10-11. |

@@ -60,6 +60,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { Pool } from '../../Pool.js';
 import { P2cBalancer } from '../../Pick.js';
+// The gate's pure helpers (the scavenge quantum Q, its re-derivation, the L9 tolerance, the lane parse) live in
+// pool-cost-gate.mjs so test/PoolCostGate.test.js can prove their fail-closed paths without real lanes.
+import { L9_TOL, l9Within, quantumOf, checkQuantum, parseLaneResult } from './pool-cost-gate.mjs';
 
 const LANES = fileURLToPath(new URL('./pool-cost-lanes.mjs', import.meta.url));
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -126,8 +129,7 @@ function runLane(id, poolImpl) {
     if (LANE_CACHE.has(ck)) return LANE_CACHE.get(ck);
     const env = poolImpl ? { ...process.env, LITE_POOL_IMPL: poolImpl } : process.env;
     const r = spawnSync(process.execPath, [...CHILD_FLAGS, LANES, id, String(N)], { encoding: 'utf8', env });
-    assert.equal(r.status, 0, 'lane ' + id + ' exited ' + r.status + '\n' + (r.stderr || ''));
-    const d = JSON.parse(r.stdout.trim().split('\n').pop());
+    const d = parseLaneResult(r, id);
     LANE_CACHE.set(ck, d);
     return d;
 }
@@ -273,51 +275,6 @@ test('pool-cost: the teeth -- CTRL_OBJ/PLANT trip attempt0, CTRL_OBJ6 trips fail
 });
 
 /**
- * ONE scavenge quantum in B/run, derived from runLane's own measurement configuration -- never typed in.
- * pool-cost-lanes.mjs counts minor GCs over a window of N runs and one of 8N runs (its main(): lo = N,
- * hi = 8 * N) under the young generation pinned by CHILD_FLAGS, and converts the count difference as
- *     B/run = (S_8N - S_N) x semiBytes / ((8 - 1) x N)
- * so one scavenge more or less moves B/run by semiBytes / (7 N) (~0.75 B/run at 1 MiB, N = 200000).
- * `checkQuantum` proves this is the lane's real conversion: each lane's reported bytesPerRun must equal
- * its own scavenge counts times Q (rounded to 0.1 as the lane rounds); if the lane formula, the windows
- * or the pin ever change, that check fails closed instead of the quantum silently going stale.
- */
-const LANE_WIN_LO = 1;   // countWindow(drive, lane, N, ...)      -- pool-cost-lanes.mjs main()
-const LANE_WIN_HI = 8;   // countWindow(drive, lane, 8 * N, ...)  -- pool-cost-lanes.mjs main()
-// The ONE L9 tolerance, in scavenges (Q each): exactly one quantum (ADR 0007, +/-1 scavenge). Three checks
-// hold it, none of them by itself: (a) the gate and the fresh-message control share l9Within, which proves
-// the gate trips on the mutant (that mutant clears the bound by ~185-200 scavenges, so it alone does NOT bound
-// the tolerance); (b) PL_BOX (L3 + one boxed double per run: measured 23 scavenges above L3 on v22.23.3, the
-// pinned CI perf job, and 61 on v26.8.2) must ALSO fall outside
-// l9Within, so any tolerance wide enough to hide one boxed double fails; (c) the literal is pinned to 1 in the
-// L9 test, which catches every other change. NEVER raise it to pass.
-const L9_TOL = 1;
-function l9Within(d9, d3) { return d9 <= d3 + L9_TOL; }
-function childSemiBytes() {
-    let max = NaN, min = NaN;
-    for (const f of CHILD_FLAGS) {
-        if (f.startsWith('--max-semi-space-size=')) max = Number(f.slice('--max-semi-space-size='.length));
-        if (f.startsWith('--min-semi-space-size=')) min = Number(f.slice('--min-semi-space-size='.length));
-    }
-    assert.ok(max > 0 && min === max, 'CHILD_FLAGS must pin min == max semi-space (got min ' + min + ', max ' + max +
-        ') -- without both, one scavenge is not a fixed number of bytes and the quantum is undefined');
-    return max * 1048576;
-}
-function quantumOf(d) {
-    assert.equal(d.N, N, 'lane ' + d.lane + ' measured N = ' + d.N + ', expected ' + N);
-    return childSemiBytes() / ((LANE_WIN_HI - LANE_WIN_LO) * d.N);
-}
-function checkQuantum(d, q) {
-    assert.equal(quantumOf(d), q, 'lane ' + d.lane + ' does not share the measurement configuration of Q');
-    // Same operation order as the lane (count x semiBytes / (span x N), then 0.1 rounding), so an equal
-    // formula can never differ here by a float ulp.
-    const fromCounts = Math.round(((d.s8N - d.sN) * childSemiBytes()) / ((LANE_WIN_HI - LANE_WIN_LO) * d.N) * 10) / 10;
-    assert.equal(d.bytesPerRun, fromCounts,
-        'lane ' + d.lane + ' reported ' + d.bytesPerRun + ' B/run but its scavenge counts (' + d.sN + ', ' + d.s8N +
-        ') x Q = ' + fromCounts + ' -- pool-cost-lanes.mjs no longer converts counts the way Q assumes; re-derive Q.');
-}
-
-/**
  * The allocating mutant of Pool's publish path: every dispatch / settle publish builds a FRESH message
  * object instead of reusing _dMsg / _sMsg (the design research 7.2 measured at 315-458 scavenges / 10M
  * runs). Written to a scratch dir with a copy of Pick.js beside it, as allocatingFallbackPool does.
@@ -340,9 +297,9 @@ test('pool-cost: L9 (both channels subscribed) <= L3 + one scavenge quantum; a f
     if (!HAVE_ROW) return;
     const l3 = runLane('L3');
     const l9 = runLane('L9');
-    const q = quantumOf(l3);
-    checkQuantum(l3, q);
-    checkQuantum(l9, q);
+    const q = quantumOf(l3, N, CHILD_FLAGS);
+    checkQuantum(l3, q, N, CHILD_FLAGS);
+    checkQuantum(l9, q, N, CHILD_FLAGS);
     assert.equal(L9_TOL, 1, 'L9_TOL = ' + L9_TOL + ': the L9 tolerance is exactly one scavenge quantum (ADR 0007, ' +
         'lanes stable to +/-1 scavenge); changing it is a gate change that needs a maintainer decision.');
     // ONE-SIDED, one quantum. B/run is scavenge-QUANTISED and each lane is stable only to +/-1 scavenge
@@ -362,7 +319,7 @@ test('pool-cost: L9 (both channels subscribed) <= L3 + one scavenge quantum; a f
     // TOLERANCE BOUND: PL_BOX is L3 + ONE escaped boxed double per run (already run and cached by the teeth
     // test). It must fall OUTSIDE l9Within, so the tolerance stays below one boxed double.
     const pb = runLane('PL_BOX');
-    checkQuantum(pb, q);
+    checkQuantum(pb, q, N, CHILD_FLAGS);
     const dpb = pb.s8N - pb.sN;
     assert.ok(!l9Within(dpb, d3),
         'PL_BOX (L3 + one boxed double/run) = ' + pb.bytesPerRun + ' B/run (scavenges ' + dpb + ' vs L3 ' + d3 +
@@ -372,7 +329,7 @@ test('pool-cost: L9 (both channels subscribed) <= L3 + one scavenge quantum; a f
     const dir = mkdtempSync(join(tmpdir(), 'litepick-poolcost-'));
     try {
         const m = runLane('L9', freshMessagePool(dir));
-        checkQuantum(m, q);
+        checkQuantum(m, q, N, CHILD_FLAGS);
         const dm = m.s8N - m.sN;
         assert.ok(!l9Within(dm, d3) && m.bytesPerRun - bound > SLACK,
             'L9 over the fresh-message mutant = ' + m.bytesPerRun + ' B/run (scavenges ' + dm + ') did NOT exceed ' +

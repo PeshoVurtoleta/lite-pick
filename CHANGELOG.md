@@ -21,6 +21,11 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
   semi-space pin (including `=Infinity`), a bytesPerRun 0.1 off its counts, and a lane child that exits 1, is
   SIGKILLed, or exits 0 with empty or non-JSON stdout; plus the `l9Within` boundary, the `Number.MAX_SAFE_INTEGER`
   boundary and the lane-formula equality for 0..4000 scavenges.
+- **Three-place version sync gate (test-only, no shipped file).** `test/Base.test.js` now asserts `Pick.js` `VERSION`
+  === `package.json` `version` === the `llms.txt` `Version:` stamp, fail-closed: a missing or non-`X.Y.Z` package.json
+  version fails, `llms.txt` must carry exactly one `version:` line (case-insensitive; zero = stamp removed, two = an
+  ambiguous duplicate, both fail) and it must read exactly `Version: X.Y.Z` (`v1.2.0`, `Version:1.2.0`, `1.2` or
+  trailing text fail). Before this only the semver shape of `VERSION` was checked; nothing compared the three sites.
 
 ## [1.2.0] - 2026-10-11
 

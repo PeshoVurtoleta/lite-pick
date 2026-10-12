@@ -3,18 +3,36 @@
  *
  *     node --test test/Base.test.js
  *
- * Covers the seams every strategy (M1+) rides: VERSION/PICK_NONE constants, the
- * deterministic xorshift32 Prng, and BalancerBase's shared eligibility view + O(1)
- * live count + fail-closed abstract pick().
+ * Covers the seams every strategy (M1+) rides: VERSION/PICK_NONE constants (plus the
+ * three-place version sync: Pick.js VERSION === package.json version === llms.txt
+ * stamp), the deterministic xorshift32 Prng, and BalancerBase's shared eligibility
+ * view + O(1) live count + fail-closed abstract pick().
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { VERSION, PICK_NONE, Prng, BalancerBase } from '../Pick.js';
 
 test('VERSION is a non-empty semver-shaped string', () => {
     assert.equal(typeof VERSION, 'string');
     assert.match(VERSION, /^\d+\.\d+\.\d+$/);
+});
+
+const readSibling = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+
+test('three-place version sync: Pick.js VERSION === package.json === llms.txt stamp', () => {
+    const pkgVersion = JSON.parse(readSibling('../package.json')).version;
+    assert.equal(typeof pkgVersion, 'string', 'package.json version is missing or not a string');
+    assert.match(pkgVersion, /^\d+\.\d+\.\d+$/, 'package.json version is not X.Y.Z');
+
+    const stamps = readSibling('../llms.txt').split(/\r?\n/).filter((l) => /^\s*version\s*:/i.test(l));
+    assert.equal(stamps.length, 1, 'llms.txt must have exactly one "Version:" line, found ' + stamps.length);
+    const m = /^Version: (\d+\.\d+\.\d+)$/.exec(stamps[0]);
+    assert.ok(m, 'llms.txt stamp is malformed (want "Version: X.Y.Z"): ' + JSON.stringify(stamps[0]));
+
+    assert.equal(VERSION, pkgVersion, 'Pick.js VERSION != package.json version');
+    assert.equal(VERSION, m[1], 'Pick.js VERSION != llms.txt Version stamp');
 });
 
 test('PICK_NONE is the -1 fail-closed sentinel', () => {

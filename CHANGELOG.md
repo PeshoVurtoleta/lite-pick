@@ -6,16 +6,18 @@ All notable changes to `@zakkster/lite-pick` are documented here. The format fol
 
 ## [Unreleased]
 
-### Tests
+### Added
 
 - **PoolCost L9 gate: committed must-fail tests (test-only, no shipped file).** The gate's pure helpers (the scavenge
   quantum `quantumOf` / `checkQuantum`, `childSemiBytes`, `L9_TOL` / `l9Within`, and runLane's result parse
-  `parseLaneResult`) moved unchanged from `test/perf/PoolCost.test.mjs` to `test/perf/pool-cost-gate.mjs`, with
-  the child flags and N passed in. The new `test/PoolCostGate.test.js` (in `npm test`, no GC flags, no real lanes)
-  proves every fail-closed path throws: null / missing / NaN scavenge counts, a lane N mismatch, an unpinned or
-  malformed semi-space pin, a bytesPerRun 0.1 off its counts, and a lane child that exits 1, is SIGKILLed, or
-  exits 0 with empty or non-JSON stdout; plus the `l9Within` boundary and the lane-formula equality for 0..4000
-  scavenges.
+  `parseLaneResult`) moved from `test/perf/PoolCost.test.mjs` to `test/perf/pool-cost-gate.mjs`, with the child
+  flags and N passed in; `CHILD_FLAGS` and `N` now live there too (single source). `checkQuantum` now asserts both
+  scavenge counts are integers before its count re-derivation (a null count coerced to 0 could reproduce the
+  reported bytesPerRun and pass). The new `test/PoolCostGate.test.js` (in `npm test`, no GC flags, no real lanes)
+  proves every fail-closed path throws: non-integer (null / missing / NaN / fractional / string) scavenge counts,
+  including the coerced-consistent shape, a lane N mismatch, an unpinned or malformed semi-space pin, a
+  bytesPerRun 0.1 off its counts, and a lane child that exits 1, is SIGKILLed, or exits 0 with empty or non-JSON
+  stdout; plus the `l9Within` boundary and the lane-formula equality for 0..4000 scavenges.
 
 ## [1.2.0] - 2026-10-11
 

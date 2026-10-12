@@ -12,8 +12,11 @@
  * message; a positive control per helper proves the case fails for the stated reason, not by accident.
  *
  * REVERT CONTROLS (each must turn this suite RED -- the reviewer can apply them to pool-cost-gate.mjs):
- *   (a) checkQuantum WITHOUT its count re-derivation (drop the `fromCounts` assert): the s8N / sN null,
- *       missing and NaN cases and the bytesPerRun 0.1-off cases stop throwing;
+ *   (a) checkQuantum WITHOUT its count re-derivation (drop the `fromCounts` assert): the bytesPerRun 0.1-off
+ *       cases stop throwing;
+ *   (a2) checkQuantum WITHOUT its integer-count assert: the coerced-consistent cases (sN null with bytesPerRun
+ *       = s8N x Q, s8N null with bytesPerRun = -sN x Q, fractional and string counts) stop throwing, and the
+ *       s8N / sN null, missing and NaN cases throw the fromCounts message instead of the integer one;
  *   (b) childSemiBytes WITHOUT `min === max` (keep only `max > 0`): the min != max case (and min missing)
  *       stops throwing;
  *   (c) parseLaneResult IGNORING r.status: the exit 1 and SIGKILL children print a VALID lane line before
@@ -27,12 +30,10 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+    CHILD_FLAGS as FLAGS, N,
     LANE_WIN_LO, LANE_WIN_HI, L9_TOL, l9Within, childSemiBytes, quantumOf, checkQuantum, parseLaneResult,
 } from './perf/pool-cost-gate.mjs';
 
-// Literal copies of PoolCost.test.mjs CHILD_FLAGS and N (importing that file would run its lanes).
-const FLAGS = ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'];
-const N = 200000;
 // The lane's OWN conversion, written out from pool-cost-lanes.mjs main() (count difference x 1 MiB / (7 N),
 // then 0.1 rounding) -- an oracle independent of checkQuantum's LANE_WIN_* / childSemiBytes derivation.
 function laneBpr(c) { return Math.round(c * 1048576 / (7 * 200000) * 10) / 10; }
@@ -61,22 +62,44 @@ test('pool-cost-gate: checkQuantum re-derivation equals the lane formula for eve
     }
 });
 
-// ---- checkQuantum: malformed scavenge counts (revert control a) -----------------------------------------
+// ---- checkQuantum: malformed scavenge counts (revert controls a, a2) ------------------------------------
 
 test('pool-cost-gate: s8N / sN null, missing or NaN fail checkQuantum', () => {
-    // null coerces to 0 in (s8N - sN), so a null count is caught because the coerced difference no longer
-    // matches the reported bytesPerRun (the fakes keep both counts far from 0); missing / NaN give NaN.
+    // The integer-count assert fires first. (Without it, these fakes would still throw the fromCounts message:
+    // they keep bytesPerRun at the TRUE count difference, which the coerced difference does not reproduce.)
     const cases = [
-        ['s8N', null, /lane LF reported 1092\.8 B\/run but its scavenge counts \(1000, null\) x Q = /],
-        ['s8N', undefined, /lane LF reported 1092\.8 B\/run but its scavenge counts \(1000, undefined\) x Q = NaN /],
-        ['s8N', NaN, /lane LF reported 1092\.8 B\/run but its scavenge counts \(1000, NaN\) x Q = NaN /],
-        ['sN', null, /lane LF reported 1092\.8 B\/run but its scavenge counts \(null, 2459\) x Q = /],
-        ['sN', undefined, /lane LF reported 1092\.8 B\/run but its scavenge counts \(undefined, 2459\) x Q = NaN /],
-        ['sN', NaN, /lane LF reported 1092\.8 B\/run but its scavenge counts \(NaN, 2459\) x Q = NaN /],
+        ['s8N', null, /lane LF scavenge counts must be integers \(got sN 1000, s8N null\)/],
+        ['s8N', undefined, /lane LF scavenge counts must be integers \(got sN 1000, s8N undefined\)/],
+        ['s8N', NaN, /lane LF scavenge counts must be integers \(got sN 1000, s8N NaN\)/],
+        ['sN', null, /lane LF scavenge counts must be integers \(got sN null, s8N 2459\)/],
+        ['sN', undefined, /lane LF scavenge counts must be integers \(got sN undefined, s8N 2459\)/],
+        ['sN', NaN, /lane LF scavenge counts must be integers \(got sN NaN, s8N 2459\)/],
     ];
     for (const [key, value, re] of cases) {
         const d = fake(C);
         if (value === undefined) delete d[key]; else d[key] = value;
+        assert.throws(() => checkQuantum(d, Q, N, FLAGS), re, key + ' = ' + String(value) + ' must fail closed');
+    }
+});
+
+test('pool-cost-gate: a non-integer count whose COERCED difference matches bytesPerRun fails checkQuantum', () => {
+    // The fail-open shape: null coerces to 0 and a string to its number in (s8N - sN), so a bytesPerRun computed
+    // from the coerced difference (by the lane's own formula, laneBpr) passes the fromCounts compare. Only the
+    // integer-count assert catches these.
+    const cases = [
+        ['sN', null, (d) => laneBpr(d.s8N), 'got sN null, s8N 2459'],             // bytesPerRun = s8N x Q
+        ['s8N', null, (d) => laneBpr(0 - d.sN), 'got sN 1000, s8N null'],         // bytesPerRun = -sN x Q
+        ['sN', 1000.5, (d) => laneBpr(d.s8N - d.sN), 'got sN 1000.5, s8N 2459'],  // fractional
+        ['s8N', 2459.5, (d) => laneBpr(d.s8N - d.sN), 'got sN 1000, s8N 2459.5'], // fractional
+        ['sN', '1000', (d) => laneBpr(d.s8N - d.sN), 'got sN 1000, s8N 2459'],    // a string, not a number
+    ];
+    for (const [key, value, bpr, got] of cases) {
+        const d = fake(C);
+        d[key] = value;
+        d.bytesPerRun = bpr(d);
+        // The shape really is consistent under coercion: the fromCounts compare alone would accept it.
+        assert.equal(d.bytesPerRun, laneBpr(Number(d.s8N) - Number(d.sN)), key + ' = ' + String(value));
+        const re = new RegExp('lane LF scavenge counts must be integers \\(' + got.replace('.', '\\.') + '\\)');
         assert.throws(() => checkQuantum(d, Q, N, FLAGS), re, key + ' = ' + String(value) + ' must fail closed');
     }
 });

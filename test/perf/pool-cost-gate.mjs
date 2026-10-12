@@ -3,11 +3,16 @@
  *
  * Not a suite: no node:test, no lanes, no GC flags. PoolCost.test.mjs imports these to decide its L9
  * gate, and test/PoolCostGate.test.js imports the SAME functions to prove each fail-closed path throws
- * (fake lane results, no real lanes). Every input -- the child flags, N, the spawnSync result -- is a
- * parameter, never a module global, so a test can inject a fake.
+ * (fake lane results, no real lanes). Every helper input -- the child flags, N, the spawnSync result -- is a
+ * parameter, never a module global, so a test can inject a fake. CHILD_FLAGS and N below are the single
+ * source of the real values; the callers pass them in.
  */
 
 import assert from 'node:assert/strict';
+
+// runLane (PoolCost.test.mjs) spawns every lane child with exactly these V8 flags and this run count.
+export const CHILD_FLAGS = ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'];
+export const N = 200000;
 
 /**
  * ONE scavenge quantum in B/run, derived from runLane's own measurement configuration -- never typed in.
@@ -30,7 +35,7 @@ export const LANE_WIN_HI = 8;   // countWindow(drive, lane, 8 * N, ...)  -- pool
 // L9 test, which catches every other change. NEVER raise it to pass.
 export const L9_TOL = 1;
 export function l9Within(d9, d3) { return d9 <= d3 + L9_TOL; }
-// `flags` = the child's V8 flags (PoolCost.test.mjs CHILD_FLAGS). Only the `--flag=value` form is read; any
+// `flags` = the child's V8 flags (CHILD_FLAGS above). Only the `--flag=value` form is read; any
 // other form leaves the value NaN, which fails closed below.
 export function childSemiBytes(flags) {
     let max = NaN, min = NaN;
@@ -42,13 +47,17 @@ export function childSemiBytes(flags) {
         ') -- without both, one scavenge is not a fixed number of bytes and the quantum is undefined');
     return max * 1048576;
 }
-// `N` = the run count runLane passes to every lane (PoolCost.test.mjs N).
+// `N` = the run count runLane passes to every lane (N above).
 export function quantumOf(d, N, flags) {
     assert.equal(d.N, N, 'lane ' + d.lane + ' measured N = ' + d.N + ', expected ' + N);
     return childSemiBytes(flags) / ((LANE_WIN_HI - LANE_WIN_LO) * d.N);
 }
 export function checkQuantum(d, q, N, flags) {
     assert.equal(quantumOf(d, N, flags), q, 'lane ' + d.lane + ' does not share the measurement configuration of Q');
+    // null / missing / NaN / fractional / string counts must not reach the arithmetic below: null coerces to 0
+    // and a string to its number, so a coerced count can still reproduce the reported bytesPerRun.
+    assert.ok(Number.isInteger(d.sN) && Number.isInteger(d.s8N), 'lane ' + d.lane +
+        ' scavenge counts must be integers (got sN ' + d.sN + ', s8N ' + d.s8N + ')');
     // Same operation order as the lane (count x semiBytes / (span x N), then 0.1 rounding), so an equal
     // formula can never differ here by a float ulp.
     const fromCounts = Math.round(((d.s8N - d.sN) * childSemiBytes(flags)) / ((LANE_WIN_HI - LANE_WIN_LO) * d.N) * 10) / 10;

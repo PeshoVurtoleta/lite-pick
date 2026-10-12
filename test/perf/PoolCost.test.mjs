@@ -60,14 +60,13 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { Pool } from '../../Pool.js';
 import { P2cBalancer } from '../../Pick.js';
-// The gate's pure helpers (the scavenge quantum Q, its re-derivation, the L9 tolerance, the lane parse) live in
-// pool-cost-gate.mjs so test/PoolCostGate.test.js can prove their fail-closed paths without real lanes.
-import { L9_TOL, l9Within, quantumOf, checkQuantum, parseLaneResult } from './pool-cost-gate.mjs';
+// The gate's pure helpers (the scavenge quantum Q, its re-derivation, the L9 tolerance, the lane parse) and the
+// lane CHILD_FLAGS / N live in pool-cost-gate.mjs so test/PoolCostGate.test.js can prove their fail-closed paths
+// without real lanes.
+import { CHILD_FLAGS, N, L9_TOL, l9Within, quantumOf, checkQuantum, parseLaneResult } from './pool-cost-gate.mjs';
 
 const LANES = fileURLToPath(new URL('./pool-cost-lanes.mjs', import.meta.url));
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
-const CHILD_FLAGS = ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'];
-const N = 200000;
 
 // Slack above the measured share. 8 B: below one boxed double (a ~16 B HeapNumber), so a single boxed
 // value crossing a call trips the gate (the PL_BOX / PL_BOX6 teeth below), and comfortably above the
